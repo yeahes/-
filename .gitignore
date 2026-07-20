@@ -1,0 +1,33 @@
+# Runtime and generated files
+runtime/
+work-dir/
+AppData/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+
+# Packaged binaries and installers
+resource/bin/
+VideoCaptioner.exe
+unins000.dat
+unins000.exe
+_pystand_static.int
+
+# Generated media/subtitle artifacts
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.m4a
+*.mp3
+*.wav
+*.ass
+*.srt
+*.vocab_cards.json
+
+# Local/editor files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

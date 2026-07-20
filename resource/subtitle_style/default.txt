@@ -1,0 +1,4 @@
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,抖音美好体,40,&H0027a9ff,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,3.0,0,1,3.4,0,2,10,10,64,1,\q1
+Style: Secondary,微软雅黑,30,&H00ffffff,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0.6,0,1,2.0,0,2,10,10,64,1,\q1
