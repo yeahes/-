@@ -3,6 +3,7 @@ import json
 import os
 import re
 import builtins
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +41,7 @@ ADJACENT_ZH_DUPLICATE_SIMILARITY = 0.88
 SUBTITLE_DURATION_INVALID_MS = 150
 SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
+SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
 
 
 SCREEN_EDITOR_PROMPT = """
@@ -289,6 +291,7 @@ class ScreenSubtitleEditor:
         self._translation_structure_errors: List[Dict] = []
         self._last_llm_raw_returns: List[Dict] = []
         self._last_semantic_group_debug: List[Dict] = []
+        self._llm_cache_used: bool = False
         self.last_validation_summary: Optional[Dict] = None
 
     @staticmethod
@@ -386,6 +389,7 @@ class ScreenSubtitleEditor:
         self._translation_structure_errors = []
         self._last_llm_raw_returns = []
         self._last_semantic_group_debug = []
+        self._llm_cache_used = False
         semantic_groups = self._semantic_translation_groups(items)
         items = self._translate_semantic_subtitle_groups(items)
         self._validate_final_item_translation_ids(items)
@@ -403,6 +407,7 @@ class ScreenSubtitleEditor:
         segments = self._merge_short_display_segments(segments)
         segments = self._repair_abnormal_timing_gaps(segments)
         segments = self._apply_display_timing_padding(segments)
+        segments = self._order_segments_by_frozen_subtitle_ids(segments)
         self._validate_final_segment_translation_ids(segments)
         self._write_stable_pipeline_artifacts(
             source_segments=asr_data.segments,
@@ -526,16 +531,16 @@ class ScreenSubtitleEditor:
         total_weight = max(1, sum(weights))
         result: List[ASRDataSeg] = []
         cursor = window_start
-        for index, (seg, weight) in enumerate(zip(cluster, weights)):
+        for index, seg in enumerate(cluster):
+            weight = weights[index]
             if index == len(cluster) - 1:
                 end_time = window_end
             else:
                 end_time = window_start + int(available * sum(weights[: index + 1]) / total_weight)
             end_time = max(end_time, cursor + 1)
             result.append(
-                ASRDataSeg(
-                    text=seg.text,
-                    translated_text=seg.translated_text,
+                self._copy_segment(
+                    seg,
                     start_time=cursor,
                     end_time=end_time,
                 )
@@ -563,19 +568,26 @@ class ScreenSubtitleEditor:
             current = ordered[index]
             if (
                 index + 1 < len(ordered)
+                and not (
+                    getattr(current, "subtitle_id", None)
+                    and getattr(ordered[index + 1], "subtitle_id", None)
+                )
                 and self._should_merge_short_display_segment(
                     current, ordered[index + 1], short_ms, merge_gap_ms
                 )
             ):
                 next_seg = ordered[index + 1]
                 merged.append(
-                    ASRDataSeg(
+                    self._copy_segment(
+                        current,
                         text=self._join_subtitle_text(current.text, next_seg.text),
                         translated_text=self._join_subtitle_text(
                             current.translated_text, next_seg.translated_text
                         ),
                         start_time=min(current.start_time, next_seg.start_time),
                         end_time=max(current.end_time, next_seg.end_time),
+                        subtitle_id=getattr(current, "subtitle_id", None)
+                        or getattr(next_seg, "subtitle_id", None),
                     )
                 )
                 merge_count += 1
@@ -695,6 +707,62 @@ class ScreenSubtitleEditor:
     @staticmethod
     def _item_subtitle_id(item: ScreenSubtitleItem, fallback_index: int) -> str:
         return item.subtitle_id or f"S{fallback_index:04d}"
+
+    @staticmethod
+    def _segment_subtitle_id(seg: ASRDataSeg, fallback_index: int) -> str:
+        return str(getattr(seg, "subtitle_id", "") or f"S{fallback_index:04d}")
+
+    @classmethod
+    def _copy_segment(
+        cls,
+        seg: ASRDataSeg,
+        *,
+        text: Optional[str] = None,
+        translated_text: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        subtitle_id: Optional[str] = None,
+    ) -> ASRDataSeg:
+        copied = ASRDataSeg(
+            text=seg.text if text is None else text,
+            translated_text=seg.translated_text if translated_text is None else translated_text,
+            start_time=seg.start_time if start_time is None else start_time,
+            end_time=seg.end_time if end_time is None else end_time,
+        )
+        source_id = subtitle_id if subtitle_id is not None else getattr(seg, "subtitle_id", None)
+        if source_id:
+            copied.subtitle_id = source_id
+        return copied
+
+    @classmethod
+    def _segment_index_by_subtitle_id(
+        cls, segments: Sequence[ASRDataSeg]
+    ) -> Dict[str, int]:
+        return {
+            cls._segment_subtitle_id(seg, index): index - 1
+            for index, seg in enumerate(segments, 1)
+        }
+
+    @staticmethod
+    def _current_git_commit() -> str:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+        except Exception:
+            return ""
+
+    def manifest_metadata(self) -> Dict:
+        return {
+            "translation_model": self.model,
+            "code_commit": self._current_git_commit(),
+            "cache_used": self._llm_cache_used,
+            "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
+        }
 
     def _group_expected_subtitle_ids(self, group: Dict) -> List[str]:
         return [
@@ -916,6 +984,21 @@ class ScreenSubtitleEditor:
                 missing_ids=missing_ids,
                 message="Final rendered subtitle segments do not preserve frozen subtitle_id coverage.",
             )
+
+    def _order_segments_by_frozen_subtitle_ids(
+        self, segments: Sequence[ASRDataSeg]
+    ) -> List[ASRDataSeg]:
+        if not self._frozen_subtitle_ids:
+            return list(segments)
+        index_map = {subtitle_id: index for index, subtitle_id in enumerate(self._frozen_subtitle_ids)}
+        return sorted(
+            list(segments),
+            key=lambda seg: (
+                index_map.get(self._segment_subtitle_id(seg, 0), len(index_map)),
+                seg.start_time,
+                seg.end_time,
+            ),
+        )
 
     def _source_ids_for_word_range(self, word_start: int, word_end: int) -> List[int]:
         ids = [
@@ -1902,6 +1985,10 @@ class ScreenSubtitleEditor:
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "pipeline": "screen_subtitle_stable",
                 "model": self.model,
+                "translation_model": self.model,
+                "code_commit": self._current_git_commit(),
+                "cache_used": self._llm_cache_used,
+                "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
                 "target_language": self.target_language,
                 "max_cjk_chars": self.max_cjk_chars,
                 "max_english_words": self.max_english_words,
@@ -3139,9 +3226,8 @@ class ScreenSubtitleEditor:
                 tail_count += 1
 
             adjusted.append(
-                ASRDataSeg(
-                    text=seg.text,
-                    translated_text=seg.translated_text,
+                ScreenSubtitleEditor._copy_segment(
+                    seg,
                     start_time=start_time,
                     end_time=end_time,
                 )
@@ -3168,6 +3254,10 @@ class ScreenSubtitleEditor:
         i = 0
         while i < len(segments):
             seg = segments[i]
+            if getattr(seg, "subtitle_id", None):
+                repaired.append(seg)
+                i += 1
+                continue
             structural_parts = self._split_structural_phrases(seg.text)
             if len(structural_parts) > 1:
                 repaired.extend(self._segments_from_parts(seg, structural_parts))
@@ -3206,6 +3296,8 @@ class ScreenSubtitleEditor:
     def _quality_check_candidate_segments(
         self, segments: List[ASRDataSeg]
     ) -> List[ASRDataSeg]:
+        if any(getattr(seg, "subtitle_id", None) for seg in segments):
+            return list(segments)
         result: List[ASRDataSeg] = []
         i = 0
         reviewed_count = 0
@@ -3290,6 +3382,7 @@ class ScreenSubtitleEditor:
         )
         try:
             if cache_result:
+                self._llm_cache_used = True
                 data = json.loads(cache_result)
             else:
                 response = self.client.chat.completions.create(
@@ -3371,6 +3464,9 @@ class ScreenSubtitleEditor:
         result: List[ASRDataSeg] = []
         changed = 0
         for seg in segments:
+            if getattr(seg, "subtitle_id", None):
+                result.append(seg)
+                continue
             text = self._normalize_text(seg.text)
             if self._word_count(text) <= self.max_english_words:
                 result.append(seg)
@@ -3385,7 +3481,9 @@ class ScreenSubtitleEditor:
             if len(zh_parts) != len(parts):
                 zh_parts = [seg.translated_text if index == 0 else "" for index in range(len(parts))]
             timings = self._proportional_segment_timings(seg, parts)
-            for part, translated, (start_ms, end_ms) in zip(parts, zh_parts, timings):
+            for offset, part in enumerate(parts):
+                translated = zh_parts[offset] if offset < len(zh_parts) else ""
+                start_ms, end_ms = timings[offset]
                 result.append(
                     ASRDataSeg(
                         text=part,
@@ -3445,17 +3543,25 @@ class ScreenSubtitleEditor:
             logger.warning("中文字幕超速压缩失败，保留原字幕: %s", str(e))
             return list(segments)
 
-        by_index: Dict[int, str] = {}
+        by_id: Dict[str, str] = {}
         for item in data.get("items", []) if isinstance(data, dict) else []:
             if not isinstance(item, dict) or not str(item.get("index", "")).isdigit():
                 continue
+            index = int(item["index"])
+            if index < 0 or index >= len(segments):
+                self._record_translation_structure_error(
+                    "translation_id_unknown",
+                    message=f"Compression returned unknown segment index: {index}",
+                )
+                continue
             text = str(item.get("chinese", "")).strip()
             if text:
-                by_index[int(item["index"])] = text
+                by_id[self._segment_subtitle_id(segments[index], index + 1)] = text
 
         group_reallocation_payload = []
         for index, seg in targets:
-            compressed = by_index.get(index, "")
+            subtitle_id = self._segment_subtitle_id(seg, index + 1)
+            compressed = by_id.get(subtitle_id, "")
             context = self._semantic_context_for_segment_index(
                 index,
                 segments,
@@ -3472,7 +3578,7 @@ class ScreenSubtitleEditor:
             item["rejected_single_chinese"] = compressed
             group_reallocation_payload.append(item)
 
-        group_allocations: Dict[int, Dict[int, str]] = {}
+        group_allocations: Dict[str, Dict[str, str]] = {}
         if group_reallocation_payload:
             group_prompt = (
                 "Reallocate Simplified Chinese subtitles only inside the provided sense_group.\n"
@@ -3490,7 +3596,9 @@ class ScreenSubtitleEditor:
                     task="screen_subtitle_chinese_group_reallocate",
                     temperature=0.1,
                 )
-                group_allocations = self._parse_chinese_group_allocations(allocation_data)
+                group_allocations = self._parse_chinese_group_allocations(
+                    allocation_data, segments
+                )
             except Exception as e:
                 logger.warning("中文字幕同组重分配失败: %s", str(e))
 
@@ -3502,13 +3610,14 @@ class ScreenSubtitleEditor:
                 semantic_groups=semantic_groups,
                 subtitle_items=subtitle_items,
             )
-            if index in group_allocations and self._is_valid_group_chinese_allocation(
-                group_allocations[index],
+            subtitle_id = self._segment_subtitle_id(seg, index + 1)
+            if subtitle_id in group_allocations and self._is_valid_group_chinese_allocation_by_id(
+                group_allocations[subtitle_id],
                 segments,
                 context,
             ):
                 continue
-            compressed = by_index.get(index, "")
+            compressed = by_id.get(subtitle_id, "")
             if compressed and self._is_valid_chinese_compression(
                 compressed, seg, segments, index, context=context
             ):
@@ -3517,7 +3626,7 @@ class ScreenSubtitleEditor:
                 index, seg, segments, semantic_groups=semantic_groups, subtitle_items=subtitle_items
             )
             retry_item["rejected_single_chinese"] = compressed
-            retry_item["rejected_group_segments"] = group_allocations.get(index, {})
+            retry_item["rejected_group_segments"] = group_allocations.get(subtitle_id, {})
             retry_payload.append(retry_item)
 
         if retry_payload:
@@ -3535,7 +3644,9 @@ class ScreenSubtitleEditor:
                     task="screen_subtitle_chinese_group_reallocate_retry",
                     temperature=0.0,
                 )
-                group_allocations.update(self._parse_chinese_group_allocations(retry_data))
+                group_allocations.update(
+                    self._parse_chinese_group_allocations(retry_data, segments)
+                )
             except Exception as e:
                 logger.warning("中文字幕同组保守重分配重试失败: %s", str(e))
 
@@ -3548,25 +3659,33 @@ class ScreenSubtitleEditor:
                 semantic_groups=semantic_groups,
                 subtitle_items=subtitle_items,
             )
-            allocation = group_allocations.get(index, {})
-            if allocation and self._is_valid_group_chinese_allocation(
+            subtitle_id = self._segment_subtitle_id(seg, index + 1)
+            allocation = group_allocations.get(subtitle_id, {})
+            if allocation and self._is_valid_group_chinese_allocation_by_id(
                 allocation,
                 result,
                 context,
             ):
-                for item_index, text in allocation.items():
+                index_by_id = self._segment_index_by_subtitle_id(result)
+                for item_id, text in allocation.items():
+                    item_index = index_by_id.get(item_id)
+                    if item_index is None:
+                        self._record_translation_structure_error(
+                            "translation_id_unknown",
+                            returned_ids=[item_id],
+                            message=f"Compression allocation references unknown subtitle_id: {item_id}",
+                        )
+                        continue
                     old = result[item_index]
                     if old.translated_text == text:
                         continue
-                    result[item_index] = ASRDataSeg(
-                        text=old.text,
+                    result[item_index] = self._copy_segment(
+                        old,
                         translated_text=text,
-                        start_time=old.start_time,
-                        end_time=old.end_time,
                     )
                     changed += 1
                 continue
-            compressed = by_index.get(index, "")
+            compressed = by_id.get(subtitle_id, "")
             if not compressed:
                 continue
             if not self._is_valid_chinese_compression(
@@ -3577,11 +3696,9 @@ class ScreenSubtitleEditor:
                 context=context,
             ):
                 continue
-            result[index] = ASRDataSeg(
-                text=seg.text,
+            result[index] = self._copy_segment(
+                seg,
                 translated_text=compressed,
-                start_time=seg.start_time,
-                end_time=seg.end_time,
             )
             changed += 1
         if changed:
@@ -3603,6 +3720,7 @@ class ScreenSubtitleEditor:
             task=task,
         )
         if cache_result:
+            self._llm_cache_used = True
             return json.loads(cache_result)
 
         response = self.client.chat.completions.create(
@@ -3624,24 +3742,48 @@ class ScreenSubtitleEditor:
         )
         return data
 
-    @staticmethod
-    def _parse_chinese_group_allocations(data: Dict) -> Dict[int, Dict[int, str]]:
-        result: Dict[int, Dict[int, str]] = {}
+    def _parse_chinese_group_allocations(
+        self, data: Dict, segments: Sequence[ASRDataSeg]
+    ) -> Dict[str, Dict[str, str]]:
+        result: Dict[str, Dict[str, str]] = {}
         groups = data.get("groups", []) if isinstance(data, dict) else []
         for group in groups:
             if not isinstance(group, dict) or not str(group.get("target_index", "")).isdigit():
                 continue
             target_index = int(group["target_index"])
-            allocation: Dict[int, str] = {}
+            if target_index < 0 or target_index >= len(segments):
+                continue
+            target_id = self._segment_subtitle_id(segments[target_index], target_index + 1)
+            allocation: Dict[str, str] = {}
             for item in group.get("segments", []):
                 if not isinstance(item, dict) or not str(item.get("index", "")).isdigit():
                     continue
+                index = int(item["index"])
+                if index < 0 or index >= len(segments):
+                    continue
                 text = str(item.get("zh", item.get("chinese", ""))).strip()
                 if text:
-                    allocation[int(item["index"])] = text
+                    allocation[self._segment_subtitle_id(segments[index], index + 1)] = text
             if allocation:
-                result[target_index] = allocation
+                result[target_id] = allocation
         return result
+
+    def _is_valid_group_chinese_allocation_by_id(
+        self,
+        allocation: Dict[str, str],
+        segments: Sequence[ASRDataSeg],
+        context: Dict,
+    ) -> bool:
+        if not allocation:
+            return False
+        id_to_index = self._segment_index_by_subtitle_id(segments)
+        index_allocation: Dict[int, str] = {}
+        for subtitle_id, text in allocation.items():
+            index = id_to_index.get(subtitle_id)
+            if index is None:
+                return False
+            index_allocation[index] = text
+        return self._is_valid_group_chinese_allocation(index_allocation, segments, context)
 
     def _chinese_compression_payload_item(
         self,
@@ -3660,6 +3802,7 @@ class ScreenSubtitleEditor:
         return {
             "index": index,
             "target": {
+                "subtitle_id": self._segment_subtitle_id(seg, index + 1),
                 "english": self._normalize_text(seg.text),
                 "current_chinese": self._normalize_text(seg.translated_text),
                 "duration_ms": max(1, int(seg.end_time) - int(seg.start_time)),
@@ -3699,6 +3842,7 @@ class ScreenSubtitleEditor:
                         ),
                         "word_start": getattr(part_item, "word_start", None),
                         "word_end": getattr(part_item, "word_end", None),
+                        "subtitle_id": self._segment_subtitle_id(group_seg, start + offset + 1),
                     }
                 )
             group_id = int(group.get("id") or 0)
@@ -3976,6 +4120,8 @@ class ScreenSubtitleEditor:
         return timings
 
     def _segments_from_parts(self, seg: ASRDataSeg, parts: List[str]) -> List[ASRDataSeg]:
+        if getattr(seg, "subtitle_id", None):
+            return [seg]
         translations = self._translate_split_parts(parts)
         duration = max(seg.end_time - seg.start_time, len(parts))
         result: List[ASRDataSeg] = []
@@ -4024,6 +4170,7 @@ class ScreenSubtitleEditor:
             task="screen_subtitle_editor",
         )
         if cache_result:
+            self._llm_cache_used = True
             data = json.loads(cache_result)
         else:
             response = self.client.chat.completions.create(
@@ -4344,9 +4491,8 @@ class ScreenSubtitleEditor:
             last_end_time = end_time
 
             aligned.append(
-                ASRDataSeg(
-                    text=seg.text,
-                    translated_text=seg.translated_text,
+                self._copy_segment(
+                    seg,
                     start_time=start_time,
                     end_time=end_time,
                 )
@@ -4568,6 +4714,7 @@ class ScreenSubtitleEditor:
                     translated=item.translated,
                     word_start=word_start,
                     word_end=word_end,
+                    subtitle_id=item.subtitle_id,
                 )
             )
 
@@ -4852,6 +4999,7 @@ class ScreenSubtitleEditor:
                 source_ids=item.source_ids,
                 original=part,
                 translated=translated_parts[index] if index < len(translated_parts) else "",
+                subtitle_id=item.subtitle_id,
             )
             for index, part in enumerate(parts)
             if part.strip()
@@ -4885,6 +5033,7 @@ class ScreenSubtitleEditor:
         )
         if cache_result:
             try:
+                self._llm_cache_used = True
                 data = json.loads(cache_result)
                 if isinstance(data, list) and len(data) == len(parts):
                     return [str(item).strip() for item in data]
@@ -4933,7 +5082,14 @@ class ScreenSubtitleEditor:
             flags=re.IGNORECASE,
         )
         if re.search(r"\bright\?\s*$", original, flags=re.IGNORECASE):
-            return ScreenSubtitleItem(item.source_ids, original, translated)
+            return ScreenSubtitleItem(
+                item.source_ids,
+                original,
+                translated,
+                item.word_start,
+                item.word_end,
+                item.subtitle_id,
+            )
 
         stripped = re.sub(
             r"(?:[,;:]\s*)?\b(?:right|yeah|yes|yep|exactly|okay|ok|sure)\.?\s*$",
@@ -4949,8 +5105,22 @@ class ScreenSubtitleEditor:
             ).strip()
             if stripped[-1] not in ".!?":
                 stripped += "."
-            return ScreenSubtitleItem(item.source_ids, stripped, translated)
-        return ScreenSubtitleItem(item.source_ids, original, translated)
+            return ScreenSubtitleItem(
+                item.source_ids,
+                stripped,
+                translated,
+                item.word_start,
+                item.word_end,
+                item.subtitle_id,
+            )
+        return ScreenSubtitleItem(
+            item.source_ids,
+            original,
+            translated,
+            item.word_start,
+            item.word_end,
+            item.subtitle_id,
+        )
 
     @classmethod
     def _strip_leading_backchannel(cls, item: ScreenSubtitleItem) -> ScreenSubtitleItem:
@@ -4970,8 +5140,22 @@ class ScreenSubtitleEditor:
             ).strip()
             if stripped[0].islower():
                 stripped = stripped[0].upper() + stripped[1:]
-            return ScreenSubtitleItem(item.source_ids, stripped, translated)
-        return ScreenSubtitleItem(item.source_ids, original, translated)
+            return ScreenSubtitleItem(
+                item.source_ids,
+                stripped,
+                translated,
+                item.word_start,
+                item.word_end,
+                item.subtitle_id,
+            )
+        return ScreenSubtitleItem(
+            item.source_ids,
+            original,
+            translated,
+            item.word_start,
+            item.word_end,
+            item.subtitle_id,
+        )
 
     @classmethod
     def _remove_embedded_backchannels(cls, item: ScreenSubtitleItem) -> ScreenSubtitleItem:
@@ -4989,7 +5173,14 @@ class ScreenSubtitleEditor:
                 "",
                 translated,
             ).strip()
-        return ScreenSubtitleItem(item.source_ids, cleaned, translated)
+        return ScreenSubtitleItem(
+            item.source_ids,
+            cleaned,
+            translated,
+            item.word_start,
+            item.word_end,
+            item.subtitle_id,
+        )
 
     @staticmethod
     def _fix_obvious_asr_errors(item: ScreenSubtitleItem) -> ScreenSubtitleItem:
@@ -4998,7 +5189,14 @@ class ScreenSubtitleEditor:
         original = re.sub(r"\bU\.\s*K\.", "U.K.", original)
         original = re.sub(r"\bA\.\s*I\.", "AI", original)
         translated = item.translated or ""
-        return ScreenSubtitleItem(item.source_ids, original, translated)
+        return ScreenSubtitleItem(
+            item.source_ids,
+            original,
+            translated,
+            item.word_start,
+            item.word_end,
+            item.subtitle_id,
+        )
 
     def _merge_dangling_items(
         self, items: List[ScreenSubtitleItem]
@@ -5018,6 +5216,10 @@ class ScreenSubtitleEditor:
                 and not self._looks_like_time_range(item.original)
                 and self._word_count(merged_text) <= max_words_for_merge
                 and self._can_merge_items(result[-1], item)
+                and not (
+                    getattr(result[-1], "subtitle_id", None)
+                    and getattr(item, "subtitle_id", None)
+                )
             ):
                 previous = result[-1]
                 result[-1] = ScreenSubtitleItem(
@@ -5028,9 +5230,18 @@ class ScreenSubtitleEditor:
                     translated=self._merge_translations(
                         previous.translated, item.translated
                     ),
+                    subtitle_id=previous.subtitle_id or item.subtitle_id,
                 )
             else:
-                if result and is_tail_dangling_word and self._can_merge_items(result[-1], item):
+                if (
+                    result
+                    and is_tail_dangling_word
+                    and self._can_merge_items(result[-1], item)
+                    and not (
+                        getattr(result[-1], "subtitle_id", None)
+                        and getattr(item, "subtitle_id", None)
+                    )
+                ):
                     rebalanced = self._rebalance_tail_dangling_merge(result[-1], item)
                     if rebalanced:
                         result[-1] = rebalanced[0]
@@ -5114,11 +5325,13 @@ class ScreenSubtitleEditor:
                 source_ids=previous.source_ids,
                 original=parts[0],
                 translated=translations[0] if len(translations) > 0 else "",
+                subtitle_id=previous.subtitle_id,
             ),
             ScreenSubtitleItem(
                 source_ids=source_ids,
                 original=parts[1],
                 translated=translations[1] if len(translations) > 1 else "",
+                subtitle_id=dangling.subtitle_id,
             ),
         ]
 
@@ -5185,6 +5398,7 @@ class ScreenSubtitleEditor:
         )
         try:
             if cache_result:
+                self._llm_cache_used = True
                 data = json.loads(cache_result)
             else:
                 response = self.client.chat.completions.create(
@@ -5265,6 +5479,7 @@ class ScreenSubtitleEditor:
         )
         try:
             if cache_result:
+                self._llm_cache_used = True
                 data = json.loads(cache_result)
             else:
                 response = self.client.chat.completions.create(
@@ -5386,6 +5601,7 @@ class ScreenSubtitleEditor:
         )
         try:
             if cache_result:
+                self._llm_cache_used = True
                 data = json.loads(cache_result)
             else:
                 response = self.client.chat.completions.create(
@@ -5558,6 +5774,10 @@ class ScreenSubtitleEditor:
             if (
                 result
                 and self._can_merge_items(result[-1], current)
+                and not (
+                    getattr(result[-1], "subtitle_id", None)
+                    and getattr(current, "subtitle_id", None)
+                )
                 and re.match(
                     r"^(?:for|of|in|on|at|to|from|with|about|around|according)\b",
                     current.original,
@@ -5572,6 +5792,7 @@ class ScreenSubtitleEditor:
                         source_ids=sorted(set(previous.source_ids + current.source_ids)),
                         original=candidate,
                         translated="",
+                        subtitle_id=previous.subtitle_id or current.subtitle_id,
                     )
                     if remainder:
                         result.append(
@@ -5579,6 +5800,7 @@ class ScreenSubtitleEditor:
                                 source_ids=current.source_ids,
                                 original=remainder,
                                 translated="",
+                                subtitle_id=current.subtitle_id,
                             )
                         )
                     i += 1
@@ -5603,6 +5825,10 @@ class ScreenSubtitleEditor:
             if (
                 result
                 and self._can_merge_items(result[-1], item)
+                and not (
+                    getattr(result[-1], "subtitle_id", None)
+                    and getattr(item, "subtitle_id", None)
+                )
                 and re.match(
                     r"^(?:for|of|in|on|at|to|from|with|about|around)\b",
                     item.original,
@@ -5618,6 +5844,7 @@ class ScreenSubtitleEditor:
                         f"{previous.original} {item.original}"
                     ),
                     translated="",
+                    subtitle_id=previous.subtitle_id or item.subtitle_id,
                 )
             else:
                 result.append(item)
@@ -5633,6 +5860,10 @@ class ScreenSubtitleEditor:
             if (
                 i + 1 < len(items)
                 and self._needs_following_preposition(current.original)
+                and not (
+                    getattr(current, "subtitle_id", None)
+                    and getattr(items[i + 1], "subtitle_id", None)
+                )
                 and re.match(r"^(?:for|of|in|on|at|to|from|with|about|around)\b", items[i + 1].original, flags=re.IGNORECASE)
             ):
                 merged_original = self._normalize_text(
@@ -5647,6 +5878,7 @@ class ScreenSubtitleEditor:
                             source_ids=sorted(set(current.source_ids + items[i + 1].source_ids)),
                             original=part,
                             translated="",
+                            subtitle_id=current.subtitle_id or items[i + 1].subtitle_id,
                         )
                     )
                 i += 2
@@ -5697,7 +5929,8 @@ class ScreenSubtitleEditor:
             return items
 
         result = list(items)
-        for index, translated in zip(missing_indices, translations):
+        for offset, index in enumerate(missing_indices):
+            translated = translations[offset]
             item = result[index]
             result[index] = ScreenSubtitleItem(
                 source_ids=item.source_ids,
@@ -5730,13 +5963,12 @@ class ScreenSubtitleEditor:
             return segments
 
         result = list(segments)
-        for index, translated in zip(missing_indices, translations):
+        for offset, index in enumerate(missing_indices):
+            translated = translations[offset]
             seg = result[index]
-            result[index] = ASRDataSeg(
-                text=seg.text,
+            result[index] = self._copy_segment(
+                seg,
                 translated_text=translated,
-                start_time=seg.start_time,
-                end_time=seg.end_time,
             )
         logger.info("最终上屏字幕缺译文已补译: %s", len(missing_indices))
         return result

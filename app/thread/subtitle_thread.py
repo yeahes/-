@@ -96,6 +96,7 @@ class SubtitleThread(QThread):
         coverage_report_path: str | None = None,
         validation_status: str = "passed",
         validation_summary: dict | None = None,
+        manifest_meta: dict | None = None,
     ) -> None:
         """Write deterministic subtitle outputs used by video synthesis.
 
@@ -159,6 +160,8 @@ class SubtitleThread(QThread):
             "subtitle_count": len(asr_data.segments),
             "paths": {key: str(path) for key, path in stable_paths.items()},
         }
+        if manifest_meta:
+            manifest.update(manifest_meta)
         manifest_path = output_dir / "stable-final-manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -389,6 +392,7 @@ class SubtitleThread(QThread):
                         coverage_report_path=coverage_report_path,
                         validation_status="failed",
                         validation_summary=screen_editor.last_validation_summary,
+                        manifest_meta=screen_editor.manifest_metadata(),
                     )
                     raise RuntimeError(
                         self.tr(
@@ -429,6 +433,7 @@ class SubtitleThread(QThread):
                 subtitle_config,
                 coverage_report_path=coverage_report_path,
                 validation_status="passed",
+                manifest_meta=screen_editor.manifest_metadata(),
             )
             logger.info(f"字幕保存到 {self.task.output_path}")
 

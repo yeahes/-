@@ -3,6 +3,7 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -76,6 +77,7 @@ def _id_editor():
     editor._last_llm_raw_returns = []
     editor._last_semantic_group_debug = []
     editor._frozen_subtitle_ids = []
+    editor._llm_cache_used = False
     return editor
 
 
@@ -98,6 +100,20 @@ def _id_group(group_id, start_index, items):
 
 def _codes(editor):
     return {issue["code"] for issue in editor._translation_structure_errors}
+
+
+def _id_segments(count, translated="这是原文"):
+    segments = []
+    for index in range(1, count + 1):
+        segment = ASRDataSeg(
+            f"English {index}.",
+            (index - 1) * 1000,
+            index * 1000,
+            translated,
+        )
+        segment.subtitle_id = f"S{index:04d}"
+        segments.append(segment)
+    return segments
 
 
 def _assert_stable_split(text):
@@ -849,6 +865,165 @@ def test_final_segment_count_mismatch_is_structural_error():
     assert editor._translation_structure_errors[-1]["missing_subtitle_ids"] == ["S0003"]
 
 
+def test_merge_preserves_ids_when_order_changes_before_final_write():
+    editor = _id_editor()
+    segments = _id_segments(4)
+    editor._frozen_subtitle_ids = ["S0001", "S0002", "S0003", "S0004"]
+
+    shuffled = [segments[2], segments[0], segments[3], segments[1]]
+    ordered = editor._order_segments_by_frozen_subtitle_ids(shuffled)
+
+    assert [seg.subtitle_id for seg in ordered] == editor._frozen_subtitle_ids
+    assert [seg.text for seg in ordered] == [seg.text for seg in segments]
+
+
+def test_repair_only_modifies_the_target_subtitle_id():
+    editor = _id_editor()
+    segments = _id_segments(3)
+    segments[1].translated_text = "LONG_TARGET"
+
+    def severe(seg):
+        return seg.translated_text == "LONG_TARGET"
+
+    def request(prompt, payload, task, temperature):
+        return {"items": [{"index": 1, "chinese": "这是修复文本"}]}
+
+    with patch.object(editor, "_is_severe_chinese_speed", side_effect=severe), patch.object(
+        editor, "_request_chinese_compression", side_effect=request
+    ):
+        repaired = editor._compress_fast_chinese_segments(segments)
+
+    assert [seg.subtitle_id for seg in repaired] == ["S0001", "S0002", "S0003"]
+    assert repaired[0].translated_text == "这是原文"
+    assert repaired[1].translated_text == "这是修复文本"
+    assert repaired[2].translated_text == "这是原文"
+
+
+def test_redistribution_parses_out_of_order_returns_by_subtitle_id():
+    editor = _id_editor()
+    segments = _id_segments(4)
+    data = {
+        "groups": [
+            {
+                "target_index": 2,
+                "segments": [
+                    {"index": 3, "zh": "这是第四条"},
+                    {"index": 1, "zh": "这是第二条"},
+                ],
+            }
+        ]
+    }
+
+    parsed = editor._parse_chinese_group_allocations(data, segments)
+
+    assert parsed == {"S0003": {"S0004": "这是第四条", "S0002": "这是第二条"}}
+
+
+def test_compression_keeps_subtitle_ids_and_count():
+    editor = _id_editor()
+    segments = _id_segments(3)
+    segments[1].translated_text = "LONG_TARGET"
+
+    def severe(seg):
+        return seg.translated_text == "LONG_TARGET"
+
+    def request(prompt, payload, task, temperature):
+        return {"items": [{"index": 1, "chinese": "这是压缩文本"}]}
+
+    with patch.object(editor, "_is_severe_chinese_speed", side_effect=severe), patch.object(
+        editor, "_request_chinese_compression", side_effect=request
+    ):
+        compressed = editor._compress_fast_chinese_segments(segments)
+
+    assert len(compressed) == len(segments)
+    assert [seg.subtitle_id for seg in compressed] == [seg.subtitle_id for seg in segments]
+    assert compressed[1].translated_text == "这是压缩文本"
+
+
+def test_fallback_translation_fills_only_one_missing_subtitle_id():
+    editor = _id_editor()
+    segments = _id_segments(3)
+    segments[1].translated_text = ""
+
+    with patch.object(editor, "_translate_split_parts", return_value=["这是补译"]):
+        repaired = editor._translate_missing_segments(segments)
+
+    assert [seg.subtitle_id for seg in repaired] == ["S0001", "S0002", "S0003"]
+    assert repaired[0].translated_text == "这是原文"
+    assert repaired[1].translated_text == "这是补译"
+    assert repaired[2].translated_text == "这是原文"
+
+
+def test_multiple_semantic_groups_apply_by_id_without_drift():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(6))
+    groups = [_id_group(1, 0, items[:3]), _id_group(2, 3, items[3:])]
+    translations = {
+        1: {"S0003": "zh-S0003", "S0001": "zh-S0001", "S0002": "zh-S0002"},
+        2: {"S0006": "zh-S0006", "S0005": "zh-S0005", "S0004": "zh-S0004"},
+    }
+
+    applied = editor._apply_semantic_group_translations(items, groups, translations)
+
+    assert [item.subtitle_id for item in applied] == [f"S{index:04d}" for index in range(1, 7)]
+    assert [item.translated for item in applied] == [f"zh-S{index:04d}" for index in range(1, 7)]
+
+
+def test_full_merge_repair_chain_keeps_400_plus_ids_without_drift():
+    editor = _id_editor()
+    editor.max_english_words = 14
+    segments = _id_segments(405)
+    editor._frozen_subtitle_ids = [seg.subtitle_id for seg in segments]
+
+    repaired = editor._repair_blocking_subtitle_issues(segments)
+    repaired = editor._merge_short_display_segments(repaired)
+    repaired = editor._repair_abnormal_timing_gaps(repaired)
+    repaired = editor._apply_display_timing_padding(repaired)
+    repaired = editor._order_segments_by_frozen_subtitle_ids(repaired)
+    editor._validate_final_segment_translation_ids(repaired)
+
+    assert editor._translation_structure_errors == []
+    assert [seg.subtitle_id for seg in repaired] == editor._frozen_subtitle_ids
+    assert [seg.text for seg in repaired] == [seg.text for seg in segments]
+
+
+def test_passed_validation_writes_final_output_and_manifest_metadata():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        task = SubtitleTask(
+            subtitle_path=str(root / "source.srt"),
+            output_path=str(root / "output.srt"),
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        config = SubtitleConfig(
+            need_screen_subtitle_edit=True,
+            screen_subtitle_stable_mode=True,
+            subtitle_layout="original_top",
+        )
+
+        thread._save_stable_subtitle_outputs(
+            ASRData([ASRDataSeg("English 1.", 0, 1000, "这是译文")]),
+            config,
+            coverage_report_path=str(root / "coverage-report.txt"),
+            validation_status="passed",
+            manifest_meta={
+                "translation_model": "deepseek-v4-flash",
+                "code_commit": "abc123",
+                "cache_used": False,
+                "prompt_version": "global-subtitle-id-v2",
+            },
+        )
+
+        manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        assert manifest["render_blocked"] is False
+        assert manifest["translation_model"] == "deepseek-v4-flash"
+        assert manifest["code_commit"] == "abc123"
+        assert manifest["cache_used"] is False
+        assert manifest["prompt_version"] == "global-subtitle-id-v2"
+        assert (root / "output.srt").exists()
+
+
 def test_id_bound_mapping_has_no_drift_over_400_subtitles():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(405))
@@ -962,6 +1137,14 @@ if __name__ == "__main__":
     test_failed_group_does_not_shift_following_100_subtitles()
     test_failed_validation_does_not_write_final_output_file()
     test_final_segment_count_mismatch_is_structural_error()
+    test_merge_preserves_ids_when_order_changes_before_final_write()
+    test_repair_only_modifies_the_target_subtitle_id()
+    test_redistribution_parses_out_of_order_returns_by_subtitle_id()
+    test_compression_keeps_subtitle_ids_and_count()
+    test_fallback_translation_fills_only_one_missing_subtitle_id()
+    test_multiple_semantic_groups_apply_by_id_without_drift()
+    test_full_merge_repair_chain_keeps_400_plus_ids_without_drift()
+    test_passed_validation_writes_final_output_and_manifest_metadata()
     test_id_bound_mapping_has_no_drift_over_400_subtitles()
     test_failed_validation_still_writes_stable_artifacts()
     test_runtime_module_import_path_is_available()
