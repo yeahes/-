@@ -1,7 +1,6 @@
 import re
 import sys
 
-from modelscope.hub.snapshot_download import snapshot_download
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
@@ -58,6 +57,8 @@ class ModelscopeDownloadThread(QThread):
             sys.stderr = CustomOutput(self.custom_write)
             
             try:
+                from modelscope.hub.snapshot_download import snapshot_download
+
                 # 下载模型
                 snapshot_download(
                     self.model_id,

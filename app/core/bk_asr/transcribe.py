@@ -4,6 +4,7 @@ from app.core.bk_asr.bcut import BcutASR
 from app.core.bk_asr.faster_whisper import FasterWhisperASR
 from app.core.bk_asr.jianying import JianYingASR
 from app.core.bk_asr.kuaishou import KuaiShouASR
+from app.core.bk_asr.qwen3_asr import Qwen3ASR
 from app.core.bk_asr.whisper_api import WhisperAPI
 from app.core.bk_asr.whisper_cpp import WhisperCppASR
 from app.core.bk_asr.asr_data import ASRData
@@ -33,6 +34,7 @@ def transcribe(audio_path: str, config: TranscribeConfig, callback=None) -> ASRD
         TranscribeModelEnum.WHISPER_CPP: WhisperCppASR,
         TranscribeModelEnum.WHISPER_API: WhisperAPI,
         TranscribeModelEnum.FASTER_WHISPER: FasterWhisperASR,
+        TranscribeModelEnum.QWEN3_ASR: Qwen3ASR,
     }
 
     asr_class = ASR_MODELS.get(config.transcribe_model)
@@ -77,6 +79,17 @@ def transcribe(audio_path: str, config: TranscribeConfig, callback=None) -> ASRD
                 "ff_mdx_kim2": config.faster_whisper_ff_mdx_kim2,
                 "one_word": config.faster_whisper_one_word,
                 "prompt": config.faster_whisper_prompt,
+            }
+        )
+    elif config.transcribe_model == TranscribeModelEnum.QWEN3_ASR:
+        asr_args.update(
+            {
+                "python_path": config.qwen3_python,
+                "language": config.transcribe_language,
+                "asr_model": config.qwen3_asr_model,
+                "aligner_model": config.qwen3_aligner_model,
+                "device": config.qwen3_device,
+                "dtype": config.qwen3_dtype,
             }
         )
 

@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 from pathlib import Path
 
@@ -19,10 +20,25 @@ def resolve_podcast_template_subtitle(video_file: str, subtitle_file: str) -> st
     search_dir = subtitle_path.parent
     video_stem = Path(video_file).stem
 
+    manifest_path = search_dir / "stable-final-manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            stable_path = Path(
+                manifest.get("paths", {}).get("original_top_srt", "")
+            )
+            if stable_path.exists() and stable_path.stat().st_size > 0:
+                logger.info("Resolved podcast subtitle from stable manifest: %s", stable_path)
+                return str(stable_path)
+        except Exception as exc:
+            logger.warning("Stable subtitle manifest ignored: %s", exc)
+
     candidates = [
+        search_dir / "stable-final-original-top.srt",
         search_dir / f"{video_stem}-原文在上.srt",
         search_dir / f"{video_stem}-译文在上.srt",
     ]
+    candidates.extend(sorted(search_dir.glob("stable-final-*-top.srt")))
     candidates.extend(sorted(search_dir.glob("*-原文在上.srt")))
     candidates.extend(sorted(search_dir.glob("*-译文在上.srt")))
     if subtitle_path.suffix.lower() == ".srt":

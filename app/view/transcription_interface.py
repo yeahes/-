@@ -187,6 +187,7 @@ class VideoInfoCard(CardWidget):
                 TranscribeModelEnum.WHISPER_CPP,
                 TranscribeModelEnum.WHISPER_API,
                 TranscribeModelEnum.FASTER_WHISPER,
+                TranscribeModelEnum.QWEN3_ASR,
             ]
             if need_language_settings and not self.show_language_settings():
                 return

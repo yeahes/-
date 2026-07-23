@@ -92,6 +92,7 @@ class TranscribeModelEnum(Enum):
     BIJIAN = "B 接口"
     JIANYING = "J 接口"
     FASTER_WHISPER = "FasterWhisper ✨"
+    QWEN3_ASR = "Qwen3-ASR"
     WHISPER_CPP = "WhisperCpp"
     WHISPER_API = "Whisper [API]"
 
@@ -365,6 +366,11 @@ class FasterWhisperModelEnum(Enum):
     LARGE_V3_TURBO = "large-v3-turbo"
 
 
+class Qwen3ASRModelEnum(Enum):
+    QWEN3_ASR_06B = "Qwen/Qwen3-ASR-0.6B"
+    QWEN3_ASR_17B = "Qwen/Qwen3-ASR-1.7B"
+
+
 LANGUAGES = {
     "英语": "en",
     "中文": "zh",
@@ -523,6 +529,12 @@ class TranscribeConfig:
     faster_whisper_ff_mdx_kim2: bool = False
     faster_whisper_one_word: bool = True
     faster_whisper_prompt: Optional[str] = None
+    # Qwen3-ASR 配置
+    qwen3_python: Optional[str] = None
+    qwen3_asr_model: Optional[str] = None
+    qwen3_aligner_model: Optional[str] = None
+    qwen3_device: str = "cuda"
+    qwen3_dtype: str = "float16"
 
 
 @dataclass
@@ -551,6 +563,7 @@ class SubtitleConfig:
     subtitle_style: Optional[str] = None
     need_remove_punctuation: bool = False
     need_screen_subtitle_edit: bool = False
+    screen_subtitle_stable_mode: bool = True
     need_screen_subtitle_quality_check: bool = False
     screen_subtitle_max_cjk: int = 24
     screen_subtitle_max_english: int = 16

@@ -109,17 +109,22 @@ class TranscriptThread(QThread):
                 and self.task.transcribe_config.need_word_time_stamp
                 and self.task.transcribe_config.transcribe_language in ["en", "english"]
             ):
-                aligned_data = align_to_word_timestamps(
-                    temp_file.name,
-                    asr_data,
-                    language=self.task.transcribe_config.transcribe_language,
-                    callback=self.progress_callback,
-                )
-                if aligned_data and aligned_data.has_data():
-                    asr_data = aligned_data
-                    logger.info("stable-ts词级时间轴已应用到转录结果")
+                if self._should_skip_stable_ts_alignment():
+                    logger.info(
+                        "stable-ts词级时间轴跳过：Qwen3-ASR已使用ForcedAligner生成词级时间轴"
+                    )
                 else:
-                    logger.info("stable-ts词级时间轴未应用，继续使用原转录时间轴")
+                    aligned_data = align_to_word_timestamps(
+                        temp_file.name,
+                        asr_data,
+                        language=self.task.transcribe_config.transcribe_language,
+                        callback=self.progress_callback,
+                    )
+                    if aligned_data and aligned_data.has_data():
+                        asr_data = aligned_data
+                        logger.info("stable-ts词级时间轴已应用到转录结果")
+                    else:
+                        logger.info("stable-ts词级时间轴未应用，继续使用原转录时间轴")
 
             # 如果是BIJIAN或JIANYING模型，增加使用次数
             if self.task.transcribe_config.transcribe_model in [
@@ -151,3 +156,9 @@ class TranscriptThread(QThread):
     def progress_callback(self, value, message):
         progress = min(20 + (value * 0.8), 100)
         self.progress.emit(int(progress), message)
+
+    def _should_skip_stable_ts_alignment(self) -> bool:
+        config = self.task.transcribe_config
+        if config.transcribe_model != TranscribeModelEnum.QWEN3_ASR:
+            return False
+        return bool(config.qwen3_aligner_model)

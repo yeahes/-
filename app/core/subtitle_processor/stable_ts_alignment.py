@@ -27,16 +27,34 @@ def _default_lab_python() -> Path:
     return Path("E:/VideoCaptioner-alignment-lab/python311/python.exe")
 
 
+def _bundled_runtime_python() -> Path:
+    return _project_root() / "runtime" / "python.exe"
+
+
+def _stable_ts_cache_dir() -> Path:
+    return _project_root() / "AppData" / "models" / "stable-ts"
+
+
+def _is_python_executable(path: Path) -> bool:
+    return path.name.lower() in {"python.exe", "pythonw.exe", "python"}
+
+
 def _find_stable_ts_python() -> Optional[Path]:
     env_path = os.getenv("VIDEOCAPTIONER_STABLE_TS_PYTHON")
     candidates = []
     if env_path:
         candidates.append(Path(env_path))
+    candidates.append(_bundled_runtime_python())
     candidates.append(_default_lab_python())
-    candidates.append(Path(sys.executable))
+    current_executable = Path(sys.executable)
+    if _is_python_executable(current_executable):
+        candidates.append(current_executable)
 
     for candidate in candidates:
         if not candidate.exists():
+            continue
+        if not _is_python_executable(candidate):
+            logger.warning("Stable-ts python candidate skipped: not a Python executable: %s", candidate)
             continue
         try:
             result = subprocess.run(
@@ -129,7 +147,7 @@ def align_to_word_timestamps(
         or configured_model
         or "large-v3-turbo"
     )
-    cache_dir = Path(os.getenv("VIDEOCAPTIONER_STABLE_TS_CACHE", "E:/VideoCaptioner-alignment-lab/models"))
+    cache_dir = Path(os.getenv("VIDEOCAPTIONER_STABLE_TS_CACHE", str(_stable_ts_cache_dir())))
     worker = Path(__file__).resolve()
 
     with tempfile.TemporaryDirectory(prefix="vc_stable_ts_") as tmp:
@@ -218,14 +236,18 @@ def _worker_extract_words(result) -> List[dict]:
 
 def _run_worker(input_path: str) -> int:
     import stable_whisper
+    import torch
 
     payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
     cache_dir = Path(payload["cache_dir"])
     cache_dir.mkdir(parents=True, exist_ok=True)
+    device = os.getenv("VIDEOCAPTIONER_STABLE_TS_DEVICE")
+    if not device:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model = stable_whisper.load_model(
         payload["model_name"],
-        device="cpu",
+        device=device,
         download_root=str(cache_dir),
     )
     result = model.align(

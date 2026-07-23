@@ -29,6 +29,7 @@ from ..core.entities import (
     TranslatorServiceEnum,
     WhisperModelEnum,
     FasterWhisperModelEnum,
+    Qwen3ASRModelEnum,
     VadMethodEnum,
 )
 
@@ -203,6 +204,29 @@ class Config(QConfig):
     # 提示词
     faster_whisper_prompt = ConfigItem("FasterWhisper", "Prompt", "")
 
+    # ------------------- Qwen3-ASR 配置 -------------------
+    qwen3_python = ConfigItem(
+        "Qwen3ASR",
+        "Python",
+        r"E:\VideoCaptioner-screen-subtitle\qwen3-runtime\Scripts\python.exe",
+    )
+    qwen3_asr_model = OptionsConfigItem(
+        "Qwen3ASR",
+        "ASRModel",
+        Qwen3ASRModelEnum.QWEN3_ASR_06B,
+        OptionsValidator(Qwen3ASRModelEnum),
+        EnumSerializer(Qwen3ASRModelEnum),
+    )
+    qwen3_aligner_model = ConfigItem(
+        "Qwen3ASR", "AlignerModel", "Qwen/Qwen3-ForcedAligner-0.6B"
+    )
+    qwen3_device = OptionsConfigItem(
+        "Qwen3ASR", "Device", "cuda", OptionsValidator(["cuda", "cpu"])
+    )
+    qwen3_dtype = OptionsConfigItem(
+        "Qwen3ASR", "DType", "float16", OptionsValidator(["float16", "bfloat16", "float32"])
+    )
+
     # ------------------- Whisper API 配置 -------------------
     whisper_api_base = ConfigItem("WhisperAPI", "WhisperApiBase", "")
     whisper_api_key = ConfigItem("WhisperAPI", "WhisperApiKey", "")
@@ -238,6 +262,9 @@ class Config(QConfig):
     )
     need_screen_subtitle_edit = ConfigItem(
         "Subtitle", "NeedScreenSubtitleEdit", False, BoolValidator()
+    )
+    screen_subtitle_stable_mode = ConfigItem(
+        "Subtitle", "ScreenSubtitleStableMode", True, BoolValidator()
     )
     need_screen_subtitle_quality_check = ConfigItem(
         "Subtitle", "NeedScreenSubtitleQualityCheck", False, BoolValidator()

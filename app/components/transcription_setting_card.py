@@ -29,6 +29,7 @@ from ..core.entities import (
 from .EditComboBoxSettingCard import EditComboBoxSettingCard
 from .FasterWhisperSettingWidget import FasterWhisperSettingWidget
 from .LineEditSettingCard import LineEditSettingCard
+from .Qwen3ASRSettingWidget import Qwen3ASRSettingWidget
 from .WhisperAPISettingWidget import WhisperAPISettingWidget
 from .WhisperCppSettingWidget import WhisperCppSettingWidget
 
@@ -50,13 +51,38 @@ class TranscriptionSettingCard(QWidget):
         self.whisper_cpp_widget = WhisperCppSettingWidget(self)
         self.whisper_api_widget = WhisperAPISettingWidget(self)
         self.faster_whisper_widget = FasterWhisperSettingWidget(self)
+        self.qwen3_asr_widget = Qwen3ASRSettingWidget(self)
 
         self.stacked_widget.addWidget(self.empty_widget)  # 添加空白页面
         self.stacked_widget.addWidget(self.whisper_cpp_widget)
         self.stacked_widget.addWidget(self.whisper_api_widget)
         self.stacked_widget.addWidget(self.faster_whisper_widget)
+        self.stacked_widget.addWidget(self.qwen3_asr_widget)
 
         self.main_layout.addWidget(self.stacked_widget)
+        self._setup_timeline_alignment_group()
+
+    def _setup_timeline_alignment_group(self):
+        self.timeline_group = SettingCardGroup(self.tr("转录时间轴增强"), self)
+        self.stable_ts_alignment_card = SwitchSettingCard(
+            FIF.ALIGNMENT,
+            self.tr("stable-ts时间轴对齐"),
+            self.tr("转录后用stable-ts重新生成英文词级时间轴；FasterWhisper可用，Qwen3-ASR会自动跳过"),
+            cfg.stable_ts_alignment_enabled,
+            self.timeline_group,
+        )
+        self.stable_ts_model_card = ComboBoxSettingCard(
+            cfg.stable_ts_alignment_model,
+            FIF.ROBOT,
+            self.tr("stable-ts对齐模型"),
+            self.tr("模型越大越慢；large-v3-turbo为当前默认"),
+            texts=["small.en", "medium.en", "large-v3", "large-v3-turbo"],
+            parent=self.timeline_group,
+        )
+        self.timeline_group.addSettingCard(self.stable_ts_alignment_card)
+        self.timeline_group.addSettingCard(self.stable_ts_model_card)
+        self.main_layout.addWidget(self.timeline_group)
+        self._sync_stable_ts_cards(cfg.transcribe_model.value.value)
 
     def on_model_changed(self, value):
         # 切换对应的设置界面
@@ -66,5 +92,27 @@ class TranscriptionSettingCard(QWidget):
             self.stacked_widget.setCurrentWidget(self.whisper_api_widget)
         elif value == TranscribeModelEnum.FASTER_WHISPER.value:
             self.stacked_widget.setCurrentWidget(self.faster_whisper_widget)
+        elif value == TranscribeModelEnum.QWEN3_ASR.value:
+            self.stacked_widget.setCurrentWidget(self.qwen3_asr_widget)
         else:
             self.stacked_widget.setCurrentWidget(self.empty_widget)
+        self._sync_stable_ts_cards(value)
+
+    def _sync_stable_ts_cards(self, model_name: str):
+        is_qwen3 = model_name == TranscribeModelEnum.QWEN3_ASR.value
+        self.stable_ts_alignment_card.setEnabled(not is_qwen3)
+        self.stable_ts_model_card.setEnabled(not is_qwen3)
+        if is_qwen3:
+            self.stable_ts_alignment_card.setContent(
+                self.tr("Qwen3-ASR已使用ForcedAligner生成词级时间轴；这里会自动跳过，避免重复对齐")
+            )
+            self.stable_ts_model_card.setContent(
+                self.tr("当前转录模型为Qwen3-ASR时不需要stable-ts模型")
+            )
+        else:
+            self.stable_ts_alignment_card.setContent(
+                self.tr("转录后用stable-ts重新生成英文词级时间轴；会变慢，但切分后的字幕更容易贴近音频")
+            )
+            self.stable_ts_model_card.setContent(
+                self.tr("模型越大越慢；large-v3-turbo为当前默认")
+            )

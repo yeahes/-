@@ -20,7 +20,7 @@ class SubtitleSettingDialog(MessageBoxBase):
         self.split_card = SwitchSettingCard(
             FIF.ALIGNMENT,
             self.tr("字幕分割"),
-            self.tr("字幕是否使用大语言模型进行智能断句"),
+            self.tr("使用大语言模型整理语义句；开启上屏稳定模式时，此处只做语义粗切"),
             cfg.need_split,
             self,
         )
@@ -62,37 +62,38 @@ class SubtitleSettingDialog(MessageBoxBase):
             self,
         )
 
-        self.screen_edit_card = SwitchSettingCard(
-            FIF.EDIT,
-            self.tr("上屏短字幕校正"),
-            self.tr("使用大模型轻校正双语字幕，保留短字幕节奏，适合视频播客上屏"),
+        self.stable_mode_card = SwitchSettingCard(
+            FIF.TILES,
+            self.tr("\u4e0a\u5c4f\u7a33\u5b9a\u6a21\u5f0f"),
+            self.tr("\u672c\u5730\u5207\u82f1\u6587\uff0c\u6a21\u578b\u53ea\u7ffb\u4e2d\u6587\uff0c\u4fdd\u62a4\u65f6\u95f4\u8f74\u548c\u82f1\u6587\u539f\u6587"),
             cfg.need_screen_subtitle_edit,
             self,
         )
 
+        self.stable_mode_status = BodyLabel(
+            self.tr(
+                "\u6d41\u7a0b\uff1a\u8bcd\u7ea7\u65f6\u95f4\u8f74 -> \u82f1\u6587\u8bed\u6cd5\u5207\u5206 -> \u4e2d\u6587\u7ffb\u8bd1 -> \u8986\u76d6\u68c0\u67e5\u3002"
+                "\u82f1\u6587\u957f\u5ea6\u770b\u4e0b\u65b9\u8f6f\u4e0a\u9650\u3002"
+            ),
+            self,
+        )
+        self.stable_mode_status.setWordWrap(True)
+
+        self.legacy_settings_status = BodyLabel(
+            self.tr(
+                "\u666e\u901a/\u517c\u5bb9\u8bbe\u7f6e\uff1a\u7a33\u5b9a\u6a21\u5f0f\u4e0b\u4fdd\u6301\u9ed8\u8ba4\u5373\u53ef\uff0c"
+                "\u53ea\u5728\u5173\u95ed\u7a33\u5b9a\u6a21\u5f0f\u6216\u9700\u8981\u7c97\u5206\u7ec4\u65f6\u8c03\u6574\u3002"
+            ),
+            self,
+        )
+        self.legacy_settings_status.setWordWrap(True)
+
         self.screen_quality_check_card = SwitchSettingCard(
             FIF.SEARCH,
             self.tr("\u4e0a\u5c4f\u5019\u9009\u8d28\u68c0"),
-            self.tr("\u4e8c\u6b21\u68c0\u67e5\u53ef\u7591\u65ad\u53e5\uff1b\u4f1a\u589e\u52a0 Token \u6d88\u8017\uff0c\u53ef\u80fd\u5f71\u54cd\u65f6\u95f4\u8f74\u5bf9\u9f50"),
+            self.tr("\u4e8c\u6b21\u68c0\u67e5\u53ef\u7591\u65ad\u53e5\uff0c\u4f1a\u589e\u52a0 Token \u6d88\u8017"),
             cfg.need_screen_subtitle_quality_check,
             self,
-        )
-
-        self.stable_ts_alignment_card = SwitchSettingCard(
-            FIF.ALIGNMENT,
-            self.tr("stable-ts时间轴对齐"),
-            self.tr("转录后用stable-ts重新生成英文词级时间轴；会变慢，但切分后的字幕更容易贴近音频"),
-            cfg.stable_ts_alignment_enabled,
-            self,
-        )
-
-        self.stable_ts_model_card = ComboBoxSettingCard(
-            cfg.stable_ts_alignment_model,
-            FIF.ROBOT,
-            self.tr("stable-ts对齐模型"),
-            self.tr("模型越大越慢；large-v3-turbo为当前默认"),
-            texts=["small.en", "medium.en", "large-v3", "large-v3-turbo"],
-            parent=self,
         )
 
         self.screen_cjk_card = SpinBoxSettingCard(
@@ -117,20 +118,22 @@ class SubtitleSettingDialog(MessageBoxBase):
 
         # 添加到布局
         self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.stable_mode_card)
+        self.viewLayout.addWidget(self.stable_mode_status)
+        self.viewLayout.addWidget(self.screen_quality_check_card)
+        self.viewLayout.addWidget(self.screen_cjk_card)
+        self.viewLayout.addWidget(self.screen_english_card)
+        self.viewLayout.addWidget(self.legacy_settings_status)
         self.viewLayout.addWidget(self.split_card)
         self.viewLayout.addWidget(self.split_type_card)
         self.viewLayout.addWidget(self.word_count_cjk_card)
         self.viewLayout.addWidget(self.word_count_english_card)
         self.viewLayout.addWidget(self.remove_punctuation_card)
-        self.viewLayout.addWidget(self.screen_edit_card)
-        self.viewLayout.addWidget(self.screen_quality_check_card)
-        self.viewLayout.addWidget(self.stable_ts_alignment_card)
-        self.viewLayout.addWidget(self.stable_ts_model_card)
-        self.viewLayout.addWidget(self.screen_cjk_card)
-        self.viewLayout.addWidget(self.screen_english_card)
         # 设置间距
 
         self.viewLayout.setSpacing(10)
+        self.setMinimumSize(920, 760)
+        self.resize(920, 760)
 
         # 设置窗口标题
         self.setWindowTitle(self.tr("字幕设置"))

@@ -84,6 +84,12 @@ class TaskFactory:
             faster_whisper_ff_mdx_kim2=cfg.faster_whisper_ff_mdx_kim2.value,
             faster_whisper_one_word=cfg.faster_whisper_one_word.value,
             faster_whisper_prompt=cfg.faster_whisper_prompt.value,
+            # Qwen3-ASR 配置
+            qwen3_python=cfg.qwen3_python.value,
+            qwen3_asr_model=cfg.qwen3_asr_model.value.value,
+            qwen3_aligner_model=cfg.qwen3_aligner_model.value,
+            qwen3_device=cfg.qwen3_device.value,
+            qwen3_dtype=cfg.qwen3_dtype.value,
         )
 
         return TranscribeTask(
@@ -191,6 +197,7 @@ class TaskFactory:
             # 字幕优化
             need_remove_punctuation=cfg.needs_remove_punctuation.value,
             need_screen_subtitle_edit=cfg.need_screen_subtitle_edit.value,
+            screen_subtitle_stable_mode=cfg.need_screen_subtitle_edit.value,
             need_screen_subtitle_quality_check=cfg.need_screen_subtitle_quality_check.value,
             screen_subtitle_max_cjk=cfg.screen_subtitle_max_cjk.value,
             screen_subtitle_max_english=cfg.screen_subtitle_max_english.value,

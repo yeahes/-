@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -303,6 +304,12 @@ class SubtitleInterface(QWidget):
         )
         self.command_bar.addAction(self.prompt_button)
 
+        self.quality_report_action = Action(
+            FIF.SEARCH, self.tr("质量报告"), triggered=self.open_quality_report
+        )
+        self.quality_report_action.setEnabled(False)
+        self.command_bar.addAction(self.quality_report_action)
+
         # 添加设置按钮
         self.command_bar.addAction(
             Action(FIF.SETTING, "", triggered=self.show_subtitle_settings)
@@ -478,6 +485,7 @@ class SubtitleInterface(QWidget):
             position=InfoBarPosition.BOTTOM,
             parent=self.parent(),
         )
+        self.check_quality_report(output_path)
 
     def on_subtitle_optimization_error(self, error):
         self.start_button.setEnabled(True)
@@ -494,6 +502,77 @@ class SubtitleInterface(QWidget):
 
     def update_all(self, data):
         self.model.update_all(data)
+
+    def quality_report_path(self, output_path: str) -> Path:
+        path = Path(output_path)
+        return path.with_name(f"{path.stem}-coverage-report.txt")
+
+    def check_quality_report(self, output_path: str):
+        report_path = self.quality_report_path(output_path)
+        self.quality_report_action.setEnabled(report_path.exists())
+        self.quality_report_action.setData(str(report_path))
+        if not report_path.exists():
+            self.status_label.setText(self.tr("未生成质量报告"))
+            return
+
+        text = report_path.read_text(encoding="utf-8", errors="ignore")
+        gap_count = self._extract_report_count(text, "覆盖缺口数量", "缺口数量")
+        missing_translation_count = self._extract_report_count(text, "缺中文字幕数量", "缺译文数量")
+        overlong_count = self._extract_report_count(text, "英文超长数量")
+        bad_cut_count = self._extract_report_count(text, "疑似坏切点数量")
+        translationese_count = self._extract_report_count(text, "疑似翻译腔数量")
+        if (
+            gap_count
+            or missing_translation_count
+            or overlong_count
+            or bad_cut_count
+            or translationese_count
+        ):
+            message = self.tr(
+                f"覆盖缺口 {gap_count} 处，缺中文字幕 {missing_translation_count} 处，"
+                f"英文超长 {overlong_count} 处，疑似坏切点 {bad_cut_count} 处，"
+                f"疑似翻译腔 {translationese_count} 处；点击“质量报告”查看"
+            )
+            self.status_label.setText(message)
+            InfoBar.warning(
+                self.tr("字幕质量检查发现问题"),
+                message,
+                duration=10000,
+                position=InfoBarPosition.BOTTOM,
+                parent=self.parent(),
+            )
+        else:
+            self.status_label.setText(self.tr("字幕质量检查通过"))
+            InfoBar.success(
+                self.tr("字幕质量检查通过"),
+                self.tr("未发现覆盖缺口、缺中文字幕、英文超长、明显坏切点或常见翻译腔"),
+                duration=3000,
+                position=InfoBarPosition.BOTTOM,
+                parent=self.parent(),
+            )
+
+    @staticmethod
+    def _extract_report_count(text: str, *labels: str) -> int:
+        pattern = rf"(?:{'|'.join(re.escape(label) for label in labels)})[^0-9]*(\d+)"
+        match = re.search(pattern, text)
+        return int(match.group(1)) if match else 0
+
+    def open_quality_report(self):
+        report_path = Path(self.quality_report_action.data() or "")
+        if not report_path.exists():
+            InfoBar.warning(
+                self.tr("质量报告不存在"),
+                self.tr("当前任务还没有生成字幕质量报告"),
+                duration=3000,
+                parent=self,
+            )
+            return
+        if sys.platform == "win32":
+            os.startfile(str(report_path))
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(report_path)])
+        else:
+            subprocess.run(["xdg-open", str(report_path)])
 
     def remove_widget(self):
         """隐藏顶部开始按钮和底部进度条"""

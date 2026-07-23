@@ -1,0 +1,17 @@
+{
+  "suggested_repo_destination": "docs/audits/2026-07-22",
+  "files": [
+    "three_audio_caption_auto_flags.csv",
+    "PROMPT_TO_CODEX.txt",
+    "three_audio_caption_audit.md",
+    "README_FOR_CODEX.md"
+  ],
+  "sample_files_expected": [
+    "000.m4a",
+    "000.srt",
+    "222.m4a",
+    "222.srt",
+    "888.m4a",
+    "888.srt"
+  ]
+}

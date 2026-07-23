@@ -1,5 +1,6 @@
 import datetime
 import copy
+import json
 import os
 from pathlib import Path
 from typing import Dict
@@ -44,6 +45,114 @@ class SubtitleThread(QThread):
 
     def set_custom_prompt_text(self, text: str):
         self.custom_prompt_text = text
+
+    @staticmethod
+    def _subtitle_layout_names() -> Dict[str, str]:
+        return {
+            "original_top": "\u539f\u6587\u5728\u4e0a",
+            "translation_top": "\u8bd1\u6587\u5728\u4e0a",
+            "only_original": "\u4ec5\u539f\u6587",
+            "only_translation": "\u4ec5\u8bd1\u6587",
+        }
+
+    @staticmethod
+    def _srt_timestamp(ms: int) -> str:
+        ms = max(0, int(ms))
+        hours = ms // 3_600_000
+        minutes = (ms % 3_600_000) // 60_000
+        seconds = (ms % 60_000) // 1000
+        millis = ms % 1000
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+    @classmethod
+    def _write_stable_srt(cls, asr_data: ASRData, save_path: Path, mode: str) -> None:
+        lines = []
+        for index, segment in enumerate(asr_data.segments, 1):
+            original = (segment.text or "").strip()
+            translated = (segment.translated_text or "").strip()
+            if mode == "original_top":
+                body = [original] + ([translated] if translated else [])
+            elif mode == "translation_top":
+                body = ([translated] if translated else []) + [original]
+            elif mode == "only_original":
+                body = [original]
+            elif mode == "only_translation":
+                body = [translated or original]
+            else:
+                body = [original] + ([translated] if translated else [])
+            lines.append(str(index))
+            lines.append(
+                f"{cls._srt_timestamp(segment.start_time)} --> "
+                f"{cls._srt_timestamp(segment.end_time)}"
+            )
+            lines.extend(line for line in body if line)
+            lines.append("")
+        save_path.write_text("\n".join(lines), encoding="utf-8-sig")
+
+    def _save_stable_subtitle_outputs(
+        self,
+        asr_data: ASRData,
+        subtitle_config: SubtitleConfig,
+        coverage_report_path: str | None = None,
+    ) -> None:
+        """Write deterministic subtitle outputs used by video synthesis.
+
+        These files are intentionally ASCII-named so the synthesis step can
+        resolve the newest stable subtitle without relying on localized names.
+        """
+        if not subtitle_config.need_screen_subtitle_edit:
+            return
+
+        output_path = Path(self.task.output_path)
+        output_dir = output_path.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        stable_paths = {
+            "original_top_srt": output_dir / "stable-final-original-top.srt",
+            "translation_top_srt": output_dir / "stable-final-translation-top.srt",
+            "only_original_srt": output_dir / "stable-final-only-original.srt",
+            "only_translation_srt": output_dir / "stable-final-only-translation.srt",
+        }
+        self._write_stable_srt(asr_data, stable_paths["original_top_srt"], "original_top")
+        self._write_stable_srt(
+            asr_data, stable_paths["translation_top_srt"], "translation_top"
+        )
+        self._write_stable_srt(
+            asr_data, stable_paths["only_original_srt"], "only_original"
+        )
+        self._write_stable_srt(
+            asr_data, stable_paths["only_translation_srt"], "only_translation"
+        )
+
+        if output_path.suffix.lower() == ".ass":
+            asr_data.to_ass(
+                save_path=str(output_path),
+                style_str=subtitle_config.subtitle_style,
+                layout=subtitle_config.subtitle_layout,
+            )
+        elif output_path.suffix.lower() == ".srt":
+            asr_data.to_srt(
+                save_path=str(output_path),
+                layout=subtitle_config.subtitle_layout,
+            )
+
+        manifest = {
+            "schema_version": 1,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "source_subtitle": self.task.subtitle_path,
+            "output_path": str(output_path),
+            "coverage_report": coverage_report_path,
+            "layout": subtitle_config.subtitle_layout,
+            "stable_mode": subtitle_config.screen_subtitle_stable_mode,
+            "subtitle_count": len(asr_data.segments),
+            "paths": {key: str(path) for key, path in stable_paths.items()},
+        }
+        manifest_path = output_dir / "stable-final-manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("Stable subtitle manifest saved: %s", manifest_path)
 
     def _setup_api_config(self) -> SubtitleConfig:
         """设置API配置，返回SubtitleConfig"""
@@ -135,9 +244,19 @@ class SubtitleThread(QThread):
                 os.environ["OPENAI_API_KEY"] = subtitle_config.api_key
 
             # 2. 重新断句（对于字词级字幕）
-            if asr_data.is_word_timestamp():
+            stable_screen_mode = (
+                subtitle_config.need_screen_subtitle_edit
+                and subtitle_config.screen_subtitle_stable_mode
+            )
+            if asr_data.is_word_timestamp() and not stable_screen_mode:
                 self.progress.emit(5, self.tr("字幕断句..."))
                 logger.info("正在字幕断句...")
+                screen_edit_mode = subtitle_config.need_screen_subtitle_edit
+                coarse_english_limit = max(
+                    subtitle_config.max_word_count_english,
+                    subtitle_config.screen_subtitle_max_english * 2,
+                    28,
+                )
                 splitter = SubtitleSplitter(
                     thread_num=subtitle_config.thread_num,
                     model=subtitle_config.llm_model,
@@ -147,12 +266,17 @@ class SubtitleThread(QThread):
                     split_type=subtitle_config.split_type,
                     max_word_count_cjk=subtitle_config.max_word_count_cjk,
                     max_word_count_english=(
-                        subtitle_config.screen_subtitle_max_english
-                        if subtitle_config.need_screen_subtitle_edit
+                        coarse_english_limit
+                        if screen_edit_mode
                         else subtitle_config.max_word_count_english
                     ),
-                    screen_mode=subtitle_config.need_screen_subtitle_edit,
+                    screen_mode=False,
                 )
+                if screen_edit_mode:
+                    logger.info(
+                        "上屏短字幕模式：字幕分割仅做语义粗切，英文粗切上限=%s，最终上屏长度由上屏校正控制",
+                        coarse_english_limit,
+                    )
                 asr_data = splitter.split_subtitle(asr_data)
                 asr_data.save(save_path=split_path)
                 self.update_all.emit(asr_data.to_json())
@@ -182,7 +306,15 @@ class SubtitleThread(QThread):
                 TranslatorServiceEnum.BING: TranslatorType.BING,
                 TranslatorServiceEnum.GOOGLE: TranslatorType.GOOGLE,
             }
-            if subtitle_config.need_translate:
+            should_translate_before_screen_edit = (
+                subtitle_config.need_translate
+                and not subtitle_config.need_screen_subtitle_edit
+            )
+            if subtitle_config.need_translate and subtitle_config.need_screen_subtitle_edit:
+                logger.info(
+                    "跳过普通翻译：上屏短字幕校正将基于语义粗切字幕直接完成翻译和细切"
+                )
+            if should_translate_before_screen_edit:
                 self.progress.emit(0, self.tr("翻译字幕..."))
                 logger.info("正在翻译字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
@@ -207,6 +339,7 @@ class SubtitleThread(QThread):
                 self.update_all.emit(asr_data.to_json())
 
             # 5. 上屏短字幕校正
+            coverage_report_path = None
             if subtitle_config.need_screen_subtitle_edit:
                 self.progress.emit(0, self.tr("上屏短字幕校正..."))
                 if any(seg.translated_text for seg in asr_data.segments):
@@ -215,6 +348,11 @@ class SubtitleThread(QThread):
                     logger.info("正在进行上屏短字幕翻译与校正...")
                 self.subtitle_length = len(asr_data.segments)
                 self.finished_subtitle_length = 0
+                coverage_report_path = str(
+                    Path(self.task.output_path).with_name(
+                        f"{Path(self.task.output_path).stem}-coverage-report.txt"
+                    )
+                )
                 screen_editor = ScreenSubtitleEditor(
                     model=subtitle_config.llm_model,
                     target_language=subtitle_config.target_language,
@@ -222,10 +360,25 @@ class SubtitleThread(QThread):
                     thread_num=min(4, max(1, subtitle_config.thread_num)),
                     max_cjk_chars=subtitle_config.screen_subtitle_max_cjk,
                     max_english_words=subtitle_config.screen_subtitle_max_english,
-                    enable_quality_check=subtitle_config.need_screen_subtitle_quality_check,
+                    enable_stable_mode=subtitle_config.screen_subtitle_stable_mode,
+                    enable_quality_check=(
+                        subtitle_config.need_screen_subtitle_quality_check
+                        and not subtitle_config.screen_subtitle_stable_mode
+                    ),
+                    coverage_report_path=coverage_report_path,
                     update_callback=self.callback,
                 )
                 asr_data = screen_editor.edit(asr_data, word_time_asr_data=word_time_asr_data)
+                if screen_editor.has_blocking_validation_errors():
+                    message = screen_editor.blocking_validation_message()
+                    raise RuntimeError(
+                        self.tr(
+                            "字幕体检发现严重问题，已停止后续合成。\n报告路径："
+                        )
+                        + coverage_report_path
+                        + "\n"
+                        + message
+                    )
                 self.update_all.emit(asr_data.to_json())
 
             # 保存翻译结果(单语、双语)
@@ -251,6 +404,11 @@ class SubtitleThread(QThread):
                 save_path=self.task.output_path,
                 ass_style=subtitle_config.subtitle_style,
                 layout=subtitle_config.subtitle_layout,
+            )
+            self._save_stable_subtitle_outputs(
+                asr_data,
+                subtitle_config,
+                coverage_report_path=coverage_report_path,
             )
             logger.info(f"字幕保存到 {self.task.output_path}")
 
