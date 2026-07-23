@@ -132,6 +132,17 @@ def _id_segments(count, translated="这是原文"):
     return segments
 
 
+class _StaticCache:
+    def __init__(self, value):
+        self.value = value
+
+    def get_llm_result(self, *args, **kwargs):
+        return json.dumps(self.value, ensure_ascii=False)
+
+    def set_llm_result(self, *args, **kwargs):
+        raise AssertionError("cache-backed test must not write")
+
+
 def _assert_stable_split(text):
     parts = _split_text(text)
     assert parts
@@ -644,6 +655,71 @@ def test_g0248_full_translation_can_be_retraced_from_generated_context():
     matched = editor._semantic_audit_context_for_group("All of it.", ["S0391"])
     assert matched["semantic_group_id"] == "G0248"
     assert matched["full_translation"] == "所有的。"
+
+
+def test_validation_report_full_translation_uses_single_stage_raw_records_for_all_valid_groups():
+    editor = _id_editor()
+    editor.model = "unit-test"
+    editor.timeout = 1
+    items = editor._assign_global_subtitle_ids(_id_items(5, translated="old-S{index:04d}"))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 6)]
+    stale_full_translations = {
+        index: f"stale-full-G{index:04d}"
+        for index in range(1, 6)
+    }
+    editor._last_semantic_full_translations = dict(stale_full_translations)
+    editor._last_semantic_group_audit_contexts = editor._semantic_group_audit_contexts(
+        groups,
+        stale_full_translations,
+    )
+    raw_groups = [
+        {
+            "id": index,
+            "full_translation": f"raw-full-G{index:04d}",
+            "part_translations": [
+                {"subtitle_id": f"S{index:04d}", "zh": f"zh-S{index:04d}"}
+            ],
+        }
+        for index in (3, 1, 5, 2, 4)
+    ]
+    editor.cache_manager = _StaticCache({"groups": raw_groups})
+
+    applied = editor._translate_semantic_subtitle_groups_single_stage(items, groups)
+    raw_by_semantic_group_id = {
+        f"G{int(group['id']):04d}": group["full_translation"]
+        for group in raw_groups
+    }
+    segments = []
+    for index, item in enumerate(applied, 1):
+        segment = ASRDataSeg(item.original, index * 1000, index * 1000 + 800, item.translated)
+        segment.subtitle_id = item.subtitle_id
+        segments.append(segment)
+
+    def forced_findings(english, chinese, parts, full_translation="", mapping_valid=False):
+        if not mapping_valid:
+            return []
+        return [
+            {
+                "code": "semantic_loss",
+                "message": "forced semantic issue",
+                "confidence_score": 0.9,
+            }
+        ]
+
+    with patch.object(
+        editor,
+        "_semantic_segment_groups",
+        return_value=[(0, 1), (0, 2), (1, 2), (2, 3), (3, 4), (4, 5)],
+    ), patch.object(editor, "_chinese_group_quality_findings", side_effect=forced_findings):
+        issues = editor._chinese_semantic_group_audit_issues(segments, "WARNING")
+
+    valid_issues = [issue for issue in issues if issue.get("mapping_valid")]
+    assert len(valid_issues) == 5
+    for issue in valid_issues:
+        semantic_group_id = issue["semantic_group_id"]
+        assert issue["full_translation"] == raw_by_semantic_group_id[semantic_group_id]
+        assert not issue["full_translation"].startswith("stale-full")
+    assert any(not issue.get("mapping_valid") for issue in issues)
 
 
 def test_mapping_failure_does_not_emit_full_translation_dependent_false_positive():
@@ -1295,6 +1371,7 @@ if __name__ == "__main__":
     test_missing_semantic_group_id_only_invalidates_that_group()
     test_identical_english_but_different_subtitle_ids_do_not_match()
     test_g0248_full_translation_can_be_retraced_from_generated_context()
+    test_validation_report_full_translation_uses_single_stage_raw_records_for_all_valid_groups()
     test_mapping_failure_does_not_emit_full_translation_dependent_false_positive()
     test_command_chinese_audit_catches_confirmed_bad_groups()
     test_command_chinese_audit_ignores_normal_short_groups()

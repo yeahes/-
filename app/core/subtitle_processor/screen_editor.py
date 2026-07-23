@@ -390,6 +390,8 @@ class ScreenSubtitleEditor:
         self._translation_structure_errors = []
         self._last_llm_raw_returns = []
         self._last_semantic_group_debug = []
+        self._last_semantic_full_translations = {}
+        self._last_semantic_group_audit_contexts = {}
         self._last_semantic_group_id_by_subtitle_id = {}
         self._llm_cache_used = False
         semantic_groups = self._semantic_translation_groups(items)
@@ -5506,6 +5508,19 @@ class ScreenSubtitleEditor:
                 result[int(group["id"])] = translated
         return result
 
+    @staticmethod
+    def _semantic_full_translations_from_groups_data(
+        groups_data: Sequence[Dict],
+    ) -> Dict[int, str]:
+        result: Dict[int, str] = {}
+        for group in groups_data:
+            if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
+                continue
+            translated = str(group.get("full_translation", "")).strip()
+            if translated:
+                result[int(group["id"])] = translated
+        return result
+
     def _allocate_semantic_group_translations(
         self, groups: Sequence[Dict], full_translations: Dict[int, str]
     ) -> Dict[int, Dict[str, str]]:
@@ -5711,6 +5726,14 @@ class ScreenSubtitleEditor:
                 "task": "screen_subtitle_semantic_translation",
                 "data": data,
             }
+        )
+        single_stage_full_translations = self._semantic_full_translations_from_groups_data(
+            groups_data if isinstance(groups_data, list) else []
+        )
+        self._last_semantic_full_translations = dict(single_stage_full_translations)
+        self._last_semantic_group_audit_contexts = self._semantic_group_audit_contexts(
+            groups,
+            single_stage_full_translations,
         )
         by_id = {
             int(group.get("id")): group
