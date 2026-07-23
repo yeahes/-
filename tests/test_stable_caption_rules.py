@@ -34,6 +34,8 @@ def _editor(max_words=14):
     editor._translation_structure_errors = []
     editor._last_llm_raw_returns = []
     editor._last_semantic_group_debug = []
+    editor._last_semantic_group_audit_contexts = {}
+    editor._last_semantic_group_id_by_subtitle_id = {}
     return editor
 
 
@@ -76,6 +78,8 @@ def _id_editor():
     editor._translation_structure_errors = []
     editor._last_llm_raw_returns = []
     editor._last_semantic_group_debug = []
+    editor._last_semantic_group_audit_contexts = {}
+    editor._last_semantic_group_id_by_subtitle_id = {}
     editor._frozen_subtitle_ids = []
     editor._llm_cache_used = False
     return editor
@@ -100,6 +104,18 @@ def _id_group(group_id, start_index, items):
 
 def _codes(editor):
     return {issue["code"] for issue in editor._translation_structure_errors}
+
+
+def _semantic_context(group_id, subtitle_ids, full_english, full_translation):
+    return {
+        "semantic_group_id": f"G{group_id:04d}",
+        "group_id": group_id,
+        "full_english": full_english,
+        "full_english_signature": ScreenSubtitleEditor._semantic_audit_signature(full_english),
+        "expected_subtitle_ids": list(subtitle_ids),
+        "full_translation": full_translation,
+        "mapping_valid": True,
+    }
 
 
 def _id_segments(count, translated="这是原文"):
@@ -147,7 +163,7 @@ def test_long_finance_sentence_keeps_full_coverage():
     )
 
 
-def test_missing_translation_is_blocking_error():
+def test_missing_translation_is_reported_but_not_blocking():
     editor = _editor()
     source = [ASRDataSeg("Hello world.", 0, 1000)]
     final = [ASRDataSeg("Hello world.", 0, 1000, translated_text="")]
@@ -155,8 +171,8 @@ def test_missing_translation_is_blocking_error():
     editor._report_subtitle_coverage_gaps(source, final)
 
     assert editor.last_validation_summary["status"] == "ERROR"
-    assert editor.has_blocking_validation_errors()
-    assert "缺少中文字幕" in editor.blocking_validation_message()
+    assert not editor.has_blocking_validation_errors()
+    assert editor.blocking_validation_message() == ""
 
 
 def test_suspicious_cut_is_warning_not_blocking():
@@ -248,7 +264,7 @@ def test_coverage_gap_blocks_single_long_uncovered_span():
     )
 
 
-def test_chinese_reading_speed_error_blocks_synthesis():
+def test_chinese_reading_speed_error_is_reported_but_not_blocking():
     editor = _editor()
     segments = [
         ASRDataSeg(
@@ -262,7 +278,7 @@ def test_chinese_reading_speed_error_blocks_synthesis():
     editor._report_subtitle_coverage_gaps(segments, segments)
 
     assert editor.last_validation_summary["status"] == "ERROR"
-    assert editor.has_blocking_validation_errors()
+    assert not editor.has_blocking_validation_errors()
     assert any(
         issue["code"] == "reading_speed_error"
         for issue in editor.last_validation_summary["errors"]
@@ -470,14 +486,14 @@ def test_chinese_semantic_group_audit_warns_on_lost_core_action():
     ]
     english = " ".join(seg.text for seg in segments)
     editor._last_semantic_group_audit_contexts = {
-        editor._semantic_audit_signature(english): {
-            "semantic_group_id": "G0001",
-            "group_id": 1,
-            "full_english": english,
-            "full_translation": "\u8fd9\u662f\u4e00\u4e2a\u503c\u5f97\u601d\u8003\u7684\u95ee\u9898\uff0c\u4e0b\u6b21\u4f60\u7ecf\u8fc7\u4e00\u680b\u7a7a\u7f6e\u7684\u653f\u5e9c\u5927\u697c\u65f6\u53ef\u4ee5\u601d\u8003\u4e00\u4e0b\u3002",
-            "mapping_valid": True,
-        }
+        "G0001": _semantic_context(
+            1,
+            ["S0001", "S0002"],
+            english,
+            "\u8fd9\u662f\u4e00\u4e2a\u503c\u5f97\u601d\u8003\u7684\u95ee\u9898\uff0c\u4e0b\u6b21\u4f60\u7ecf\u8fc7\u4e00\u680b\u7a7a\u7f6e\u7684\u653f\u5e9c\u5927\u697c\u65f6\u53ef\u4ee5\u601d\u8003\u4e00\u4e0b\u3002",
+        )
     }
+    editor._last_semantic_group_id_by_subtitle_id = {"S0001": "G0001", "S0002": "G0001"}
 
     issues = editor._chinese_semantic_group_audit_issues(segments)
 
@@ -491,16 +507,156 @@ def test_chinese_semantic_audit_skips_semantic_loss_when_mapping_invalid():
         ASRDataSeg("Bouncing the sunlight away.", 1000, 2500, "\u628a\u9633\u5149\u53cd\u5c04\u56de\u53bb\u3002")
     ]
     editor._last_semantic_group_audit_contexts = {
-        "oh yeah": {
-            "semantic_group_id": "G0002",
-            "full_translation": "\u662f\u7684\u3002",
-            "mapping_valid": True,
-        }
+        "G0002": _semantic_context(2, ["S0002"], "Yeah.", "\u662f\u7684\u3002"),
     }
+    editor._last_semantic_group_id_by_subtitle_id = {"S0002": "G0002"}
 
     issues = editor._chinese_semantic_group_audit_issues(segments, "WARNING")
 
     assert not [issue for issue in issues if "semantic_loss" in issue.get("reason", "")]
+
+
+def test_semantic_audit_context_requires_id_signature_and_expected_ids():
+    editor = _editor()
+    context = _semantic_context(24, ["S0101", "S0102"], "Meta, the American tech giant.", "甲")
+    editor._last_semantic_group_audit_contexts = {"G0024": context}
+    editor._last_semantic_group_id_by_subtitle_id = {
+        "S0101": "G0024",
+        "S0102": "G0024",
+        "S9999": "G0099",
+    }
+
+    matched = editor._semantic_audit_context_for_group(
+        "Meta, the American tech giant.",
+        ["S0101", "S0102"],
+    )
+    assert matched["mapping_valid"] is True
+    assert matched["semantic_group_id"] == "G0024"
+
+    mismatch = editor._semantic_audit_context_for_group(
+        "Meta, the American tech giant.",
+        ["S0101", "S9999"],
+    )
+    assert mismatch["mapping_valid"] is False
+
+
+def test_semantic_audit_mapping_does_not_shift_when_audit_groups_exceed_generation_count():
+    editor = _editor()
+    editor._last_semantic_group_audit_contexts = {
+        "G0001": _semantic_context(1, ["S0001"], "Alpha one.", "甲一"),
+        "G0002": _semantic_context(2, ["S0002"], "Bravo two.", "乙二"),
+        "G0003": _semantic_context(3, ["S0003"], "Charlie three.", "丙三"),
+    }
+    editor._last_semantic_group_id_by_subtitle_id = {
+        "S0001": "G0001",
+        "S0002": "G0002",
+        "S0003": "G0003",
+    }
+    checks = [
+        editor._semantic_audit_context_for_group("Alpha one.", ["S0001"]),
+        editor._semantic_audit_context_for_group("Exactly.", ["S9998"]),
+        editor._semantic_audit_context_for_group("Bravo two.", ["S0002"]),
+        editor._semantic_audit_context_for_group("Charlie three.", ["S0003"]),
+        editor._semantic_audit_context_for_group("Right.", ["S9999"]),
+    ]
+
+    assert [checks[index]["semantic_group_id"] for index in (0, 2, 3)] == ["G0001", "G0002", "G0003"]
+    assert [checks[index]["mapping_valid"] for index in (0, 2, 3)] == [True, True, True]
+    assert checks[1]["mapping_valid"] is False
+    assert checks[4]["mapping_valid"] is False
+
+
+def test_semantic_audit_mapping_does_not_shift_when_audit_groups_drop_generation_count():
+    editor = _editor()
+    editor._last_semantic_group_audit_contexts = {
+        "G0001": _semantic_context(1, ["S0001"], "Alpha one.", "甲一"),
+        "G0002": _semantic_context(2, ["S0002"], "Bravo two.", "乙二"),
+        "G0003": _semantic_context(3, ["S0003"], "Charlie three.", "丙三"),
+    }
+    editor._last_semantic_group_id_by_subtitle_id = {
+        "S0001": "G0001",
+        "S0002": "G0002",
+        "S0003": "G0003",
+    }
+    checks = [
+        editor._semantic_audit_context_for_group("Alpha one. Bravo two.", ["S0001", "S0002"]),
+        editor._semantic_audit_context_for_group("Charlie three.", ["S0003"]),
+    ]
+
+    assert checks[0]["mapping_valid"] is False
+    assert checks[1]["mapping_valid"] is True
+    assert checks[1]["semantic_group_id"] == "G0003"
+
+
+def test_repeated_short_dialogue_does_not_map_to_wrong_semantic_group():
+    editor = _editor()
+    editor._last_semantic_group_audit_contexts = {
+        "G0024": _semantic_context(24, ["S0247"], "Exactly.", "完全正确。"),
+        "G0025": _semantic_context(25, ["S0248"], "Right.", "对。"),
+    }
+    editor._last_semantic_group_id_by_subtitle_id = {"S0247": "G0024", "S0248": "G0025"}
+    context = editor._semantic_audit_context_for_group("Exactly.", ["S9999"])
+    assert context["mapping_valid"] is False
+    assert context.get("semantic_group_id", "") == ""
+
+
+def test_missing_semantic_group_id_only_invalidates_that_group():
+    editor = _editor()
+    editor._last_semantic_group_audit_contexts = {
+        "G0001": _semantic_context(1, ["S0001"], "Alpha one.", "甲一"),
+        "G0003": _semantic_context(3, ["S0003"], "Charlie three.", "丙三"),
+    }
+    editor._last_semantic_group_id_by_subtitle_id = {
+        "S0001": "G0001",
+        "S0003": "G0003",
+    }
+    groups = [("Alpha one.", ["S0001"]), ("Bravo two.", ["S0002"]), ("Charlie three.", ["S0003"])]
+    results = [editor._semantic_audit_context_for_group(english, ids) for english, ids in groups]
+    assert results[0]["mapping_valid"] is True
+    assert results[1]["mapping_valid"] is False
+    assert results[2]["mapping_valid"] is True
+    assert results[2]["semantic_group_id"] == "G0003"
+
+
+def test_identical_english_but_different_subtitle_ids_do_not_match():
+    editor = _editor()
+    editor._last_semantic_group_audit_contexts = {
+        "G0010": _semantic_context(10, ["S0101"], "Right.", "对。"),
+        "G0011": _semantic_context(11, ["S0102"], "Right.", "没错。"),
+    }
+    editor._last_semantic_group_id_by_subtitle_id = {"S0101": "G0010", "S0102": "G0011"}
+    matched = editor._semantic_audit_context_for_group("Right.", ["S0102"])
+    assert matched["semantic_group_id"] == "G0011"
+    mismatch = editor._semantic_audit_context_for_group("Right.", ["S0101", "S0102"])
+    assert mismatch["mapping_valid"] is False
+
+
+def test_g0248_full_translation_can_be_retraced_from_generated_context():
+    editor = _editor()
+    context = _semantic_context(
+        248,
+        ["S0391"],
+        "All of it.",
+        "所有的。"
+    )
+    editor._last_semantic_group_audit_contexts = {"G0248": context}
+    editor._last_semantic_group_id_by_subtitle_id = {"S0391": "G0248"}
+    matched = editor._semantic_audit_context_for_group("All of it.", ["S0391"])
+    assert matched["semantic_group_id"] == "G0248"
+    assert matched["full_translation"] == "所有的。"
+
+
+def test_mapping_failure_does_not_emit_full_translation_dependent_false_positive():
+    editor = _editor()
+    editor._last_semantic_group_audit_contexts = {
+        "G0001": _semantic_context(1, ["S0001"], "Alpha one.", "甲一"),
+    }
+    editor._last_semantic_group_id_by_subtitle_id = {"S0001": "G0001"}
+    issues = editor._chinese_semantic_group_audit_issues(
+        [ASRDataSeg("Unmapped group.", 0, 1000, "孤立中文")],
+        "WARNING",
+    )
+    assert all("semantic_loss" not in issue.get("reason", "") for issue in issues)
 
 
 def test_command_chinese_audit_catches_confirmed_bad_groups():
@@ -848,6 +1004,20 @@ def test_failed_validation_does_not_write_final_output_file():
         assert Path(manifest["paths"]["original_top_srt"]).exists()
 
 
+def test_non_structural_validation_errors_do_not_block_render_gate():
+    editor = _id_editor()
+    editor._translation_structure_errors = []
+    editor.last_validation_summary = {
+        "status": "ERROR",
+        "errors": [{"code": "subtitle_duration_invalid"}],
+        "warnings": [],
+        "info": [],
+    }
+
+    assert editor.has_blocking_validation_errors() is False
+    assert editor.blocking_validation_message() == ""
+
+
 def test_final_segment_count_mismatch_is_structural_error():
     editor = _id_editor()
     editor._assign_global_subtitle_ids(_id_items(4))
@@ -1046,7 +1216,7 @@ def test_id_bound_mapping_has_no_drift_over_400_subtitles():
     assert applied[-1].translated == "zh-S0405"
 
 
-def test_failed_validation_still_writes_stable_artifacts():
+def test_non_structural_validation_errors_still_write_stable_artifacts():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         task = SubtitleTask(
@@ -1072,16 +1242,16 @@ def test_failed_validation_still_writes_stable_artifacts():
             data,
             config,
             coverage_report_path=str(root / "coverage-report.txt"),
-            validation_status="failed",
+            validation_status="passed",
             validation_summary=summary,
         )
 
         manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
-        assert manifest["validation_status"] == "failed"
-        assert manifest["render_blocked"] is True
+        assert manifest["validation_status"] == "passed"
+        assert manifest["render_blocked"] is False
         assert manifest["validation_error_codes"] == ["subtitle_duration_invalid"]
         assert Path(manifest["paths"]["original_top_srt"]).exists()
-        assert not (root / "output.srt").exists()
+        assert (root / "output.srt").exists()
 
 
 def test_runtime_module_import_path_is_available():
@@ -1101,12 +1271,12 @@ if __name__ == "__main__":
     test_preposition_phrase_is_not_stranded()
     test_number_and_policy_sentence_keeps_readable_boundaries()
     test_long_finance_sentence_keeps_full_coverage()
-    test_missing_translation_is_blocking_error()
+    test_missing_translation_is_reported_but_not_blocking()
     test_suspicious_cut_is_warning_not_blocking()
     test_abnormal_timing_gap_is_repaired_for_compressed_cluster()
     test_coverage_gap_does_not_sum_natural_pauses()
     test_coverage_gap_blocks_single_long_uncovered_span()
-    test_chinese_reading_speed_error_blocks_synthesis()
+    test_chinese_reading_speed_error_is_reported_but_not_blocking()
     test_duplicate_chinese_is_warning_not_blocking()
     test_overlong_english_segment_is_locally_split_without_llm()
     test_audit_parser_does_not_count_chinese_line_with_it_as_english()
@@ -1118,6 +1288,14 @@ if __name__ == "__main__":
     test_syntax_boundary_audit_keeps_confirmed_bad_cuts()
     test_chinese_semantic_group_audit_warns_on_lost_core_action()
     test_chinese_semantic_audit_skips_semantic_loss_when_mapping_invalid()
+    test_semantic_audit_context_requires_id_signature_and_expected_ids()
+    test_semantic_audit_mapping_does_not_shift_when_audit_groups_exceed_generation_count()
+    test_semantic_audit_mapping_does_not_shift_when_audit_groups_drop_generation_count()
+    test_repeated_short_dialogue_does_not_map_to_wrong_semantic_group()
+    test_missing_semantic_group_id_only_invalidates_that_group()
+    test_identical_english_but_different_subtitle_ids_do_not_match()
+    test_g0248_full_translation_can_be_retraced_from_generated_context()
+    test_mapping_failure_does_not_emit_full_translation_dependent_false_positive()
     test_command_chinese_audit_catches_confirmed_bad_groups()
     test_command_chinese_audit_ignores_normal_short_groups()
     test_very_short_subtitle_has_dedicated_duration_error()
@@ -1136,6 +1314,7 @@ if __name__ == "__main__":
     test_empty_middle_translation_keeps_its_own_id_slot()
     test_failed_group_does_not_shift_following_100_subtitles()
     test_failed_validation_does_not_write_final_output_file()
+    test_non_structural_validation_errors_do_not_block_render_gate()
     test_final_segment_count_mismatch_is_structural_error()
     test_merge_preserves_ids_when_order_changes_before_final_write()
     test_repair_only_modifies_the_target_subtitle_id()
@@ -1146,6 +1325,6 @@ if __name__ == "__main__":
     test_full_merge_repair_chain_keeps_400_plus_ids_without_drift()
     test_passed_validation_writes_final_output_and_manifest_metadata()
     test_id_bound_mapping_has_no_drift_over_400_subtitles()
-    test_failed_validation_still_writes_stable_artifacts()
+    test_non_structural_validation_errors_still_write_stable_artifacts()
     test_runtime_module_import_path_is_available()
     print("stable caption rule smoke tests passed")

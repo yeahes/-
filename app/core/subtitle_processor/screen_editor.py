@@ -287,6 +287,7 @@ class ScreenSubtitleEditor:
         self._syntax_nlp = None
         self._last_semantic_full_translations: Dict[int, str] = {}
         self._last_semantic_group_audit_contexts: Dict[str, Dict] = {}
+        self._last_semantic_group_id_by_subtitle_id: Dict[str, str] = {}
         self._frozen_subtitle_ids: List[str] = []
         self._translation_structure_errors: List[Dict] = []
         self._last_llm_raw_returns: List[Dict] = []
@@ -389,6 +390,7 @@ class ScreenSubtitleEditor:
         self._translation_structure_errors = []
         self._last_llm_raw_returns = []
         self._last_semantic_group_debug = []
+        self._last_semantic_group_id_by_subtitle_id = {}
         self._llm_cache_used = False
         semantic_groups = self._semantic_translation_groups(items)
         items = self._translate_semantic_subtitle_groups(items)
@@ -1748,12 +1750,10 @@ class ScreenSubtitleEditor:
             logger.warning("上屏字幕覆盖报告保存失败 / Coverage report save failed: %s", str(e))
 
     def has_blocking_validation_errors(self) -> bool:
-        summary = self.last_validation_summary or {}
-        return bool(summary.get("errors"))
+        return bool(self._translation_structure_errors)
 
     def blocking_validation_message(self) -> str:
-        summary = self.last_validation_summary or {}
-        errors = summary.get("errors") or []
+        errors = self._translation_structure_errors or []
         if not errors:
             return ""
         messages = [str(error.get("message") or error.get("code") or "未知错误") for error in errors]
@@ -2485,7 +2485,11 @@ class ScreenSubtitleEditor:
             chinese = self._normalize_text("".join(chinese_parts))
             if not english or not chinese:
                 continue
-            mapping = self._semantic_audit_context_for_english(english)
+            subtitle_ids = [
+                self._segment_subtitle_id(seg, start + offset + 1)
+                for offset, seg in enumerate(group_segments)
+            ]
+            mapping = self._semantic_audit_context_for_group(english, subtitle_ids)
             mapping_valid = bool(mapping.get("mapping_valid"))
             full_translation = str(mapping.get("full_translation") or "")
             findings = self._chinese_group_quality_findings(
@@ -2507,8 +2511,8 @@ class ScreenSubtitleEditor:
             issues.append(
                 {
                     "group_index": group_index,
-                    "semantic_group_id": mapping.get("semantic_group_id") or f"G{group_index:04d}",
-                    "subtitle_ids": [f"S{index:04d}" for index in range(start + 1, end + 1)],
+                    "semantic_group_id": mapping.get("semantic_group_id") or "",
+                    "subtitle_ids": subtitle_ids,
                     "start_index": start + 1,
                     "end_index": end,
                     "start": self._format_ms(group_segments[0].start_time),
@@ -2547,75 +2551,133 @@ class ScreenSubtitleEditor:
         self, groups: Sequence[Dict], full_translations: Dict[int, str]
     ) -> Dict[str, Dict]:
         contexts: Dict[str, Dict] = {}
+        subtitle_id_to_group_id: Dict[str, str] = {}
         seen_ids: set[int] = set()
         for group in groups:
             group_id = int(group.get("id") or 0)
             english = self._normalize_text(" ".join(item.original for item in group.get("items", [])))
             signature = self._semantic_audit_signature(english)
+            expected_ids = self._group_expected_subtitle_ids(group)
             if not group_id or not signature or group_id in seen_ids:
                 continue
             seen_ids.add(group_id)
-            contexts[signature] = {
-                "semantic_group_id": f"G{group_id:04d}",
+            semantic_group_id = f"G{group_id:04d}"
+            contexts[semantic_group_id] = {
+                "semantic_group_id": semantic_group_id,
                 "group_id": group_id,
                 "full_english": english,
+                "full_english_signature": signature,
+                "expected_subtitle_ids": expected_ids,
                 "full_translation": full_translations.get(group_id, ""),
                 "mapping_valid": bool(full_translations.get(group_id)),
             }
+            for subtitle_id in expected_ids:
+                if subtitle_id in subtitle_id_to_group_id:
+                    subtitle_id_to_group_id[subtitle_id] = ""
+                else:
+                    subtitle_id_to_group_id[subtitle_id] = semantic_group_id
+        self._last_semantic_group_id_by_subtitle_id = {
+            subtitle_id: semantic_group_id
+            for subtitle_id, semantic_group_id in subtitle_id_to_group_id.items()
+            if semantic_group_id
+        }
         return contexts
 
     def _semantic_audit_context_for_english(self, english: str) -> Dict:
+        signature = self._semantic_audit_signature(english)
+        matches = [
+            context
+            for context in (getattr(self, "_last_semantic_group_audit_contexts", {}) or {}).values()
+            if context.get("full_english_signature") == signature
+        ]
+        if len(matches) != 1:
+            return {"mapping_valid": False}
+        return dict(matches[0])
+
+    def _semantic_audit_context_for_group(
+        self, english: str, subtitle_ids: Sequence[str]
+    ) -> Dict:
         contexts = getattr(self, "_last_semantic_group_audit_contexts", {}) or {}
         if not contexts:
             return {"mapping_valid": False}
-        signature = self._semantic_audit_signature(english)
-        context = contexts.get(signature)
-        if not context:
+        subtitle_ids = [str(subtitle_id) for subtitle_id in subtitle_ids if subtitle_id]
+        if not subtitle_ids:
             return {"mapping_valid": False}
-        return dict(context)
+        id_map = getattr(self, "_last_semantic_group_id_by_subtitle_id", {}) or {}
+        candidate_ids = [id_map.get(subtitle_id, "") for subtitle_id in subtitle_ids]
+        unique_ids = {candidate_id for candidate_id in candidate_ids if candidate_id}
+        if len(candidate_ids) != len(subtitle_ids) or len(unique_ids) != 1:
+            return {
+                "mapping_valid": False,
+                "mapping_failure_reason": "subtitle_id_set_does_not_map_to_unique_semantic_group",
+            }
+        semantic_group_id = next(iter(unique_ids))
+        context = contexts.get(semantic_group_id)
+        if not context:
+            return {
+                "mapping_valid": False,
+                "semantic_group_id": semantic_group_id,
+                "mapping_failure_reason": "semantic_group_id_not_found",
+            }
+        signature = self._semantic_audit_signature(english)
+        expected_ids = list(context.get("expected_subtitle_ids") or [])
+        if (
+            str(context.get("semantic_group_id") or "") != semantic_group_id
+            or expected_ids != list(subtitle_ids)
+            or str(context.get("full_english_signature") or "") != signature
+        ):
+            return {
+                "mapping_valid": False,
+                "semantic_group_id": semantic_group_id,
+                "expected_subtitle_ids": expected_ids,
+                "returned_subtitle_ids": list(subtitle_ids),
+                "mapping_failure_reason": "semantic_group_identity_mismatch",
+            }
+        mapped = dict(context)
+        mapped["mapping_valid"] = bool(context.get("full_translation"))
+        return mapped
 
     def _semantic_audit_mapping_issues(self, segments: Sequence[ASRDataSeg]) -> List[Dict]:
         contexts = getattr(self, "_last_semantic_group_audit_contexts", {}) or {}
         if not contexts:
             return []
         issues: List[Dict] = []
-        seen_signatures: set[str] = set()
-        duplicate_ids: set[str] = set()
-        seen_ids: set[str] = set()
-        for context in contexts.values():
-            gid = str(context.get("semantic_group_id") or "")
-            if gid in seen_ids:
-                duplicate_ids.add(gid)
-            if gid:
-                seen_ids.add(gid)
+        seen_mapped_ids: set[str] = set()
         for _, (start, end) in enumerate(self._semantic_segment_groups(segments), 1):
             english = self._normalize_text(" ".join(seg.text for seg in segments[start:end]))
-            signature = self._semantic_audit_signature(english)
-            if not signature:
+            subtitle_ids = [
+                self._segment_subtitle_id(seg, start + offset + 1)
+                for offset, seg in enumerate(segments[start:end])
+            ]
+            if not self._semantic_audit_signature(english):
                 continue
-            if signature in seen_signatures:
+            mapping = self._semantic_audit_context_for_group(english, subtitle_ids)
+            semantic_group_id = str(mapping.get("semantic_group_id") or "")
+            if mapping.get("mapping_valid") and semantic_group_id:
+                if semantic_group_id in seen_mapped_ids:
+                    issues.append(
+                        {
+                            "reason": "duplicate_reconstructed_semantic_group_id",
+                            "rule_codes": ["audit_mapping_invalid"],
+                            "semantic_group_id": semantic_group_id,
+                            "subtitle_ids": subtitle_ids,
+                            "mapping_valid": False,
+                            "english": english,
+                        }
+                    )
+                seen_mapped_ids.add(semantic_group_id)
+                continue
+            if not mapping.get("mapping_valid"):
                 issues.append(
                     {
-                        "reason": "duplicate_reconstructed_semantic_group_signature",
+                        "reason": mapping.get("mapping_failure_reason") or "semantic_group_mapping_invalid",
                         "rule_codes": ["audit_mapping_invalid"],
-                        "semantic_group_id": "",
-                        "subtitle_ids": [f"S{index:04d}" for index in range(start + 1, end + 1)],
+                        "semantic_group_id": semantic_group_id,
+                        "subtitle_ids": subtitle_ids,
                         "mapping_valid": False,
                         "english": english,
                     }
                 )
-            seen_signatures.add(signature)
-        for gid in sorted(duplicate_ids):
-            issues.append(
-                {
-                    "reason": "duplicate_semantic_group_id",
-                    "rule_codes": ["audit_mapping_invalid"],
-                    "semantic_group_id": gid,
-                    "subtitle_ids": [],
-                    "mapping_valid": False,
-                    "english": "",
-                }
-            )
         return issues
 
     @staticmethod
@@ -2638,7 +2700,7 @@ class ScreenSubtitleEditor:
     ) -> List[Dict]:
         findings: List[Dict] = []
         reasons: List[str] = []
-        if self._is_incomplete_chinese_group(chinese):
+        if mapping_valid and self._is_incomplete_chinese_group(chinese):
             findings.append(
                 {
                     "code": "missing_predicate",
@@ -2656,18 +2718,19 @@ class ScreenSubtitleEditor:
                     "confidence_score": 0.9,
                 }
             )
-        bad_fragments = [
-            index + 1 for index, part in enumerate(parts) if self._is_bad_chinese_fragment(part)
-        ]
-        if bad_fragments:
-            findings.append(
-                {
-                    "code": "dangling_preposition",
-                    "message": f"第 {bad_fragments} 条中文疑似悬空片段",
-                    "confidence_score": 0.72,
-                    "segment_offsets": bad_fragments,
-                }
-            )
+        if mapping_valid:
+            bad_fragments = [
+                index + 1 for index, part in enumerate(parts) if self._is_bad_chinese_fragment(part)
+            ]
+            if bad_fragments:
+                findings.append(
+                    {
+                        "code": "dangling_preposition",
+                        "message": f"第 {bad_fragments} 条中文疑似悬空片段",
+                        "confidence_score": 0.72,
+                        "segment_offsets": bad_fragments,
+                    }
+                )
         if self._looks_like_english_order_chinese(chinese):
             findings.append(
                 {
@@ -3061,6 +3124,8 @@ class ScreenSubtitleEditor:
             for i, left in enumerate(names):
                 for right in names[i + 1 :]:
                     ratio = SequenceMatcher(None, left.lower(), right.lower()).ratio()
+                    if self._is_expected_capitalized_variant_pair(left, right):
+                        continue
                     if 0.62 <= ratio < 1.0:
                         similar_pairs.append((left, right, round(ratio, 3)))
             if not similar_pairs:
@@ -3090,6 +3155,15 @@ class ScreenSubtitleEditor:
                 }
             )
         return issues
+
+    @staticmethod
+    def _is_expected_capitalized_variant_pair(left: str, right: str) -> bool:
+        pair = tuple(sorted((left.lower(), right.lower())))
+        return pair in {
+            ("china", "chinese"),
+            ("america", "american"),
+            ("insta", "instead"),
+        }
 
     @staticmethod
     def _normalize_chinese_for_compare(text: str) -> str:
