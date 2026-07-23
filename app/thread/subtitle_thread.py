@@ -126,17 +126,19 @@ class SubtitleThread(QThread):
             asr_data, stable_paths["only_translation_srt"], "only_translation"
         )
 
-        if output_path.suffix.lower() == ".ass":
-            asr_data.to_ass(
-                save_path=str(output_path),
-                style_str=subtitle_config.subtitle_style,
-                layout=subtitle_config.subtitle_layout,
-            )
-        elif output_path.suffix.lower() == ".srt":
-            asr_data.to_srt(
-                save_path=str(output_path),
-                layout=subtitle_config.subtitle_layout,
-            )
+        render_blocked = validation_status == "failed"
+        if not render_blocked:
+            if output_path.suffix.lower() == ".ass":
+                asr_data.to_ass(
+                    save_path=str(output_path),
+                    style_str=subtitle_config.subtitle_style,
+                    layout=subtitle_config.subtitle_layout,
+                )
+            elif output_path.suffix.lower() == ".srt":
+                asr_data.to_srt(
+                    save_path=str(output_path),
+                    layout=subtitle_config.subtitle_layout,
+                )
 
         manifest = {
             "schema_version": 1,
@@ -145,6 +147,7 @@ class SubtitleThread(QThread):
             "output_path": str(output_path),
             "coverage_report": coverage_report_path,
             "validation_status": validation_status,
+            "render_blocked": render_blocked,
             "validation_error_codes": [
                 str(issue.get("code"))
                 for issue in (validation_summary or {}).get("errors", [])

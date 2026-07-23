@@ -29,6 +29,10 @@ def _editor(max_words=14):
     editor._active_word_entries = []
     editor.coverage_report_path = None
     editor.last_validation_summary = None
+    editor._frozen_subtitle_ids = []
+    editor._translation_structure_errors = []
+    editor._last_llm_raw_returns = []
+    editor._last_semantic_group_debug = []
     return editor
 
 
@@ -63,6 +67,37 @@ def _split_text(text, max_words=14):
 
 def _words(text):
     return ScreenSubtitleEditor._word_tokens(text)
+
+
+def _id_editor():
+    editor = _editor()
+    editor.max_cjk_chars = 18
+    editor._translation_structure_errors = []
+    editor._last_llm_raw_returns = []
+    editor._last_semantic_group_debug = []
+    editor._frozen_subtitle_ids = []
+    return editor
+
+
+def _id_items(count, translated=""):
+    return [
+        ScreenSubtitleItem(
+            source_ids=[index],
+            original=f"English {index}.",
+            translated=translated.format(index=index) if translated else "",
+            word_start=index * 2,
+            word_end=index * 2 + 1,
+        )
+        for index in range(1, count + 1)
+    ]
+
+
+def _id_group(group_id, start_index, items):
+    return {"id": group_id, "start_index": start_index, "items": items}
+
+
+def _codes(editor):
+    return {issue["code"] for issue in editor._translation_structure_errors}
 
 
 def _assert_stable_split(text):
@@ -606,6 +641,236 @@ def test_stable_srt_writer_keeps_bilingual_original_top():
         assert "Hello world.\n你好，世界。" in text
 
 
+def test_id_bound_group_missing_one_id_does_not_shift_later_subtitles():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(4, translated="fallback-S{index:04d}"))
+    group = _id_group(1, 0, items)
+    translations = editor._parse_id_bound_translations(
+        group,
+        editor._group_expected_subtitle_ids(group),
+        [
+            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+            {"subtitle_id": "S0002", "zh": "zh-S0002"},
+            {"subtitle_id": "S0004", "zh": "zh-S0004"},
+        ],
+    )
+
+    applied = editor._apply_semantic_group_translations(items, [group], {1: translations})
+
+    assert [item.subtitle_id for item in applied] == ["S0001", "S0002", "S0003", "S0004"]
+    assert [item.original for item in applied] == [item.original for item in items]
+    assert [item.word_start for item in applied] == [item.word_start for item in items]
+    assert applied[2].translated == "fallback-S0003"
+    assert applied[3].translated == "zh-S0004"
+    assert {"translation_id_missing", "translation_group_cardinality_mismatch"} <= _codes(editor)
+
+
+def test_id_bound_group_rejects_duplicate_id_without_compressing_chinese():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(3))
+    group = _id_group(1, 0, items)
+
+    translations = editor._parse_id_bound_translations(
+        group,
+        editor._group_expected_subtitle_ids(group),
+        [
+            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+            {"subtitle_id": "S0002", "zh": "zh-S0002"},
+            {"subtitle_id": "S0002", "zh": "duplicate"},
+        ],
+    )
+
+    assert translations == {"S0001": "zh-S0001", "S0002": "zh-S0002"}
+    assert {
+        "translation_id_duplicate",
+        "translation_id_missing",
+        "translation_group_cardinality_mismatch",
+    } <= _codes(editor)
+
+
+def test_id_bound_group_rejects_unknown_id():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    group = _id_group(1, 0, items)
+
+    translations = editor._parse_id_bound_translations(
+        group,
+        editor._group_expected_subtitle_ids(group),
+        [
+            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+            {"subtitle_id": "S9999", "zh": "unknown"},
+        ],
+    )
+
+    assert translations == {"S0001": "zh-S0001"}
+    assert {
+        "translation_id_unknown",
+        "translation_id_missing",
+        "translation_group_cardinality_mismatch",
+    } <= _codes(editor)
+
+
+def test_id_bound_group_allows_different_return_order():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    group = _id_group(1, 0, items)
+
+    translations = editor._parse_id_bound_translations(
+        group,
+        editor._group_expected_subtitle_ids(group),
+        [
+            {"subtitle_id": "S0004", "zh": "zh-S0004"},
+            {"subtitle_id": "S0002", "zh": "zh-S0002"},
+            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+            {"subtitle_id": "S0003", "zh": "zh-S0003"},
+        ],
+    )
+    applied = editor._apply_semantic_group_translations(items, [group], {1: translations})
+
+    assert [item.translated for item in applied] == [
+        "zh-S0001",
+        "zh-S0002",
+        "zh-S0003",
+        "zh-S0004",
+    ]
+    assert editor._translation_structure_errors == []
+
+
+def test_empty_middle_translation_keeps_its_own_id_slot():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(3))
+    group = _id_group(1, 0, items)
+
+    translations = editor._parse_id_bound_translations(
+        group,
+        editor._group_expected_subtitle_ids(group),
+        [
+            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+            {"subtitle_id": "S0002", "zh": ""},
+            {"subtitle_id": "S0003", "zh": "zh-S0003"},
+        ],
+    )
+    applied = editor._apply_semantic_group_translations(items, [group], {1: translations})
+    editor._validate_final_item_translation_ids(applied)
+
+    assert [item.subtitle_id for item in applied] == ["S0001", "S0002", "S0003"]
+    assert applied[1].translated == ""
+    assert applied[2].translated == "zh-S0003"
+    final_errors = [
+        issue for issue in editor._translation_structure_errors
+        if issue["code"] == "final_translation_id_mismatch"
+    ]
+    assert final_errors and final_errors[0]["missing_subtitle_ids"] == ["S0002"]
+
+
+def test_failed_group_does_not_shift_following_100_subtitles():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(104))
+    first = _id_group(1, 0, items[:4])
+    tail = _id_group(2, 4, items[4:])
+    first_translations = editor._parse_id_bound_translations(
+        first,
+        editor._group_expected_subtitle_ids(first),
+        [
+            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+            {"subtitle_id": "S0002", "zh": "zh-S0002"},
+            {"subtitle_id": "S0004", "zh": "zh-S0004"},
+        ],
+    )
+    tail_translations = editor._parse_id_bound_translations(
+        tail,
+        editor._group_expected_subtitle_ids(tail),
+        [
+            {"subtitle_id": item.subtitle_id, "zh": f"zh-{item.subtitle_id}"}
+            for item in items[4:]
+        ],
+    )
+
+    applied = editor._apply_semantic_group_translations(
+        items,
+        [first, tail],
+        {1: first_translations, 2: tail_translations},
+    )
+
+    assert applied[2].subtitle_id == "S0003"
+    assert applied[2].translated == ""
+    assert all(item.translated == f"zh-{item.subtitle_id}" for item in applied[4:])
+
+
+def test_failed_validation_does_not_write_final_output_file():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        task = SubtitleTask(
+            subtitle_path=str(root / "source.srt"),
+            output_path=str(root / "output.ass"),
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        config = SubtitleConfig(
+            need_screen_subtitle_edit=True,
+            screen_subtitle_stable_mode=True,
+            subtitle_layout="original_top",
+        )
+        summary = {
+            "status": "ERROR",
+            "errors": [{"code": "final_translation_id_mismatch"}],
+            "warnings": [],
+            "info": [],
+        }
+
+        thread._save_stable_subtitle_outputs(
+            ASRData([ASRDataSeg("English 1.", 0, 1000, "")]),
+            config,
+            coverage_report_path=str(root / "coverage-report.txt"),
+            validation_status="failed",
+            validation_summary=summary,
+        )
+
+        manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        assert manifest["render_blocked"] is True
+        assert not (root / "output.ass").exists()
+        assert Path(manifest["paths"]["original_top_srt"]).exists()
+
+
+def test_final_segment_count_mismatch_is_structural_error():
+    editor = _id_editor()
+    editor._assign_global_subtitle_ids(_id_items(4))
+
+    segments = [
+        ASRDataSeg("English 1.", 0, 1000, "zh-S0001"),
+        ASRDataSeg("English 2.", 1000, 2000, "zh-S0002"),
+        ASRDataSeg("English 4.", 3000, 4000, "zh-S0004"),
+    ]
+    for segment, subtitle_id in zip(segments, ["S0001", "S0002", "S0004"]):
+        segment.subtitle_id = subtitle_id
+    editor._validate_final_segment_translation_ids(segments)
+
+    assert "final_translation_id_mismatch" in _codes(editor)
+    assert editor._translation_structure_errors[-1]["missing_subtitle_ids"] == ["S0003"]
+
+
+def test_id_bound_mapping_has_no_drift_over_400_subtitles():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(405))
+    group = _id_group(1, 0, items)
+    translations = editor._parse_id_bound_translations(
+        group,
+        editor._group_expected_subtitle_ids(group),
+        [
+            {"subtitle_id": item.subtitle_id, "zh": f"zh-{item.subtitle_id}"}
+            for item in reversed(items)
+        ],
+    )
+    applied = editor._apply_semantic_group_translations(items, [group], {1: translations})
+    editor._validate_final_item_translation_ids(applied)
+
+    assert editor._translation_structure_errors == []
+    assert [item.subtitle_id for item in applied] == [item.subtitle_id for item in items]
+    assert [item.original for item in applied] == [item.original for item in items]
+    assert [item.word_start for item in applied] == [item.word_start for item in items]
+    assert applied[-1].translated == "zh-S0405"
+
+
 def test_failed_validation_still_writes_stable_artifacts():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -638,9 +903,10 @@ def test_failed_validation_still_writes_stable_artifacts():
 
         manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
         assert manifest["validation_status"] == "failed"
+        assert manifest["render_blocked"] is True
         assert manifest["validation_error_codes"] == ["subtitle_duration_invalid"]
         assert Path(manifest["paths"]["original_top_srt"]).exists()
-        assert (root / "output.srt").exists()
+        assert not (root / "output.srt").exists()
 
 
 def test_runtime_module_import_path_is_available():
@@ -688,6 +954,15 @@ if __name__ == "__main__":
     test_short_sentence_bridges_small_gap_before_next_subtitle()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
+    test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()
+    test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()
+    test_id_bound_group_rejects_unknown_id()
+    test_id_bound_group_allows_different_return_order()
+    test_empty_middle_translation_keeps_its_own_id_slot()
+    test_failed_group_does_not_shift_following_100_subtitles()
+    test_failed_validation_does_not_write_final_output_file()
+    test_final_segment_count_mismatch_is_structural_error()
+    test_id_bound_mapping_has_no_drift_over_400_subtitles()
     test_failed_validation_still_writes_stable_artifacts()
     test_runtime_module_import_path_is_available()
     print("stable caption rule smoke tests passed")

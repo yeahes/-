@@ -141,7 +141,8 @@ Workflow:
 
 Rules:
 - Do not change, summarize, omit, or reorder the English parts.
-- Keep exactly the same number of part translations as subtitle_parts.
+- Return one translation object for every subtitle_parts item.
+- Keep exactly the same subtitle_id set as subtitle_parts.
 - Chinese should sound like polished magazine/documentary narration.
 - Avoid word-for-word English sentence shape.
 - Preserve facts, negation, contrast, condition, numbers, names, modality, and speaker stance.
@@ -155,7 +156,10 @@ Return pure JSON only:
     {
       "id": 1,
       "full_translation": "natural complete Chinese meaning",
-      "part_translations": ["Chinese for part 1", "Chinese for part 2"]
+      "part_translations": [
+        {"subtitle_id": "S0001", "zh": "Chinese for part 1"},
+        {"subtitle_id": "S0002", "zh": "Chinese for part 2"}
+      ]
     }
   ]
 }
@@ -193,7 +197,8 @@ Task:
 Given a full English sense group, its completed Chinese translation, and fixed subtitle parts, write one concise Chinese subtitle for each part.
 
 Rules:
-- Keep exactly the same number of part_translations as subtitle_parts.
+- Return one translation object for every subtitle_parts item.
+- Keep exactly the same subtitle_id set as subtitle_parts.
 - Do not change, omit, summarize, or reorder the English parts.
 - Do not move information earlier than when the corresponding English part is spoken.
 - Use the full_translation as the authority for Chinese wording and style.
@@ -207,7 +212,10 @@ Return pure JSON only:
   "groups": [
     {
       "id": 1,
-      "part_translations": ["中文字幕1", "中文字幕2"]
+      "part_translations": [
+        {"subtitle_id": "S0001", "zh": "中文字幕1"},
+        {"subtitle_id": "S0002", "zh": "中文字幕2"}
+      ]
     }
   ]
 }
@@ -221,6 +229,7 @@ class ScreenSubtitleItem:
     translated: str
     word_start: Optional[int] = None
     word_end: Optional[int] = None
+    subtitle_id: Optional[str] = None
 
 
 class ScreenSubtitleEditor:
@@ -276,6 +285,10 @@ class ScreenSubtitleEditor:
         self._syntax_nlp = None
         self._last_semantic_full_translations: Dict[int, str] = {}
         self._last_semantic_group_audit_contexts: Dict[str, Dict] = {}
+        self._frozen_subtitle_ids: List[str] = []
+        self._translation_structure_errors: List[Dict] = []
+        self._last_llm_raw_returns: List[Dict] = []
+        self._last_semantic_group_debug: List[Dict] = []
         self.last_validation_summary: Optional[Dict] = None
 
     @staticmethod
@@ -369,8 +382,13 @@ class ScreenSubtitleEditor:
     def _edit_stable_word_timed(self, asr_data: ASRData) -> ASRData:
         logger.info("Screen subtitle stable mode: local English cutting, LLM Chinese only")
         items = self._stable_cut_items(asr_data.segments)
+        items = self._assign_global_subtitle_ids(items)
+        self._translation_structure_errors = []
+        self._last_llm_raw_returns = []
+        self._last_semantic_group_debug = []
         semantic_groups = self._semantic_translation_groups(items)
         items = self._translate_semantic_subtitle_groups(items)
+        self._validate_final_item_translation_ids(items)
         items = self._validate_stable_items(items)
         segments = self._items_to_segments(
             items, list(enumerate(asr_data.segments, 1))
@@ -385,6 +403,7 @@ class ScreenSubtitleEditor:
         segments = self._merge_short_display_segments(segments)
         segments = self._repair_abnormal_timing_gaps(segments)
         segments = self._apply_display_timing_padding(segments)
+        self._validate_final_segment_translation_ids(segments)
         self._write_stable_pipeline_artifacts(
             source_segments=asr_data.segments,
             semantic_groups=semantic_groups,
@@ -652,6 +671,251 @@ class ScreenSubtitleEditor:
             )
         logger.info("Screen subtitle stable mode items: %s", len(items))
         return items
+
+    def _assign_global_subtitle_ids(
+        self, items: Sequence[ScreenSubtitleItem]
+    ) -> List[ScreenSubtitleItem]:
+        assigned: List[ScreenSubtitleItem] = []
+        self._frozen_subtitle_ids = []
+        for index, item in enumerate(items, 1):
+            subtitle_id = item.subtitle_id or f"S{index:04d}"
+            self._frozen_subtitle_ids.append(subtitle_id)
+            assigned.append(
+                ScreenSubtitleItem(
+                    source_ids=item.source_ids,
+                    original=item.original,
+                    translated=item.translated,
+                    word_start=item.word_start,
+                    word_end=item.word_end,
+                    subtitle_id=subtitle_id,
+                )
+            )
+        return assigned
+
+    @staticmethod
+    def _item_subtitle_id(item: ScreenSubtitleItem, fallback_index: int) -> str:
+        return item.subtitle_id or f"S{fallback_index:04d}"
+
+    def _group_expected_subtitle_ids(self, group: Dict) -> List[str]:
+        return [
+            self._item_subtitle_id(item, int(group.get("start_index") or 0) + offset)
+            for offset, item in enumerate(group.get("items") or [], 1)
+        ]
+
+    def _record_translation_structure_error(
+        self,
+        code: str,
+        *,
+        group_id: Optional[int] = None,
+        expected_ids: Optional[Sequence[str]] = None,
+        returned_ids: Optional[Sequence[str]] = None,
+        duplicate_ids: Optional[Sequence[str]] = None,
+        unknown_ids: Optional[Sequence[str]] = None,
+        missing_ids: Optional[Sequence[str]] = None,
+        message: str = "",
+    ) -> None:
+        issue = {
+            "code": code,
+            "message": message or code,
+            "semantic_group_id": f"G{group_id:04d}" if group_id else "",
+            "expected_subtitle_ids": list(expected_ids or []),
+            "returned_subtitle_ids": list(returned_ids or []),
+            "duplicate_subtitle_ids": list(duplicate_ids or []),
+            "unknown_subtitle_ids": list(unknown_ids or []),
+            "missing_subtitle_ids": list(missing_ids or []),
+        }
+        self._translation_structure_errors.append(issue)
+
+    def _parse_id_bound_translations(
+        self,
+        group: Dict,
+        expected_ids: Sequence[str],
+        raw_parts: object,
+    ) -> Dict[str, str]:
+        group_id = int(group.get("id") or 0)
+        expected_set = set(expected_ids)
+        result: Dict[str, str] = {}
+        returned_ids: List[str] = []
+        duplicate_ids: List[str] = []
+        unknown_ids: List[str] = []
+
+        if not isinstance(raw_parts, list):
+            self._record_translation_structure_error(
+                "translation_group_cardinality_mismatch",
+                group_id=group_id,
+                expected_ids=expected_ids,
+                returned_ids=[],
+                missing_ids=expected_ids,
+                message="LLM returned no id-bound part_translations list.",
+            )
+            return result
+
+        for part in raw_parts:
+            if not isinstance(part, dict):
+                self._record_translation_structure_error(
+                    "translation_group_cardinality_mismatch",
+                    group_id=group_id,
+                    expected_ids=expected_ids,
+                    returned_ids=returned_ids,
+                    message="LLM returned legacy positional part_translations.",
+                )
+                continue
+            subtitle_id = str(part.get("subtitle_id") or "").strip()
+            chinese = str(
+                part.get("zh")
+                or part.get("chinese")
+                or part.get("translation")
+                or part.get("translated_text")
+                or ""
+            ).strip()
+            if not subtitle_id:
+                self._record_translation_structure_error(
+                    "translation_id_missing",
+                    group_id=group_id,
+                    expected_ids=expected_ids,
+                    returned_ids=returned_ids,
+                    message="LLM returned a translation item without subtitle_id.",
+                )
+                continue
+            returned_ids.append(subtitle_id)
+            if subtitle_id in result:
+                duplicate_ids.append(subtitle_id)
+                self._record_translation_structure_error(
+                    "translation_id_duplicate",
+                    group_id=group_id,
+                    expected_ids=expected_ids,
+                    returned_ids=returned_ids,
+                    duplicate_ids=[subtitle_id],
+                    message=f"Duplicate translation subtitle_id: {subtitle_id}",
+                )
+                continue
+            if subtitle_id not in expected_set:
+                unknown_ids.append(subtitle_id)
+                self._record_translation_structure_error(
+                    "translation_id_unknown",
+                    group_id=group_id,
+                    expected_ids=expected_ids,
+                    returned_ids=returned_ids,
+                    unknown_ids=[subtitle_id],
+                    message=f"Unknown translation subtitle_id: {subtitle_id}",
+                )
+                continue
+            result[subtitle_id] = chinese
+
+        missing_ids = [subtitle_id for subtitle_id in expected_ids if subtitle_id not in result]
+        self._last_semantic_group_debug.append(
+            {
+                "semantic_group_id": f"G{group_id:04d}" if group_id else "",
+                "expected_subtitle_ids": list(expected_ids),
+                "returned_subtitle_ids": list(returned_ids),
+                "mapped_subtitle_ids": list(result.keys()),
+                "duplicate_subtitle_ids": list(duplicate_ids),
+                "unknown_subtitle_ids": list(unknown_ids),
+                "missing_subtitle_ids": list(missing_ids),
+            }
+        )
+        if missing_ids:
+            self._record_translation_structure_error(
+                "translation_id_missing",
+                group_id=group_id,
+                expected_ids=expected_ids,
+                returned_ids=returned_ids,
+                missing_ids=missing_ids,
+                message="Missing translation subtitle_id(s).",
+            )
+        if set(returned_ids) != expected_set or duplicate_ids or unknown_ids:
+            self._record_translation_structure_error(
+                "translation_group_cardinality_mismatch",
+                group_id=group_id,
+                expected_ids=expected_ids,
+                returned_ids=returned_ids,
+                duplicate_ids=duplicate_ids,
+                unknown_ids=unknown_ids,
+                missing_ids=missing_ids,
+                message="Returned subtitle_id set does not match expected subtitle_id set.",
+            )
+        return result
+
+    def _validate_final_item_translation_ids(
+        self, items: Sequence[ScreenSubtitleItem]
+    ) -> None:
+        english_ids = [
+            self._item_subtitle_id(item, index)
+            for index, item in enumerate(items, 1)
+        ]
+        chinese_ids = [
+            self._item_subtitle_id(item, index)
+            for index, item in enumerate(items, 1)
+            if (item.translated or "").strip()
+        ]
+        duplicate_ids = sorted(
+            subtitle_id for subtitle_id in set(english_ids) if english_ids.count(subtitle_id) > 1
+        )
+        unknown_ids = sorted(set(chinese_ids) - set(english_ids))
+        missing_ids = [subtitle_id for subtitle_id in english_ids if subtitle_id not in chinese_ids]
+        expected = set(self._frozen_subtitle_ids or english_ids)
+        if (
+            set(english_ids) != expected
+            or set(english_ids) != set(chinese_ids)
+            or len(english_ids) != len(chinese_ids)
+            or duplicate_ids
+            or unknown_ids
+            or missing_ids
+        ):
+            self._record_translation_structure_error(
+                "final_translation_id_mismatch",
+                expected_ids=english_ids,
+                returned_ids=chinese_ids,
+                duplicate_ids=duplicate_ids,
+                unknown_ids=unknown_ids,
+                missing_ids=missing_ids,
+                message="Final English subtitle_id set and Chinese subtitle_id set do not match.",
+            )
+
+    def _validate_final_segment_translation_ids(
+        self, segments: Sequence[ASRDataSeg]
+    ) -> None:
+        expected_ids = list(self._frozen_subtitle_ids)
+        if not expected_ids:
+            return
+        segment_ids = [
+            str(getattr(seg, "subtitle_id", "") or "").strip()
+            for seg in segments
+        ]
+        if segment_ids and all(segment_ids):
+            duplicate_ids = sorted(
+                subtitle_id
+                for subtitle_id in set(segment_ids)
+                if segment_ids.count(subtitle_id) > 1
+            )
+            unknown_ids = sorted(set(segment_ids) - set(expected_ids))
+            missing_ids = [subtitle_id for subtitle_id in expected_ids if subtitle_id not in segment_ids]
+            mismatch = (
+                set(segment_ids) != set(expected_ids)
+                or len(segment_ids) != len(expected_ids)
+                or duplicate_ids
+                or unknown_ids
+                or missing_ids
+            )
+        else:
+            duplicate_ids = []
+            unknown_ids = []
+            missing_ids = (
+                expected_ids[len(segments):]
+                if len(segments) < len(expected_ids)
+                else []
+            )
+            mismatch = len(segments) != len(expected_ids)
+        if mismatch:
+            self._record_translation_structure_error(
+                "final_translation_id_mismatch",
+                expected_ids=expected_ids,
+                returned_ids=segment_ids,
+                duplicate_ids=duplicate_ids,
+                unknown_ids=unknown_ids,
+                missing_ids=missing_ids,
+                message="Final rendered subtitle segments do not preserve frozen subtitle_id coverage.",
+            )
 
     def _source_ids_for_word_range(self, word_start: int, word_end: int) -> List[int]:
         ids = [
@@ -1474,6 +1738,9 @@ class ScreenSubtitleEditor:
                 }
             )
 
+        if self._translation_structure_errors:
+            errors.extend(self._translation_structure_errors)
+
         if health["bad_cuts"]:
             warnings.append(
                 {
@@ -1642,6 +1909,8 @@ class ScreenSubtitleEditor:
                 "source_segment_count": len(source_segments),
                 "word_count": len(self._active_word_entries),
                 "subtitle_count": len(final_segments),
+                "frozen_subtitle_ids": list(self._frozen_subtitle_ids),
+                "translation_structure_error_count": len(self._translation_structure_errors),
                 "artifact_schema_version": 1,
             }
             self._write_json_artifact(artifact_dir / "run-manifest.json", manifest)
@@ -1664,6 +1933,18 @@ class ScreenSubtitleEditor:
             self._write_json_artifact(
                 artifact_dir / "translations.json",
                 [self._segment_to_dict(index, seg) for index, seg in enumerate(final_segments, 1)],
+            )
+            self._write_json_artifact(
+                artifact_dir / "llm-raw-returns.json",
+                self._last_llm_raw_returns,
+            )
+            self._write_json_artifact(
+                artifact_dir / "semantic-group-debug.json",
+                self._last_semantic_group_debug,
+            )
+            self._write_json_artifact(
+                artifact_dir / "translation-structure-errors.json",
+                self._translation_structure_errors,
             )
             logger.info("稳定模式中间产物已保存 / Stable artifacts saved: %s", artifact_dir)
         except Exception as e:
@@ -1723,6 +2004,7 @@ class ScreenSubtitleEditor:
                     "group_id": group.get("id"),
                     "start_index": group.get("start_index"),
                     "subtitle_count": len(items),
+                    "expected_subtitle_ids": self._group_expected_subtitle_ids(group),
                     "full_english": " ".join(item.original for item in items),
                     "subtitle_parts": [
                         self._item_to_span_dict(index, item)
@@ -1735,7 +2017,7 @@ class ScreenSubtitleEditor:
     @staticmethod
     def _item_to_span_dict(index: int, item: ScreenSubtitleItem) -> Dict:
         return {
-            "subtitle_id": f"S{index:04d}",
+            "subtitle_id": item.subtitle_id or f"S{index:04d}",
             "source_ids": item.source_ids,
             "word_start": item.word_start,
             "word_end": item.word_end,
@@ -1747,6 +2029,7 @@ class ScreenSubtitleEditor:
     def _segment_to_dict(index: int, seg: ASRDataSeg) -> Dict:
         return {
             "id": index,
+            "subtitle_id": str(getattr(seg, "subtitle_id", "") or f"S{index:04d}"),
             "start_ms": int(seg.start_time),
             "end_ms": int(seg.end_time),
             "text": seg.text,
@@ -3964,14 +4247,14 @@ class ScreenSubtitleEditor:
                 end_time = start_time + 500
             last_end_time = end_time
 
-            result.append(
-                ASRDataSeg(
-                    text=original,
-                    translated_text=item.translated,
-                    start_time=start_time,
-                    end_time=end_time,
-                )
+            segment = ASRDataSeg(
+                text=original,
+                translated_text=item.translated,
+                start_time=start_time,
+                end_time=end_time,
             )
+            segment.subtitle_id = item.subtitle_id
+            result.append(segment)
 
         return result
 
@@ -4937,7 +5220,7 @@ class ScreenSubtitleEditor:
 
     def _allocate_semantic_group_translations(
         self, groups: Sequence[Dict], full_translations: Dict[int, str]
-    ) -> Dict[int, List[str]]:
+    ) -> Dict[int, Dict[str, str]]:
         if not full_translations:
             return {}
         payload = []
@@ -4955,7 +5238,10 @@ class ScreenSubtitleEditor:
                 )
                 subtitle_parts.append(
                     {
-                        "subtitle_id": f"S{offset:03d}",
+                        "subtitle_id": self._item_subtitle_id(
+                            item,
+                            int(group.get("start_index") or 0) + offset,
+                        ),
                         "english": item.original,
                         "duration_ms": duration_ms,
                         "max_zh_chars": self.max_cjk_chars,
@@ -5003,39 +5289,60 @@ class ScreenSubtitleEditor:
             return {}
 
         groups_data = data.get("groups", []) if isinstance(data, dict) else data
-        result: Dict[int, List[str]] = {}
+        self._last_llm_raw_returns.append(
+            {
+                "task": "screen_subtitle_semantic_translation_allocation",
+                "data": data,
+            }
+        )
+        result: Dict[int, Dict[str, str]] = {}
         for group in groups_data:
             if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
                 continue
-            translations = group.get("part_translations", [])
-            if not isinstance(translations, list):
+            group_id = int(group["id"])
+            expected_group = next(
+                (expected for expected in groups if int(expected.get("id") or 0) == group_id),
+                None,
+            )
+            if expected_group is None:
+                self._record_translation_structure_error(
+                    "translation_id_unknown",
+                    group_id=group_id,
+                    message=f"Unknown semantic group id returned: {group_id}",
+                )
                 continue
-            result[int(group["id"])] = [str(text).strip() for text in translations]
+            result[group_id] = self._parse_id_bound_translations(
+                expected_group,
+                self._group_expected_subtitle_ids(expected_group),
+                group.get("part_translations", []),
+            )
         return result
 
     def _apply_semantic_group_translations(
         self,
         items: List[ScreenSubtitleItem],
         groups: Sequence[Dict],
-        translations_by_group: Dict[int, List[str]],
+        translations_by_group: Dict[int, Dict[str, str]],
     ) -> List[ScreenSubtitleItem]:
         result: List[ScreenSubtitleItem] = []
         used_indexes = set()
         for group in groups:
             group_items = group["items"]
-            translations = translations_by_group.get(group["id"], [])
-            if len(translations) != len(group_items) or not all(
-                str(text).strip() for text in translations
-            ):
-                return []
+            translations = translations_by_group.get(group["id"], {})
+            if not isinstance(translations, dict):
+                translations = {}
+            expected_ids = self._group_expected_subtitle_ids(group)
             for offset, item in enumerate(group_items):
+                subtitle_id = expected_ids[offset]
+                translated = str(translations.get(subtitle_id, "")).strip()
                 result.append(
                     ScreenSubtitleItem(
                         source_ids=item.source_ids,
                         original=item.original,
-                        translated=str(translations[offset]).strip() or item.translated,
+                        translated=translated or item.translated,
                         word_start=item.word_start,
                         word_end=item.word_end,
+                        subtitle_id=item.subtitle_id,
                     )
                 )
                 used_indexes.add(group["start_index"] + offset)
@@ -5055,7 +5362,17 @@ class ScreenSubtitleEditor:
             {
                 "id": group["id"],
                 "full_english": " ".join(item.original for item in group["items"]),
-                "subtitle_parts": [item.original for item in group["items"]],
+                "expected_subtitle_ids": self._group_expected_subtitle_ids(group),
+                "subtitle_parts": [
+                    {
+                        "subtitle_id": self._item_subtitle_id(
+                            item,
+                            int(group.get("start_index") or 0) + offset,
+                        ),
+                        "english": item.original,
+                    }
+                    for offset, item in enumerate(group["items"], 1)
+                ],
                 "current_translations": [item.translated for item in group["items"]],
             }
             for group in groups
@@ -5099,6 +5416,12 @@ class ScreenSubtitleEditor:
             return items
 
         groups_data = data.get("groups", []) if isinstance(data, dict) else data
+        self._last_llm_raw_returns.append(
+            {
+                "task": "screen_subtitle_semantic_translation",
+                "data": data,
+            }
+        )
         by_id = {
             int(group.get("id")): group
             for group in groups_data
@@ -5108,24 +5431,16 @@ class ScreenSubtitleEditor:
         used_indexes = set()
         for group in groups:
             translated_group = by_id.get(group["id"], {})
-            translations = translated_group.get("part_translations", [])
-            if not isinstance(translations, list):
-                translations = []
             group_items = group["items"]
-            if len(translations) != len(group_items) or not all(
-                str(text).strip() for text in translations
-            ):
-                full_translation = str(translated_group.get("full_translation", "")).strip()
-                translations = self._split_translated_text(
-                    full_translation or self._merge_group_translation(group_items),
-                    len(group_items),
-                )
+            expected_ids = self._group_expected_subtitle_ids(group)
+            translations = self._parse_id_bound_translations(
+                group,
+                expected_ids,
+                translated_group.get("part_translations", []),
+            )
             for offset, item in enumerate(group_items):
-                translated = (
-                    str(translations[offset]).strip()
-                    if offset < len(translations)
-                    else item.translated
-                )
+                subtitle_id = expected_ids[offset]
+                translated = str(translations.get(subtitle_id, "")).strip()
                 result.append(
                     ScreenSubtitleItem(
                         source_ids=item.source_ids,
@@ -5133,6 +5448,7 @@ class ScreenSubtitleEditor:
                         translated=translated or item.translated,
                         word_start=item.word_start,
                         word_end=item.word_end,
+                        subtitle_id=item.subtitle_id,
                     )
                 )
                 used_indexes.add(group["start_index"] + offset)
@@ -5387,6 +5703,9 @@ class ScreenSubtitleEditor:
                 source_ids=item.source_ids,
                 original=item.original,
                 translated=translated,
+                word_start=item.word_start,
+                word_end=item.word_end,
+                subtitle_id=item.subtitle_id,
             )
         return result
 
@@ -5442,6 +5761,9 @@ class ScreenSubtitleEditor:
             translated=cls._align_translation_punctuation(
                 item.original, item.translated
             ),
+            word_start=item.word_start,
+            word_end=item.word_end,
+            subtitle_id=item.subtitle_id,
         )
 
     @staticmethod
