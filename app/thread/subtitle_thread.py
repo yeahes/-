@@ -94,6 +94,8 @@ class SubtitleThread(QThread):
         asr_data: ASRData,
         subtitle_config: SubtitleConfig,
         coverage_report_path: str | None = None,
+        validation_status: str = "passed",
+        validation_summary: dict | None = None,
     ) -> None:
         """Write deterministic subtitle outputs used by video synthesis.
 
@@ -142,6 +144,13 @@ class SubtitleThread(QThread):
             "source_subtitle": self.task.subtitle_path,
             "output_path": str(output_path),
             "coverage_report": coverage_report_path,
+            "validation_status": validation_status,
+            "validation_error_codes": [
+                str(issue.get("code"))
+                for issue in (validation_summary or {}).get("errors", [])
+                if issue.get("code")
+            ],
+            "validation_summary": validation_summary or {},
             "layout": subtitle_config.subtitle_layout,
             "stable_mode": subtitle_config.screen_subtitle_stable_mode,
             "subtitle_count": len(asr_data.segments),
@@ -371,6 +380,13 @@ class SubtitleThread(QThread):
                 asr_data = screen_editor.edit(asr_data, word_time_asr_data=word_time_asr_data)
                 if screen_editor.has_blocking_validation_errors():
                     message = screen_editor.blocking_validation_message()
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=screen_editor.last_validation_summary,
+                    )
                     raise RuntimeError(
                         self.tr(
                             "字幕体检发现严重问题，已停止后续合成。\n报告路径："
@@ -409,6 +425,7 @@ class SubtitleThread(QThread):
                 asr_data,
                 subtitle_config,
                 coverage_report_path=coverage_report_path,
+                validation_status="passed",
             )
             logger.info(f"字幕保存到 {self.task.output_path}")
 

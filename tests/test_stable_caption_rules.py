@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
+from app.core.entities import SubtitleConfig, SubtitleTask
 from app.thread.subtitle_thread import SubtitleThread
 from app.thread.video_synthesis_thread import resolve_podcast_template_subtitle
 from tests.caption_audit.metrics import (
@@ -605,6 +606,43 @@ def test_stable_srt_writer_keeps_bilingual_original_top():
         assert "Hello world.\n你好，世界。" in text
 
 
+def test_failed_validation_still_writes_stable_artifacts():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        task = SubtitleTask(
+            subtitle_path=str(root / "source.srt"),
+            output_path=str(root / "output.srt"),
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        config = SubtitleConfig(
+            need_screen_subtitle_edit=True,
+            screen_subtitle_stable_mode=True,
+            subtitle_layout="original_top",
+        )
+        data = ASRData([ASRDataSeg("Really?", 0, 100, "ok")])
+        summary = {
+            "status": "ERROR",
+            "errors": [{"code": "subtitle_duration_invalid"}],
+            "warnings": [],
+            "info": [],
+        }
+
+        thread._save_stable_subtitle_outputs(
+            data,
+            config,
+            coverage_report_path=str(root / "coverage-report.txt"),
+            validation_status="failed",
+            validation_summary=summary,
+        )
+
+        manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        assert manifest["validation_status"] == "failed"
+        assert manifest["validation_error_codes"] == ["subtitle_duration_invalid"]
+        assert Path(manifest["paths"]["original_top_srt"]).exists()
+        assert (root / "output.srt").exists()
+
+
 def test_runtime_module_import_path_is_available():
     result = subprocess.run(
         [str(ROOT / "runtime" / "python.exe"), "-m", "tests.caption_audit.run_all", "--help"],
@@ -650,5 +688,6 @@ if __name__ == "__main__":
     test_short_sentence_bridges_small_gap_before_next_subtitle()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
+    test_failed_validation_still_writes_stable_artifacts()
     test_runtime_module_import_path_is_available()
     print("stable caption rule smoke tests passed")
