@@ -1,9 +1,12 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from app.core.article_context import (
+    ARTICLE_ANALYSIS_META_KEY,
     ARTICLE_RAW_RESPONSE_KEY,
+    analyze_article_text,
     apply_article_asr_corrections,
     build_article_glossary,
     enrich_article_context_with_evidence,
@@ -195,6 +198,35 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             self.assertEqual(Path(paths["article_llm_raw_response"]).read_text(encoding="utf-8"), '{"raw": true}')
             audit = Path(paths["article_context_audit"]).read_text(encoding="utf-8")
             self.assertIn("unsupported_alias_count", audit)
+
+    def test_cache_hit_marks_analysis_meta_without_calling_llm(self):
+        class FakeCache:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def get_llm_result(self, *args, **kwargs):
+                return self.payload
+
+        cached_payload = {
+            "title": "Cached title",
+            "summary": "Cached summary",
+            "people": [],
+            "companies": [],
+            "brands": [],
+            "organisations": [],
+            "places": [],
+            "technical_terms": [],
+            "numbers_and_dates": [],
+        }
+
+        context = analyze_article_text(
+            "Cached summary text.",
+            type("LLMConfig", (), {"base_url": "", "api_key": "", "model": "deepseek-v4-flash"})(),
+            cache_manager=FakeCache(json.dumps(cached_payload, ensure_ascii=False)),
+        )
+
+        self.assertTrue(context[ARTICLE_ANALYSIS_META_KEY]["cache_used"])
+        self.assertEqual(context["summary"], "Cached summary")
 
 
 if __name__ == "__main__":

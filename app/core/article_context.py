@@ -102,6 +102,10 @@ def normalize_article_context(data: Any) -> Dict[str, Any]:
         "numbers_and_dates",
     ):
         result[key] = [_normalize_term(item, key) for item in data.get(key, []) if isinstance(item, dict)]
+    if data.get(ARTICLE_RAW_RESPONSE_KEY) is not None:
+        result[ARTICLE_RAW_RESPONSE_KEY] = str(data.get(ARTICLE_RAW_RESPONSE_KEY) or "")
+    if isinstance(data.get(ARTICLE_ANALYSIS_META_KEY), dict):
+        result[ARTICLE_ANALYSIS_META_KEY] = dict(data.get(ARTICLE_ANALYSIS_META_KEY) or {})
     return result
 
 
@@ -156,7 +160,17 @@ def analyze_article_text(
         schema_version=ARTICLE_CONTEXT_SCHEMA_VERSION,
     )
     if cache_result:
-        return normalize_article_context(json.loads(cache_result))
+        cached = normalize_article_context(json.loads(cache_result))
+        meta = dict(cached.get(ARTICLE_ANALYSIS_META_KEY) or {})
+        meta.update(
+            {
+                "model": llm_config.model,
+                "cache_used": True,
+                "prompt_hash": cache_key,
+            }
+        )
+        cached[ARTICLE_ANALYSIS_META_KEY] = meta
+        return cached
 
     client = OpenAI(base_url=llm_config.base_url, api_key=llm_config.api_key)
     response = client.chat.completions.create(

@@ -14,6 +14,7 @@ from qfluentwidgets.common.config import isDarkTheme
 
 from app.common.config import cfg
 from app.core.article_context import (
+    ARTICLE_ANALYSIS_META_KEY,
     ArticleContextThread,
     ArticleLLMConfig,
     build_translation_context_prompt,
@@ -160,13 +161,31 @@ class ArticleContextPanel(QFrame):
         self.clear_button.setEnabled(True)
         summary = context.get("summary", "").strip()
         glossary = build_translation_context_prompt(context)
+        meta = context.get(ARTICLE_ANALYSIS_META_KEY) or {}
+        cache_used = bool(meta.get("cache_used"))
+        prefix = self.tr("命中缓存：") if cache_used else self.tr("新分析完成：")
         if summary:
-            self.status_label.setText(summary[:80])
+            self.status_label.setText(prefix + summary[:80])
         elif glossary:
-            self.status_label.setText(self.tr("已生成辅助词表"))
+            self.status_label.setText(
+                self.tr("命中缓存，已生成辅助词表")
+                if cache_used
+                else self.tr("新分析完成，已生成辅助词表")
+            )
         else:
-            self.status_label.setText(self.tr("分析完成"))
-        InfoBar.success(self.tr("分析完成"), self.tr("原文分析完成"), duration=2000, parent=self)
+            self.status_label.setText(
+                self.tr("命中缓存，分析完成")
+                if cache_used
+                else self.tr("新分析完成")
+            )
+        InfoBar.success(
+            self.tr("分析完成"),
+            self.tr("命中缓存，已加载原文分析结果")
+            if cache_used
+            else self.tr("新文章分析完成"),
+            duration=2000,
+            parent=self,
+        )
 
     def _on_analysis_error(self, error: str):
         self.article_context_data = empty_article_context()
