@@ -283,11 +283,13 @@ class ScreenSubtitleEditor:
         self.client = self._init_client()
         self._active_word_entries: List[Dict] = []
         self._active_source_word_spans: Dict[int, tuple[int, int]] = {}
+        self._active_source_segments_by_id: Dict[int, ASRDataSeg] = {}
         self._syntax_protected_cuts: set[tuple[int, int]] = set()
         self._syntax_nlp = None
         self._last_semantic_full_translations: Dict[int, str] = {}
         self._last_semantic_group_audit_contexts: Dict[str, Dict] = {}
         self._last_semantic_group_id_by_subtitle_id: Dict[str, str] = {}
+        self._discourse_marker_orphans: List[Dict] = []
         self._frozen_subtitle_ids: List[str] = []
         self._translation_structure_errors: List[Dict] = []
         self._last_llm_raw_returns: List[Dict] = []
@@ -385,15 +387,21 @@ class ScreenSubtitleEditor:
 
     def _edit_stable_word_timed(self, asr_data: ASRData) -> ASRData:
         logger.info("Screen subtitle stable mode: local English cutting, LLM Chinese only")
-        items = self._stable_cut_items(asr_data.segments)
-        items = self._assign_global_subtitle_ids(items)
         self._translation_structure_errors = []
         self._last_llm_raw_returns = []
         self._last_semantic_group_debug = []
         self._last_semantic_full_translations = {}
         self._last_semantic_group_audit_contexts = {}
         self._last_semantic_group_id_by_subtitle_id = {}
+        self._discourse_marker_orphans = []
+        self._active_source_segments_by_id = {
+            index: seg for index, seg in enumerate(asr_data.segments, 1)
+        }
         self._llm_cache_used = False
+        items = self._stable_cut_items(asr_data.segments)
+        items = self._merge_standalone_discourse_markers(items)
+        items = self._merge_short_display_segments(items)
+        items = self._assign_global_subtitle_ids(items)
         semantic_groups = self._semantic_translation_groups(items)
         items = self._translate_semantic_subtitle_groups(items)
         self._validate_final_item_translation_ids(items)
@@ -408,7 +416,6 @@ class ScreenSubtitleEditor:
             semantic_groups=semantic_groups,
             subtitle_items=items,
         )
-        segments = self._merge_short_display_segments(segments)
         segments = self._repair_abnormal_timing_gaps(segments)
         segments = self._apply_display_timing_padding(segments)
         segments = self._order_segments_by_frozen_subtitle_ids(segments)
@@ -559,9 +566,15 @@ class ScreenSubtitleEditor:
         segments: Sequence[ASRDataSeg],
         short_ms: int = DISPLAY_SHORT_MERGE_MS,
         merge_gap_ms: int = DISPLAY_SHORT_MERGE_GAP_MS,
-    ) -> List[ASRDataSeg]:
+    ) -> List:
         if len(segments) < 2:
             return list(segments)
+        if isinstance(segments[0], ScreenSubtitleItem):
+            return self._merge_short_display_items(
+                segments,
+                short_ms=short_ms,
+                merge_gap_ms=merge_gap_ms,
+            )
 
         ordered = self._sort_segments_by_time(list(segments))
         merged: List[ASRDataSeg] = []
@@ -603,6 +616,65 @@ class ScreenSubtitleEditor:
         if merge_count:
             logger.info("Screen subtitle short display segments merged: %s", merge_count)
         return merged
+
+    def _merge_short_display_items(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        short_ms: int = DISPLAY_SHORT_MERGE_MS,
+        merge_gap_ms: int = DISPLAY_SHORT_MERGE_GAP_MS,
+    ) -> List[ScreenSubtitleItem]:
+        ordered = self._sort_items_by_word_span(list(items))
+        merged: List[ScreenSubtitleItem] = []
+        index = 0
+        merge_count = 0
+        while index < len(ordered):
+            current = ordered[index]
+            if index + 1 < len(ordered) and self._should_merge_short_display_item(
+                current,
+                ordered[index + 1],
+                short_ms,
+                merge_gap_ms,
+            ):
+                merged.append(self._merge_subtitle_items(current, ordered[index + 1]))
+                merge_count += 1
+                index += 2
+                continue
+            merged.append(current)
+            index += 1
+        if merge_count:
+            logger.info("Screen subtitle short display items merged before ids: %s", merge_count)
+        return merged
+
+    def _should_merge_short_display_item(
+        self,
+        current: ScreenSubtitleItem,
+        next_item: ScreenSubtitleItem,
+        short_ms: int,
+        merge_gap_ms: int,
+    ) -> bool:
+        if current.subtitle_id or next_item.subtitle_id:
+            return False
+        timing = self._item_word_timing(current)
+        next_timing = self._item_word_timing(next_item)
+        if not timing or not next_timing:
+            return False
+        duration = max(0, timing[1] - timing[0])
+        gap = max(0, next_timing[0] - timing[1])
+        if duration >= short_ms or gap > merge_gap_ms:
+            return False
+        if not self._items_are_continuous(current, next_item):
+            return False
+        if self._items_cross_speaker(current, next_item):
+            return False
+        current_words = self._word_tokens(current.original)
+        if not current_words or len(current_words) > 4:
+            return False
+        combined_words = self._word_tokens(
+            self._join_subtitle_text(current.original, next_item.original)
+        )
+        if len(combined_words) > max(1, self.max_english_words):
+            return False
+        return self._is_short_backchannel_text(current.original)
 
     def _should_merge_short_display_segment(
         self,
@@ -687,6 +759,259 @@ class ScreenSubtitleEditor:
             )
         logger.info("Screen subtitle stable mode items: %s", len(items))
         return items
+
+    def _merge_standalone_discourse_markers(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        merge_gap_ms: int = DISPLAY_SHORT_MERGE_GAP_MS,
+    ) -> List[ScreenSubtitleItem]:
+        ordered = self._sort_items_by_word_span(list(items))
+        if len(ordered) < 2:
+            return ordered
+        result: List[ScreenSubtitleItem] = []
+        index = 0
+        merged_count = 0
+        while index < len(ordered):
+            item = ordered[index]
+            marker = self._standalone_discourse_marker(item.original)
+            if not marker:
+                result.append(item)
+                index += 1
+                continue
+
+            previous_item = result[-1] if result else None
+            next_item = ordered[index + 1] if index + 1 < len(ordered) else None
+            if (
+                next_item
+                and not self._is_independent_discourse_answer(item, previous_item, next_item)
+                and self._can_attach_discourse_marker(item, next_item, merge_gap_ms)
+            ):
+                merged, remainder = self._attach_marker_to_next_item(item, next_item)
+                if merged:
+                    result.append(merged)
+                    if remainder:
+                        ordered[index + 1] = remainder
+                        index += 1
+                    else:
+                        index += 2
+                    merged_count += 1
+                    continue
+            if (
+                previous_item
+                and not self._is_independent_discourse_answer(item, previous_item, next_item)
+                and self._can_attach_discourse_marker(previous_item, item, merge_gap_ms)
+            ):
+                merged, remainder = self._attach_marker_to_previous_item(previous_item, item)
+                if merged:
+                    if remainder:
+                        result[-1] = remainder
+                        result.append(merged)
+                    else:
+                        result[-1] = merged
+                    index += 1
+                    merged_count += 1
+                    continue
+
+            self._record_discourse_marker_orphan(item, marker)
+            result.append(item)
+            index += 1
+        if merged_count:
+            logger.info("Standalone discourse markers merged before ids: %s", merged_count)
+        return result
+
+    @classmethod
+    def _standalone_discourse_marker(cls, text: str) -> str:
+        normalized = cls._normalize_text(text)
+        normalized = re.sub(r"[^a-z]+", " ", normalized.lower()).strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        if normalized in {"i mean", "you know", "i guess", "well i mean"}:
+            return normalized
+        return ""
+
+    def _can_attach_discourse_marker(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+        merge_gap_ms: int,
+    ) -> bool:
+        if left.subtitle_id or right.subtitle_id:
+            return False
+        if not self._items_are_continuous(left, right):
+            return False
+        if self._items_cross_speaker(left, right):
+            return False
+        left_timing = self._item_word_timing(left)
+        right_timing = self._item_word_timing(right)
+        if left_timing and right_timing:
+            gap = right_timing[0] - left_timing[1]
+            if gap < 0 or gap > merge_gap_ms:
+                return False
+        return True
+
+    def _attach_marker_to_next_item(
+        self,
+        marker: ScreenSubtitleItem,
+        next_item: ScreenSubtitleItem,
+    ) -> tuple[Optional[ScreenSubtitleItem], Optional[ScreenSubtitleItem]]:
+        combined = self._merge_subtitle_items(marker, next_item)
+        if self._word_count(combined.original) <= self.max_english_words:
+            return combined, None
+        if next_item.word_start is None or next_item.word_end is None:
+            return None, None
+        allowed = max(1, self.max_english_words - self._word_count(marker.original))
+        split_end = min(next_item.word_end, next_item.word_start + allowed - 1)
+        if split_end < next_item.word_start:
+            return None, None
+        head_text = self._text_from_word_span(next_item.word_start, split_end)
+        if not self._normalize_text(head_text) or not re.search(r"[A-Za-z]", head_text):
+            return None, None
+        head = ScreenSubtitleItem(
+            source_ids=self._source_ids_for_word_range(next_item.word_start, split_end),
+            original=head_text,
+            translated="",
+            word_start=next_item.word_start,
+            word_end=split_end,
+        )
+        merged = self._merge_subtitle_items(marker, head)
+        if self._word_count(merged.original) > self.max_english_words:
+            return None, None
+        remainder = None
+        if split_end < next_item.word_end:
+            remainder_text = self._text_from_word_span(split_end + 1, next_item.word_end)
+            if remainder_text:
+                remainder = ScreenSubtitleItem(
+                    source_ids=self._source_ids_for_word_range(split_end + 1, next_item.word_end),
+                    original=remainder_text,
+                    translated="",
+                    word_start=split_end + 1,
+                    word_end=next_item.word_end,
+                )
+        return merged, remainder
+
+    def _attach_marker_to_previous_item(
+        self,
+        previous_item: ScreenSubtitleItem,
+        marker: ScreenSubtitleItem,
+    ) -> tuple[Optional[ScreenSubtitleItem], Optional[ScreenSubtitleItem]]:
+        combined = self._merge_subtitle_items(previous_item, marker)
+        if self._word_count(combined.original) <= self.max_english_words:
+            return combined, None
+        if previous_item.word_start is None or previous_item.word_end is None:
+            return None, None
+        allowed = max(1, self.max_english_words - self._word_count(marker.original))
+        split_start = max(previous_item.word_start, previous_item.word_end - allowed + 1)
+        tail_text = self._text_from_word_span(split_start, previous_item.word_end)
+        if not self._normalize_text(tail_text) or not re.search(r"[A-Za-z]", tail_text):
+            return None, None
+        prefix = None
+        if split_start > previous_item.word_start:
+            prefix_text = self._text_from_word_span(previous_item.word_start, split_start - 1)
+            if prefix_text:
+                prefix = ScreenSubtitleItem(
+                    source_ids=self._source_ids_for_word_range(previous_item.word_start, split_start - 1),
+                    original=prefix_text,
+                    translated="",
+                    word_start=previous_item.word_start,
+                    word_end=split_start - 1,
+                )
+        tail = ScreenSubtitleItem(
+            source_ids=self._source_ids_for_word_range(split_start, previous_item.word_end),
+            original=tail_text,
+            translated="",
+            word_start=split_start,
+            word_end=previous_item.word_end,
+        )
+        merged = self._merge_subtitle_items(tail, marker)
+        if self._word_count(merged.original) > self.max_english_words:
+            return None, None
+        return merged, prefix
+
+    def _merge_subtitle_items(
+        self, left: ScreenSubtitleItem, right: ScreenSubtitleItem
+    ) -> ScreenSubtitleItem:
+        word_start = left.word_start
+        if word_start is None or (
+            right.word_start is not None and right.word_start < word_start
+        ):
+            word_start = right.word_start
+        word_end = right.word_end
+        if word_end is None or (left.word_end is not None and left.word_end > word_end):
+            word_end = left.word_end
+        return ScreenSubtitleItem(
+            source_ids=sorted(set(left.source_ids + right.source_ids)),
+            original=self._join_subtitle_text(left.original, right.original),
+            translated=self._join_subtitle_text(left.translated, right.translated),
+            word_start=word_start,
+            word_end=word_end,
+            subtitle_id=left.subtitle_id or right.subtitle_id,
+        )
+
+    @staticmethod
+    def _items_are_continuous(left: ScreenSubtitleItem, right: ScreenSubtitleItem) -> bool:
+        if (
+            left.word_end is not None
+            and right.word_start is not None
+            and right.word_start != left.word_end + 1
+        ):
+            return False
+        if left.source_ids and right.source_ids and min(right.source_ids) - max(left.source_ids) > 1:
+            return False
+        return True
+
+    def _items_cross_speaker(
+        self, left: ScreenSubtitleItem, right: ScreenSubtitleItem
+    ) -> bool:
+        by_id = getattr(self, "_active_source_segments_by_id", {}) or {}
+        left_speakers = {
+            self._segment_speaker(by_id[source_id])
+            for source_id in left.source_ids
+            if source_id in by_id and self._segment_speaker(by_id[source_id])
+        }
+        right_speakers = {
+            self._segment_speaker(by_id[source_id])
+            for source_id in right.source_ids
+            if source_id in by_id and self._segment_speaker(by_id[source_id])
+        }
+        return bool(left_speakers and right_speakers and left_speakers.isdisjoint(right_speakers))
+
+    @staticmethod
+    def _segment_speaker(seg: ASRDataSeg) -> str:
+        for attr in ("speaker", "speaker_id", "speaker_name"):
+            value = getattr(seg, attr, None)
+            if value not in (None, ""):
+                return str(value)
+        return ""
+
+    @classmethod
+    def _is_independent_discourse_answer(
+        cls,
+        marker: ScreenSubtitleItem,
+        previous_item: Optional[ScreenSubtitleItem],
+        next_item: Optional[ScreenSubtitleItem],
+    ) -> bool:
+        text = cls._normalize_text(marker.original)
+        if not re.search(r"[.!?]\s*$", text):
+            return False
+        previous_question = bool(previous_item and re.search(r"\?\s*$", previous_item.original or ""))
+        next_question = bool(next_item and re.search(r"\?\s*$", next_item.original or ""))
+        return previous_question or next_question
+
+    def _record_discourse_marker_orphan(
+        self, item: ScreenSubtitleItem, marker: str
+    ) -> None:
+        timing = self._item_word_timing(item)
+        issue = {
+            "code": "discourse_marker_orphan",
+            "marker": marker,
+            "text": self._normalize_text(item.original),
+            "source_ids": list(item.source_ids),
+            "word_start": item.word_start,
+            "word_end": item.word_end,
+        }
+        if timing:
+            issue["start"] = self._format_ms(timing[0])
+            issue["end"] = self._format_ms(timing[1])
+        self._discourse_marker_orphans.append(issue)
 
     def _assign_global_subtitle_ids(
         self, items: Sequence[ScreenSubtitleItem]
@@ -1565,6 +1890,7 @@ class ScreenSubtitleEditor:
                 or health["duration_warnings"]
                 or health["duplicate_chinese"]
                 or health["asr_suspicious"]
+                or health["discourse_marker_orphans"]
                 or health["syntax_boundary_audit"]
                 or health["chinese_semantic_group_warnings"]
                 or health["chinese_semantic_group_info"]
@@ -1874,6 +2200,14 @@ class ScreenSubtitleEditor:
                     "items": health["asr_suspicious"],
                 }
             )
+        if health["discourse_marker_orphans"]:
+            warnings.append(
+                {
+                    "code": "discourse_marker_orphan",
+                    "message": f"存在 {len(health['discourse_marker_orphans'])} 处无法安全归并的孤立口头标记。",
+                    "items": health["discourse_marker_orphans"],
+                }
+            )
 
         if health["syntax_boundary_audit"]:
             warnings.append(
@@ -2143,6 +2477,7 @@ class ScreenSubtitleEditor:
             "duration_warnings": self._subtitle_duration_issues(final_segments, "WARNING"),
             "duplicate_chinese": self._duplicate_chinese_issues(final_segments),
             "asr_suspicious": self._asr_suspicious_issues(final_segments),
+            "discourse_marker_orphans": list(getattr(self, "_discourse_marker_orphans", []) or []),
             "syntax_boundary_audit": self._syntax_boundary_audit_issues(english_segments),
             "chinese_semantic_group_warnings": self._chinese_semantic_group_audit_issues(final_segments, "WARNING"),
             "chinese_semantic_group_info": self._chinese_semantic_group_audit_issues(final_segments, "INFO"),

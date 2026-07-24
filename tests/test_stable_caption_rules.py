@@ -132,6 +132,40 @@ def _id_segments(count, translated="这是原文"):
     return segments
 
 
+def _marker_editor(words, max_words=14):
+    editor = _id_editor()
+    editor.max_english_words = max_words
+    editor._active_word_entries = [
+        {
+            "token": ScreenSubtitleEditor._word_tokens(word)[0],
+            "surface": word,
+            "start_time": index * 200,
+            "end_time": index * 200 + 120,
+        }
+        for index, word in enumerate(words)
+    ]
+    editor._active_source_word_spans = {
+        index + 1: (index, index)
+        for index in range(len(words))
+    }
+    editor._active_source_segments_by_id = {
+        index + 1: ASRDataSeg(word, index * 200, index * 200 + 120, "")
+        for index, word in enumerate(words)
+    }
+    editor._discourse_marker_orphans = []
+    return editor
+
+
+def _word_item(editor, start, end, source_id=None):
+    return ScreenSubtitleItem(
+        source_ids=[source_id if source_id is not None else start + 1],
+        original=editor._text_from_word_span(start, end),
+        translated="",
+        word_start=start,
+        word_end=end,
+    )
+
+
 class _StaticCache:
     def __init__(self, value):
         self.value = value
@@ -858,6 +892,129 @@ def test_short_sentence_bridges_small_gap_before_next_subtitle():
     assert adjusted[0].end_time == adjusted[1].start_time - 40
 
 
+def test_standalone_discourse_marker_attaches_to_immediate_next_sentence():
+    editor = _marker_editor(["I", "mean,", "this", "market", "changed."])
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 4, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 1
+    assert merged[0].original == "I mean, this market changed."
+    assert editor._discourse_marker_orphans == []
+
+
+def test_trailing_standalone_discourse_marker_attaches_to_previous_sentence():
+    editor = _marker_editor(["this", "market", "changed,", "you", "know."])
+    items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 4, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 1
+    assert merged[0].original == "this market changed, you know."
+    assert editor._discourse_marker_orphans == []
+
+
+def test_standalone_discourse_marker_does_not_cross_long_pause():
+    editor = _marker_editor(["You", "know,", "this", "market", "changed."])
+    editor._active_word_entries[2]["start_time"] = 1500
+    editor._active_word_entries[2]["end_time"] = 1620
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 4, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 2
+    assert merged[0].original == "You know,"
+    assert editor._discourse_marker_orphans
+    assert editor._discourse_marker_orphans[0]["code"] == "discourse_marker_orphan"
+
+
+def test_standalone_discourse_marker_does_not_cross_speaker_change():
+    editor = _marker_editor(["I", "guess,", "this", "market", "changed."])
+    editor._active_source_segments_by_id[1].speaker = "A"
+    editor._active_source_segments_by_id[2].speaker = "B"
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 4, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 2
+    assert merged[0].original == "I guess,"
+    assert editor._discourse_marker_orphans
+
+
+def test_overlong_discourse_marker_attachment_reselects_cutpoint():
+    content_words = [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+        "juliet",
+        "kilo",
+        "lima",
+        "mike",
+        "november",
+        "oscar",
+        "papa",
+    ]
+    words = ["Well,", "I", "mean,"] + content_words
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 18, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 2
+    assert merged[0].original.startswith("Well, I mean, alpha")
+    assert ScreenSubtitleEditor._word_count(merged[0].original) == 14
+    assert merged[1].original == "lima mike november oscar papa"
+    assert all(editor._standalone_discourse_marker(item.original) == "" for item in merged)
+    assert editor._discourse_marker_orphans == []
+
+
+def test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed():
+    editor = _marker_editor(["I", "mean,", "this", "market", "changed."])
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 4, 2)]
+    assert all(item.subtitle_id is None for item in items)
+
+    merged = editor._merge_standalone_discourse_markers(items)
+    merged = editor._merge_short_display_segments(merged)
+    assigned = editor._assign_global_subtitle_ids(merged)
+
+    assert len(assigned) == 1
+    assert assigned[0].subtitle_id == "S0001"
+    assert assigned[0].original == "I mean, this market changed."
+
+
+def test_discourse_marker_pre_id_pipeline_keeps_400_plus_english_chinese_id_sets_equal():
+    words = [f"word{i}" for i in range(1, 406)]
+    editor = _marker_editor(words, max_words=14)
+    items = [
+        ScreenSubtitleItem(
+            source_ids=[index],
+            original=f"English {index}.",
+            translated=f"zh-S{index:04d}",
+            word_start=index - 1,
+            word_end=index - 1,
+        )
+        for index in range(1, 406)
+    ]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+    merged = editor._merge_short_display_segments(merged)
+    assigned = editor._assign_global_subtitle_ids(merged)
+    editor._validate_final_item_translation_ids(assigned)
+
+    english_ids = [item.subtitle_id for item in assigned]
+    chinese_ids = [item.subtitle_id for item in assigned if item.translated]
+    assert len(assigned) == 405
+    assert english_ids == [f"S{index:04d}" for index in range(1, 406)]
+    assert english_ids == chinese_ids
+    assert editor._translation_structure_errors == []
+
+
 def test_podcast_template_prefers_stable_manifest_subtitle():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -1382,6 +1539,13 @@ if __name__ == "__main__":
     test_short_subtitle_gets_minimum_display_duration_when_room_allows()
     test_short_backchannel_merges_with_following_segment()
     test_short_sentence_bridges_small_gap_before_next_subtitle()
+    test_standalone_discourse_marker_attaches_to_immediate_next_sentence()
+    test_trailing_standalone_discourse_marker_attaches_to_previous_sentence()
+    test_standalone_discourse_marker_does_not_cross_long_pause()
+    test_standalone_discourse_marker_does_not_cross_speaker_change()
+    test_overlong_discourse_marker_attachment_reselects_cutpoint()
+    test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed()
+    test_discourse_marker_pre_id_pipeline_keeps_400_plus_english_chinese_id_sets_equal()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()
