@@ -1707,6 +1707,127 @@ def test_boundary_snapshots_record_stage_changes_before_subtitle_ids():
     assert "boundary_score" in payload["stages"][0]["boundaries"][0]
 
 
+def test_final_gate_blocks_particle_preposition_complement_split():
+    editor = _marker_editor(["straight", "into", "the", "absolute", "tundra"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "particle_or_preposition_complement_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_short_verb_object_split():
+    editor = _marker_editor(["issued", "this", "stark", "public", "warning"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "short_verb_object_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_auxiliary_predicate_split():
+    editor = _marker_editor(["work", "doesn't", "have", "to", "be", "a", "tradeoff"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "auxiliary_predicate_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_catenative_verb_complement_split():
+    editor = _marker_editor(["helped", "expose", "the", "crimes"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "verb_complement_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_numeric_unit_or_noun_split():
+    editor = _marker_editor(["80", "000", "hours"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "numeric_unit_or_noun_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_compound_noun_split():
+    editor = _marker_editor(["large-scale", "job", "displacement"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "compound_noun_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_modifier_noun_head_split():
+    editor = _marker_editor(["the", "vast", "majority", "of", "people"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "modifier_noun_head_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_negation_emphasis_split():
+    editor = _marker_editor(["never,", "ever", "be", "automated"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "negation_or_emphasis_fragment" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_fragment_gate_repairs_incomplete_interrogative_fragment():
+    editor = _marker_editor(["How", "on", "earth", "do", "you", "know", "this?"], max_words=14)
+    items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 6, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert repaired[0].original.startswith("How on earth do")
+    assert all(item.subtitle_id is None for item in repaired)
+
+
+def test_final_repair_does_not_create_adjacent_subject_fragment():
+    editor = _marker_editor(["what", "you", "are", "actually", "good", "at"], max_words=14)
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 5, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert all(
+        editor._evaluate_item_pair_for_final_boundary(
+            left,
+            right,
+            repaired[index - 1] if index > 0 else None,
+        )["legal"]
+        for index, (left, right) in enumerate(zip(repaired, repaired[1:]))
+    )
+
+
+def test_final_repair_does_not_create_ordinary_one_word_fragment():
+    editor = _marker_editor(["a", "Pulitzer", "Prize-winning", "journalist", "reported", "it"], max_words=5)
+    items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 5, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert not any(editor._is_ordinary_one_word_fragment(item.original) for item in repaired)
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 5 for item in repaired)
+
+
+def test_final_fragment_gate_records_unresolved_when_no_legal_solution():
+    editor = _marker_editor(["How", "on", "earth", "do", "you"], max_words=2)
+    items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 4, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [item.original for item in items]
+    assert any(
+        repair["unresolved_hard_issue"]
+        for repair in editor._pre_id_boundary_repairs
+    )
+
+
 def test_podcast_template_prefers_stable_manifest_subtitle():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -2625,6 +2746,18 @@ if __name__ == "__main__":
     test_unresolved_weak_fragment_is_recorded_when_no_safe_repair()
     test_final_pre_id_second_phase_preserves_word_order_and_timestamps()
     test_boundary_snapshots_record_stage_changes_before_subtitle_ids()
+    test_final_gate_blocks_particle_preposition_complement_split()
+    test_final_gate_blocks_short_verb_object_split()
+    test_final_gate_blocks_auxiliary_predicate_split()
+    test_final_gate_blocks_catenative_verb_complement_split()
+    test_final_gate_blocks_numeric_unit_or_noun_split()
+    test_final_gate_blocks_compound_noun_split()
+    test_final_gate_blocks_modifier_noun_head_split()
+    test_final_gate_blocks_negation_emphasis_split()
+    test_final_fragment_gate_repairs_incomplete_interrogative_fragment()
+    test_final_repair_does_not_create_adjacent_subject_fragment()
+    test_final_repair_does_not_create_ordinary_one_word_fragment()
+    test_final_fragment_gate_records_unresolved_when_no_legal_solution()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()
