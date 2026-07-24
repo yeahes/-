@@ -1400,12 +1400,12 @@ def test_allocation_parser_recovers_orphan_subtitle_rows_by_global_id():
 def test_allocation_requests_large_payload_in_small_id_bound_chunks():
     editor = _id_editor()
     editor.batch_num = 50
-    items = editor._assign_global_subtitle_ids(_id_items(10))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 11)]
-    full_translations = {index: f"full-{index}" for index in range(1, 11)}
+    items = editor._assign_global_subtitle_ids(_id_items(25))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 26)]
+    full_translations = {index: f"full-{index}" for index in range(1, 26)}
     requested_group_ids = []
 
-    def request(prompt, payload):
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
         requested_group_ids.append([entry["id"] for entry in payload])
         return {
             "groups": [
@@ -1425,9 +1425,65 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
     with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
         allocated = editor._allocate_semantic_group_translations(groups, full_translations)
 
-    assert requested_group_ids == [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10]]
+    assert requested_group_ids == [
+        list(range(1, 25)),
+        [25],
+    ]
     assert allocated[1] == {"S0001": "zh-S0001"}
-    assert allocated[10] == {"S0010": "zh-S0010"}
+    assert allocated[25] == {"S0025": "zh-S0025"}
+    assert editor._translation_structure_errors == []
+
+
+def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_errors():
+    editor = _id_editor()
+    editor.batch_num = 24
+    items = editor._assign_global_subtitle_ids(_id_items(3))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 4)]
+    full_translations = {index: f"full-{index}" for index in range(1, 4)}
+    calls = []
+
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+        calls.append((cache_task, [entry["id"] for entry in payload]))
+        if cache_task == "screen_subtitle_semantic_translation_allocation":
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "part_translations": [
+                            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+                        ],
+                    }
+                ]
+            }
+        return {
+            "groups": [
+                {
+                    "id": entry["id"],
+                    "part_translations": [
+                        {
+                            "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
+                            "zh": f"zh-{entry['subtitle_parts'][0]['subtitle_id']}",
+                        }
+                    ],
+                }
+                for entry in payload
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    assert calls == [
+        ("screen_subtitle_semantic_translation_allocation", [1, 2, 3]),
+        ("screen_subtitle_semantic_translation_allocation_retry", [1]),
+        ("screen_subtitle_semantic_translation_allocation_retry", [2]),
+        ("screen_subtitle_semantic_translation_allocation_retry", [3]),
+    ]
+    assert allocated == {
+        1: {"S0001": "zh-S0001"},
+        2: {"S0002": "zh-S0002"},
+        3: {"S0003": "zh-S0003"},
+    }
     assert editor._translation_structure_errors == []
 
 

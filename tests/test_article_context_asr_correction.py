@@ -101,6 +101,35 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
         corrected = self._correct(raw)
         self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
 
+    def test_skips_self_replacements_and_technical_terms_for_asr_correction(self):
+        context = {
+            "technical_terms": [
+                {"canonical_name": "AI", "aliases": [], "category": "technical_term"},
+                {"canonical_name": "automation", "aliases": [], "category": "technical_term"},
+            ],
+            "brands": [
+                {"canonical_name": "DeepSeek", "aliases": ["Deep Seek"], "category": "brand"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(
+                    [
+                        ASRDataSeg("AI and automation are already correct.", 100, 200),
+                        ASRDataSeg("Deep Seek is a brand.", 300, 500),
+                    ]
+                ),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            [seg.text for seg in corrected.segments],
+            ["AI and automation are already correct.", "DeepSeek is a brand."],
+        )
+        self.assertEqual([item["corrected_text"] for item in logs], ["DeepSeek"])
+
     def test_rejects_fluent_common_phrases_that_sound_like_entities(self):
         raw = [
             ASRDataSeg("I mean, they are trading.", 100, 200),

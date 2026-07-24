@@ -528,6 +528,8 @@ def _correct_word_timestamp_segments(
                 candidate["window_size"] = window_size
                 candidate["context_match"] = False
                 candidate["asr_confidence_low"] = None
+                if _is_self_replacement_candidate(candidate):
+                    continue
                 if candidate["final_confidence"] >= review_confidence:
                     candidates.append(candidate)
                 if best is None or candidate["final_confidence"] > best["final_confidence"]:
@@ -597,10 +599,6 @@ def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, 
         "places",
         "location",
         "locations",
-        "technical_term",
-        "technical_terms",
-        "term",
-        "terms",
         "institution",
         "institutions",
         "list",
@@ -723,7 +721,19 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
     }
 
 
+def _is_self_replacement_candidate(candidate: Dict[str, Any]) -> bool:
+    original = str(candidate.get("original_text", "") or "")
+    corrected = str(candidate.get("corrected_text", "") or "")
+    return _surface_text_key(original) == _surface_text_key(corrected)
+
+
+def _surface_text_key(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+
+
 def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -> bool:
+    if _is_self_replacement_candidate(candidate):
+        return False
     if candidate["final_confidence"] < high_confidence:
         return False
     if not _candidate_stays_in_article_scope(candidate):
@@ -732,6 +742,8 @@ def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -
 
 
 def _not_applied_reason(candidate: Dict[str, Any], high_confidence: float) -> str:
+    if _is_self_replacement_candidate(candidate):
+        return "self_replacement_skipped"
     if candidate["final_confidence"] < high_confidence:
         return "below_high_confidence_threshold"
     if not _candidate_stays_in_article_scope(candidate):

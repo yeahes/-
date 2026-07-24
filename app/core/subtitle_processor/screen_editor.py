@@ -6072,30 +6072,97 @@ class ScreenSubtitleEditor:
         }
         prompt = self._compose_prompt(SEMANTIC_TRANSLATION_ALLOCATION_PROMPT)
         for payload_chunk in self._semantic_allocation_payload_chunks(payload):
-            data = self._request_semantic_translation_allocation(prompt, payload_chunk)
+            chunk_result, complete, data = self._request_and_parse_allocation_chunk(
+                prompt,
+                payload_chunk,
+                expected_groups_by_id,
+            )
             if data is None:
                 return {}
-            self._last_llm_raw_returns.append(
-                {
-                    "task": "screen_subtitle_semantic_translation_allocation",
-                    "data": data,
-                    "expected_group_ids": [entry.get("id") for entry in payload_chunk],
-                }
-            )
-            groups_data = data.get("groups", []) if isinstance(data, dict) else data
-            groups_data = self._normalize_allocation_groups_data(groups, groups_data)
-            returned_group_ids = set()
+            if not complete:
+                chunk_result, complete = self._retry_incomplete_allocation_chunk(
+                    prompt,
+                    payload_chunk,
+                    expected_groups_by_id,
+                )
+            result.update(chunk_result)
+            if not complete:
+                self._record_omitted_allocation_groups(
+                    payload_chunk,
+                    expected_groups_by_id,
+                    chunk_result,
+                )
+        return result
+
+    def _request_and_parse_allocation_chunk(
+        self,
+        prompt: str,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+        *,
+        cache_task: str = "screen_subtitle_semantic_translation_allocation",
+    ) -> tuple[Dict[int, Dict[str, str]], bool, Optional[object]]:
+        data = self._request_semantic_translation_allocation(
+            prompt,
+            payload_chunk,
+            cache_task=cache_task,
+        )
+        if data is None:
+            return {}, False, None
+        self._last_llm_raw_returns.append(
+            {
+                "task": cache_task,
+                "data": data,
+                "expected_group_ids": [entry.get("id") for entry in payload_chunk],
+            }
+        )
+        return self._parse_allocation_chunk_data(
+            payload_chunk,
+            expected_groups_by_id,
+            data,
+        ) + (data,)
+
+    def _parse_allocation_chunk_data(
+        self,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+        data: object,
+    ) -> tuple[Dict[int, Dict[str, str]], bool]:
+        result: Dict[int, Dict[str, str]] = {}
+        groups_data = data.get("groups", []) if isinstance(data, dict) else data
+        groups_data = self._normalize_allocation_groups_data(
+            list(expected_groups_by_id.values()),
+            groups_data,
+        )
+        expected_group_ids = [int(entry.get("id") or 0) for entry in payload_chunk]
+        returned_group_ids = set()
+        saved_errors = self._translation_structure_errors
+        saved_debug = self._last_semantic_group_debug
+        temp_errors: List[Dict] = []
+        temp_debug: List[Dict] = []
+        self._translation_structure_errors = temp_errors
+        self._last_semantic_group_debug = temp_debug
+        try:
             for group in groups_data:
                 if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
                     continue
                 group_id = int(group["id"])
+                if group_id not in expected_group_ids:
+                    saved_errors.append(
+                        {
+                            "code": "translation_id_unknown",
+                            "message": f"Unknown semantic group id returned: {group_id}",
+                            "semantic_group_id": f"G{group_id:04d}",
+                            "expected_subtitle_ids": [],
+                            "returned_subtitle_ids": [],
+                            "duplicate_subtitle_ids": [],
+                            "unknown_subtitle_ids": [],
+                            "missing_subtitle_ids": [],
+                        }
+                    )
+                    continue
                 expected_group = expected_groups_by_id.get(group_id)
                 if expected_group is None:
-                    self._record_translation_structure_error(
-                        "translation_id_unknown",
-                        group_id=group_id,
-                        message=f"Unknown semantic group id returned: {group_id}",
-                    )
                     continue
                 returned_group_ids.add(group_id)
                 result[group_id] = self._parse_id_bound_translations(
@@ -6103,28 +6170,65 @@ class ScreenSubtitleEditor:
                     self._group_expected_subtitle_ids(expected_group),
                     group.get("part_translations", []),
                 )
-            for expected_group_id in [int(entry.get("id") or 0) for entry in payload_chunk]:
-                if expected_group_id in returned_group_ids:
-                    continue
-                expected_group = expected_groups_by_id.get(expected_group_id)
-                if expected_group is None:
-                    continue
-                expected_ids = self._group_expected_subtitle_ids(expected_group)
-                self._record_translation_structure_error(
-                    "translation_group_cardinality_mismatch",
-                    group_id=expected_group_id,
-                    expected_ids=expected_ids,
-                    returned_ids=[],
-                    missing_ids=expected_ids,
-                    message="LLM omitted semantic group allocation result.",
-                )
-                result.setdefault(expected_group_id, {})
-        return result
+        finally:
+            self._translation_structure_errors = saved_errors
+            self._last_semantic_group_debug = saved_debug
+        complete = not temp_errors and set(expected_group_ids) == returned_group_ids
+        if complete:
+            saved_debug.extend(temp_debug)
+        return result, complete
+
+    def _retry_incomplete_allocation_chunk(
+        self,
+        prompt: str,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+    ) -> tuple[Dict[int, Dict[str, str]], bool]:
+        result: Dict[int, Dict[str, str]] = {}
+        complete = True
+        for entry in payload_chunk:
+            group_result, group_complete, data = self._request_and_parse_allocation_chunk(
+                prompt,
+                [entry],
+                expected_groups_by_id,
+                cache_task="screen_subtitle_semantic_translation_allocation_retry",
+            )
+            if data is None:
+                complete = False
+                continue
+            result.update(group_result)
+            complete = complete and group_complete
+        return result, complete
+
+    def _record_omitted_allocation_groups(
+        self,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+        chunk_result: Dict[int, Dict[str, str]],
+    ) -> None:
+        for expected_group_id in [int(entry.get("id") or 0) for entry in payload_chunk]:
+            expected_group = expected_groups_by_id.get(expected_group_id)
+            if expected_group is None:
+                continue
+            expected_ids = self._group_expected_subtitle_ids(expected_group)
+            mapped = chunk_result.get(expected_group_id, {})
+            returned_ids = list(mapped.keys()) if isinstance(mapped, dict) else []
+            missing_ids = [subtitle_id for subtitle_id in expected_ids if subtitle_id not in returned_ids]
+            if not missing_ids:
+                continue
+            self._record_translation_structure_error(
+                "translation_group_cardinality_mismatch",
+                group_id=expected_group_id,
+                expected_ids=expected_ids,
+                returned_ids=returned_ids,
+                missing_ids=missing_ids,
+                message="LLM omitted semantic group allocation result after retry.",
+            )
 
     def _semantic_allocation_payload_chunks(
         self, payload: Sequence[Dict]
     ) -> List[List[Dict]]:
-        batch_size = min(8, max(1, int(self.batch_num or 8)))
+        batch_size = min(24, max(1, int(self.batch_num or 24)))
         return [
             list(payload[index : index + batch_size])
             for index in range(0, len(payload), batch_size)
@@ -6134,13 +6238,15 @@ class ScreenSubtitleEditor:
         self,
         prompt: str,
         payload: Sequence[Dict],
+        *,
+        cache_task: str = "screen_subtitle_semantic_translation_allocation",
     ) -> Optional[object]:
         cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
             temperature=0.2,
-            task="screen_subtitle_semantic_translation_allocation",
+            task=cache_task,
         )
         try:
             if cache_result:
@@ -6161,7 +6267,7 @@ class ScreenSubtitleEditor:
                 json.dumps(data, ensure_ascii=False),
                 self.model,
                 temperature=0.2,
-                task="screen_subtitle_semantic_translation_allocation",
+                task=cache_task,
             )
             return data
         except Exception as e:
