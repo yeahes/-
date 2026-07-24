@@ -43,6 +43,9 @@ SUBTITLE_DURATION_INVALID_MS = 150
 SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
+SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v2"
+SEMANTIC_ALLOCATION_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_v2"
+SEMANTIC_ALLOCATION_RETRY_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_retry_v2"
 
 
 SCREEN_EDITOR_PROMPT = """
@@ -196,6 +199,8 @@ Return pure JSON only:
 SEMANTIC_TRANSLATION_ALLOCATION_PROMPT = """
 You are assigning a completed Chinese translation back to fixed English subtitle parts.
 
+Version: semantic-allocation-v2
+
 Task:
 Given a full English sense group, its completed Chinese translation, and fixed subtitle parts, write one concise Chinese subtitle for each part.
 
@@ -205,6 +210,11 @@ Rules:
 - Do not change, omit, summarize, or reorder the English parts.
 - Do not move information earlier than when the corresponding English part is spoken.
 - Use the full_translation as the authority for Chinese wording and style.
+- Treat full_translation as authoritative. Do not retranslate or rewrite the whole group from English.
+- Split and lightly adapt only the provided full_translation so the concatenated part_translations preserve it.
+- Keep each entity, number, negation, contrast marker, and core action near the subtitle_id where its English anchor appears.
+- Do not duplicate the same core Chinese information in adjacent subtitle_ids.
+- Do not leave obvious dangling Chinese fragments unless the English part itself is an incomplete fragment.
 - Compress only enough for on-screen reading.
 - Prefer natural Chinese video subtitle phrasing over word-for-word alignment.
 - Preserve facts, numbers, names, negation, contrast, conditions, modality, and speaker stance.
@@ -215,6 +225,7 @@ Return pure JSON only:
   "groups": [
     {
       "id": 1,
+      "allocation_prompt_version": "semantic-allocation-v2",
       "part_translations": [
         {"subtitle_id": "S0001", "zh": "中文字幕1"},
         {"subtitle_id": "S0002", "zh": "中文字幕2"}
@@ -313,6 +324,12 @@ class ScreenSubtitleEditor:
         self._translation_structure_errors: List[Dict] = []
         self._last_llm_raw_returns: List[Dict] = []
         self._last_semantic_group_debug: List[Dict] = []
+        self._last_allocation_inputs: List[Dict] = []
+        self._last_allocation_raw_returns: List[Dict] = []
+        self._last_allocation_validation: List[Dict] = []
+        self._last_allocation_retry_log: List[Dict] = []
+        self._last_allocation_final: List[Dict] = []
+        self._last_allocation_unresolved: List[Dict] = []
         self._llm_cache_used: bool = False
         self._boundary_snapshots: List[Dict] = []
         self._boundary_snapshot_changes: List[Dict] = []
@@ -418,6 +435,12 @@ class ScreenSubtitleEditor:
         self._translation_structure_errors = []
         self._last_llm_raw_returns = []
         self._last_semantic_group_debug = []
+        self._last_allocation_inputs = []
+        self._last_allocation_raw_returns = []
+        self._last_allocation_validation = []
+        self._last_allocation_retry_log = []
+        self._last_allocation_final = []
+        self._last_allocation_unresolved = []
         self._last_semantic_full_translations = {}
         self._last_semantic_group_audit_contexts = {}
         self._last_semantic_group_id_by_subtitle_id = {}
@@ -4170,6 +4193,30 @@ class ScreenSubtitleEditor:
                 self._last_llm_raw_returns,
             )
             self._write_json_artifact(
+                artifact_dir / "allocation-inputs.json",
+                self._last_allocation_inputs,
+            )
+            self._write_json_artifact(
+                artifact_dir / "allocation-raw-returns.json",
+                self._last_allocation_raw_returns,
+            )
+            self._write_json_artifact(
+                artifact_dir / "allocation-validation.json",
+                self._last_allocation_validation,
+            )
+            self._write_json_artifact(
+                artifact_dir / "allocation-retry-log.json",
+                self._last_allocation_retry_log,
+            )
+            self._write_json_artifact(
+                artifact_dir / "allocation-final.json",
+                self._last_allocation_final,
+            )
+            self._write_json_artifact(
+                artifact_dir / "allocation-unresolved.json",
+                self._last_allocation_unresolved,
+            )
+            self._write_json_artifact(
                 artifact_dir / "semantic-group-debug.json",
                 self._last_semantic_group_debug,
             )
@@ -6038,8 +6085,99 @@ class ScreenSubtitleEditor:
             )
             changed += 1
         if changed:
+            result = self._restore_invalid_postprocess_allocations(
+                before_segments=segments,
+                after_segments=result,
+                semantic_groups=semantic_groups,
+                subtitle_items=subtitle_items,
+            )
             logger.info("局部压缩中文字幕阅读速度: %s", changed)
         return result
+
+    def _restore_invalid_postprocess_allocations(
+        self,
+        *,
+        before_segments: Sequence[ASRDataSeg],
+        after_segments: Sequence[ASRDataSeg],
+        semantic_groups: Optional[Sequence[Dict]],
+        subtitle_items: Optional[Sequence[ScreenSubtitleItem]],
+    ) -> List[ASRDataSeg]:
+        if not semantic_groups or not subtitle_items:
+            return list(after_segments)
+        result = list(after_segments)
+        for group in semantic_groups:
+            start = int(group.get("start_index") or 0)
+            count = len(group.get("items") or [])
+            end = start + count
+            if count <= 0 or end > len(result) or end > len(before_segments):
+                continue
+            if all(
+                before_segments[index].translated_text == result[index].translated_text
+                for index in range(start, end)
+            ):
+                continue
+            entry = self._allocation_entry_from_group_segments(group, result[start:end])
+            before_entry = self._allocation_entry_from_group_segments(group, before_segments[start:end])
+            after_allocation = {
+                self._segment_subtitle_id(result[index], index + 1): result[index].translated_text
+                for index in range(start, end)
+            }
+            before_allocation = {
+                self._segment_subtitle_id(before_segments[index], index + 1): before_segments[index].translated_text
+                for index in range(start, end)
+            }
+            before_valid = self._validate_group_chinese_allocation(before_entry, before_allocation)["valid"]
+            after_validation = self._validate_group_chinese_allocation(entry, after_allocation)
+            self._last_allocation_validation.append(
+                {
+                    **after_validation,
+                    "postprocess_stage": "compression_or_reallocation",
+                }
+            )
+            if before_valid and not after_validation["valid"]:
+                for index in range(start, end):
+                    result[index] = before_segments[index]
+                self._last_allocation_unresolved.append(
+                    {
+                        "semantic_group_id": f"G{int(group.get('id') or 0):04d}",
+                        "reason": "postprocess_allocation_quality_regression_restored",
+                        "issue_codes": after_validation["issue_codes"],
+                    }
+                )
+        return result
+
+    def _allocation_entry_from_group_segments(
+        self,
+        group: Dict,
+        segments: Sequence[ASRDataSeg],
+    ) -> Dict:
+        group_id = int(group.get("id") or 0)
+        items = list(group.get("items") or [])
+        parts = []
+        for offset, item in enumerate(items):
+            seg = segments[offset] if offset < len(segments) else None
+            parts.append(
+                {
+                    "subtitle_id": self._item_subtitle_id(
+                        item,
+                        int(group.get("start_index") or 0) + offset + 1,
+                    ),
+                    "english": item.original,
+                    "duration_ms": (
+                        max(1, int(seg.end_time) - int(seg.start_time))
+                        if seg is not None
+                        else None
+                    ),
+                    "max_zh_chars": self.max_cjk_chars,
+                }
+            )
+        return {
+            "id": group_id,
+            "allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
+            "full_english": " ".join(item.original for item in items),
+            "full_translation": self._last_semantic_full_translations.get(group_id, ""),
+            "subtitle_parts": parts,
+        }
 
     def _request_chinese_compression(
         self,
@@ -7816,12 +7954,14 @@ class ScreenSubtitleEditor:
             payload.append(
                 {
                     "id": group["id"],
+                    "allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
                     "full_english": " ".join(item.original for item in group["items"]),
                     "full_translation": full_translation,
                     "subtitle_parts": subtitle_parts,
                 }
             )
 
+        self._last_allocation_inputs.extend(payload)
         result: Dict[int, Dict[str, str]] = {}
         expected_groups_by_id = {
             int(group.get("id") or 0): group
@@ -7850,6 +7990,12 @@ class ScreenSubtitleEditor:
                     payload_chunk,
                     expected_groups_by_id,
                 )
+            chunk_result = self._retry_quality_failed_group_allocations(
+                prompt,
+                payload_chunk,
+                expected_groups_by_id,
+                chunk_result,
+            )
             result.update(chunk_result)
             if not complete:
                 self._record_omitted_allocation_groups(
@@ -7874,7 +8020,7 @@ class ScreenSubtitleEditor:
                 payload_chunk,
                 expected_groups_by_id,
                 batch_id=batch_id,
-                cache_task="screen_subtitle_semantic_translation_allocation",
+                cache_task=SEMANTIC_ALLOCATION_CACHE_TASK,
             )
             if cached is None:
                 pending.append((batch_id, payload_chunk))
@@ -7891,7 +8037,7 @@ class ScreenSubtitleEditor:
                         payload_chunk,
                         expected_groups_by_id,
                         batch_id=batch_id,
-                        cache_task="screen_subtitle_semantic_translation_allocation",
+                        cache_task=SEMANTIC_ALLOCATION_CACHE_TASK,
                     ): (batch_id, payload_chunk)
                     for batch_id, payload_chunk in pending
                 }
@@ -7916,7 +8062,7 @@ class ScreenSubtitleEditor:
                             prompt,
                             payload_chunk,
                             batch_result.data,
-                            cache_task="screen_subtitle_semantic_translation_allocation",
+                            cache_task=SEMANTIC_ALLOCATION_CACHE_TASK,
                         )
                     results_by_batch[batch_id] = batch_result
 
@@ -7940,7 +8086,17 @@ class ScreenSubtitleEditor:
 
             self._last_llm_raw_returns.append(
                 {
-                    "task": "screen_subtitle_semantic_translation_allocation",
+                    "task": SEMANTIC_ALLOCATION_CACHE_TASK,
+                    "data": batch_result.data,
+                    "expected_group_ids": [entry.get("id") for entry in payload_chunk],
+                    "batch_id": batch_id,
+                    "elapsed_seconds": round(batch_result.elapsed_seconds, 3),
+                    "error_message": batch_result.error_message,
+                }
+            )
+            self._last_allocation_raw_returns.append(
+                {
+                    "task": SEMANTIC_ALLOCATION_CACHE_TASK,
                     "data": batch_result.data,
                     "expected_group_ids": [entry.get("id") for entry in payload_chunk],
                     "batch_id": batch_id,
@@ -7969,6 +8125,13 @@ class ScreenSubtitleEditor:
                     expected_groups_by_id,
                     chunk_result,
                 )
+            quality_retry = self._retry_quality_failed_group_allocations(
+                prompt,
+                payload_chunk,
+                expected_groups_by_id,
+                chunk_result,
+            )
+            merged.update(quality_retry)
         return merged
 
     def _request_and_parse_allocation_chunk(
@@ -7977,7 +8140,7 @@ class ScreenSubtitleEditor:
         payload_chunk: Sequence[Dict],
         expected_groups_by_id: Dict[int, Dict],
         *,
-        cache_task: str = "screen_subtitle_semantic_translation_allocation",
+        cache_task: str = SEMANTIC_ALLOCATION_CACHE_TASK,
     ) -> tuple[Dict[int, Dict[str, str]], bool, Optional[object]]:
         data = self._request_semantic_translation_allocation(
             prompt,
@@ -7987,6 +8150,13 @@ class ScreenSubtitleEditor:
         if data is None:
             return {}, False, None
         self._last_llm_raw_returns.append(
+            {
+                "task": cache_task,
+                "data": data,
+                "expected_group_ids": [entry.get("id") for entry in payload_chunk],
+            }
+        )
+        self._last_allocation_raw_returns.append(
             {
                 "task": cache_task,
                 "data": data,
@@ -8175,11 +8345,19 @@ class ScreenSubtitleEditor:
             data = self._request_semantic_translation_allocation(
                 prompt,
                 [entry],
-                cache_task="screen_subtitle_semantic_translation_allocation_retry",
+                cache_task=SEMANTIC_ALLOCATION_RETRY_CACHE_TASK,
             )
             if data is None:
                 complete = False
                 continue
+            self._last_allocation_raw_returns.append(
+                {
+                    "task": SEMANTIC_ALLOCATION_RETRY_CACHE_TASK,
+                    "data": data,
+                    "expected_group_ids": [entry.get("id")],
+                    "structure_retry": True,
+                }
+            )
             group_result, group_complete, errors, debug = self._parse_allocation_chunk_data_isolated(
                 [entry],
                 expected_groups_by_id,
@@ -8192,6 +8370,312 @@ class ScreenSubtitleEditor:
                 self._translation_structure_errors.extend(errors)
             complete = complete and group_complete
         return result, complete
+
+    def _retry_quality_failed_group_allocations(
+        self,
+        prompt: str,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+        chunk_result: Dict[int, Dict[str, str]],
+    ) -> Dict[int, Dict[str, str]]:
+        result = dict(chunk_result)
+        for entry in payload_chunk:
+            group_id = int(entry.get("id") or 0)
+            expected_group = expected_groups_by_id.get(group_id)
+            if expected_group is None:
+                continue
+            allocation = result.get(group_id, {})
+            validation = self._validate_group_chinese_allocation(
+                entry,
+                allocation,
+            )
+            self._last_allocation_validation.append(validation)
+            if validation["valid"]:
+                self._last_allocation_final.append(
+                    {
+                        "semantic_group_id": f"G{group_id:04d}",
+                        "subtitle_ids": self._group_expected_subtitle_ids(expected_group),
+                        "allocation": dict(allocation),
+                        "source": "initial",
+                    }
+                )
+                continue
+
+            retry_record = {
+                "semantic_group_id": f"G{group_id:04d}",
+                "reason_codes": list(validation.get("issue_codes") or []),
+                "attempted": True,
+                "success": False,
+            }
+            data = self._request_semantic_translation_allocation(
+                prompt,
+                [entry],
+                cache_task=SEMANTIC_ALLOCATION_RETRY_CACHE_TASK,
+            )
+            if data is None:
+                self._last_allocation_retry_log.append(retry_record)
+                self._record_allocation_quality_unresolved(entry, allocation, validation, "retry_request_failed")
+                continue
+            self._last_allocation_raw_returns.append(
+                {
+                    "task": SEMANTIC_ALLOCATION_RETRY_CACHE_TASK,
+                    "data": data,
+                    "expected_group_ids": [group_id],
+                    "quality_retry": True,
+                }
+            )
+            group_result, group_complete, errors, debug = self._parse_allocation_chunk_data_isolated(
+                [entry],
+                expected_groups_by_id,
+                data,
+            )
+            if not group_complete:
+                self._translation_structure_errors.extend(errors)
+                self._last_allocation_retry_log.append(retry_record)
+                self._record_allocation_quality_unresolved(entry, allocation, validation, "retry_structure_failed")
+                continue
+            retry_allocation = group_result.get(group_id, {})
+            retry_validation = self._validate_group_chinese_allocation(
+                entry,
+                retry_allocation,
+                retry_of=validation,
+            )
+            self._last_allocation_validation.append(retry_validation)
+            if retry_validation["valid"]:
+                result[group_id] = retry_allocation
+                self._last_semantic_group_debug.extend(debug)
+                retry_record["success"] = True
+                self._last_allocation_final.append(
+                    {
+                        "semantic_group_id": f"G{group_id:04d}",
+                        "subtitle_ids": self._group_expected_subtitle_ids(expected_group),
+                        "allocation": dict(retry_allocation),
+                        "source": "quality_retry",
+                    }
+                )
+            else:
+                self._record_allocation_quality_unresolved(
+                    entry,
+                    retry_allocation or allocation,
+                    retry_validation,
+                    "retry_quality_failed",
+                )
+            self._last_allocation_retry_log.append(retry_record)
+        return result
+
+    def _record_allocation_quality_unresolved(
+        self,
+        entry: Dict,
+        allocation: Dict[str, str],
+        validation: Dict,
+        reason: str,
+    ) -> None:
+        group_id = int(entry.get("id") or 0)
+        self._last_allocation_unresolved.append(
+            {
+                "semantic_group_id": f"G{group_id:04d}",
+                "reason": reason,
+                "issue_codes": list(validation.get("issue_codes") or []),
+                "full_english": entry.get("full_english", ""),
+                "full_translation": entry.get("full_translation", ""),
+                "allocation": dict(allocation or {}),
+            }
+        )
+
+    def _validate_group_chinese_allocation(
+        self,
+        entry: Dict,
+        allocation: Dict[str, str],
+        *,
+        retry_of: Optional[Dict] = None,
+    ) -> Dict:
+        group_id = int(entry.get("id") or 0)
+        subtitle_parts = list(entry.get("subtitle_parts") or [])
+        expected_ids = [str(part.get("subtitle_id") or "").strip() for part in subtitle_parts]
+        issue_codes: List[str] = []
+        issues: List[Dict] = []
+
+        if set(allocation or {}) != set(expected_ids):
+            issue_codes.append("translation_group_cardinality_mismatch")
+        full_translation = self._normalize_text(str(entry.get("full_translation") or ""))
+        if full_translation and not re.search(r"[\u4e00-\u9fff]", full_translation):
+            issue_codes.append("full_translation_quality_issue")
+
+        ordered_texts = [
+            self._normalize_text(str((allocation or {}).get(subtitle_id, "")))
+            for subtitle_id in expected_ids
+        ]
+        for offset, text in enumerate(ordered_texts):
+            if not text:
+                issue_codes.append("group_allocation_information_omission")
+                issues.append({"subtitle_id": expected_ids[offset], "reason": "empty_chinese"})
+                continue
+            if self._is_bad_chinese_fragment(text):
+                issue_codes.append("unnatural_chinese_fragment")
+                issues.append({"subtitle_id": expected_ids[offset], "text": text})
+
+        duplicate_pairs = self._detect_adjacent_chinese_duplication(expected_ids, ordered_texts)
+        if duplicate_pairs:
+            issue_codes.append("adjacent_chinese_semantic_duplication")
+            issues.extend(duplicate_pairs)
+
+        merged = self._normalize_text("".join(ordered_texts))
+        omission = self._detect_group_information_omission(full_translation, merged)
+        if omission:
+            issue_codes.append("group_allocation_information_omission")
+            issues.append(omission)
+
+        anchor_issues = self._detect_cross_id_anchor_misplacement(entry, allocation or {})
+        issue_codes.extend(issue["code"] for issue in anchor_issues)
+        issues.extend(anchor_issues)
+
+        issue_codes = list(dict.fromkeys(issue_codes))
+        blocking_issue_codes = [
+            code for code in issue_codes if code != "full_translation_quality_issue"
+        ]
+        return {
+            "semantic_group_id": f"G{group_id:04d}",
+            "allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
+            "valid": not blocking_issue_codes,
+            "issue_codes": issue_codes,
+            "issues": issues,
+            "expected_subtitle_ids": expected_ids,
+            "allocated_subtitle_ids": list((allocation or {}).keys()),
+            "full_english": entry.get("full_english", ""),
+            "full_translation": full_translation,
+            "merged_allocation": merged,
+            "retry_of": retry_of.get("semantic_group_id") if retry_of else "",
+        }
+
+    def _detect_adjacent_chinese_duplication(
+        self,
+        subtitle_ids: Sequence[str],
+        texts: Sequence[str],
+    ) -> List[Dict]:
+        issues: List[Dict] = []
+        normalized = [self._normalize_chinese_for_compare(text) for text in texts]
+        for index, (left, right) in enumerate(zip(normalized, normalized[1:])):
+            if not left or not right:
+                continue
+            if left == right or (len(left) >= 8 and left in right) or (len(right) >= 8 and right in left):
+                issues.append(
+                    {
+                        "subtitle_ids": [subtitle_ids[index], subtitle_ids[index + 1]],
+                        "reason": "adjacent_duplicate_or_containment",
+                    }
+                )
+        return issues
+
+    def _detect_group_information_omission(
+        self,
+        full_translation: str,
+        merged_allocation: str,
+    ) -> Dict:
+        full = self._normalize_chinese_for_compare(full_translation)
+        merged = self._normalize_chinese_for_compare(merged_allocation)
+        if not full or not merged:
+            return {}
+        if len(full) < 10:
+            return {} if full in merged else {"reason": "short_full_translation_not_preserved"}
+        lcs = self._lcs_length(full, merged)
+        coverage = lcs / max(1, len(full))
+        if coverage < 0.62:
+            return {
+                "reason": "low_full_translation_coverage",
+                "coverage": round(coverage, 3),
+                "full_length": len(full),
+                "merged_length": len(merged),
+            }
+        return {}
+
+    def _detect_cross_id_anchor_misplacement(
+        self,
+        entry: Dict,
+        allocation: Dict[str, str],
+    ) -> List[Dict]:
+        parts = list(entry.get("subtitle_parts") or [])
+        issues: List[Dict] = []
+        expected_by_anchor: Dict[str, tuple[str, str]] = {}
+        for part in parts:
+            subtitle_id = str(part.get("subtitle_id") or "").strip()
+            english = str(part.get("english") or "")
+            for anchor in self._build_group_allocation_anchors(english):
+                expected_by_anchor.setdefault(anchor["value"], (subtitle_id, anchor["type"]))
+
+        for value, (expected_id, anchor_type) in expected_by_anchor.items():
+            present_ids = [
+                subtitle_id
+                for subtitle_id, zh in allocation.items()
+                if self._allocation_anchor_present(value, anchor_type, zh)
+            ]
+            if not present_ids:
+                if anchor_type in {"number", "negation"} or (
+                    anchor_type == "entity"
+                    and self._allocation_anchor_present(value, anchor_type, str(entry.get("full_translation") or ""))
+                ):
+                    issues.append(
+                        {
+                            "code": f"{anchor_type}_allocation_mismatch",
+                            "anchor": value,
+                            "expected_subtitle_id": expected_id,
+                            "actual_subtitle_ids": [],
+                            "reason": "anchor_missing",
+                        }
+                    )
+                continue
+            if expected_id not in present_ids:
+                code = (
+                    "cross_id_semantic_leakage"
+                    if anchor_type == "entity"
+                    else f"{anchor_type}_allocation_mismatch"
+                )
+                issues.append(
+                    {
+                        "code": code,
+                        "anchor": value,
+                        "expected_subtitle_id": expected_id,
+                        "actual_subtitle_ids": present_ids,
+                    }
+                )
+        return issues
+
+    def _build_group_allocation_anchors(self, english: str) -> List[Dict]:
+        anchors: List[Dict] = []
+        for match in re.finditer(r"\b\d+(?:[.,]\d+)?\b", english or ""):
+            anchors.append({"type": "number", "value": match.group(0).replace(",", "")})
+        if re.search(r"\b(?:not|n't|never|no|without|cannot|can't|doesn't|don't|didn't)\b", english or "", re.IGNORECASE):
+            anchors.append({"type": "negation", "value": "negation"})
+        for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:[- ][A-Z][A-Za-z0-9]*){0,3}\b", english or ""):
+            value = match.group(0).strip()
+            if value.lower() in {"i", "ai", "the", "this", "that"}:
+                continue
+            anchors.append({"type": "entity", "value": value})
+        return anchors
+
+    @staticmethod
+    def _allocation_anchor_present(value: str, anchor_type: str, chinese: str) -> bool:
+        text = chinese or ""
+        if anchor_type == "number":
+            compact = re.sub(r"[,，\s]", "", text)
+            return value in compact
+        if anchor_type == "negation":
+            return bool(re.search(r"[不没无非未别勿]|不能|不会|不是|没有", text))
+        return value in text
+
+    @staticmethod
+    def _lcs_length(left: str, right: str) -> int:
+        if not left or not right:
+            return 0
+        previous = [0] * (len(right) + 1)
+        for left_char in left:
+            current = [0]
+            for index, right_char in enumerate(right, 1):
+                if left_char == right_char:
+                    current.append(previous[index - 1] + 1)
+                else:
+                    current.append(max(previous[index], current[-1]))
+            previous = current
+        return previous[-1]
 
     def _record_omitted_allocation_groups(
         self,
@@ -8232,7 +8716,7 @@ class ScreenSubtitleEditor:
         prompt: str,
         payload: Sequence[Dict],
         *,
-        cache_task: str = "screen_subtitle_semantic_translation_allocation",
+        cache_task: str = SEMANTIC_ALLOCATION_CACHE_TASK,
     ) -> Optional[object]:
         cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
@@ -8269,7 +8753,7 @@ class ScreenSubtitleEditor:
         prompt: str,
         payload: Sequence[Dict],
         *,
-        cache_task: str = "screen_subtitle_semantic_translation_allocation",
+        cache_task: str = SEMANTIC_ALLOCATION_CACHE_TASK,
         max_attempts: int = 3,
     ) -> tuple[Optional[object], str]:
         delay_seconds = 1.0

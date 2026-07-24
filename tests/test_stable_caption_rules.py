@@ -37,6 +37,12 @@ def _editor(max_words=14):
     editor._translation_structure_errors = []
     editor._last_llm_raw_returns = []
     editor._last_semantic_group_debug = []
+    editor._last_allocation_inputs = []
+    editor._last_allocation_raw_returns = []
+    editor._last_allocation_validation = []
+    editor._last_allocation_retry_log = []
+    editor._last_allocation_final = []
+    editor._last_allocation_unresolved = []
     editor._last_semantic_group_audit_contexts = {}
     editor._last_semantic_group_id_by_subtitle_id = {}
     editor._boundary_snapshots = []
@@ -83,6 +89,7 @@ def _id_editor():
     editor = _editor()
     editor.model = "test-model"
     editor.timeout = 5
+    editor.batch_num = 24
     editor.allocation_max_concurrency = 1
     editor.cache_manager = _NoCache()
     editor.client = None
@@ -2043,7 +2050,7 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
 
     def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
         calls.append((cache_task, [entry["id"] for entry in payload]))
-        if cache_task == "screen_subtitle_semantic_translation_allocation":
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v2":
             return {
                 "groups": [
                     {
@@ -2073,10 +2080,10 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
         allocated = editor._allocate_semantic_group_translations(groups, full_translations)
 
     assert calls == [
-        ("screen_subtitle_semantic_translation_allocation", [1, 2, 3]),
-        ("screen_subtitle_semantic_translation_allocation_retry", [1]),
-        ("screen_subtitle_semantic_translation_allocation_retry", [2]),
-        ("screen_subtitle_semantic_translation_allocation_retry", [3]),
+        ("screen_subtitle_semantic_translation_allocation_v2", [1, 2, 3]),
+        ("screen_subtitle_semantic_translation_allocation_retry_v2", [1]),
+        ("screen_subtitle_semantic_translation_allocation_retry_v2", [2]),
+        ("screen_subtitle_semantic_translation_allocation_retry_v2", [3]),
     ]
     assert allocated == {
         1: {"S0001": "zh-S0001"},
@@ -2303,6 +2310,193 @@ def test_allocation_concurrency_preserves_400_plus_subtitle_ids_without_drift():
     assert [item.subtitle_id for item in applied] == [f"S{index:04d}" for index in range(1, 433)]
     assert [item.translated for item in applied] == [f"zh-S{index:04d}" for index in range(1, 433)]
     assert editor._translation_structure_errors == []
+
+
+def test_allocation_quality_retries_information_leaked_to_previous_id():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "Alice arrived."
+    items[1].original = "Bob signed 42 contracts."
+    groups = [_id_group(1, 0, items)]
+    full_translations = {1: "爱丽丝到了。鲍勃签了42份合同。"}
+    calls = []
+
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
+        calls.append(cache_task)
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v2":
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "part_translations": [
+                            {"subtitle_id": "S0001", "zh": "鲍勃签了42份合同。"},
+                            {"subtitle_id": "S0002", "zh": "爱丽丝到了。"},
+                        ],
+                    }
+                ]
+            }
+        return {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "爱丽丝到了。"},
+                        {"subtitle_id": "S0002", "zh": "鲍勃签了42份合同。"},
+                    ],
+                }
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    assert allocated[1] == {"S0001": "爱丽丝到了。", "S0002": "鲍勃签了42份合同。"}
+    assert calls == [
+        "screen_subtitle_semantic_translation_allocation_v2",
+        "screen_subtitle_semantic_translation_allocation_retry_v2",
+    ]
+    assert any("number_allocation_mismatch" in item["issue_codes"] for item in editor._last_allocation_validation)
+    assert editor._last_allocation_retry_log[-1]["success"] is True
+    assert editor._translation_structure_errors == []
+
+
+def test_allocation_quality_rejects_adjacent_core_duplication():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "Alice arrived."
+    items[1].original = "Bob left."
+    entry = {
+        "id": 1,
+        "full_translation": "爱丽丝到了。鲍勃离开了。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": items[0].original},
+            {"subtitle_id": "S0002", "english": items[1].original},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {"S0001": "鲍勃离开了。", "S0002": "鲍勃离开了。"},
+    )
+
+    assert not validation["valid"]
+    assert "adjacent_chinese_semantic_duplication" in validation["issue_codes"]
+
+
+def test_allocation_quality_detects_negation_misplacement():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "方案可行。但它不能扩展。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "The plan works."},
+            {"subtitle_id": "S0002", "english": "But it does not scale."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {"S0001": "它不能扩展。", "S0002": "方案可行。"},
+    )
+
+    assert not validation["valid"]
+    assert "negation_allocation_mismatch" in validation["issue_codes"]
+
+
+def test_allocation_quality_keeps_out_of_order_return_by_subtitle_id():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "The plan works."
+    items[1].original = "It scales."
+    groups = [_id_group(1, 0, items)]
+    full_translations = {1: "方案可行。它可以扩展。"}
+
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
+        return {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [
+                        {"subtitle_id": "S0002", "zh": "它可以扩展。"},
+                        {"subtitle_id": "S0001", "zh": "方案可行。"},
+                    ],
+                }
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    applied = editor._apply_semantic_group_translations(items, groups, allocated)
+    assert [item.translated for item in applied] == ["方案可行。", "它可以扩展。"]
+    assert editor._translation_structure_errors == []
+
+
+def test_allocation_quality_failed_group_does_not_shift_following_100_ids():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(101))
+    items[0].original = "It does not work."
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 102)]
+    full_translations = {1: "它不能工作。", **{index: f"中文{index}" for index in range(2, 102)}}
+
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
+        if payload[0]["id"] == 1:
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "part_translations": [{"subtitle_id": "S0001", "zh": ""}],
+                    }
+                ]
+            }
+        return {
+            "groups": [
+                {
+                    "id": entry["id"],
+                    "part_translations": [
+                        {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"中文{entry['id']}"}
+                    ],
+                }
+                for entry in payload
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    applied = editor._apply_semantic_group_translations(items, groups, allocated)
+    assert [item.subtitle_id for item in applied] == [f"S{index:04d}" for index in range(1, 102)]
+    assert applied[100].translated == "中文101"
+    assert editor._last_allocation_unresolved
+
+
+def test_compression_quality_regression_restores_previous_group_allocation():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "Alice arrived."
+    items[1].original = "Bob left."
+    group = _id_group(1, 0, items)
+    editor._last_semantic_full_translations = {1: "爱丽丝到了。鲍勃离开了。"}
+    before = [
+        ASRDataSeg("Alice arrived.", 0, 1000, "爱丽丝到了。"),
+        ASRDataSeg("Bob left.", 1000, 2000, "鲍勃离开了。"),
+    ]
+    after = [
+        ASRDataSeg("Alice arrived.", 0, 1000, "鲍勃离开了。"),
+        ASRDataSeg("Bob left.", 1000, 2000, "鲍勃离开了。"),
+    ]
+    for index, seg in enumerate(before + after):
+        seg.subtitle_id = f"S{index % 2 + 1:04d}"
+
+    restored = editor._restore_invalid_postprocess_allocations(
+        before_segments=before,
+        after_segments=after,
+        semantic_groups=[group],
+        subtitle_items=items,
+    )
+
+    assert [seg.translated_text for seg in restored] == ["爱丽丝到了。", "鲍勃离开了。"]
+    assert editor._last_allocation_unresolved[-1]["reason"] == "postprocess_allocation_quality_regression_restored"
 
 
 def test_empty_middle_translation_keeps_its_own_id_slot():
@@ -2764,6 +2958,12 @@ if __name__ == "__main__":
     test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()
     test_id_bound_group_rejects_unknown_id()
     test_id_bound_group_allows_different_return_order()
+    test_allocation_quality_retries_information_leaked_to_previous_id()
+    test_allocation_quality_rejects_adjacent_core_duplication()
+    test_allocation_quality_detects_negation_misplacement()
+    test_allocation_quality_keeps_out_of_order_return_by_subtitle_id()
+    test_allocation_quality_failed_group_does_not_shift_following_100_ids()
+    test_compression_quality_regression_restores_previous_group_allocation()
     test_empty_middle_translation_keeps_its_own_id_slot()
     test_failed_group_does_not_shift_following_100_subtitles()
     test_failed_validation_does_not_write_final_output_file()
