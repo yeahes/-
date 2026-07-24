@@ -6064,7 +6064,77 @@ class ScreenSubtitleEditor:
                 }
             )
 
+        result: Dict[int, Dict[str, str]] = {}
+        expected_groups_by_id = {
+            int(group.get("id") or 0): group
+            for group in groups
+            if str(group.get("id", "")).isdigit()
+        }
         prompt = self._compose_prompt(SEMANTIC_TRANSLATION_ALLOCATION_PROMPT)
+        for payload_chunk in self._semantic_allocation_payload_chunks(payload):
+            data = self._request_semantic_translation_allocation(prompt, payload_chunk)
+            if data is None:
+                return {}
+            self._last_llm_raw_returns.append(
+                {
+                    "task": "screen_subtitle_semantic_translation_allocation",
+                    "data": data,
+                    "expected_group_ids": [entry.get("id") for entry in payload_chunk],
+                }
+            )
+            groups_data = data.get("groups", []) if isinstance(data, dict) else data
+            groups_data = self._normalize_allocation_groups_data(groups, groups_data)
+            returned_group_ids = set()
+            for group in groups_data:
+                if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
+                    continue
+                group_id = int(group["id"])
+                expected_group = expected_groups_by_id.get(group_id)
+                if expected_group is None:
+                    self._record_translation_structure_error(
+                        "translation_id_unknown",
+                        group_id=group_id,
+                        message=f"Unknown semantic group id returned: {group_id}",
+                    )
+                    continue
+                returned_group_ids.add(group_id)
+                result[group_id] = self._parse_id_bound_translations(
+                    expected_group,
+                    self._group_expected_subtitle_ids(expected_group),
+                    group.get("part_translations", []),
+                )
+            for expected_group_id in [int(entry.get("id") or 0) for entry in payload_chunk]:
+                if expected_group_id in returned_group_ids:
+                    continue
+                expected_group = expected_groups_by_id.get(expected_group_id)
+                if expected_group is None:
+                    continue
+                expected_ids = self._group_expected_subtitle_ids(expected_group)
+                self._record_translation_structure_error(
+                    "translation_group_cardinality_mismatch",
+                    group_id=expected_group_id,
+                    expected_ids=expected_ids,
+                    returned_ids=[],
+                    missing_ids=expected_ids,
+                    message="LLM omitted semantic group allocation result.",
+                )
+                result.setdefault(expected_group_id, {})
+        return result
+
+    def _semantic_allocation_payload_chunks(
+        self, payload: Sequence[Dict]
+    ) -> List[List[Dict]]:
+        batch_size = min(8, max(1, int(self.batch_num or 8)))
+        return [
+            list(payload[index : index + batch_size])
+            for index in range(0, len(payload), batch_size)
+        ]
+
+    def _request_semantic_translation_allocation(
+        self,
+        prompt: str,
+        payload: Sequence[Dict],
+    ) -> Optional[object]:
         cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
@@ -6075,59 +6145,28 @@ class ScreenSubtitleEditor:
         try:
             if cache_result:
                 self._llm_cache_used = True
-                data = json.loads(cache_result)
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                    temperature=0.2,
-                    timeout=self.timeout,
-                )
-                data = json_repair.loads(response.choices[0].message.content)
-                self.cache_manager.set_llm_result(
-                    cache_key,
-                    json.dumps(data, ensure_ascii=False),
-                    self.model,
-                    temperature=0.2,
-                    task="screen_subtitle_semantic_translation_allocation",
-                )
+                return json.loads(cache_result)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.2,
+                timeout=self.timeout,
+            )
+            data = json_repair.loads(response.choices[0].message.content)
+            self.cache_manager.set_llm_result(
+                cache_key,
+                json.dumps(data, ensure_ascii=False),
+                self.model,
+                temperature=0.2,
+                task="screen_subtitle_semantic_translation_allocation",
+            )
+            return data
         except Exception as e:
-            logger.warning("语义组译文分配失败: %s", str(e))
-            return {}
-
-        groups_data = data.get("groups", []) if isinstance(data, dict) else data
-        groups_data = self._normalize_allocation_groups_data(groups, groups_data)
-        self._last_llm_raw_returns.append(
-            {
-                "task": "screen_subtitle_semantic_translation_allocation",
-                "data": data,
-            }
-        )
-        result: Dict[int, Dict[str, str]] = {}
-        for group in groups_data:
-            if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
-                continue
-            group_id = int(group["id"])
-            expected_group = next(
-                (expected for expected in groups if int(expected.get("id") or 0) == group_id),
-                None,
-            )
-            if expected_group is None:
-                self._record_translation_structure_error(
-                    "translation_id_unknown",
-                    group_id=group_id,
-                    message=f"Unknown semantic group id returned: {group_id}",
-                )
-                continue
-            result[group_id] = self._parse_id_bound_translations(
-                expected_group,
-                self._group_expected_subtitle_ids(expected_group),
-                group.get("part_translations", []),
-            )
-        return result
+            logger.warning("Semantic subtitle translation allocation failed: %s", str(e))
+            return None
 
     def _normalize_allocation_groups_data(
         self,
