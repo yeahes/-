@@ -6099,6 +6099,7 @@ class ScreenSubtitleEditor:
             return {}
 
         groups_data = data.get("groups", []) if isinstance(data, dict) else data
+        groups_data = self._normalize_allocation_groups_data(groups, groups_data)
         self._last_llm_raw_returns.append(
             {
                 "task": "screen_subtitle_semantic_translation_allocation",
@@ -6127,6 +6128,83 @@ class ScreenSubtitleEditor:
                 group.get("part_translations", []),
             )
         return result
+
+    def _normalize_allocation_groups_data(
+        self,
+        expected_groups: Sequence[Dict],
+        groups_data: object,
+    ) -> List[Dict]:
+        expected_ids_by_group: Dict[int, set] = {
+            int(group.get("id") or 0): set(self._group_expected_subtitle_ids(group))
+            for group in expected_groups
+            if str(group.get("id", "")).isdigit()
+        }
+        group_records: Dict[int, Dict] = {}
+        orphan_parts: List[Dict] = []
+
+        def visit(node: object) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    visit(item)
+                return
+            if not isinstance(node, dict):
+                return
+            nested = node.get("groups")
+            if isinstance(nested, list):
+                visit(nested)
+                return
+            subtitle_id = str(node.get("subtitle_id") or "").strip()
+            if subtitle_id:
+                orphan_parts.append(node)
+                return
+            if not str(node.get("id", "")).isdigit():
+                return
+            group_id = int(node["id"])
+            if group_id not in group_records:
+                record = dict(node)
+                parts = record.get("part_translations", [])
+                record["part_translations"] = list(parts) if isinstance(parts, list) else []
+                group_records[group_id] = record
+                return
+            record = group_records[group_id]
+            existing_parts = record.setdefault("part_translations", [])
+            if not isinstance(existing_parts, list):
+                existing_parts = []
+                record["part_translations"] = existing_parts
+            new_parts = node.get("part_translations", [])
+            if isinstance(new_parts, list):
+                existing_parts.extend(new_parts)
+
+        visit(groups_data)
+
+        for part in orphan_parts:
+            subtitle_id = str(part.get("subtitle_id") or "").strip()
+            matching_group_ids = [
+                group_id
+                for group_id, expected_ids in expected_ids_by_group.items()
+                if subtitle_id in expected_ids
+            ]
+            if len(matching_group_ids) != 1:
+                self._record_translation_structure_error(
+                    "translation_id_unknown",
+                    expected_ids=[],
+                    returned_ids=[subtitle_id],
+                    unknown_ids=[subtitle_id],
+                    message=f"Orphan translation subtitle_id cannot be mapped to one group: {subtitle_id}",
+                )
+                continue
+            group_id = matching_group_ids[0]
+            record = group_records.setdefault(
+                group_id,
+                {"id": group_id, "part_translations": []},
+            )
+            parts = record.setdefault("part_translations", [])
+            if not isinstance(parts, list):
+                parts = []
+                record["part_translations"] = parts
+            parts.append(part)
+
+        return [group_records[group_id] for group_id in sorted(group_records)]
 
     def _apply_semantic_group_translations(
         self,

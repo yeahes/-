@@ -1354,6 +1354,48 @@ def test_id_bound_group_allows_different_return_order():
     assert editor._translation_structure_errors == []
 
 
+def test_allocation_parser_recovers_orphan_subtitle_rows_by_global_id():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    groups = [_id_group(1, 0, items[:2]), _id_group(2, 2, items[2:])]
+    groups_data = [
+        {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [{"subtitle_id": "S0001", "zh": "zh-S0001"}],
+                },
+                {"subtitle_id": "S0002", "zh": "zh-S0002"},
+            ]
+        },
+        {
+            "id": 2,
+            "part_translations": [{"subtitle_id": "S0003", "zh": "zh-S0003"}],
+        },
+        {"subtitle_id": "S0004", "zh": "zh-S0004"},
+    ]
+
+    normalized = editor._normalize_allocation_groups_data(groups, groups_data)
+    translations = {}
+    for group in normalized:
+        expected_group = groups[int(group["id"]) - 1]
+        translations[int(group["id"])] = editor._parse_id_bound_translations(
+            expected_group,
+            editor._group_expected_subtitle_ids(expected_group),
+            group.get("part_translations", []),
+        )
+    applied = editor._apply_semantic_group_translations(items, groups, translations)
+
+    assert [item.subtitle_id for item in applied] == ["S0001", "S0002", "S0003", "S0004"]
+    assert [item.translated for item in applied] == [
+        "zh-S0001",
+        "zh-S0002",
+        "zh-S0003",
+        "zh-S0004",
+    ]
+    assert editor._translation_structure_errors == []
+
+
 def test_empty_middle_translation_keeps_its_own_id_slot():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(3))
