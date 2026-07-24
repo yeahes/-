@@ -11,18 +11,31 @@ def _context():
         "people": [
             {"canonical_name": "Liang Wenfeng", "aliases": [], "category": "person"},
             {"canonical_name": "Zhang Junjie", "aliases": [], "category": "person"},
+            {"canonical_name": "Jack Ma", "aliases": [], "category": "person"},
+            {"canonical_name": "Yu Hao", "aliases": [], "category": "person"},
+            {"canonical_name": "Zhong Shanshan", "aliases": [], "category": "person"},
         ],
         "brands": [
             {"canonical_name": "Pop Mart", "aliases": ["PopMart"], "category": "brand"},
             {"canonical_name": "Labubu", "aliases": [], "category": "product"},
             {"canonical_name": "Chagee", "aliases": ["Chagee's"], "category": "brand"},
+            {"canonical_name": "DeepSeek", "aliases": ["Deep Seek"], "category": "brand"},
+            {"canonical_name": "Meta", "aliases": [], "category": "company"},
         ],
         "organisations": [
             {
                 "canonical_name": "Hurun Rich List",
                 "aliases": ["Hurun List"],
                 "category": "list",
-            }
+            },
+            {"canonical_name": "Hurun", "aliases": [], "category": "organisation"},
+            {"canonical_name": "The Economist", "aliases": [], "category": "organisation"},
+            {
+                "canonical_name": "World Trade Organisation",
+                "aliases": ["World Trade Organization"],
+                "category": "organisation",
+            },
+            {"canonical_name": "Evergrande", "aliases": [], "category": "company"},
         ],
         "numbers_and_dates": [
             {"canonical_name": "33 founder", "aliases": ["33 year old"], "category": "numbers_and_dates"}
@@ -53,12 +66,57 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
         self.assertEqual(texts[1], "Hurun Rich List and Pop Mart were mentioned.")
         self.assertEqual(texts[2], "Labubu dolls and Chagee's Zhang Junjie.")
 
+    def test_corrects_entity_shaped_names_without_special_case_audio_rules(self):
+        raw = [
+            ASRDataSeg("Zong Shan Shan built a water empire.", 100, 200),
+            ASRDataSeg("Deep Seek startled the market.", 300, 500),
+        ]
+
+        corrected = self._correct(raw)
+        self.assertEqual(
+            [seg.text for seg in corrected.segments],
+            [
+                "Zhong Shanshan built a water empire.",
+                "DeepSeek startled the market.",
+            ],
+        )
+
     def test_does_not_rewrite_common_words_or_numbers(self):
         raw = [
             ASRDataSeg("it doesn't just change where they sell,", 100, 200),
             ASRDataSeg("China's brand new generation stayed unchanged.", 300, 500),
             ASRDataSeg("33 year-old founders are not rewritten.", 600, 900),
             ASRDataSeg("Jack Ma of Alibaba stayed outside the glossary.", 1000, 1200),
+        ]
+
+        corrected = self._correct(raw)
+        self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+
+    def test_rejects_fluent_common_phrases_that_sound_like_entities(self):
+        raw = [
+            ASRDataSeg("I mean, they are trading.", 100, 200),
+            ASRDataSeg("No, he was not there.", 300, 500),
+            ASRDataSeg("Seven are in video games.", 600, 900),
+            ASRDataSeg("Four are in tea or coffee.", 1000, 1200),
+            ASRDataSeg("Oh, yeah, that is right.", 1300, 1500),
+            ASRDataSeg("But wait, I have to ask.", 1600, 1900),
+            ASRDataSeg("They run their offices overseas.", 2000, 2300),
+            ASRDataSeg("It might be the most interesting case.", 2400, 2700),
+            ASRDataSeg("The economy is changing.", 2800, 3100),
+            ASRDataSeg("It was gritty survival.", 3200, 3500),
+            ASRDataSeg("Yet they are still expanding.", 3600, 3900),
+            ASRDataSeg("But hey, you are right.", 4000, 4300),
+        ]
+
+        corrected = self._correct(raw)
+        self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+
+    def test_rejects_short_alias_expansion_to_longer_entity(self):
+        raw = [
+            ASRDataSeg("Seven Hurun video games.", 100, 200),
+            ASRDataSeg("Four Hurun tea or coffee.", 300, 500),
+            ASRDataSeg("They run their offices overseas.", 600, 900),
+            ASRDataSeg("The founder of Dreame Consumer Electronics spoke.", 1000, 1200),
         ]
 
         corrected = self._correct(raw)

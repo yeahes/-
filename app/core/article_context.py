@@ -297,12 +297,21 @@ def apply_article_asr_corrections(
                 candidates.append(item)
 
     candidates_path = output_root / "correction_candidates.json"
+    entity_candidates_path = output_root / "entity_candidates.json"
     log_path = output_root / "correction_log.json"
+    rejected_path = output_root / "correction_rejected.json"
     compatibility_path = output_root / "article_asr_corrections.json"
     candidates_path.write_text(
         json.dumps(candidates, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    entity_candidates_path.write_text(
+        json.dumps(candidates, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     log_path.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+    rejected_path.write_text(
+        json.dumps([item for item in logs if not item.get("applied")], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     compatibility_path.write_text(
         json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -508,6 +517,7 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
         conditions.append("phonetic_similarity")
     original_tokens = _word_tokens(original_text)
     canonical_tokens = _word_tokens(canonical)
+    entity_gate = _entity_phrase_gate(original_text, canonical)
     return {
         "original_text": original_text,
         "suspicious_text": original_text,
@@ -524,6 +534,10 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
         "candidate_token_count": len(canonical_tokens),
         "original_has_uppercase": bool(re.search(r"[A-Z]", original_text or "")),
         "original_is_all_lowercase": bool(original_text) and original_text == original_text.lower(),
+        "article_entity_present": True,
+        "entity_gate_passed": entity_gate["passed"],
+        "entity_gate_reason": entity_gate["reason"],
+        "grammar_validation": entity_gate["grammar_validation"],
         "source_glossary": {
             "canonical_name": term["source"].get("canonical_name", ""),
             "chinese_name": term["source"].get("chinese_name", ""),
@@ -558,12 +572,77 @@ def _candidate_stays_in_article_scope(candidate: Dict[str, Any]) -> bool:
         return False
 
     if "exact_alias_match" in (candidate.get("matched_conditions") or []):
-        return True
+        return _exact_alias_can_auto_apply(candidate)
+
+    if not candidate.get("entity_gate_passed"):
+        return False
 
     if len(original_tokens) == 1 and len(corrected_tokens) == 1:
         if not _single_token_candidate_stays_in_scope(original_tokens[0], corrected_tokens[0], candidate):
             return False
     return True
+
+
+def _exact_alias_can_auto_apply(candidate: Dict[str, Any]) -> bool:
+    original = str(candidate.get("original_text", "") or "")
+    corrected = str(candidate.get("candidate_text", "") or "")
+    return _compact_text(original) == _compact_text(corrected)
+
+
+def _entity_phrase_gate(original_text: str, canonical: str) -> Dict[str, Any]:
+    original_tokens = _word_tokens(original_text)
+    canonical_tokens = _word_tokens(canonical)
+    if not original_tokens or not canonical_tokens:
+        return _entity_gate_result(False, "empty_candidate")
+
+    if len(canonical_tokens) > len(original_tokens) + 1:
+        return _entity_gate_result(False, "candidate_would_expand_short_phrase")
+    if len(original_tokens) > len(canonical_tokens) + 1:
+        return _entity_gate_result(False, "candidate_would_delete_common_words")
+
+    normalized = [_normalize_entity_gate_token(token) for token in original_tokens]
+    if any(token in _ENTITY_BLOCKING_FUNCTION_WORDS for token in normalized):
+        return _entity_gate_result(False, "contains_function_word_or_discourse_marker")
+
+    entity_like_count = sum(1 for token in original_tokens if _token_looks_entity_like(token))
+    if len(original_tokens) == 1:
+        if entity_like_count == 1:
+            return _entity_gate_result(True, "single_token_entity_shape")
+        return _entity_gate_result(False, "single_token_not_entity_like")
+
+    if entity_like_count >= max(2, len(original_tokens) - 1):
+        return _entity_gate_result(True, "multi_token_entity_shape")
+    return _entity_gate_result(False, "multi_token_not_entity_like")
+
+
+def _entity_gate_result(passed: bool, reason: str) -> Dict[str, Any]:
+    return {
+        "passed": passed,
+        "reason": reason,
+        "grammar_validation": "passed" if passed else "failed",
+    }
+
+
+def _normalize_entity_gate_token(token: str) -> str:
+    core = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", token or "")
+    core = re.sub(r"(?:'|\u2019)s$", "", core, flags=re.IGNORECASE)
+    return core.casefold()
+
+
+def _token_looks_entity_like(token: str) -> bool:
+    core = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", token or "")
+    core = re.sub(r"(?:'|\u2019)s$", "", core, flags=re.IGNORECASE)
+    if not core:
+        return False
+    if core.casefold() in _ENTITY_BLOCKING_FUNCTION_WORDS:
+        return False
+    if re.search(r"[a-z][A-Z]", core):
+        return True
+    if re.search(r"[A-Z].*[A-Z]", core) and re.search(r"[a-z]", core):
+        return True
+    if core[:1].isupper() and len(core) >= 3:
+        return True
+    return False
 
 
 def _single_token_candidate_stays_in_scope(
@@ -644,6 +723,75 @@ _COMMON_LOWERCASE_WORD_PROTECTION = {
 }
 
 
+_ENTITY_BLOCKING_FUNCTION_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "hers",
+    "him",
+    "his",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "me",
+    "mean",
+    "might",
+    "must",
+    "now",
+    "no",
+    "not",
+    "of",
+    "oh",
+    "on",
+    "or",
+    "our",
+    "run",
+    "she",
+    "should",
+    "that",
+    "the",
+    "their",
+    "them",
+    "they",
+    "this",
+    "to",
+    "was",
+    "we",
+    "were",
+    "will",
+    "with",
+    "would",
+    "yeah",
+    "yet",
+    "you",
+    "your",
+}
+
+
 def _replacement_text_for_original(original_text: str, canonical: str) -> str:
     trailing_punctuation = ""
     match = re.search(r"([,.;:!?]+)$", original_text or "")
@@ -704,18 +852,34 @@ def _correct_segment_text(
                 continue
             pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(candidate)}(?![A-Za-z0-9])", re.IGNORECASE)
             for match in list(pattern.finditer(result)):
-                confidence = 0.98
-                logs.append(
-                    _replacement_log(
-                        match.group(0),
-                        canonical,
-                        confidence,
-                        "exact_alias_match",
-                        term,
-                        applied=True,
+                scored = _score_correction_candidate(match.group(0), match_term)
+                confidence = float(scored["final_confidence"])
+                replacement = scored["corrected_text"]
+                if _should_apply_candidate(scored, high_confidence):
+                    logs.append(
+                        _replacement_log(
+                            match.group(0),
+                            replacement,
+                            confidence,
+                            "exact_alias_match",
+                            term,
+                            applied=True,
+                            extra=scored,
+                        )
                     )
-                )
-                result = result[: match.start()] + canonical + result[match.end() :]
+                    result = result[: match.start()] + replacement + result[match.end() :]
+                elif confidence >= review_confidence:
+                    logs.append(
+                        _replacement_log(
+                            match.group(0),
+                            canonical,
+                            confidence,
+                            _not_applied_reason(scored, high_confidence),
+                            term,
+                            applied=False,
+                            extra=scored,
+                        )
+                    )
 
         for phrase in _candidate_phrases(result, canonical):
             if phrase.lower() == canonical.lower():
@@ -735,6 +899,7 @@ def _correct_segment_text(
                             "high_confidence_name_similarity",
                             term,
                             applied=True,
+                            extra=scored,
                         )
                     )
             elif confidence >= review_confidence:
@@ -751,6 +916,7 @@ def _correct_segment_text(
                         reason,
                         term,
                         applied=False,
+                        extra=scored,
                     )
                 )
     return result, logs
@@ -767,14 +933,14 @@ def _candidate_phrases(text: str, canonical: str) -> List[str]:
         for index in range(0, max(0, len(tokens) - window_size + 1)):
             phrase = text[tokens[index].start() : tokens[index + window_size - 1].end()]
             phrase_tokens = _word_tokens(phrase)
-            if window_size > word_count and _phrase_has_boundary_filler(phrase_tokens):
+            if window_size > word_count and _phrase_has_boundary_filler(phrase_tokens, _word_tokens(canonical)):
                 continue
             if len(phrase) >= max(4, len(canonical) - 2):
                 phrases.append(phrase)
     return phrases
 
 
-def _phrase_has_boundary_filler(tokens: Sequence[str]) -> bool:
+def _phrase_has_boundary_filler(tokens: Sequence[str], canonical_tokens: Sequence[str]) -> bool:
     if not tokens:
         return False
     boundary_words = {
@@ -793,7 +959,22 @@ def _phrase_has_boundary_filler(tokens: Sequence[str]) -> bool:
         "to",
         "with",
     }
-    return tokens[0].casefold() in boundary_words or tokens[-1].casefold() in boundary_words
+    if tokens[0].casefold() in boundary_words or tokens[-1].casefold() in boundary_words:
+        return True
+    if not canonical_tokens:
+        return True
+    return not (
+        _edge_token_similarity(tokens[0], canonical_tokens[0]) >= 0.55
+        and _edge_token_similarity(tokens[-1], canonical_tokens[-1]) >= 0.55
+    )
+
+
+def _edge_token_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(
+        None,
+        _normalize_entity_gate_token(left),
+        _normalize_entity_gate_token(right),
+    ).ratio()
 
 
 def _replacement_log(
@@ -804,8 +985,9 @@ def _replacement_log(
     term: Dict[str, Any],
     *,
     applied: bool,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    result = {
         "original_text": original,
         "corrected_text": corrected,
         "confidence": round(float(confidence), 4),
@@ -818,6 +1000,22 @@ def _replacement_log(
         },
         "applied": applied,
     }
+    if extra:
+        for key in (
+            "string_similarity",
+            "phonetic_similarity",
+            "final_confidence",
+            "matched_conditions",
+            "article_entity_present",
+            "entity_gate_passed",
+            "entity_gate_reason",
+            "grammar_validation",
+            "original_token_count",
+            "candidate_token_count",
+        ):
+            if key in extra:
+                result[key] = extra[key]
+    return result
 
 
 class ArticleContextThread(QThread):
