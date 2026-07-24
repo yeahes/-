@@ -508,6 +508,7 @@ def _correct_word_timestamp_segments(
     candidates: List[Dict[str, Any]] = []
     logs: List[Dict[str, Any]] = []
     max_window = min(8, max((term["max_tokens"] + 1 for term in terms), default=1))
+    terms_by_window_size = _glossary_terms_by_window_size(terms, max_window)
 
     candidate_seq = 0
     for index in range(len(segments)):
@@ -518,7 +519,7 @@ def _correct_word_timestamp_segments(
             original_text = _join_asr_words(seg.text for seg in window)
             if not re.search(r"[A-Za-z0-9]", original_text or ""):
                 continue
-            for term in terms:
+            for term in terms_by_window_size.get(window_size, []):
                 if window_size > term["max_tokens"] and _has_boundary_filler(window):
                     continue
                 candidate = _score_correction_candidate(original_text, term)
@@ -580,6 +581,23 @@ def _correct_word_timestamp_segments(
             candidate["final_confidence"],
         )
     return corrected, candidates, logs
+
+
+def _glossary_terms_by_window_size(
+    terms: Sequence[Dict[str, Any]],
+    max_window: int,
+) -> Dict[int, List[Dict[str, Any]]]:
+    terms_by_size: Dict[int, List[Dict[str, Any]]] = {
+        size: [] for size in range(1, max_window + 1)
+    }
+    for term in terms:
+        canonical_token_count = int(term.get("canonical_token_count") or 0)
+        if canonical_token_count <= 0:
+            continue
+        for window_size in range(1, max_window + 1):
+            if abs(window_size - canonical_token_count) <= 1:
+                terms_by_size[window_size].append(term)
+    return terms_by_size
 
 
 def _resolve_overlapping_article_correction_candidates(
@@ -867,8 +885,17 @@ def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, 
             {
                 "canonical": canonical,
                 "variants": variants,
+                "variant_match_keys": [
+                    {
+                        "text": variant,
+                        "compact": _compact_text(variant),
+                        "phonetic": _phonetic_key(variant),
+                    }
+                    for variant in variants
+                ],
                 "source": dict(term),
                 "max_tokens": max(len(_word_tokens(variant)) for variant in variants),
+                "canonical_token_count": len(_word_tokens(canonical)),
             }
         )
     return terms
@@ -922,12 +949,21 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
     best_variant = ""
     best_string = 0.0
     best_phonetic = 0.0
-    for variant in term["variants"]:
+    variant_match_keys = term.get("variant_match_keys") or [
+        {
+            "text": variant,
+            "compact": _compact_text(variant),
+            "phonetic": _phonetic_key(variant),
+        }
+        for variant in term.get("variants", [])
+    ]
+    for variant_key in variant_match_keys:
+        variant = str(variant_key.get("text") or "")
         string_similarity = SequenceMatcher(
-            None, original_norm, _compact_text(variant)
+            None, original_norm, str(variant_key.get("compact") or "")
         ).ratio()
         phonetic_similarity = SequenceMatcher(
-            None, original_phone, _phonetic_key(variant)
+            None, original_phone, str(variant_key.get("phonetic") or "")
         ).ratio()
         if (string_similarity, phonetic_similarity) > (best_string, best_phonetic):
             best_variant = variant
