@@ -18,6 +18,8 @@ from app.core.utils.logger import setup_logger
 logger = setup_logger("article_context")
 
 ARTICLE_CONTEXT_SCHEMA_VERSION = 1
+ARTICLE_RAW_RESPONSE_KEY = "_raw_response"
+ARTICLE_ANALYSIS_META_KEY = "_analysis_meta"
 ARTICLE_CONTEXT_PROMPT = """
 You analyze an English reference article for subtitle production.
 
@@ -115,12 +117,24 @@ def _normalize_term(item: Dict[str, Any], default_category: str) -> Dict[str, An
         alias_text = str(alias or "").strip()
         if alias_text and alias_text not in normalized_aliases and alias_text != canonical:
             normalized_aliases.append(alias_text)
-    return {
+    normalized = {
         "canonical_name": canonical,
         "chinese_name": str(item.get("chinese_name", "") or "").strip(),
         "aliases": normalized_aliases,
         "category": str(item.get("category", "") or default_category).strip() or default_category,
     }
+    for key in (
+        "source_key",
+        "canonical_in_article",
+        "evidence",
+        "alias_details",
+        "unsupported_aliases",
+        "asr_correction_enabled",
+        "asr_disabled_reason",
+    ):
+        if key in item:
+            normalized[key] = item[key]
+    return normalized
 
 
 def analyze_article_text(
@@ -154,7 +168,14 @@ def analyze_article_text(
         temperature=0.0,
         timeout=timeout,
     )
-    data = normalize_article_context(json_repair.loads(response.choices[0].message.content))
+    raw_response = response.choices[0].message.content or ""
+    data = normalize_article_context(json_repair.loads(raw_response))
+    data[ARTICLE_RAW_RESPONSE_KEY] = raw_response
+    data[ARTICLE_ANALYSIS_META_KEY] = {
+        "model": llm_config.model,
+        "cache_used": False,
+        "prompt_hash": cache_key,
+    }
     cache.set_llm_result(
         cache_key,
         json.dumps(data, ensure_ascii=False),
@@ -173,20 +194,30 @@ def save_article_artifacts(
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     cleaned = clean_article_text(article_text)
-    normalized = normalize_article_context(context)
+    normalized = enrich_article_context_with_evidence(context, cleaned)
     glossary = build_article_glossary(normalized)
     paths = {
         "article_source": root / "article_source.txt",
+        "article_llm_raw_response": root / "article_llm_raw_response.txt",
         "article_context": root / "article_context.json",
         "article_glossary": root / "article_glossary.json",
+        "article_context_audit": root / "article_context_audit.json",
     }
     paths["article_source"].write_text(cleaned, encoding="utf-8")
+    paths["article_llm_raw_response"].write_text(
+        str(context.get(ARTICLE_RAW_RESPONSE_KEY, "") or ""),
+        encoding="utf-8",
+    )
     paths["article_context"].write_text(
         json.dumps(normalized, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     paths["article_glossary"].write_text(
         json.dumps(glossary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    paths["article_context_audit"].write_text(
+        json.dumps(build_article_context_audit(normalized), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return {key: str(path) for key, path in paths.items()}
@@ -197,6 +228,135 @@ def load_article_context(path: str | Path) -> Dict[str, Any]:
     if not path.exists():
         return empty_article_context()
     return normalize_article_context(json.loads(path.read_text(encoding="utf-8")))
+
+
+def enrich_article_context_with_evidence(context: Dict[str, Any], article_text: str) -> Dict[str, Any]:
+    normalized = normalize_article_context(context)
+    cleaned = clean_article_text(article_text)
+    for key in (
+        "people",
+        "companies",
+        "brands",
+        "organisations",
+        "places",
+        "technical_terms",
+        "numbers_and_dates",
+    ):
+        enriched_items = []
+        for item in normalized.get(key, []):
+            enriched = dict(item)
+            canonical = str(enriched.get("canonical_name", "") or "")
+            canonical_evidence = _find_article_evidence(cleaned, canonical)
+            enriched["source_key"] = key
+            enriched["canonical_in_article"] = canonical_evidence is not None
+            enriched["evidence"] = canonical_evidence or {}
+            alias_details = []
+            for alias in enriched.get("aliases") or []:
+                alias_evidence = _find_article_evidence(cleaned, str(alias or ""))
+                alias_details.append(
+                    {
+                        "alias": alias,
+                        "source": "llm",
+                        "in_article": alias_evidence is not None,
+                        "evidence": alias_evidence or {},
+                    }
+                )
+            enriched["alias_details"] = alias_details
+            enriched["unsupported_aliases"] = [
+                detail["alias"] for detail in alias_details if not detail["in_article"]
+            ]
+            enriched_items.append(enriched)
+        normalized[key] = enriched_items
+    if context.get(ARTICLE_ANALYSIS_META_KEY):
+        normalized[ARTICLE_ANALYSIS_META_KEY] = dict(context.get(ARTICLE_ANALYSIS_META_KEY) or {})
+    return normalized
+
+
+def build_article_context_audit(context: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = normalize_article_context(context)
+    unsupported_entities = []
+    unsupported_aliases = []
+    category_counts: Dict[str, int] = {}
+    for key in (
+        "people",
+        "companies",
+        "brands",
+        "organisations",
+        "places",
+        "technical_terms",
+        "numbers_and_dates",
+    ):
+        for item in normalized.get(key, []):
+            category = str(item.get("category", "") or key)
+            category_counts[category] = category_counts.get(category, 0) + 1
+            if item.get("canonical_in_article") is False:
+                unsupported_entities.append(
+                    {
+                        "canonical_name": item.get("canonical_name", ""),
+                        "category": category,
+                        "source_key": key,
+                    }
+                )
+            for detail in item.get("alias_details") or []:
+                if not detail.get("in_article"):
+                    unsupported_aliases.append(
+                        {
+                            "canonical_name": item.get("canonical_name", ""),
+                            "alias": detail.get("alias", ""),
+                            "category": category,
+                            "source_key": key,
+                        }
+                    )
+    return {
+        "schema_version": ARTICLE_CONTEXT_SCHEMA_VERSION,
+        "category_counts": category_counts,
+        "unsupported_entity_count": len(unsupported_entities),
+        "unsupported_alias_count": len(unsupported_aliases),
+        "unsupported_entities": unsupported_entities,
+        "unsupported_aliases": unsupported_aliases,
+    }
+
+
+def _find_article_evidence(article_text: str, phrase: str) -> Optional[Dict[str, Any]]:
+    phrase = str(phrase or "").strip()
+    if not article_text or not phrase:
+        return None
+    pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(phrase)}(?![A-Za-z0-9])", re.IGNORECASE)
+    match = pattern.search(article_text)
+    if not match:
+        return None
+    sentence_start = max(article_text.rfind(".", 0, match.start()), article_text.rfind("\n", 0, match.start()))
+    sentence_start = 0 if sentence_start < 0 else sentence_start + 1
+    sentence_end_candidates = [
+        pos for pos in (
+            article_text.find(".", match.end()),
+            article_text.find("\n", match.end()),
+        )
+        if pos >= 0
+    ]
+    sentence_end = min(sentence_end_candidates) + 1 if sentence_end_candidates else len(article_text)
+    sentence = " ".join(article_text[sentence_start:sentence_end].split())
+    return {
+        "start_char": match.start(),
+        "end_char": match.end(),
+        "evidence_sentence": sentence,
+    }
+
+
+def _glossary_term_for_matching(item: Dict[str, Any]) -> Dict[str, Any]:
+    term = dict(item)
+    supported_aliases = []
+    for detail in term.get("alias_details") or []:
+        if detail.get("in_article"):
+            alias = str(detail.get("alias", "") or "").strip()
+            if alias and alias not in supported_aliases:
+                supported_aliases.append(alias)
+    if term.get("canonical_in_article") is False and not supported_aliases:
+        term["asr_correction_enabled"] = False
+        term["asr_disabled_reason"] = "canonical_not_in_article"
+    if term.get("alias_details"):
+        term["aliases"] = supported_aliases
+    return term
 
 
 def build_article_glossary(context: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -220,7 +380,7 @@ def build_article_glossary(context: Dict[str, Any]) -> List[Dict[str, Any]]:
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
-            terms.append(dict(item))
+            terms.append(_glossary_term_for_matching(item))
     return terms
 
 
@@ -432,6 +592,8 @@ def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, 
         "list",
     }
     for term in glossary:
+        if term.get("asr_correction_enabled") is False:
+            continue
         canonical = str(term.get("canonical_name", "") or "").strip()
         if not canonical or not re.search(r"[A-Za-z0-9]", canonical):
             continue

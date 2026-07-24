@@ -2,7 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.core.article_context import apply_article_asr_corrections
+from app.core.article_context import (
+    ARTICLE_RAW_RESPONSE_KEY,
+    apply_article_asr_corrections,
+    build_article_glossary,
+    enrich_article_context_with_evidence,
+    save_article_artifacts,
+)
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 
 
@@ -135,6 +141,60 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             [(seg.start_time, seg.end_time) for seg in corrected.segments],
             [(seg.start_time, seg.end_time) for seg in raw],
         )
+
+    def test_glossary_keeps_only_article_supported_aliases_for_matching(self):
+        article = "Jack Ma founded Alibaba. Popmart became popular."
+        context = {
+            "people": [
+                {
+                    "canonical_name": "Jack Ma",
+                    "aliases": ["Ma Yun"],
+                    "category": "person",
+                }
+            ],
+            "brands": [
+                {
+                    "canonical_name": "Pop Mart",
+                    "aliases": ["Popmart", "POP MART Global"],
+                    "category": "brand",
+                }
+            ],
+        }
+
+        enriched = enrich_article_context_with_evidence(context, article)
+        glossary = build_article_glossary(enriched)
+
+        jack = next(item for item in glossary if item["canonical_name"] == "Jack Ma")
+        pop = next(item for item in glossary if item["canonical_name"] == "Pop Mart")
+        self.assertEqual(jack["aliases"], [])
+        self.assertEqual(pop["aliases"], ["Popmart"])
+        self.assertTrue(pop["canonical_in_article"] is False)
+        self.assertNotIn("asr_disabled_reason", pop)
+
+    def test_save_article_artifacts_writes_raw_response_and_audit(self):
+        article = "DeepSeek was founded by Liang Wenfeng."
+        context = {
+            ARTICLE_RAW_RESPONSE_KEY: '{"raw": true}',
+            "people": [
+                {
+                    "canonical_name": "Liang Wenfeng",
+                    "aliases": ["Li Yang"],
+                    "category": "person",
+                }
+            ],
+            "companies": [
+                {
+                    "canonical_name": "DeepSeek",
+                    "aliases": ["Deep Seek"],
+                    "category": "company",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = save_article_artifacts(Path(tmp), article, context)
+            self.assertEqual(Path(paths["article_llm_raw_response"]).read_text(encoding="utf-8"), '{"raw": true}')
+            audit = Path(paths["article_context_audit"]).read_text(encoding="utf-8")
+            self.assertIn("unsupported_alias_count", audit)
 
 
 if __name__ == "__main__":
