@@ -1120,6 +1120,48 @@ def test_short_yeah_rebalances_with_long_following_sentence():
     )
 
 
+def test_short_though_attaches_to_following_sentence():
+    editor = _marker_editor(["Though,", "it", "was", "different."])
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 3, 2)]
+
+    merged = editor._merge_short_display_segments(items)
+
+    assert len(merged) == 1
+    assert merged[0].original == "Though, it was different."
+
+
+def test_short_though_rebalances_without_leaving_orphan():
+    words = [
+        "Though,",
+        "this",
+        "generation",
+        "still",
+        "built",
+        "durable",
+        "companies",
+        "through",
+        "exports",
+        "software",
+        "capital",
+        "discipline",
+        "and",
+        "constant",
+        "pressure.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 14, 2)]
+
+    merged = editor._merge_short_display_segments(items)
+
+    assert len(merged) == 2
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in merged)
+    assert all(item.original != "Though," for item in merged)
+    assert all(ScreenSubtitleEditor._word_count(item.original) > 1 for item in merged)
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in merged)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+
+
 def test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed():
     editor = _marker_editor(["I", "mean,", "this", "market", "changed."])
     items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 4, 2)]
@@ -1720,6 +1762,8 @@ if __name__ == "__main__":
     test_discourse_marker_phrase_is_not_split_during_rebalance()
     test_trailing_discourse_marker_rebalances_two_long_items_without_word_loss()
     test_short_yeah_rebalances_with_long_following_sentence()
+    test_short_though_attaches_to_following_sentence()
+    test_short_though_rebalances_without_leaving_orphan()
     test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed()
     test_discourse_marker_pre_id_pipeline_keeps_400_plus_english_chinese_id_sets_equal()
     test_discourse_marker_pre_id_pipeline_keeps_421_item_structure_errors_zero()

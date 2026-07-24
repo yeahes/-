@@ -681,10 +681,10 @@ class ScreenSubtitleEditor:
         combined_words = self._word_tokens(
             self._join_subtitle_text(current.original, next_item.original)
         )
-        is_short_backchannel = self._is_short_backchannel_text(current.original)
+        is_short_bridge = self._is_short_bridge_text(current.original)
         if len(combined_words) > max(1, self.max_english_words):
             return bool(
-                is_short_backchannel
+                is_short_bridge
                 and
                 self._balanced_two_item_split(
                     current,
@@ -692,7 +692,7 @@ class ScreenSubtitleEditor:
                     require_left_not_marker_only=True,
                 )
             )
-        return is_short_backchannel
+        return is_short_bridge
 
     def _should_merge_short_display_segment(
         self,
@@ -713,7 +713,7 @@ class ScreenSubtitleEditor:
         )
         if len(combined_words) > max(1, self.max_english_words):
             return False
-        return self._is_short_backchannel_text(current.text)
+        return self._is_short_bridge_text(current.text)
 
     @staticmethod
     def _is_short_backchannel_text(text: str) -> bool:
@@ -735,6 +735,12 @@ class ScreenSubtitleEditor:
             "they are",
             "they really are",
         }
+
+    @classmethod
+    def _is_short_bridge_text(cls, text: str) -> bool:
+        normalized = re.sub(r"[^a-z'\s]", " ", text.lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized == "though" or cls._is_short_backchannel_text(text)
 
     @staticmethod
     def _join_subtitle_text(left: str, right: str) -> str:
