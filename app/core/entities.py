@@ -622,6 +622,10 @@ class SubtitleTask:
     need_next_task: bool = True
 
     subtitle_config: Optional[SubtitleConfig] = None
+    article_reference_text: str = ""
+    article_context_data: Optional[dict] = None
+    use_article_reference_assist: bool = False
+    use_article_translation_terms: bool = False
 
 
 @dataclass

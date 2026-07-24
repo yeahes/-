@@ -265,6 +265,7 @@ class ScreenSubtitleEditor:
         enable_stable_mode: bool = True,
         enable_quality_check: bool = False,
         coverage_report_path: Optional[str] = None,
+        article_context_prompt: str = "",
         update_callback: Optional[Callable[[Dict], None]] = None,
     ):
         self.model = model
@@ -278,6 +279,7 @@ class ScreenSubtitleEditor:
         self.enable_stable_mode = enable_stable_mode
         self.enable_quality_check = enable_quality_check
         self.coverage_report_path = coverage_report_path
+        self.article_context_prompt = (article_context_prompt or "").strip()
         self.update_callback = update_callback
         self.cache_manager = CacheManager(str(CACHE_PATH))
         self.client = self._init_client()
@@ -296,6 +298,11 @@ class ScreenSubtitleEditor:
         self._last_semantic_group_debug: List[Dict] = []
         self._llm_cache_used: bool = False
         self.last_validation_summary: Optional[Dict] = None
+
+    def _compose_prompt(self, base_prompt: str) -> str:
+        if not self.article_context_prompt:
+            return base_prompt
+        return f"{base_prompt}\n\n{self.article_context_prompt}"
 
     @staticmethod
     def _init_client() -> OpenAI:
@@ -4728,10 +4735,12 @@ class ScreenSubtitleEditor:
             for idx, seg in chunk
         ]
 
-        prompt = Template(SCREEN_EDITOR_PROMPT).safe_substitute(
-            target_language=self.target_language,
-            max_cjk_chars=self.max_cjk_chars,
-            max_english_words=self.max_english_words,
+        prompt = self._compose_prompt(
+            Template(SCREEN_EDITOR_PROMPT).safe_substitute(
+                target_language=self.target_language,
+                max_cjk_chars=self.max_cjk_chars,
+                max_english_words=self.max_english_words,
+            )
         )
         cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
@@ -5960,7 +5969,8 @@ class ScreenSubtitleEditor:
             }
             for group in groups
         ]
-        cache_key = self._cache_key(SEMANTIC_FULL_TRANSLATION_PROMPT, payload)
+        prompt = self._compose_prompt(SEMANTIC_FULL_TRANSLATION_PROMPT)
+        cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
@@ -5975,7 +5985,7 @@ class ScreenSubtitleEditor:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": SEMANTIC_FULL_TRANSLATION_PROMPT},
+                        {"role": "system", "content": prompt},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
                     temperature=0.2,
@@ -6054,7 +6064,8 @@ class ScreenSubtitleEditor:
                 }
             )
 
-        cache_key = self._cache_key(SEMANTIC_TRANSLATION_ALLOCATION_PROMPT, payload)
+        prompt = self._compose_prompt(SEMANTIC_TRANSLATION_ALLOCATION_PROMPT)
+        cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
@@ -6069,7 +6080,7 @@ class ScreenSubtitleEditor:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": SEMANTIC_TRANSLATION_ALLOCATION_PROMPT},
+                        {"role": "system", "content": prompt},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
                     temperature=0.2,
@@ -6176,7 +6187,8 @@ class ScreenSubtitleEditor:
             }
             for group in groups
         ]
-        cache_key = self._cache_key(SEMANTIC_SUBTITLE_TRANSLATION_PROMPT, payload)
+        prompt = self._compose_prompt(SEMANTIC_SUBTITLE_TRANSLATION_PROMPT)
+        cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
@@ -6193,7 +6205,7 @@ class ScreenSubtitleEditor:
                     messages=[
                         {
                             "role": "system",
-                            "content": SEMANTIC_SUBTITLE_TRANSLATION_PROMPT,
+                            "content": prompt,
                         },
                         {
                             "role": "user",

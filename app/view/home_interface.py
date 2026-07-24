@@ -1,4 +1,3 @@
-from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import SegmentedWidget
 
@@ -10,11 +9,9 @@ from app.view.video_synthesis_interface import VideoSynthesisInterface
 
 
 class HomeInterface(QWidget):
-
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        # 设置对象名称和样式
         self.setObjectName("HomeInterface")
         self.setStyleSheet(
             """
@@ -22,14 +19,13 @@ class HomeInterface(QWidget):
         """
         )
 
-        # 创建分段控件和堆叠控件
         self.pivot = SegmentedWidget(self)
         self.pivot.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
 
         self.stackedWidget = QStackedWidget(self)
         self.vBoxLayout = QVBoxLayout(self)
+        self._last_transcribe_task = None
 
-        # 添加子界面
         self.task_creation_interface = TaskCreationInterface(self)
         self.transcription_interface = TranscriptionInterface(self)
         self.subtitle_optimization_interface = SubtitleInterface(self)
@@ -69,19 +65,37 @@ class HomeInterface(QWidget):
         )
 
     def switch_to_transcription(self, file_path):
-        # 切换到转录界面
         transcribe_task = TaskFactory.create_transcribe_task(
             file_path, need_next_task=True
         )
+        state = self.task_creation_interface.get_article_reference_state()
+        transcribe_task.article_reference_text = state.get("article_source_text", "")
+        transcribe_task.article_context_data = state.get("article_context_data")
+        transcribe_task.use_article_reference_assist = bool(
+            state.get("use_article_reference_assist")
+        )
+        transcribe_task.use_article_translation_terms = bool(
+            state.get("use_article_translation_terms")
+        )
+        self._last_transcribe_task = transcribe_task
         self.transcription_interface.set_task(transcribe_task)
         self.transcription_interface.process()
         self.stackedWidget.setCurrentWidget(self.transcription_interface)
         self.pivot.setCurrentItem("TranscriptionInterface")
 
     def switch_to_subtitle_optimization(self, file_path, video_path):
-        # 切换到字幕处理界面
         subtitle_task = TaskFactory.create_subtitle_task(
-            file_path, video_path, need_next_task=True
+            file_path,
+            video_path,
+            need_next_task=True,
+            article_reference_text=getattr(self._last_transcribe_task, "article_reference_text", ""),
+            article_context_data=getattr(self._last_transcribe_task, "article_context_data", None),
+            use_article_reference_assist=bool(
+                getattr(self._last_transcribe_task, "use_article_reference_assist", False)
+            ),
+            use_article_translation_terms=bool(
+                getattr(self._last_transcribe_task, "use_article_translation_terms", False)
+            ),
         )
         self.subtitle_optimization_interface.set_task(subtitle_task)
         self.subtitle_optimization_interface.process()
@@ -89,7 +103,6 @@ class HomeInterface(QWidget):
         self.pivot.setCurrentItem("SubtitleInterface")
 
     def switch_to_video_synthesis(self, video_path, subtitle_path):
-        # 切换到视频合成界面
         synthesis_task = TaskFactory.create_synthesis_task(
             video_path, subtitle_path, need_next_task=True
         )
@@ -99,7 +112,6 @@ class HomeInterface(QWidget):
         self.pivot.setCurrentItem("VideoSynthesisInterface")
 
     def addSubInterface(self, widget, objectName, text):
-        # 添加子界面到堆叠控件和分段控件
         widget.setObjectName(objectName)
         self.stackedWidget.addWidget(widget)
         self.pivot.addItem(
@@ -109,13 +121,11 @@ class HomeInterface(QWidget):
         )
 
     def onCurrentIndexChanged(self, index):
-        # 当堆叠控件的当前索引改变时，更新分段控件的当前项
         widget = self.stackedWidget.widget(index)
         if widget:
             self.pivot.setCurrentItem(widget.objectName())
 
     def closeEvent(self, event):
-        # 关闭事件，关闭所有子界面
         self.task_creation_interface.close()
         self.transcription_interface.close()
         self.subtitle_optimization_interface.close()

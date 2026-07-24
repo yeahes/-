@@ -10,6 +10,15 @@ from PyQt5.QtCore import QSettings, QThread, pyqtSignal
 from app.common.config import cfg
 from app.core.bk_asr.asr_data import ASRData
 from app.core.entities import SubtitleConfig, SubtitleTask, TranslatorServiceEnum
+from app.core.article_context import (
+    ArticleLLMConfig,
+    analyze_article_text,
+    apply_article_asr_corrections,
+    build_translation_context_prompt,
+    empty_article_context,
+    normalize_article_context,
+    save_article_artifacts,
+)
 from app.core.subtitle_processor.split import SubtitleSplitter
 from app.core.subtitle_processor.summarization import SubtitleSummarizer
 from app.core.subtitle_processor.optimize import SubtitleOptimizer
@@ -54,6 +63,95 @@ class SubtitleThread(QThread):
             "only_original": "\u4ec5\u539f\u6587",
             "only_translation": "\u4ec5\u8bd1\u6587",
         }
+
+    def _article_reference_enabled(self) -> bool:
+        article_text = str(getattr(self.task, "article_reference_text", "") or "").strip()
+        return bool(article_text) and (
+            bool(getattr(self.task, "use_article_reference_assist", False))
+            or bool(getattr(self.task, "use_article_translation_terms", False))
+        )
+
+    def _article_output_dir(self) -> Path:
+        output_path = getattr(self.task, "output_path", None) or getattr(
+            self.task, "subtitle_path", ""
+        )
+        return Path(output_path).parent if output_path else Path(CACHE_PATH)
+
+    @staticmethod
+    def _compose_prompt(base_prompt: str, extra_prompt: str) -> str:
+        parts = [part.strip() for part in (base_prompt, extra_prompt) if part and part.strip()]
+        return "\n\n".join(parts)
+
+    def _article_llm_config(self, subtitle_config: SubtitleConfig) -> ArticleLLMConfig | None:
+        if not (
+            subtitle_config.base_url
+            and subtitle_config.api_key
+            and subtitle_config.llm_model
+        ):
+            return None
+        return ArticleLLMConfig(
+            base_url=subtitle_config.base_url,
+            api_key=subtitle_config.api_key,
+            model=subtitle_config.llm_model,
+        )
+
+    @staticmethod
+    def _has_article_context(context: Dict) -> bool:
+        normalized = normalize_article_context(context)
+        if normalized.get("title") or normalized.get("summary"):
+            return True
+        for key in (
+            "people",
+            "companies",
+            "brands",
+            "organisations",
+            "places",
+            "technical_terms",
+            "numbers_and_dates",
+        ):
+            if normalized.get(key):
+                return True
+        return False
+
+    def _resolve_article_context(
+        self, subtitle_config: SubtitleConfig, output_dir: Path
+    ) -> Dict:
+        if not self._article_reference_enabled():
+            return empty_article_context()
+
+        article_text = str(getattr(self.task, "article_reference_text", "") or "").strip()
+        context = normalize_article_context(
+            getattr(self.task, "article_context_data", None)
+        )
+        if not self._has_article_context(context):
+            llm_config = self._article_llm_config(subtitle_config)
+            if llm_config is not None:
+                try:
+                    context = analyze_article_text(
+                        article_text,
+                        llm_config,
+                        timeout=60,
+                    )
+                except Exception as exc:
+                    logger.warning("Article context analysis failed, fallback to empty context: %s", exc)
+                    context = empty_article_context()
+
+        try:
+            save_article_artifacts(output_dir, article_text, context)
+        except Exception as exc:
+            logger.warning("Saving article artifacts failed: %s", exc)
+        return context
+
+    @staticmethod
+    def _save_stage_json(output_dir: Path, name: str, asr_data: ASRData) -> None:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / name).write_text(
+                json.dumps(asr_data.to_json(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning("Saving %s failed: %s", name, exc)
 
     @staticmethod
     def _srt_timestamp(ms: int) -> str:
@@ -228,13 +326,46 @@ class SubtitleThread(QThread):
 
             subtitle_config = self.task.subtitle_config
 
-            asr_data = ASRData.from_subtitle_file(subtitle_path)
-            word_time_asr_data = copy.deepcopy(asr_data) if asr_data.is_word_timestamp() else None
+            asr_raw = ASRData.from_subtitle_file(subtitle_path)
+            asr_data = asr_raw
+            word_time_asr_data = None
+            article_output_dir = self._article_output_dir()
+            self._save_stage_json(article_output_dir, "asr_raw.json", asr_raw)
+            article_context = self._resolve_article_context(subtitle_config, article_output_dir)
+            article_translation_prompt = ""
+            if (
+                str(getattr(self.task, "article_reference_text", "") or "").strip()
+                and bool(getattr(self.task, "use_article_translation_terms", False))
+            ):
+                try:
+                    article_translation_prompt = build_translation_context_prompt(article_context)
+                except Exception as exc:
+                    logger.warning("Building article translation prompt failed: %s", exc)
+                    article_translation_prompt = ""
+            if (
+                str(getattr(self.task, "article_reference_text", "") or "").strip()
+                and bool(getattr(self.task, "use_article_reference_assist", False))
+            ):
+                try:
+                    asr_corrected = apply_article_asr_corrections(
+                        asr_raw,
+                        article_context,
+                        output_dir=article_output_dir,
+                    )
+                    asr_data = asr_corrected
+                    self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
+                    self.update_all.emit(asr_data.to_json())
+                except Exception as exc:
+                    logger.warning("Article ASR correction failed, using original ASR: %s", exc)
+                    self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
+            else:
+                self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
 
             # 1. 分割成字词级时间戳（对于非断句字幕且开启分割选项）
             if subtitle_config.need_split and not asr_data.is_word_timestamp():
                 asr_data.split_to_word_segments()
-                word_time_asr_data = copy.deepcopy(asr_data) if asr_data.is_word_timestamp() else None
+            if asr_data.is_word_timestamp():
+                word_time_asr_data = copy.deepcopy(asr_data)
 
             # 获取API配置，会先检查可用性（优先使用设置的API，其次使用自带的公益API）
             if (
@@ -295,9 +426,13 @@ class SubtitleThread(QThread):
                 asr_data = splitter.split_subtitle(asr_data)
                 asr_data.save(save_path=split_path)
                 self.update_all.emit(asr_data.to_json())
+            self._save_stage_json(article_output_dir, "segmented_english.json", asr_data)
 
             # 3. 优化字幕
-            custom_prompt = subtitle_config.custom_prompt_text
+            custom_prompt = self._compose_prompt(
+                subtitle_config.custom_prompt_text,
+                article_translation_prompt,
+            )
             self.subtitle_length = len(asr_data.segments)
 
             if subtitle_config.need_optimize:
@@ -352,6 +487,7 @@ class SubtitleThread(QThread):
                 ):
                     asr_data.remove_punctuation()
                 self.update_all.emit(asr_data.to_json())
+            self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
 
             # 5. 上屏短字幕校正
             coverage_report_path = None
@@ -380,6 +516,7 @@ class SubtitleThread(QThread):
                         subtitle_config.need_screen_subtitle_quality_check
                         and not subtitle_config.screen_subtitle_stable_mode
                     ),
+                    article_context_prompt=article_translation_prompt,
                     coverage_report_path=coverage_report_path,
                     update_callback=self.callback,
                 )
@@ -403,6 +540,7 @@ class SubtitleThread(QThread):
                         + message
                     )
                 self.update_all.emit(asr_data.to_json())
+                self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
 
             # 保存翻译结果(单语、双语)
             if (
@@ -428,6 +566,7 @@ class SubtitleThread(QThread):
                 ass_style=subtitle_config.subtitle_style,
                 layout=subtitle_config.subtitle_layout,
             )
+            self._save_stage_json(article_output_dir, "final_subtitles.json", asr_data)
             self._save_stable_subtitle_outputs(
                 asr_data,
                 subtitle_config,

@@ -102,7 +102,13 @@ class TaskFactory:
 
     @staticmethod
     def create_subtitle_task(
-        file_path: str, video_path: Optional[str] = None, need_next_task: bool = False
+        file_path: str,
+        video_path: Optional[str] = None,
+        need_next_task: bool = False,
+        article_reference_text: str = "",
+        article_context_data: Optional[dict] = None,
+        use_article_reference_assist: bool = False,
+        use_article_translation_terms: bool = False,
     ) -> SubtitleTask:
         """创建字幕任务"""
         output_name = (
@@ -212,6 +218,10 @@ class TaskFactory:
             output_path=output_path,
             subtitle_config=config,
             need_next_task=need_next_task,
+            article_reference_text=article_reference_text or "",
+            article_context_data=article_context_data,
+            use_article_reference_assist=use_article_reference_assist,
+            use_article_translation_terms=use_article_translation_terms,
         )
 
     @staticmethod

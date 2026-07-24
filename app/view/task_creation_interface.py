@@ -35,6 +35,7 @@ from app.core.entities import (
 from app.thread.video_download_thread import VideoDownloadThread
 from app.view.log_window import LogWindow
 from app.components.DonateDialog import DonateDialog
+from app.components.article_context_panel import ArticleContextPanel
 from app.components.LanguageSettingDialog import LanguageSettingDialog
 from app.core.entities import TranscribeModelEnum
 
@@ -68,6 +69,7 @@ class TaskCreationInterface(QWidget):
         self.main_layout.addSpacing(120)
         self.setup_logo()
         self.setup_search_layout()
+        self.setup_article_context_layout()
         self.setup_status_layout()
         self.setup_info_label()
 
@@ -132,7 +134,12 @@ class TaskCreationInterface(QWidget):
         self.search_layout.addWidget(self.start_button)
         self.search_layout.setSpacing(10)
         self.main_layout.addLayout(self.search_layout)
-        self.main_layout.addSpacing(100)
+        self.main_layout.addSpacing(16)
+
+    def setup_article_context_layout(self):
+        self.article_context_panel = ArticleContextPanel(self)
+        self.main_layout.addWidget(self.article_context_panel)
+        self.main_layout.addSpacing(12)
 
     def setup_status_layout(self):
         self.status_layout = QVBoxLayout()
@@ -293,6 +300,16 @@ class TaskCreationInterface(QWidget):
                 duration=3000,
                 parent=self,
             )
+
+    def get_article_reference_state(self):
+        if hasattr(self, "article_context_panel"):
+            return self.article_context_panel.get_state()
+        return {
+            "article_source_text": "",
+            "article_context_data": None,
+            "use_article_reference_assist": False,
+            "use_article_translation_terms": False,
+        }
 
     def _is_valid_url(self, url):
         try:
