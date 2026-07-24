@@ -4,6 +4,7 @@ import os
 import re
 import builtins
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -234,6 +235,19 @@ class ScreenSubtitleItem:
     subtitle_id: Optional[str] = None
 
 
+@dataclass
+class AllocationBatchResult:
+    batch_id: int
+    expected_ids: List[int]
+    translations: Dict[int, Dict[str, str]]
+    complete: bool
+    data: Optional[object]
+    elapsed_seconds: float
+    errors: List[Dict]
+    debug: List[Dict]
+    error_message: str = ""
+
+
 class ScreenSubtitleEditor:
     """LLM-assisted editor for short bilingual on-screen subtitles."""
 
@@ -267,6 +281,7 @@ class ScreenSubtitleEditor:
         coverage_report_path: Optional[str] = None,
         article_context_prompt: str = "",
         update_callback: Optional[Callable[[Dict], None]] = None,
+        allocation_max_concurrency: int = 1,
     ):
         self.model = model
         self.target_language = target_language
@@ -281,6 +296,7 @@ class ScreenSubtitleEditor:
         self.coverage_report_path = coverage_report_path
         self.article_context_prompt = (article_context_prompt or "").strip()
         self.update_callback = update_callback
+        self.allocation_max_concurrency = max(1, int(allocation_max_concurrency or 1))
         self.cache_manager = CacheManager(str(CACHE_PATH))
         self.client = self._init_client()
         self._active_word_entries: List[Dict] = []
@@ -1290,11 +1306,53 @@ class ScreenSubtitleEditor:
         }
         self._translation_structure_errors.append(issue)
 
+    @staticmethod
+    def _append_translation_structure_error(
+        target: List[Dict],
+        code: str,
+        *,
+        group_id: Optional[int] = None,
+        expected_ids: Optional[Sequence[str]] = None,
+        returned_ids: Optional[Sequence[str]] = None,
+        duplicate_ids: Optional[Sequence[str]] = None,
+        unknown_ids: Optional[Sequence[str]] = None,
+        missing_ids: Optional[Sequence[str]] = None,
+        message: str = "",
+    ) -> None:
+        target.append(
+            {
+                "code": code,
+                "message": message or code,
+                "semantic_group_id": f"G{group_id:04d}" if group_id else "",
+                "expected_subtitle_ids": list(expected_ids or []),
+                "returned_subtitle_ids": list(returned_ids or []),
+                "duplicate_subtitle_ids": list(duplicate_ids or []),
+                "unknown_subtitle_ids": list(unknown_ids or []),
+                "missing_subtitle_ids": list(missing_ids or []),
+            }
+        )
+
     def _parse_id_bound_translations(
         self,
         group: Dict,
         expected_ids: Sequence[str],
         raw_parts: object,
+    ) -> Dict[str, str]:
+        return self._parse_id_bound_translations_into(
+            group,
+            expected_ids,
+            raw_parts,
+            self._translation_structure_errors,
+            self._last_semantic_group_debug,
+        )
+
+    def _parse_id_bound_translations_into(
+        self,
+        group: Dict,
+        expected_ids: Sequence[str],
+        raw_parts: object,
+        errors: List[Dict],
+        debug: List[Dict],
     ) -> Dict[str, str]:
         group_id = int(group.get("id") or 0)
         expected_set = set(expected_ids)
@@ -1304,7 +1362,8 @@ class ScreenSubtitleEditor:
         unknown_ids: List[str] = []
 
         if not isinstance(raw_parts, list):
-            self._record_translation_structure_error(
+            self._append_translation_structure_error(
+                errors,
                 "translation_group_cardinality_mismatch",
                 group_id=group_id,
                 expected_ids=expected_ids,
@@ -1316,7 +1375,8 @@ class ScreenSubtitleEditor:
 
         for part in raw_parts:
             if not isinstance(part, dict):
-                self._record_translation_structure_error(
+                self._append_translation_structure_error(
+                    errors,
                     "translation_group_cardinality_mismatch",
                     group_id=group_id,
                     expected_ids=expected_ids,
@@ -1333,7 +1393,8 @@ class ScreenSubtitleEditor:
                 or ""
             ).strip()
             if not subtitle_id:
-                self._record_translation_structure_error(
+                self._append_translation_structure_error(
+                    errors,
                     "translation_id_missing",
                     group_id=group_id,
                     expected_ids=expected_ids,
@@ -1344,7 +1405,8 @@ class ScreenSubtitleEditor:
             returned_ids.append(subtitle_id)
             if subtitle_id in result:
                 duplicate_ids.append(subtitle_id)
-                self._record_translation_structure_error(
+                self._append_translation_structure_error(
+                    errors,
                     "translation_id_duplicate",
                     group_id=group_id,
                     expected_ids=expected_ids,
@@ -1355,7 +1417,8 @@ class ScreenSubtitleEditor:
                 continue
             if subtitle_id not in expected_set:
                 unknown_ids.append(subtitle_id)
-                self._record_translation_structure_error(
+                self._append_translation_structure_error(
+                    errors,
                     "translation_id_unknown",
                     group_id=group_id,
                     expected_ids=expected_ids,
@@ -1367,7 +1430,7 @@ class ScreenSubtitleEditor:
             result[subtitle_id] = chinese
 
         missing_ids = [subtitle_id for subtitle_id in expected_ids if subtitle_id not in result]
-        self._last_semantic_group_debug.append(
+        debug.append(
             {
                 "semantic_group_id": f"G{group_id:04d}" if group_id else "",
                 "expected_subtitle_ids": list(expected_ids),
@@ -1379,7 +1442,8 @@ class ScreenSubtitleEditor:
             }
         )
         if missing_ids:
-            self._record_translation_structure_error(
+            self._append_translation_structure_error(
+                errors,
                 "translation_id_missing",
                 group_id=group_id,
                 expected_ids=expected_ids,
@@ -1388,7 +1452,8 @@ class ScreenSubtitleEditor:
                 message="Missing translation subtitle_id(s).",
             )
         if set(returned_ids) != expected_set or duplicate_ids or unknown_ids:
-            self._record_translation_structure_error(
+            self._append_translation_structure_error(
+                errors,
                 "translation_group_cardinality_mismatch",
                 group_id=group_id,
                 expected_ids=expected_ids,
@@ -6071,7 +6136,14 @@ class ScreenSubtitleEditor:
             if str(group.get("id", "")).isdigit()
         }
         prompt = self._compose_prompt(SEMANTIC_TRANSLATION_ALLOCATION_PROMPT)
-        for payload_chunk in self._semantic_allocation_payload_chunks(payload):
+        payload_chunks = self._semantic_allocation_payload_chunks(payload)
+        if self.allocation_max_concurrency > 1 and len(payload_chunks) > 1:
+            return self._allocate_semantic_group_translations_concurrent(
+                prompt,
+                payload_chunks,
+                expected_groups_by_id,
+            )
+        for payload_chunk in payload_chunks:
             chunk_result, complete, data = self._request_and_parse_allocation_chunk(
                 prompt,
                 payload_chunk,
@@ -6093,6 +6165,118 @@ class ScreenSubtitleEditor:
                     chunk_result,
                 )
         return result
+
+    def _allocate_semantic_group_translations_concurrent(
+        self,
+        prompt: str,
+        payload_chunks: Sequence[Sequence[Dict]],
+        expected_groups_by_id: Dict[int, Dict],
+    ) -> Dict[int, Dict[str, str]]:
+        results_by_batch: Dict[int, AllocationBatchResult] = {}
+        pending: List[tuple[int, Sequence[Dict]]] = []
+
+        for batch_id, payload_chunk in enumerate(payload_chunks, 1):
+            cached = self._load_cached_allocation_batch(
+                prompt,
+                payload_chunk,
+                expected_groups_by_id,
+                batch_id=batch_id,
+                cache_task="screen_subtitle_semantic_translation_allocation",
+            )
+            if cached is None:
+                pending.append((batch_id, payload_chunk))
+            else:
+                results_by_batch[batch_id] = cached
+
+        max_workers = max(1, min(self.allocation_max_concurrency, len(pending)))
+        if pending:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._request_and_parse_allocation_chunk_uncached,
+                        prompt,
+                        payload_chunk,
+                        expected_groups_by_id,
+                        batch_id=batch_id,
+                        cache_task="screen_subtitle_semantic_translation_allocation",
+                    ): (batch_id, payload_chunk)
+                    for batch_id, payload_chunk in pending
+                }
+                for future in as_completed(futures):
+                    batch_id, payload_chunk = futures[future]
+                    try:
+                        batch_result = future.result()
+                    except Exception as e:
+                        batch_result = AllocationBatchResult(
+                            batch_id=batch_id,
+                            expected_ids=[int(entry.get("id") or 0) for entry in payload_chunk],
+                            translations={},
+                            complete=False,
+                            data=None,
+                            elapsed_seconds=0.0,
+                            errors=[],
+                            debug=[],
+                            error_message=str(e),
+                        )
+                    if batch_result.data is not None:
+                        self._store_allocation_batch_cache(
+                            prompt,
+                            payload_chunk,
+                            batch_result.data,
+                            cache_task="screen_subtitle_semantic_translation_allocation",
+                        )
+                    results_by_batch[batch_id] = batch_result
+
+        merged: Dict[int, Dict[str, str]] = {}
+        for batch_id, payload_chunk in enumerate(payload_chunks, 1):
+            batch_result = results_by_batch.get(batch_id)
+            if batch_result is None or batch_result.data is None:
+                retry_result, retry_complete = self._retry_incomplete_allocation_chunk(
+                    prompt,
+                    payload_chunk,
+                    expected_groups_by_id,
+                )
+                merged.update(retry_result)
+                if not retry_complete:
+                    self._record_omitted_allocation_groups(
+                        payload_chunk,
+                        expected_groups_by_id,
+                        retry_result,
+                    )
+                continue
+
+            self._last_llm_raw_returns.append(
+                {
+                    "task": "screen_subtitle_semantic_translation_allocation",
+                    "data": batch_result.data,
+                    "expected_group_ids": [entry.get("id") for entry in payload_chunk],
+                    "batch_id": batch_id,
+                    "elapsed_seconds": round(batch_result.elapsed_seconds, 3),
+                    "error_message": batch_result.error_message,
+                }
+            )
+
+            chunk_result = batch_result.translations
+            complete = batch_result.complete
+            if not complete:
+                retry_result, retry_complete = self._retry_incomplete_allocation_chunk(
+                    prompt,
+                    payload_chunk,
+                    expected_groups_by_id,
+                )
+                chunk_result = retry_result
+                complete = retry_complete
+            else:
+                self._last_semantic_group_debug.extend(batch_result.debug)
+
+            merged.update(chunk_result)
+            if not complete:
+                self._record_omitted_allocation_groups(
+                    payload_chunk,
+                    expected_groups_by_id,
+                    chunk_result,
+                )
+        return merged
 
     def _request_and_parse_allocation_chunk(
         self,
@@ -6122,61 +6306,169 @@ class ScreenSubtitleEditor:
             data,
         ) + (data,)
 
+    def _request_and_parse_allocation_chunk_uncached(
+        self,
+        prompt: str,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+        *,
+        batch_id: int,
+        cache_task: str,
+    ) -> AllocationBatchResult:
+        started = time.perf_counter()
+        expected_ids = [int(entry.get("id") or 0) for entry in payload_chunk]
+        data, error_message = self._request_semantic_translation_allocation_api_only(
+            prompt,
+            payload_chunk,
+            cache_task=cache_task,
+        )
+        elapsed = time.perf_counter() - started
+        if data is None:
+            return AllocationBatchResult(
+                batch_id=batch_id,
+                expected_ids=expected_ids,
+                translations={},
+                complete=False,
+                data=None,
+                elapsed_seconds=elapsed,
+                errors=[],
+                debug=[],
+                error_message=error_message,
+            )
+        translations, complete, errors, debug = self._parse_allocation_chunk_data_isolated(
+            payload_chunk,
+            expected_groups_by_id,
+            data,
+        )
+        return AllocationBatchResult(
+            batch_id=batch_id,
+            expected_ids=expected_ids,
+            translations=translations,
+            complete=complete,
+            data=data,
+            elapsed_seconds=elapsed,
+            errors=errors,
+            debug=debug,
+            error_message=error_message,
+        )
+
+    def _load_cached_allocation_batch(
+        self,
+        prompt: str,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+        *,
+        batch_id: int,
+        cache_task: str,
+    ) -> Optional[AllocationBatchResult]:
+        cache_key = self._cache_key(prompt, payload_chunk)
+        cache_result = self.cache_manager.get_llm_result(
+            cache_key,
+            self.model,
+            temperature=0.2,
+            task=cache_task,
+        )
+        if not cache_result:
+            return None
+        self._llm_cache_used = True
+        started = time.perf_counter()
+        try:
+            data = json.loads(cache_result)
+        except Exception as e:
+            logger.warning("Semantic allocation cache parse failed; requesting fresh batch: %s", str(e))
+            return None
+        translations, complete, errors, debug = self._parse_allocation_chunk_data_isolated(
+            payload_chunk,
+            expected_groups_by_id,
+            data,
+        )
+        return AllocationBatchResult(
+            batch_id=batch_id,
+            expected_ids=[int(entry.get("id") or 0) for entry in payload_chunk],
+            translations=translations,
+            complete=complete,
+            data=data,
+            elapsed_seconds=time.perf_counter() - started,
+            errors=errors,
+            debug=debug,
+        )
+
+    def _store_allocation_batch_cache(
+        self,
+        prompt: str,
+        payload_chunk: Sequence[Dict],
+        data: object,
+        *,
+        cache_task: str,
+    ) -> None:
+        cache_key = self._cache_key(prompt, payload_chunk)
+        try:
+            self.cache_manager.set_llm_result(
+                cache_key,
+                json.dumps(data, ensure_ascii=False),
+                self.model,
+                temperature=0.2,
+                task=cache_task,
+            )
+        except Exception as e:
+            logger.warning("Semantic allocation cache write failed: %s", str(e))
+
     def _parse_allocation_chunk_data(
         self,
         payload_chunk: Sequence[Dict],
         expected_groups_by_id: Dict[int, Dict],
         data: object,
     ) -> tuple[Dict[int, Dict[str, str]], bool]:
+        result, complete, errors, debug = self._parse_allocation_chunk_data_isolated(
+            payload_chunk,
+            expected_groups_by_id,
+            data,
+        )
+        if complete:
+            self._last_semantic_group_debug.extend(debug)
+        return result, complete
+
+    def _parse_allocation_chunk_data_isolated(
+        self,
+        payload_chunk: Sequence[Dict],
+        expected_groups_by_id: Dict[int, Dict],
+        data: object,
+    ) -> tuple[Dict[int, Dict[str, str]], bool, List[Dict], List[Dict]]:
         result: Dict[int, Dict[str, str]] = {}
+        errors: List[Dict] = []
+        debug: List[Dict] = []
         groups_data = data.get("groups", []) if isinstance(data, dict) else data
         groups_data = self._normalize_allocation_groups_data(
             list(expected_groups_by_id.values()),
             groups_data,
+            errors=errors,
         )
         expected_group_ids = [int(entry.get("id") or 0) for entry in payload_chunk]
         returned_group_ids = set()
-        saved_errors = self._translation_structure_errors
-        saved_debug = self._last_semantic_group_debug
-        temp_errors: List[Dict] = []
-        temp_debug: List[Dict] = []
-        self._translation_structure_errors = temp_errors
-        self._last_semantic_group_debug = temp_debug
-        try:
-            for group in groups_data:
-                if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
-                    continue
-                group_id = int(group["id"])
-                if group_id not in expected_group_ids:
-                    saved_errors.append(
-                        {
-                            "code": "translation_id_unknown",
-                            "message": f"Unknown semantic group id returned: {group_id}",
-                            "semantic_group_id": f"G{group_id:04d}",
-                            "expected_subtitle_ids": [],
-                            "returned_subtitle_ids": [],
-                            "duplicate_subtitle_ids": [],
-                            "unknown_subtitle_ids": [],
-                            "missing_subtitle_ids": [],
-                        }
-                    )
-                    continue
-                expected_group = expected_groups_by_id.get(group_id)
-                if expected_group is None:
-                    continue
-                returned_group_ids.add(group_id)
-                result[group_id] = self._parse_id_bound_translations(
-                    expected_group,
-                    self._group_expected_subtitle_ids(expected_group),
-                    group.get("part_translations", []),
+        for group in groups_data:
+            if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
+                continue
+            group_id = int(group["id"])
+            if group_id not in expected_group_ids:
+                self._append_translation_structure_error(
+                    errors,
+                    "translation_id_unknown",
+                    message=f"Unknown semantic group id returned: {group_id}",
                 )
-        finally:
-            self._translation_structure_errors = saved_errors
-            self._last_semantic_group_debug = saved_debug
-        complete = not temp_errors and set(expected_group_ids) == returned_group_ids
-        if complete:
-            saved_debug.extend(temp_debug)
-        return result, complete
+                continue
+            expected_group = expected_groups_by_id.get(group_id)
+            if expected_group is None:
+                continue
+            returned_group_ids.add(group_id)
+            result[group_id] = self._parse_id_bound_translations_into(
+                expected_group,
+                self._group_expected_subtitle_ids(expected_group),
+                group.get("part_translations", []),
+                errors,
+                debug,
+            )
+        complete = not errors and set(expected_group_ids) == returned_group_ids
+        return result, complete, errors, debug
 
     def _retry_incomplete_allocation_chunk(
         self,
@@ -6187,16 +6479,24 @@ class ScreenSubtitleEditor:
         result: Dict[int, Dict[str, str]] = {}
         complete = True
         for entry in payload_chunk:
-            group_result, group_complete, data = self._request_and_parse_allocation_chunk(
+            data = self._request_semantic_translation_allocation(
                 prompt,
                 [entry],
-                expected_groups_by_id,
                 cache_task="screen_subtitle_semantic_translation_allocation_retry",
             )
             if data is None:
                 complete = False
                 continue
+            group_result, group_complete, errors, debug = self._parse_allocation_chunk_data_isolated(
+                [entry],
+                expected_groups_by_id,
+                data,
+            )
             result.update(group_result)
+            if group_complete:
+                self._last_semantic_group_debug.extend(debug)
+            else:
+                self._translation_structure_errors.extend(errors)
             complete = complete and group_complete
         return result, complete
 
@@ -6252,16 +6552,13 @@ class ScreenSubtitleEditor:
             if cache_result:
                 self._llm_cache_used = True
                 return json.loads(cache_result)
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                temperature=0.2,
-                timeout=self.timeout,
+            data, _ = self._request_semantic_translation_allocation_api_only(
+                prompt,
+                payload,
+                cache_task=cache_task,
             )
-            data = json_repair.loads(response.choices[0].message.content)
+            if data is None:
+                return None
             self.cache_manager.set_llm_result(
                 cache_key,
                 json.dumps(data, ensure_ascii=False),
@@ -6274,11 +6571,60 @@ class ScreenSubtitleEditor:
             logger.warning("Semantic subtitle translation allocation failed: %s", str(e))
             return None
 
+    def _request_semantic_translation_allocation_api_only(
+        self,
+        prompt: str,
+        payload: Sequence[Dict],
+        *,
+        cache_task: str = "screen_subtitle_semantic_translation_allocation",
+        max_attempts: int = 3,
+    ) -> tuple[Optional[object], str]:
+        delay_seconds = 1.0
+        last_error = ""
+        for attempt in range(1, max(1, max_attempts) + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                    temperature=0.2,
+                    timeout=self.timeout,
+                )
+                return json_repair.loads(response.choices[0].message.content), ""
+            except Exception as e:
+                last_error = str(e)
+                if attempt >= max_attempts or not self._is_retryable_allocation_error(e):
+                    break
+                logger.warning(
+                    "Semantic allocation batch request failed; retrying attempt %s/%s task=%s error=%s",
+                    attempt + 1,
+                    max_attempts,
+                    cache_task,
+                    last_error,
+                )
+                time.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 2, 8.0)
+        logger.warning("Semantic subtitle translation allocation failed: %s", last_error)
+        return None, last_error
+
+    @staticmethod
+    def _is_retryable_allocation_error(error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        if status_code == 429 or (isinstance(status_code, int) and 500 <= status_code < 600):
+            return True
+        name = type(error).__name__.lower()
+        text = str(error).lower()
+        return any(token in name or token in text for token in ("timeout", "timed out", "429", "rate limit", "500", "502", "503", "504"))
+
     def _normalize_allocation_groups_data(
         self,
         expected_groups: Sequence[Dict],
         groups_data: object,
+        errors: Optional[List[Dict]] = None,
     ) -> List[Dict]:
+        target_errors = self._translation_structure_errors if errors is None else errors
         expected_ids_by_group: Dict[int, set] = {
             int(group.get("id") or 0): set(self._group_expected_subtitle_ids(group))
             for group in expected_groups
@@ -6330,7 +6676,8 @@ class ScreenSubtitleEditor:
                 if subtitle_id in expected_ids
             ]
             if len(matching_group_ids) != 1:
-                self._record_translation_structure_error(
+                self._append_translation_structure_error(
+                    target_errors,
                     "translation_id_unknown",
                     expected_ids=[],
                     returned_ids=[subtitle_id],

@@ -2,6 +2,7 @@ import sys
 import json
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,11 @@ def _words(text):
 
 def _id_editor():
     editor = _editor()
+    editor.model = "test-model"
+    editor.timeout = 5
+    editor.allocation_max_concurrency = 1
+    editor.cache_manager = _NoCache()
+    editor.client = None
     editor.max_cjk_chars = 18
     editor._translation_structure_errors = []
     editor._last_llm_raw_returns = []
@@ -84,6 +90,28 @@ def _id_editor():
     editor._frozen_subtitle_ids = []
     editor._llm_cache_used = False
     return editor
+
+
+class _NoCache:
+    def get_llm_result(self, *args, **kwargs):
+        return None
+
+    def set_llm_result(self, *args, **kwargs):
+        return None
+
+
+class _QueueCache:
+    def __init__(self, results):
+        self.results = list(results)
+        self.set_calls = []
+
+    def get_llm_result(self, *args, **kwargs):
+        if self.results:
+            return self.results.pop(0)
+        return None
+
+    def set_llm_result(self, *args, **kwargs):
+        self.set_calls.append((args, kwargs))
 
 
 def _id_items(count, translated=""):
@@ -1484,6 +1512,225 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
         2: {"S0002": "zh-S0002"},
         3: {"S0003": "zh-S0003"},
     }
+    assert editor._translation_structure_errors == []
+
+
+def test_allocation_concurrency_merges_out_of_order_batches_by_id():
+    editor = _id_editor()
+    editor.batch_num = 2
+    editor.allocation_max_concurrency = 2
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
+    full_translations = {index: f"full-{index}" for index in range(1, 5)}
+    completions = []
+
+    def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+        ids = [entry["id"] for entry in payload]
+        if ids == [1, 2]:
+            time.sleep(0.05)
+        completions.append(ids)
+        return (
+            {
+                "groups": [
+                    {
+                        "id": entry["id"],
+                        "part_translations": [
+                            {
+                                "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
+                                "zh": f"zh-{entry['subtitle_parts'][0]['subtitle_id']}",
+                            }
+                        ],
+                    }
+                    for entry in reversed(payload)
+                ]
+            },
+            "",
+        )
+
+    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    assert completions[0] == [3, 4]
+    assert allocated == {
+        1: {"S0001": "zh-S0001"},
+        2: {"S0002": "zh-S0002"},
+        3: {"S0003": "zh-S0003"},
+        4: {"S0004": "zh-S0004"},
+    }
+    assert [entry["batch_id"] for entry in editor._last_llm_raw_returns] == [1, 2]
+    assert editor._translation_structure_errors == []
+
+
+def test_allocation_concurrency_retries_one_failed_batch_without_dropping_completed_batches():
+    editor = _id_editor()
+    editor.batch_num = 2
+    editor.allocation_max_concurrency = 2
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
+    full_translations = {index: f"full-{index}" for index in range(1, 5)}
+    retried = []
+
+    def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+        ids = [entry["id"] for entry in payload]
+        if ids == [1, 2]:
+            return None, "timeout"
+        return (
+            {
+                "groups": [
+                    {
+                        "id": entry["id"],
+                        "part_translations": [
+                            {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"zh-{entry['id']}"}
+                        ],
+                    }
+                    for entry in payload
+                ]
+            },
+            "",
+        )
+
+    def retry_request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_retry"):
+        retried.append([entry["id"] for entry in payload])
+        return {
+            "groups": [
+                {
+                    "id": entry["id"],
+                    "part_translations": [
+                        {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"retry-{entry['id']}"}
+                    ],
+                }
+                for entry in payload
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api), patch.object(
+        editor, "_request_semantic_translation_allocation", side_effect=retry_request
+    ):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    assert retried == [[1], [2]]
+    assert allocated == {
+        1: {"S0001": "retry-1"},
+        2: {"S0002": "retry-2"},
+        3: {"S0003": "zh-3"},
+        4: {"S0004": "zh-4"},
+    }
+    assert editor._translation_structure_errors == []
+
+
+def test_allocation_concurrency_records_duplicate_and_unknown_ids_after_retry_failure():
+    editor = _id_editor()
+    editor.batch_num = 2
+    editor.allocation_max_concurrency = 2
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 3)]
+    full_translations = {1: "full-1", 2: "full-2"}
+
+    def bad_response(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+        return {
+            "groups": [
+                {
+                    "id": entry["id"],
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "one"},
+                        {"subtitle_id": "S0001", "zh": "duplicate"},
+                        {"subtitle_id": "S9999", "zh": "unknown"},
+                    ],
+                }
+                for entry in payload
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation_api_only", return_value=(bad_response("", []), "")), patch.object(
+        editor, "_request_semantic_translation_allocation", side_effect=bad_response
+    ):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    assert allocated[1] == {"S0001": "one"}
+    codes = _codes(editor)
+    assert "translation_id_duplicate" in codes
+    assert "translation_id_unknown" in codes
+    assert "translation_group_cardinality_mismatch" in codes
+
+
+def test_allocation_concurrency_uses_mixed_cache_hits_without_worker_cache_writes():
+    editor = _id_editor()
+    editor.batch_num = 2
+    editor.allocation_max_concurrency = 2
+    cached_payload = {
+        "groups": [
+            {"id": 1, "part_translations": [{"subtitle_id": "S0001", "zh": "cached-1"}]},
+            {"id": 2, "part_translations": [{"subtitle_id": "S0002", "zh": "cached-2"}]},
+        ]
+    }
+    editor.cache_manager = _QueueCache([json.dumps(cached_payload, ensure_ascii=False), None])
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
+    full_translations = {index: f"full-{index}" for index in range(1, 5)}
+
+    def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+        return (
+            {
+                "groups": [
+                    {
+                        "id": entry["id"],
+                        "part_translations": [
+                            {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"api-{entry['id']}"}
+                        ],
+                    }
+                    for entry in payload
+                ]
+            },
+            "",
+        )
+
+    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    assert allocated == {
+        1: {"S0001": "cached-1"},
+        2: {"S0002": "cached-2"},
+        3: {"S0003": "api-3"},
+        4: {"S0004": "api-4"},
+    }
+    assert editor._llm_cache_used is True
+    assert len(editor.cache_manager.set_calls) == 1
+    assert editor._translation_structure_errors == []
+
+
+def test_allocation_concurrency_preserves_400_plus_subtitle_ids_without_drift():
+    editor = _id_editor()
+    editor.batch_num = 24
+    editor.allocation_max_concurrency = 2
+    items = editor._assign_global_subtitle_ids(_id_items(432))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 433)]
+    full_translations = {index: f"full-{index}" for index in range(1, 433)}
+
+    def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+        return (
+            {
+                "groups": [
+                    {
+                        "id": entry["id"],
+                        "part_translations": [
+                            {
+                                "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
+                                "zh": f"zh-{entry['subtitle_parts'][0]['subtitle_id']}",
+                            }
+                        ],
+                    }
+                    for entry in reversed(payload)
+                ]
+            },
+            "",
+        )
+
+    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api):
+        translations = editor._allocate_semantic_group_translations(groups, full_translations)
+    applied = editor._apply_semantic_group_translations(items, groups, translations)
+
+    assert [item.subtitle_id for item in applied] == [f"S{index:04d}" for index in range(1, 433)]
+    assert [item.translated for item in applied] == [f"zh-S{index:04d}" for index in range(1, 433)]
     assert editor._translation_structure_errors == []
 
 
