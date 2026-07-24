@@ -2403,6 +2403,110 @@ def test_allocation_quality_detects_negation_misplacement():
     assert "negation_allocation_mismatch" in validation["issue_codes"]
 
 
+def test_allocation_quality_allows_negation_with_adjacent_predicate_completion():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "把工作当作巨大方程，难道不会剥夺我们的人性吗？",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "doesn't treating your life's work like"},
+            {"subtitle_id": "S0002", "english": "a giant equation strip away our humanity?"},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "把工作当作",
+            "S0002": "巨大方程，难道不会剥夺我们的人性吗？",
+        },
+    )
+
+    assert validation["valid"]
+    assert "negation_allocation_mismatch" not in validation["issue_codes"]
+
+
+def test_allocation_quality_accepts_chinese_number_equivalents():
+    editor = _id_editor()
+    percent_entry = {
+        "id": 1,
+        "full_translation": "哦，百分之百。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Oh, 100%."},
+        ],
+    }
+    percent_validation = editor._validate_group_chinese_allocation(
+        percent_entry,
+        {"S0001": "哦，百分之百。"},
+    )
+
+    hours_entry = {
+        "id": 2,
+        "full_translation": "这本书叫《八万小时》。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "The book is called 80 000 Hours."},
+        ],
+    }
+    hours_validation = editor._validate_group_chinese_allocation(
+        hours_entry,
+        {"S0001": "这本书叫《八万小时》。"},
+    )
+    million_entry = {
+        "id": 3,
+        "full_translation": "拥有一千万并不会让你更快乐。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Having 10 million does not make you happier."},
+        ],
+    }
+    million_validation = editor._validate_group_chinese_allocation(
+        million_entry,
+        {"S0001": "拥有一千万并不会让你更快乐。"},
+    )
+    economists_entry = {
+        "id": 4,
+        "full_translation": "那两百位经济学家发出了警告。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Those 200 economists issued a warning."},
+        ],
+    }
+    economists_validation = editor._validate_group_chinese_allocation(
+        economists_entry,
+        {"S0001": "那两百位经济学家发出了警告。"},
+    )
+
+    assert percent_validation["valid"]
+    assert "number_allocation_mismatch" not in percent_validation["issue_codes"]
+    assert hours_validation["valid"]
+    assert "number_allocation_mismatch" not in hours_validation["issue_codes"]
+    assert million_validation["valid"]
+    assert "number_allocation_mismatch" not in million_validation["issue_codes"]
+    assert economists_validation["valid"]
+    assert "number_allocation_mismatch" not in economists_validation["issue_codes"]
+
+
+def test_allocation_quality_accepts_natural_subtitle_half_sentence():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "她指出，做好事和追随热情并不意味着你必须发誓过贫穷的生活。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "She points out that doing good and following your passion doesn't mean"},
+            {"subtitle_id": "S0002", "english": "you have to take a vow of poverty."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "她指出，做好事和追随热情并不意味着",
+            "S0002": "你必须发誓过贫穷的生活。",
+        },
+    )
+
+    assert validation["valid"]
+    assert "unnatural_chinese_fragment" not in validation["issue_codes"]
+
+
 def test_allocation_quality_keeps_out_of_order_return_by_subtitle_id():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
@@ -2961,6 +3065,9 @@ if __name__ == "__main__":
     test_allocation_quality_retries_information_leaked_to_previous_id()
     test_allocation_quality_rejects_adjacent_core_duplication()
     test_allocation_quality_detects_negation_misplacement()
+    test_allocation_quality_allows_negation_with_adjacent_predicate_completion()
+    test_allocation_quality_accepts_chinese_number_equivalents()
+    test_allocation_quality_accepts_natural_subtitle_half_sentence()
     test_allocation_quality_keeps_out_of_order_return_by_subtitle_id()
     test_allocation_quality_failed_group_does_not_shift_following_100_ids()
     test_compression_quality_regression_restores_previous_group_allocation()

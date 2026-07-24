@@ -8510,7 +8510,7 @@ class ScreenSubtitleEditor:
                 issue_codes.append("group_allocation_information_omission")
                 issues.append({"subtitle_id": expected_ids[offset], "reason": "empty_chinese"})
                 continue
-            if self._is_bad_chinese_fragment(text):
+            if self._is_bad_allocation_chinese_fragment(text, offset, len(ordered_texts)):
                 issue_codes.append("unnatural_chinese_fragment")
                 issues.append({"subtitle_id": expected_ids[offset], "text": text})
 
@@ -8577,6 +8577,9 @@ class ScreenSubtitleEditor:
             return {}
         if len(full) < 10:
             return {} if full in merged else {"reason": "short_full_translation_not_preserved"}
+        bag_overlap = self._character_bag_overlap(full, merged)
+        if bag_overlap >= 0.82:
+            return {}
         lcs = self._lcs_length(full, merged)
         coverage = lcs / max(1, len(full))
         if coverage < 0.62:
@@ -8588,6 +8591,34 @@ class ScreenSubtitleEditor:
             }
         return {}
 
+    def _is_bad_allocation_chinese_fragment(self, text: str, offset: int, total: int) -> bool:
+        raw = re.sub(r"\s+", "", text or "")
+        normalized = re.sub(r"\s+", "", text or "")
+        normalized = re.sub(r"[，。！？；：、,.!?;:]+$", "", normalized)
+        if not normalized:
+            return True
+        if re.search(r"[。！？.!?]$", raw) and len(normalized) >= 4:
+            return False
+        if total <= 1:
+            return self._is_bad_chinese_fragment(text)
+        if len(normalized) <= 2 and normalized not in {"好的", "没错", "对", "是的", "真的"}:
+            return True
+        # Allocation is allowed to create natural subtitle half-sentences inside
+        # one semantic group. Hard-failing these fragments creates noisy retries.
+        if offset < total - 1 and normalized.endswith(
+            ("意味着", "因为", "如果", "对于", "以及", "将", "把", "在", "的")
+        ):
+            return False
+        if offset < total - 1 and normalized.startswith(
+            ("因为", "如果", "对于", "在", "将", "把", "以及", "而", "但", "并")
+        ):
+            return False
+        if offset > 0 and normalized.startswith(
+            ("因为", "如果", "对于", "在", "将", "把", "以及", "而", "但", "并")
+        ):
+            return False
+        return self._is_bad_chinese_fragment(text)
+
     def _detect_cross_id_anchor_misplacement(
         self,
         entry: Dict,
@@ -8596,9 +8627,11 @@ class ScreenSubtitleEditor:
         parts = list(entry.get("subtitle_parts") or [])
         issues: List[Dict] = []
         expected_by_anchor: Dict[str, tuple[str, str]] = {}
+        english_by_id: Dict[str, str] = {}
         for part in parts:
             subtitle_id = str(part.get("subtitle_id") or "").strip()
             english = str(part.get("english") or "")
+            english_by_id[subtitle_id] = english
             for anchor in self._build_group_allocation_anchors(english):
                 expected_by_anchor.setdefault(anchor["value"], (subtitle_id, anchor["type"]))
 
@@ -8624,6 +8657,13 @@ class ScreenSubtitleEditor:
                     )
                 continue
             if expected_id not in present_ids:
+                if anchor_type == "negation" and self._is_allowed_adjacent_negation_allocation(
+                    expected_id,
+                    present_ids,
+                    [str(part.get("subtitle_id") or "").strip() for part in parts],
+                    english_by_id,
+                ):
+                    continue
                 code = (
                     "cross_id_semantic_leakage"
                     if anchor_type == "entity"
@@ -8639,10 +8679,47 @@ class ScreenSubtitleEditor:
                 )
         return issues
 
+    @staticmethod
+    def _is_allowed_adjacent_negation_allocation(
+        expected_id: str,
+        present_ids: Sequence[str],
+        ordered_ids: Sequence[str],
+        english_by_id: Dict[str, str],
+    ) -> bool:
+        if expected_id not in ordered_ids:
+            return False
+        expected_index = list(ordered_ids).index(expected_id)
+        adjacent_ids = {
+            ordered_ids[index]
+            for index in (expected_index - 1, expected_index + 1)
+            if 0 <= index < len(ordered_ids)
+        }
+        if not adjacent_ids.intersection(present_ids):
+            return False
+        english = (english_by_id.get(expected_id) or "").strip().lower()
+        # English can carry the auxiliary negation before the local predicate is
+        # completed; Chinese often places the negative marker with that predicate.
+        return bool(re.search(r"\b(?:like|as|to|of|for|with|that|which|who|when|if)$", english))
+
     def _build_group_allocation_anchors(self, english: str) -> List[Dict]:
         anchors: List[Dict] = []
-        for match in re.finditer(r"\b\d+(?:[.,]\d+)?\b", english or ""):
-            anchors.append({"type": "number", "value": match.group(0).replace(",", "")})
+        for match in re.finditer(r"\b\d{1,3}(?:[ ,]\d{3})+(?:\.\d+)?%?|\b\d+(?:[.,]\d+)?%?", english or ""):
+            raw = match.group(0)
+            after = (english or "")[match.end(): match.end() + 16]
+            value = raw.replace(",", "").replace(" ", "")
+            scale_match = re.match(r"\s*(million|thousand|hundred)\b", after, re.IGNORECASE)
+            if scale_match and value.isdigit():
+                scale = {"hundred": 100, "thousand": 1000, "million": 1000000}[scale_match.group(1).lower()]
+                value = str(int(value) * scale)
+            anchors.append(
+                {
+                    "type": "number",
+                    "value": value,
+                    "raw": raw,
+                    "percent": raw.endswith("%"),
+                    "decade": bool(re.match(r"\s*s\b", after, re.IGNORECASE)),
+                }
+            )
         if re.search(r"\b(?:not|n't|never|no|without|cannot|can't|doesn't|don't|didn't)\b", english or "", re.IGNORECASE):
             anchors.append({"type": "negation", "value": "negation"})
         for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:[- ][A-Z][A-Za-z0-9]*){0,3}\b", english or ""):
@@ -8652,15 +8729,103 @@ class ScreenSubtitleEditor:
             anchors.append({"type": "entity", "value": value})
         return anchors
 
-    @staticmethod
-    def _allocation_anchor_present(value: str, anchor_type: str, chinese: str) -> bool:
+    @classmethod
+    def _allocation_anchor_present(cls, value: str, anchor_type: str, chinese: str) -> bool:
         text = chinese or ""
         if anchor_type == "number":
             compact = re.sub(r"[,，\s]", "", text)
-            return value in compact
+            value = (value or "").replace(",", "").replace(" ", "")
+            if value in compact:
+                return True
+            return any(variant and variant in compact for variant in cls._chinese_number_anchor_variants(value))
         if anchor_type == "negation":
             return bool(re.search(r"[不没无非未别勿]|不能|不会|不是|没有", text))
         return value in text
+
+    @staticmethod
+    def _chinese_number_anchor_variants(value: str) -> List[str]:
+        compact = (value or "").strip()
+        is_percent = compact.endswith("%")
+        compact = compact[:-1] if is_percent else compact
+        if not re.fullmatch(r"\d+(?:\.\d+)?", compact):
+            return []
+        if "." in compact:
+            return []
+        number = int(compact)
+        digit_map = "零一二三四五六七八九"
+
+        def small_to_zh(num: int) -> str:
+            if num == 0:
+                return "零"
+            units = [(1000, "千"), (100, "百"), (10, "十"), (1, "")]
+            out: List[str] = []
+            zero_pending = False
+            rest = num
+            for unit, label in units:
+                digit = rest // unit
+                rest %= unit
+                if digit:
+                    if zero_pending:
+                        out.append("零")
+                        zero_pending = False
+                    if not (unit == 10 and digit == 1 and not out):
+                        out.append(digit_map[digit])
+                    out.append(label)
+                elif out and rest:
+                    zero_pending = True
+            return "".join(out)
+
+        def int_to_zh(num: int) -> str:
+            if num < 10000:
+                return small_to_zh(num)
+            high, low = divmod(num, 10000)
+            result = small_to_zh(high) + "万"
+            if low:
+                result += ("零" if low < 1000 else "") + small_to_zh(low)
+            return result
+
+        variants = {int_to_zh(number)}
+        variants.update({item.replace("二百", "两百").replace("二千", "两千").replace("二万", "两万") for item in list(variants)})
+        if 1000 <= number <= 2099:
+            year_digits = "".join(digit_map[int(ch)] for ch in str(number))
+            variants.update({year_digits, f"{year_digits}年", f"{number}年"})
+            if number % 10 == 0:
+                century = number // 100 + 1
+                decade = (number % 100) // 10 * 10
+                variants.update(
+                    {
+                        f"{century}世纪{decade}年代",
+                        f"{small_to_zh(century)}世纪{small_to_zh(decade)}年代",
+                    }
+                )
+        if number % 10000 == 0 and number >= 10000:
+            variants.add(f"{number // 10000}万")
+        if number % 1000 == 0 and number >= 1000:
+            variants.add(f"{number // 1000}千")
+        if is_percent:
+            variants.update({f"百分之{item}" for item in list(variants)})
+            if number == 100:
+                variants.add("百分之百")
+        elif 0 <= number <= 100:
+            variants.add(f"百分之{int_to_zh(number)}")
+            if number == 100:
+                variants.add("百分之百")
+        return sorted(variants, key=len, reverse=True)
+
+    @staticmethod
+    def _character_bag_overlap(left: str, right: str) -> float:
+        if not left:
+            return 0.0
+        counts: Dict[str, int] = {}
+        for char in right:
+            counts[char] = counts.get(char, 0) + 1
+        matched = 0
+        for char in left:
+            available = counts.get(char, 0)
+            if available:
+                matched += 1
+                counts[char] = available - 1
+        return matched / max(1, len(left))
 
     @staticmethod
     def _lcs_length(left: str, right: str) -> int:
