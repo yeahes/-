@@ -1114,10 +1114,14 @@ class ScreenSubtitleEditor:
         return best[5] if best else []
 
     def _item_from_word_span(
-        self, word_start: int, word_end: int
+        self,
+        word_start: int,
+        word_end: int,
+        *,
+        require_alpha: bool = True,
     ) -> Optional[ScreenSubtitleItem]:
         text = self._text_from_word_span(word_start, word_end)
-        if not text or not re.search(r"[A-Za-z]", text):
+        if not text or (require_alpha and not re.search(r"[A-Za-z]", text)):
             return None
         return ScreenSubtitleItem(
             source_ids=self._source_ids_for_word_range(word_start, word_end),
@@ -1286,12 +1290,20 @@ class ScreenSubtitleEditor:
         self,
         items: Sequence[ScreenSubtitleItem],
     ) -> List[ScreenSubtitleItem]:
-        result = self._sort_items_by_word_span(list(items))
+        result = self._split_internal_sentence_transition_items(
+            self._sort_items_by_word_span(list(items))
+        )
         index = 0
-        while index < len(result) - 1:
+        while index < len(result):
+            if index >= len(result) - 1:
+                break
             left = result[index]
             right = result[index + 1]
-            evaluation = self._evaluate_item_boundary(left, right)
+            evaluation = self._evaluate_item_pair_for_final_boundary(
+                left,
+                right,
+                result[index - 1] if index > 0 else None,
+            )
             if evaluation["legal"]:
                 index += 1
                 continue
@@ -1321,6 +1333,63 @@ class ScreenSubtitleEditor:
             index = max(0, start - 1)
         return result
 
+    def _split_internal_sentence_transition_items(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> List[ScreenSubtitleItem]:
+        result: List[ScreenSubtitleItem] = []
+        for item in items:
+            transition_index = self._internal_sentence_transition_word_index(item)
+            if transition_index is None or item.word_start is None or item.word_end is None:
+                result.append(item)
+                continue
+            left = self._item_from_word_span(
+                item.word_start,
+                transition_index - 1,
+                require_alpha=False,
+            )
+            right = self._item_from_word_span(transition_index, item.word_end)
+            if not left or not right:
+                result.append(item)
+                continue
+            self._record_pre_id_boundary_repair(
+                repaired_by="_validate_and_repair_final_pre_id_boundaries",
+                old_items=[item],
+                new_items=[left, right],
+                evaluation={
+                    "legal": False,
+                    "hard_issues": ["transition_attached_to_previous_sentence"],
+                    "soft_issues": [],
+                    "boundary_score": 0.0,
+                    "protected_syntax": False,
+                    "pause_ms": None,
+                    "fragment_type": "",
+                },
+                repair_reason="internal_transition_split",
+                candidates_considered=[],
+            )
+            result.extend([left, right])
+        return result
+
+    def _internal_sentence_transition_word_index(
+        self,
+        item: ScreenSubtitleItem,
+    ) -> Optional[int]:
+        if item.word_start is None or item.word_end is None:
+            return None
+        if item.word_end <= item.word_start:
+            return None
+        entries = self._active_word_entries
+        for index in range(item.word_start + 1, item.word_end + 1):
+            token = self._clean_boundary_token(entries[index].get("token") or "")
+            if token not in self._sentence_transition_tokens():
+                continue
+            surface = str(entries[index].get("surface") or "")
+            previous_surface = str(entries[index - 1].get("surface") or "")
+            if surface[:1].isupper() or re.search(r"[.!?]\s*$", previous_surface):
+                return index
+        return None
+
     def _evaluate_item_boundary(
         self,
         left: ScreenSubtitleItem,
@@ -1342,6 +1411,154 @@ class ScreenSubtitleEditor:
             source_end=max(left.word_end, right.word_end),
         )
 
+    def _evaluate_item_pair_for_final_boundary(
+        self,
+        left: ScreenSubtitleItem,
+        right: Optional[ScreenSubtitleItem],
+        previous_item: Optional[ScreenSubtitleItem] = None,
+    ) -> Dict:
+        if right is None:
+            evaluation = {
+                "legal": True,
+                "hard_issues": [],
+                "soft_issues": [],
+                "boundary_score": 0.0,
+                "protected_syntax": False,
+                "pause_ms": None,
+            }
+        else:
+            evaluation = self._evaluate_item_boundary(left, right)
+        hard_issues = list(evaluation.get("hard_issues") or [])
+        fragment_issues = self._weak_fragment_issues(left, previous_item, right)
+        for issue in fragment_issues:
+            if issue not in hard_issues:
+                hard_issues.append(issue)
+        result = dict(evaluation)
+        result["hard_issues"] = hard_issues
+        result["fragment_type"] = fragment_issues[0] if fragment_issues else ""
+        result["legal"] = not hard_issues
+        return result
+
+    def _weak_fragment_issues(
+        self,
+        item: ScreenSubtitleItem,
+        previous_item: Optional[ScreenSubtitleItem],
+        next_item: Optional[ScreenSubtitleItem],
+    ) -> List[str]:
+        if item.subtitle_id:
+            return []
+        text = self._normalize_text(item.original)
+        words = [word.casefold() for word in self._word_tokens(text)]
+        if not words:
+            return []
+        if self._is_allowed_independent_short_item(item, previous_item, next_item):
+            return []
+        can_attach_next = bool(
+            next_item is not None
+            and self._items_are_continuous(item, next_item)
+            and not self._items_cross_speaker(item, next_item)
+            and not (
+                (pause := self._boundary_pause_ms(item, next_item)) is not None
+                and pause >= 450
+            )
+        )
+        can_attach_previous = bool(
+            previous_item is not None
+            and self._items_are_continuous(previous_item, item)
+            and not self._items_cross_speaker(previous_item, item)
+            and not (
+                (previous_pause := self._boundary_pause_ms(previous_item, item)) is not None
+                and previous_pause >= 450
+            )
+        )
+        if not can_attach_next and not can_attach_previous:
+            return []
+        issues: List[str] = []
+        if len(words) == 1 and words[0] in {"we", "they", "he", "she", "it", "i", "you"}:
+            issues.append("pronoun_only_fragment")
+        if len(words) == 1 and words[0] in self._stable_determiners():
+            issues.append("incomplete_short_fragment")
+        if self._is_standalone_transition_text(text):
+            issues.append("standalone_transition_fragment")
+        if self._internal_sentence_transition_word_index(item) is not None:
+            issues.append("transition_attached_to_previous_sentence")
+        if len(words) == 1 and self._is_plain_content_word(words[0]):
+            issues.append("incomplete_short_fragment")
+        if 1 <= len(words) <= 2 and all(self._token_is_numeric_like(word) for word in words):
+            issues.append("incomplete_short_fragment")
+        if len(words) <= 3 and self._looks_like_subject_without_predicate(words):
+            issues.append("weak_subject_fragment")
+        return list(dict.fromkeys(issues))
+
+    def _is_allowed_independent_short_item(
+        self,
+        item: ScreenSubtitleItem,
+        previous_item: Optional[ScreenSubtitleItem],
+        next_item: Optional[ScreenSubtitleItem],
+    ) -> bool:
+        text = self._normalize_text(item.original)
+        normalized = re.sub(r"[^a-z?\s]", " ", text.casefold())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized in {"yes", "no", "really", "right", "exactly", "okay", "ok"} and re.search(r"[.!?]\s*$", text):
+            return True
+        if previous_item and self._items_cross_speaker(previous_item, item):
+            return True
+        if next_item and self._items_cross_speaker(item, next_item):
+            return True
+        return False
+
+    @classmethod
+    def _is_standalone_transition_text(cls, text: str) -> bool:
+        normalized = re.sub(r"[^a-z\s]", " ", (text or "").casefold())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        transition_phrases = {
+            "so",
+            "and",
+            "but",
+            "alternatively",
+            "however",
+            "therefore",
+            "instead",
+            "meanwhile",
+            "in fact",
+            "for example",
+            "on the other hand",
+        }
+        return normalized in transition_phrases
+
+    @staticmethod
+    def _is_plain_content_word(token: str) -> bool:
+        return bool(token) and token not in {
+            "yes", "no", "really", "right", "exactly", "okay", "ok",
+            "so", "and", "but", "or",
+        }
+
+    @staticmethod
+    def _looks_like_subject_without_predicate(words: Sequence[str]) -> bool:
+        if not words:
+            return False
+        finite_or_aux = {
+            "am", "is", "are", "was", "were", "be", "been", "being",
+            "do", "does", "did", "have", "has", "had",
+            "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+            "tend", "tends", "need", "needs", "needed",
+        }
+        if any(word in finite_or_aux for word in words):
+            return False
+        if words[0] in {"yeah", "so", "well", "and", "but"} and len(words) >= 2:
+            return True
+        if words[0] in {"a", "an", "the", "this", "that", "these", "those"}:
+            return True
+        if words[-1] in {"i", "you", "we", "they", "he", "she", "it"}:
+            return True
+        return len(words) <= 3 and words[0] in {"i", "you", "we", "they", "he", "she", "it", "this", "that", "those"}
+
+    def _short_item_duration_ms(self, item: ScreenSubtitleItem) -> int:
+        timing = self._item_word_timing(item)
+        if not timing:
+            return 0
+        return max(0, int(timing[1]) - int(timing[0]))
+
     def _repair_pre_id_boundary_window(
         self,
         items: Sequence[ScreenSubtitleItem],
@@ -1350,6 +1567,7 @@ class ScreenSubtitleEditor:
     ) -> Optional[tuple[int, int, List[ScreenSubtitleItem], List[Dict]]]:
         attempts = [
             (boundary_index, boundary_index + 2),
+            (max(0, boundary_index - 1), boundary_index + 1),
             (max(0, boundary_index - 1), boundary_index + 2),
             (boundary_index, min(len(items), boundary_index + 3)),
         ]
@@ -1361,11 +1579,45 @@ class ScreenSubtitleEditor:
             window = list(items[start:end])
             if not self._can_repair_pre_id_window(window):
                 continue
+            direct = self._direct_merge_weak_fragment_window(window, evaluation)
+            if direct:
+                return start, end, direct, [
+                    {
+                        "cuts": [],
+                        "word_counts": [self._word_count(direct[0].original)],
+                        "hard_issues": [],
+                        "boundary_scores": [],
+                    }
+                ]
             repaired, candidates = self._repartition_pre_id_window(window)
             if not repaired:
                 continue
             return start, end, repaired, candidates
         return None
+
+    def _direct_merge_weak_fragment_window(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        evaluation: Dict,
+    ) -> List[ScreenSubtitleItem]:
+        weak_codes = {
+            "weak_subject_fragment",
+            "standalone_transition_fragment",
+            "incomplete_short_fragment",
+            "pronoun_only_fragment",
+        }
+        if len(items) != 2:
+            return []
+        if not any(issue in weak_codes for issue in (evaluation.get("hard_issues") or [])):
+            return []
+        merged = self._merge_subtitle_items(items[0], items[1])
+        if self._word_count(merged.original) > self.max_english_words:
+            return []
+        if self._internal_sentence_transition_word_index(merged) is not None:
+            return []
+        if self._weak_fragment_issues(merged, None, None):
+            return []
+        return [merged]
 
     def _can_repair_pre_id_window(self, items: Sequence[ScreenSubtitleItem]) -> bool:
         if len(items) < 2 or len(items) > 3:
@@ -1410,10 +1662,21 @@ class ScreenSubtitleEditor:
             word_counts = [self._word_count(item.original) for item in candidate_items]
             hard_issues: List[str] = []
             boundary_scores: List[float] = []
-            for left, right in zip(candidate_items, candidate_items[1:]):
-                evaluation = self._evaluate_item_boundary(left, right)
+            for boundary_index, (left, right) in enumerate(zip(candidate_items, candidate_items[1:])):
+                evaluation = self._evaluate_item_pair_for_final_boundary(
+                    left,
+                    right,
+                    candidate_items[boundary_index - 1] if boundary_index > 0 else None,
+                )
                 hard_issues.extend(evaluation["hard_issues"])
                 boundary_scores.append(float(evaluation["boundary_score"]))
+            if candidate_items:
+                trailing_evaluation = self._evaluate_item_pair_for_final_boundary(
+                    candidate_items[-1],
+                    None,
+                    candidate_items[-2] if len(candidate_items) > 1 else None,
+                )
+                hard_issues.extend(trailing_evaluation["hard_issues"])
             candidate_record = {
                 "cuts": [list(cut) for cut in zip(cuts, [cut + 1 for cut in cuts])],
                 "word_counts": word_counts,
@@ -1424,6 +1687,8 @@ class ScreenSubtitleEditor:
             if hard_issues:
                 continue
             if any(count > self.max_english_words for count in word_counts):
+                continue
+            if any(self._internal_sentence_transition_word_index(item) is not None for item in candidate_items):
                 continue
             if any(self._is_ordinary_one_word_fragment(item.original) for item in candidate_items):
                 continue
@@ -1481,10 +1746,23 @@ class ScreenSubtitleEditor:
                 "old_cut_word_index": old_cut,
                 "new_cut_word_index": new_cuts,
                 "repair_reason": repair_reason,
+                "fragment_type": evaluation.get("fragment_type", ""),
                 "hard_issues": list(evaluation.get("hard_issues") or []),
                 "soft_issues": list(evaluation.get("soft_issues") or []),
+                "hard_issues_before": list(evaluation.get("hard_issues") or []),
+                "hard_issues_after": [
+                    self._evaluate_item_pair_for_final_boundary(
+                        left,
+                        right,
+                        (new_items or [])[index - 1] if index > 0 else None,
+                    ).get("hard_issues", [])
+                    for index, (left, right) in enumerate(zip(new_items or [], (new_items or [])[1:]))
+                ],
                 "pause_ms": evaluation.get("pause_ms"),
                 "boundary_score": evaluation.get("boundary_score"),
+                "created_by_stage": repaired_by,
+                "old_boundary": old_cut,
+                "new_boundary": new_cuts,
                 "old_items": [
                     self._item_to_span_dict(index, item)
                     for index, item in enumerate(old_items, 1)
@@ -1493,8 +1771,19 @@ class ScreenSubtitleEditor:
                     self._item_to_span_dict(index, item)
                     for index, item in enumerate(new_items or [], 1)
                 ],
+                "local_items_before": [
+                    self._item_to_span_dict(index, item)
+                    for index, item in enumerate(old_items, 1)
+                ],
+                "local_items_after": [
+                    self._item_to_span_dict(index, item)
+                    for index, item in enumerate(new_items or [], 1)
+                ],
                 "candidate_boundaries_considered": list(candidates_considered),
+                "repair_attempted": True,
+                "repair_succeeded": new_items is not None,
                 "unresolved_hard_issue": new_items is None,
+                "unresolved_reason": "" if new_items is not None else repair_reason,
             }
         )
 
@@ -1656,7 +1945,12 @@ class ScreenSubtitleEditor:
             left_text = self._normalize_text(left.original)
             right_text = self._normalize_text(right.original)
             cut = (int(left.word_end), int(right.word_start))
-            evaluation = self._evaluate_stable_cut_boundary(
+            evaluation = self._evaluate_item_pair_for_final_boundary(
+                left,
+                right,
+                ordered[index - 2] if index > 1 else None,
+            )
+            boundary_evaluation = self._evaluate_stable_cut_boundary(
                 cut[0],
                 cut[1],
                 source_start=min(left.word_start, right.word_start),
@@ -1685,9 +1979,13 @@ class ScreenSubtitleEditor:
                     "legal": evaluation["legal"],
                     "hard_issues": evaluation["hard_issues"],
                     "soft_issues": evaluation["soft_issues"],
+                    "fragment_type": evaluation.get("fragment_type", ""),
+                    "repair_attempted": False,
+                    "repair_succeeded": False,
+                    "unresolved_reason": "",
                     "bad_cut_reasons": bad_reasons,
                     "syntax_boundary_reasons": syntax_reasons,
-                    "protected_syntax_cut": evaluation["protected_syntax"],
+                    "protected_syntax_cut": boundary_evaluation["protected_syntax"],
                     "high_confidence_syntax_bad_cut": bool(syntax_reasons and confidence_score >= 0.75),
                     "syntax_confidence_score": round(confidence_score, 2),
                 }
@@ -2358,6 +2656,8 @@ class ScreenSubtitleEditor:
             issues.append("quantifier_phrase_split")
         if self._is_adverb_adjective_boundary(left_token, right_token, pause_ms):
             issues.append("adverb_adjective_split")
+        if self._is_transition_attached_to_previous_sentence(left, right, pause_ms):
+            issues.append("transition_attached_to_previous_sentence")
         for issue in (getattr(self, "_syntax_hard_cut_issues", {}) or {}).get((left, right), []):
             if issue not in issues:
                 issues.append(issue)
@@ -2371,6 +2671,35 @@ class ScreenSubtitleEditor:
         if left_token in {"you", "than"} and right_token:
             issues.append("comparative_clause_split")
         return issues
+
+    def _is_transition_attached_to_previous_sentence(
+        self,
+        left: int,
+        right: int,
+        pause_ms: Optional[int],
+    ) -> bool:
+        if pause_ms is not None and pause_ms >= 450:
+            return False
+        entries = self._active_word_entries
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        if left_token not in self._sentence_transition_tokens() or not right_token:
+            return False
+        if left == 0:
+            return False
+        previous_surface = str(entries[left - 1].get("surface") or "")
+        left_surface = str(entries[left].get("surface") or "")
+        return bool(re.search(r"[.!?]\s*$", previous_surface) or re.search(r"[,;:]\s*$", left_surface))
+
+    @staticmethod
+    def _sentence_transition_tokens() -> set:
+        return {
+            "alternatively",
+            "however",
+            "therefore",
+            "instead",
+            "meanwhile",
+        }
 
     def _word_pause_ms(self, left: int, right: int) -> Optional[int]:
         entries = self._active_word_entries
@@ -2652,6 +2981,8 @@ class ScreenSubtitleEditor:
                 if right - left <= 3:
                     self._protect_internal_boundaries(range(left, right + 1), protected)
             self._protect_short_verb_complement_boundaries(doc, doc_to_word)
+            self._protect_subject_verb_boundaries(doc, doc_to_word)
+            self._protect_modifier_head_boundaries(doc, doc_to_word)
 
         self._syntax_protected_cuts = protected
         if protected:
@@ -2708,6 +3039,69 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 [head_index] + subtree_indices,
                 "short_verb_complement_split",
+            )
+
+    def _protect_subject_verb_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        for token in doc:
+            if token.dep_ not in {"nsubj", "nsubjpass", "expl"}:
+                continue
+            head = token.head
+            if head.i not in doc_to_word or token.i not in doc_to_word:
+                continue
+            if getattr(head, "pos_", "") not in {"VERB", "AUX"}:
+                continue
+            subject_indices = sorted(
+                doc_to_word[item.i]
+                for item in token.subtree
+                if item.i in doc_to_word
+            )
+            if not subject_indices:
+                continue
+            subject_end = max(subject_indices)
+            verb_index = doc_to_word[head.i]
+            if verb_index <= subject_end:
+                continue
+            if verb_index - subject_end > 4:
+                continue
+            if self._word_pause_ms(subject_end, subject_end + 1) is not None:
+                pauses = [
+                    self._word_pause_ms(index, index + 1)
+                    for index in range(subject_end, verb_index)
+                ]
+                if any(pause is not None and pause >= 450 for pause in pauses):
+                    continue
+            issue = (
+                "relative_clause_subject_verb_split"
+                if getattr(head, "dep_", "") == "relcl" or getattr(token, "dep_", "") == "nsubj"
+                and any(getattr(ancestor, "dep_", "") == "relcl" for ancestor in head.ancestors)
+                else "subject_finite_verb_split"
+            )
+            self._record_syntax_hard_issue_for_indices(
+                list(range(subject_end, verb_index + 1)),
+                issue,
+            )
+
+    def _protect_modifier_head_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        for token in doc:
+            if token.dep_ not in {"advmod", "amod"}:
+                continue
+            head = token.head
+            if token.i not in doc_to_word or head.i not in doc_to_word:
+                continue
+            if getattr(token, "pos_", "") != "ADV":
+                continue
+            if getattr(head, "pos_", "") not in {"ADJ", "ADV", "VERB"}:
+                continue
+            left = doc_to_word[token.i]
+            right = doc_to_word[head.i]
+            if right != left + 1:
+                continue
+            pause = self._word_pause_ms(left, right)
+            if pause is not None and pause > 180:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [left, right],
+                "modifier_head_split",
             )
 
     def _record_syntax_hard_issue_for_indices(

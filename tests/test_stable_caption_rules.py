@@ -1483,6 +1483,194 @@ def test_boundary_snapshot_payload_records_pre_id_repairs():
     assert payload["pre_id_boundary_repairs"]
 
 
+def test_subject_finite_verb_we_tend_is_hard_boundary():
+    editor = _marker_editor(["We", "tend", "to", "view", "AI"])
+    editor._record_syntax_hard_issue_for_indices([0, 1], "subject_finite_verb_split")
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "subject_finite_verb_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_subject_finite_verb_they_needed_is_hard_boundary():
+    editor = _marker_editor(["they", "needed", "to", "hire", "more", "clerks"])
+    editor._record_syntax_hard_issue_for_indices([0, 1], "subject_finite_verb_split")
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "subject_finite_verb_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_subject_finite_verb_ai_is_upending_is_hard_boundary():
+    editor = _marker_editor(["when", "AI", "is", "completely", "upending"])
+    editor._record_syntax_hard_issue_for_indices([1, 2], "subject_finite_verb_split")
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "subject_finite_verb_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_modifier_head_actually_good_is_hard_boundary():
+    editor = _marker_editor(["actually", "good", "at", "this"])
+    editor._record_syntax_hard_issue_for_indices([0, 1], "modifier_head_split")
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "modifier_head_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_relative_clause_subject_verb_you_can_is_hard_boundary():
+    editor = _marker_editor(["the", "good", "you", "can", "do"])
+    editor._record_syntax_hard_issue_for_indices([2, 3], "relative_clause_subject_verb_split")
+
+    evaluation = editor._evaluate_stable_cut_boundary(2, 3)
+
+    assert "relative_clause_subject_verb_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_pre_id_repairs_yeah_so_todd_subject_fragment():
+    words = [
+        "Yeah,",
+        "so",
+        "Todd",
+        "is",
+        "the",
+        "founder",
+        "of",
+        "a",
+        "non-profit",
+        "and",
+        "the",
+        "author",
+        "of",
+        "a",
+        "book,",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 14, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert repaired[0].original.startswith("Yeah, so Todd is the founder")
+    assert all(editor._evaluate_item_pair_for_final_boundary(left, right)["legal"] for left, right in zip(repaired, repaired[1:]))
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in repaired)
+
+
+def test_final_pre_id_repairs_pronoun_only_fragment():
+    editor = _marker_editor(["We", "tend", "to", "view", "AI", "carefully."])
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 5, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert repaired[0].original.startswith("We tend")
+    assert all(item.original != "We" for item in repaired)
+
+
+def test_final_pre_id_attaches_standalone_so_to_next_sentence():
+    editor = _marker_editor(["So,", "this", "matters", "now."])
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 3, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert repaired[0].original == "So, this matters now."
+
+
+def test_final_pre_id_keeps_independent_short_answers():
+    editor = _marker_editor(["No.", "Really?", "This", "changed."])
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 1, 2), _word_item(editor, 2, 3, 3)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired][:2] == ["No.", "Really?"]
+
+
+def test_weak_fragment_repair_does_not_cross_speaker_change():
+    editor = _marker_editor(["We", "tend", "to", "view", "AI"])
+    editor._active_source_segments_by_id[1].speaker = "A"
+    editor._active_source_segments_by_id[2].speaker = "B"
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 4, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [item.original for item in items]
+
+
+def test_weak_fragment_repair_does_not_cross_long_pause():
+    editor = _marker_editor(["We", "tend", "to", "view", "AI"])
+    editor._active_word_entries[1]["start_time"] = editor._active_word_entries[0]["end_time"] + 800
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 4, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [item.original for item in items]
+
+
+def test_internal_transition_attaches_to_following_sentence():
+    words = [
+        "having",
+        "80",
+        "000",
+        "Alternatively,",
+        "if",
+        "you",
+        "want",
+        "to",
+        "work",
+        "directly",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 9, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert repaired[0].original == "having 80 000"
+    assert repaired[1].original.startswith("Alternatively, if you want")
+    assert all("Alternatively" not in item.original or item.original.startswith("Alternatively") for item in repaired)
+
+
+def test_final_pre_id_repair_does_not_create_new_hard_issue():
+    editor = _marker_editor(["We", "tend", "to", "view", "AI", "as", "important."])
+    editor._record_syntax_hard_issue_for_indices([0, 1], "subject_finite_verb_split")
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 6, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert all(
+        editor._evaluate_item_pair_for_final_boundary(left, right)["legal"]
+        for left, right in zip(repaired, repaired[1:])
+    )
+
+
+def test_unresolved_weak_fragment_is_recorded_when_no_safe_repair():
+    editor = _marker_editor(["We", "tend", "to", "view", "AI"], max_words=2)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 4, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [item.original for item in items]
+    assert editor._pre_id_boundary_repairs[-1]["unresolved_hard_issue"] is True
+
+
+def test_final_pre_id_second_phase_preserves_word_order_and_timestamps():
+    words = ["We", "tend", "to", "view", "AI", "as", "important."]
+    editor = _marker_editor(words, max_words=14)
+    before_times = [(entry["start_time"], entry["end_time"]) for entry in editor._active_word_entries]
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 6, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in repaired)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+    assert [(entry["start_time"], entry["end_time"]) for entry in editor._active_word_entries] == before_times
+    assert all(item.subtitle_id is None for item in repaired)
+
+
 def test_boundary_snapshots_record_stage_changes_before_subtitle_ids():
     editor = _marker_editor(["I", "mean,", "this", "market", "changed."])
     items = [
@@ -2421,6 +2609,21 @@ if __name__ == "__main__":
     test_short_display_merge_keeps_original_when_no_safe_boundary_exists()
     test_final_pre_id_preserves_word_order_coverage_and_timestamps()
     test_boundary_snapshot_payload_records_pre_id_repairs()
+    test_subject_finite_verb_we_tend_is_hard_boundary()
+    test_subject_finite_verb_they_needed_is_hard_boundary()
+    test_subject_finite_verb_ai_is_upending_is_hard_boundary()
+    test_modifier_head_actually_good_is_hard_boundary()
+    test_relative_clause_subject_verb_you_can_is_hard_boundary()
+    test_final_pre_id_repairs_yeah_so_todd_subject_fragment()
+    test_final_pre_id_repairs_pronoun_only_fragment()
+    test_final_pre_id_attaches_standalone_so_to_next_sentence()
+    test_final_pre_id_keeps_independent_short_answers()
+    test_weak_fragment_repair_does_not_cross_speaker_change()
+    test_weak_fragment_repair_does_not_cross_long_pause()
+    test_internal_transition_attaches_to_following_sentence()
+    test_final_pre_id_repair_does_not_create_new_hard_issue()
+    test_unresolved_weak_fragment_is_recorded_when_no_safe_repair()
+    test_final_pre_id_second_phase_preserves_word_order_and_timestamps()
     test_boundary_snapshots_record_stage_changes_before_subtitle_ids()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
