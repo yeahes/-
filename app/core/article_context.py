@@ -505,16 +505,16 @@ def _correct_word_timestamp_segments(
     if not terms:
         return list(segments), [], []
 
-    corrected: List[ASRDataSeg] = []
     candidates: List[Dict[str, Any]] = []
     logs: List[Dict[str, Any]] = []
-    index = 0
     max_window = min(8, max((term["max_tokens"] + 1 for term in terms), default=1))
 
-    while index < len(segments):
-        best = None
+    candidate_seq = 0
+    for index in range(len(segments)):
         for window_size in range(1, min(max_window, len(segments) - index) + 1):
             window = segments[index : index + window_size]
+            if _window_crosses_sentence_boundary(window):
+                continue
             original_text = _join_asr_words(seg.text for seg in window)
             if not re.search(r"[A-Za-z0-9]", original_text or ""):
                 continue
@@ -526,38 +526,154 @@ def _correct_word_timestamp_segments(
                 candidate["end_time"] = window[-1].end_time
                 candidate["segment_index"] = index + 1
                 candidate["window_size"] = window_size
+                candidate["start_word_index"] = index
+                candidate["end_word_index"] = index + window_size
+                candidate["original_words"] = [str(seg.text or "") for seg in window]
+                candidate["canonical_name"] = term["source"].get("canonical_name", term["canonical"])
+                candidate["category"] = term["source"].get("category", "")
+                candidate["source_key"] = term["source"].get("source_key", "")
+                candidate["evidence"] = term["source"].get("evidence", {})
+                candidate["candidate_id"] = f"article-correction-{candidate_seq:06d}"
+                candidate_seq += 1
                 candidate["context_match"] = False
                 candidate["asr_confidence_low"] = None
                 if _is_self_replacement_candidate(candidate):
                     continue
                 if candidate["final_confidence"] >= review_confidence:
                     candidates.append(candidate)
-                if best is None or candidate["final_confidence"] > best["final_confidence"]:
-                    best = candidate
 
-        if best and _should_apply_candidate(best, high_confidence):
+    selected, overlap_rejections = _resolve_overlapping_article_correction_candidates(
+        [candidate for candidate in candidates if _should_apply_candidate(candidate, high_confidence)]
+    )
+    selected_ids = {candidate["candidate_id"] for candidate in selected}
+    overlap_rejected_ids = {
+        item["rejected_candidate_id"]: item for item in overlap_rejections
+    }
+
+    for candidate in candidates:
+        if candidate.get("candidate_id") in selected_ids:
+            candidate["applied"] = True
+            candidate["result"] = "replaced"
+            candidate["reason"] = "high_confidence_article_glossary_match"
+            logs.append(candidate)
+        elif candidate.get("candidate_id") in overlap_rejected_ids:
+            candidate["applied"] = False
+            candidate["result"] = "rejected"
+            candidate["reason"] = "overlapping_candidate"
+            candidate["overlap_resolution"] = overlap_rejected_ids[candidate["candidate_id"]]
+            logs.append(candidate)
+        else:
+            candidate["applied"] = False
+            candidate["result"] = "review_only"
+            candidate["reason"] = _not_applied_reason(candidate, high_confidence)
+            if candidate["final_confidence"] >= review_confidence:
+                logs.append(candidate)
+
+    corrected = _apply_article_correction_candidates(segments, selected)
+    corrected, dedupe_logs = _dedupe_adjacent_canonical_entity_overlap(corrected)
+    logs.extend(dedupe_logs)
+    for candidate in selected:
+        logger.info(
+            "Article ASR correction applied: %s -> %s confidence=%.4f",
+            candidate["original_text"],
+            candidate["corrected_text"],
+            candidate["final_confidence"],
+        )
+    return corrected, candidates, logs
+
+
+def _resolve_overlapping_article_correction_candidates(
+    candidates: Sequence[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    selected: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    for candidate in sorted(candidates, key=_candidate_resolution_sort_key):
+        conflicts = [
+            kept
+            for kept in selected
+            if _candidate_ranges_overlap(candidate, kept)
+        ]
+        if not conflicts:
+            selected.append(candidate)
+            continue
+        kept = sorted(conflicts, key=_candidate_resolution_sort_key)[0]
+        rejected.append(
+            {
+                "reason": "overlapping_candidate",
+                "kept_candidate_id": kept.get("candidate_id", ""),
+                "rejected_candidate_id": candidate.get("candidate_id", ""),
+                "kept_word_range": [
+                    int(kept.get("start_word_index", 0)),
+                    int(kept.get("end_word_index", 0)),
+                ],
+                "rejected_word_range": [
+                    int(candidate.get("start_word_index", 0)),
+                    int(candidate.get("end_word_index", 0)),
+                ],
+                "kept_score": float(kept.get("final_confidence") or 0.0),
+                "rejected_score": float(candidate.get("final_confidence") or 0.0),
+                "canonical_name": candidate.get("canonical_name", candidate.get("candidate_text", "")),
+                "original_words": candidate.get("original_words", []),
+            }
+        )
+    return sorted(selected, key=lambda item: int(item.get("start_word_index", 0))), rejected
+
+
+def _candidate_resolution_sort_key(candidate: Dict[str, Any]) -> tuple:
+    return (
+        0 if _candidate_has_article_evidence(candidate) else 1,
+        0 if str(candidate.get("reason", "") or "") != "review_only" else 1,
+        -float(candidate.get("final_confidence") or 0.0),
+        -int(candidate.get("end_word_index", 0)) + int(candidate.get("start_word_index", 0)),
+        str(candidate.get("candidate_id", "")),
+        int(candidate.get("start_word_index", 0)),
+    )
+
+
+def _candidate_has_article_evidence(candidate: Dict[str, Any]) -> bool:
+    evidence = candidate.get("evidence")
+    if isinstance(evidence, dict) and evidence.get("evidence_sentence"):
+        return True
+    source = candidate.get("source_glossary")
+    if isinstance(source, dict) and source.get("evidence"):
+        return True
+    return bool(candidate.get("article_entity_present"))
+
+
+def _candidate_ranges_overlap(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    left_start = int(left.get("start_word_index", 0))
+    left_end = int(left.get("end_word_index", 0))
+    right_start = int(right.get("start_word_index", 0))
+    right_end = int(right.get("end_word_index", 0))
+    return left_start < right_end and right_start < left_end
+
+
+def _apply_article_correction_candidates(
+    segments: Sequence[ASRDataSeg],
+    selected: Sequence[Dict[str, Any]],
+) -> List[ASRDataSeg]:
+    selected_by_start = {
+        int(candidate.get("start_word_index", 0)): candidate for candidate in selected
+    }
+    corrected: List[ASRDataSeg] = []
+    index = 0
+    while index < len(segments):
+        candidate = selected_by_start.get(index)
+        if candidate:
+            end_index = int(candidate.get("end_word_index", index + 1))
             replacement = ASRDataSeg(
-                best["corrected_text"],
+                candidate["corrected_text"],
                 segments[index].start_time,
-                segments[index + best["window_size"] - 1].end_time,
+                segments[end_index - 1].end_time,
                 segments[index].translated_text,
             )
             if hasattr(segments[index], "subtitle_id"):
                 replacement.subtitle_id = getattr(segments[index], "subtitle_id")
-            best["applied"] = True
-            best["result"] = "replaced"
-            best["reason"] = "high_confidence_article_glossary_match"
+            replacement._article_word_range = (index, end_index)
+            replacement._article_correction = candidate
             corrected.append(replacement)
-            logs.append(best)
-            logger.info(
-                "Article ASR correction applied: %s -> %s confidence=%.4f",
-                best["original_text"],
-                best["corrected_text"],
-                best["final_confidence"],
-            )
-            index += best["window_size"]
+            index = end_index
             continue
-
         original = segments[index]
         copied = ASRDataSeg(
             original.text,
@@ -567,17 +683,147 @@ def _correct_word_timestamp_segments(
         )
         if hasattr(original, "subtitle_id"):
             copied.subtitle_id = getattr(original, "subtitle_id")
+        copied._article_word_range = (index, index + 1)
         corrected.append(copied)
         index += 1
+    _validate_corrected_word_ledger(corrected)
+    return corrected
 
-    for candidate in candidates:
-        if "applied" not in candidate:
-            candidate["applied"] = False
-            candidate["result"] = "review_only"
-            candidate["reason"] = _not_applied_reason(candidate, high_confidence)
-            if candidate["final_confidence"] >= review_confidence:
-                logs.append(candidate)
-    return corrected, candidates, logs
+
+def _validate_corrected_word_ledger(segments: Sequence[ASRDataSeg]) -> None:
+    previous_end: Optional[int] = None
+    for segment in segments:
+        word_range = getattr(segment, "_article_word_range", None)
+        if not word_range:
+            continue
+        start, end = int(word_range[0]), int(word_range[1])
+        if start >= end:
+            raise ValueError("invalid_article_correction_word_range")
+        if previous_end is not None and start < previous_end:
+            raise ValueError("overlapping_article_correction_word_ledger")
+        previous_end = end
+
+
+def _dedupe_adjacent_canonical_entity_overlap(
+    segments: Sequence[ASRDataSeg],
+) -> tuple[List[ASRDataSeg], List[Dict[str, Any]]]:
+    result = list(segments)
+    logs: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(result):
+        current = result[index]
+        correction = getattr(current, "_article_correction", None)
+        if not correction:
+            index += 1
+            continue
+        canonical = str(correction.get("canonical_name") or correction.get("candidate_text") or "")
+        canonical_tokens = _word_tokens(canonical)
+        current_tokens = _word_tokens(current.text)
+        if not canonical_tokens or _normalized_entity_tokens(current_tokens) != _normalized_entity_tokens(
+            canonical_tokens
+        ):
+            index += 1
+            continue
+
+        if index > 0 and _tokens_are_canonical_edge_overlap(
+            _word_tokens(result[index - 1].text), canonical_tokens, prefix=True
+        ):
+            previous = result[index - 1]
+            logs.append(
+                _canonical_overlap_log(previous, current, canonical, correction, "prefix")
+            )
+            current.start_time = previous.start_time
+            current._article_word_range = (
+                getattr(previous, "_article_word_range", (0, 0))[0],
+                getattr(current, "_article_word_range", (0, 0))[1],
+            )
+            del result[index - 1]
+            index -= 1
+            continue
+
+        if index + 1 < len(result) and _tokens_are_canonical_edge_overlap(
+            _word_tokens(result[index + 1].text), canonical_tokens, prefix=False
+        ):
+            following = result[index + 1]
+            logs.append(
+                _canonical_overlap_log(current, following, canonical, correction, "suffix")
+            )
+            current.end_time = following.end_time
+            current.text = _carry_trailing_punctuation(current.text, following.text)
+            current._article_word_range = (
+                getattr(current, "_article_word_range", (0, 0))[0],
+                getattr(following, "_article_word_range", (0, 0))[1],
+            )
+            del result[index + 1]
+            continue
+        index += 1
+    _validate_corrected_word_ledger(result)
+    return result, logs
+
+
+def _tokens_are_canonical_edge_overlap(
+    tokens: Sequence[str],
+    canonical_tokens: Sequence[str],
+    *,
+    prefix: bool,
+) -> bool:
+    if not tokens or len(tokens) >= len(canonical_tokens):
+        return False
+    left = _normalized_entity_tokens(tokens)
+    right = _normalized_entity_tokens(canonical_tokens)
+    if prefix:
+        return left == right[: len(left)]
+    return left == right[-len(left) :]
+
+
+def _canonical_overlap_log(
+    left: ASRDataSeg,
+    right: ASRDataSeg,
+    canonical: str,
+    correction: Dict[str, Any],
+    overlap_side: str,
+) -> Dict[str, Any]:
+    left_range = getattr(left, "_article_word_range", (0, 0))
+    right_range = getattr(right, "_article_word_range", (0, 0))
+    after_text = (
+        right.text
+        if overlap_side == "prefix"
+        else _carry_trailing_punctuation(left.text, right.text)
+    )
+    return {
+        "original_text": _join_asr_words([left.text, right.text]),
+        "before_words": [left.text, right.text],
+        "corrected_text": after_text,
+        "after_text": after_text,
+        "word_range": [int(left_range[0]), int(right_range[1])],
+        "start_word_index": int(left_range[0]),
+        "end_word_index": int(right_range[1]),
+        "start_time": left.start_time,
+        "end_time": right.end_time,
+        "canonical_name": canonical,
+        "candidate_id": f"{correction.get('candidate_id', '')}:canonical-overlap-{overlap_side}",
+        "source_candidate_id": correction.get("candidate_id", ""),
+        "confidence": correction.get("confidence", correction.get("final_confidence", 0.0)),
+        "final_confidence": correction.get("final_confidence", correction.get("confidence", 0.0)),
+        "category": correction.get("category", ""),
+        "source_key": correction.get("source_key", ""),
+        "source_glossary": correction.get("source_glossary", {}),
+        "applied": True,
+        "result": "replaced",
+        "reason": "adjacent_canonical_entity_overlap_deduped",
+        "overlap_side": overlap_side,
+    }
+
+
+def _normalized_entity_tokens(tokens: Sequence[str]) -> List[str]:
+    return [_normalize_entity_gate_token(token) for token in tokens if _normalize_entity_gate_token(token)]
+
+
+def _carry_trailing_punctuation(text: str, source_text: str) -> str:
+    match = re.search(r"([,.;:!?]+)$", str(source_text or "").strip())
+    if not match or re.search(r"[,.;:!?]+$", str(text or "").strip()):
+        return text
+    return f"{text}{match.group(1)}"
 
 
 def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -661,6 +907,12 @@ def _has_boundary_filler(window: Sequence[ASRDataSeg]) -> bool:
     last_tokens = _word_tokens(window[-1].text)
     last = (last_tokens[-1] if last_tokens else "").casefold()
     return first in boundary_words or last in boundary_words
+
+
+def _window_crosses_sentence_boundary(window: Sequence[ASRDataSeg]) -> bool:
+    if len(window) <= 1:
+        return False
+    return any(re.search(r"[.!?]+$", str(seg.text or "").strip()) for seg in window[:-1])
 
 
 def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dict[str, Any]:

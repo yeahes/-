@@ -11,6 +11,8 @@ from app.core.article_context import (
     build_article_glossary,
     enrich_article_context_with_evidence,
     save_article_artifacts,
+    _dedupe_adjacent_canonical_entity_overlap,
+    _resolve_overlapping_article_correction_candidates,
 )
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 
@@ -45,6 +47,7 @@ def _context():
                 "category": "organisation",
             },
             {"canonical_name": "Evergrande", "aliases": [], "category": "company"},
+            {"canonical_name": "New York Fed", "aliases": [], "category": "organisation"},
         ],
         "numbers_and_dates": [
             {"canonical_name": "33 founder", "aliases": ["33 year old"], "category": "numbers_and_dates"}
@@ -256,6 +259,194 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
 
         self.assertTrue(context[ARTICLE_ANALYSIS_META_KEY]["cache_used"])
         self.assertEqual(context["summary"], "Cached summary")
+
+    def test_overlapping_candidates_keep_highest_score_for_same_range(self):
+        low = _candidate(
+            "candidate-1",
+            10,
+            12,
+            "New York",
+            "New York Times",
+            0.86,
+        )
+        high = _candidate(
+            "candidate-2",
+            10,
+            12,
+            "New York",
+            "New York Fed",
+            0.93,
+        )
+
+        selected, rejected = _resolve_overlapping_article_correction_candidates([low, high])
+
+        self.assertEqual([item["candidate_id"] for item in selected], ["candidate-2"])
+        self.assertEqual(rejected[0]["reason"], "overlapping_candidate")
+        self.assertEqual(rejected[0]["kept_candidate_id"], "candidate-2")
+        self.assertEqual(rejected[0]["rejected_candidate_id"], "candidate-1")
+
+    def test_contained_and_crossing_candidates_apply_only_one_deterministically(self):
+        long = _candidate("candidate-1", 20, 23, "Sam Bankman", "Sam Bankman-Fried", 0.91)
+        short = _candidate("candidate-2", 21, 23, "Bankman Fried", "Sam Bankman-Fried", 0.9)
+        crossing = _candidate("candidate-3", 22, 24, "Fried said", "Sam Bankman-Fried", 0.89)
+
+        selected, rejected = _resolve_overlapping_article_correction_candidates(
+            [crossing, short, long]
+        )
+        selected_again, rejected_again = _resolve_overlapping_article_correction_candidates(
+            [long, crossing, short]
+        )
+
+        self.assertEqual([item["candidate_id"] for item in selected], ["candidate-1"])
+        self.assertEqual([item["candidate_id"] for item in selected_again], ["candidate-1"])
+        self.assertEqual({item["rejected_candidate_id"] for item in rejected}, {"candidate-2", "candidate-3"})
+        self.assertEqual(
+            {item["rejected_candidate_id"] for item in rejected_again},
+            {"candidate-2", "candidate-3"},
+        )
+
+    def test_adjacent_canonical_prefix_and_suffix_overlap_is_deduped(self):
+        segments = [
+            _word("First", 0, 100, 0, 1),
+            _word("Bill", 100, 200, 1, 2),
+            _corrected_word("Bill Gurley,", 200, 300, 2, 3, "Bill Gurley"),
+            _word("survey", 400, 500, 3, 4),
+            _word("by", 500, 600, 4, 5),
+            _word("the", 600, 700, 5, 6),
+            _corrected_word("New York Fed", 700, 900, 6, 8, "New York Fed"),
+            _word("Fed", 900, 1000, 8, 9),
+            _word("found", 1000, 1100, 9, 10),
+        ]
+
+        corrected, logs = _dedupe_adjacent_canonical_entity_overlap(segments)
+        texts = [seg.text for seg in corrected]
+
+        self.assertIn("Bill Gurley,", texts)
+        self.assertIn("New York Fed", texts)
+        self.assertNotIn("Bill", texts)
+        self.assertNotIn("Fed", texts)
+        self.assertEqual(
+            " ".join(texts),
+            "First Bill Gurley, survey by the New York Fed found",
+        )
+        bill = next(seg for seg in corrected if seg.text == "Bill Gurley,")
+        fed = next(seg for seg in corrected if seg.text == "New York Fed")
+        self.assertEqual((bill.start_time, bill.end_time), (100, 300))
+        self.assertEqual((fed.start_time, fed.end_time), (700, 1000))
+        self.assertEqual(len(logs), 2)
+
+    def test_adjacent_canonical_overlap_examples_without_hardcoded_names(self):
+        context = {
+            "people": [
+                {"canonical_name": "Sam Bankman-Fried", "aliases": [], "category": "person"},
+                {"canonical_name": "Maya Angelou", "aliases": [], "category": "person"},
+                {"canonical_name": "Benjamin Todd", "aliases": [], "category": "person"},
+            ]
+        }
+        raw = [
+            ASRDataSeg("Sam", 0, 100),
+            ASRDataSeg("Bankman-Fried.", 100, 200),
+            ASRDataSeg("Maya", 300, 400),
+            ASRDataSeg("Angelou", 400, 500),
+            ASRDataSeg("Benjamin", 600, 700),
+            ASRDataSeg("Todd.", 700, 800),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        texts = [seg.text for seg in corrected.segments]
+        self.assertEqual(texts, ["Sam Bankman-Fried.", "Maya Angelou", "Benjamin Todd."])
+        self.assertTrue(
+            any(item["reason"] == "adjacent_canonical_entity_overlap_deduped" for item in logs)
+        )
+
+    def test_dedupe_does_not_delete_general_adjacent_repeated_words(self):
+        raw = [
+            ASRDataSeg("very", 0, 100),
+            ASRDataSeg("very", 100, 200),
+            ASRDataSeg("important", 200, 300),
+            ASRDataSeg("had", 400, 500),
+            ASRDataSeg("had", 500, 600),
+            ASRDataSeg("no", 600, 700),
+            ASRDataSeg("effect", 700, 800),
+        ]
+
+        corrected = self._correct(raw)
+
+        self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+        self.assertEqual(
+            [(seg.start_time, seg.end_time) for seg in corrected.segments],
+            [(seg.start_time, seg.end_time) for seg in raw],
+        )
+
+    def test_rejected_file_records_overlapping_candidate(self):
+        context = {"organisations": [{"canonical_name": "New York Fed", "aliases": [], "category": "organisation"}]}
+        raw = [
+            ASRDataSeg("by", 0, 100),
+            ASRDataSeg("the", 100, 200),
+            ASRDataSeg("New", 200, 300),
+            ASRDataSeg("York", 300, 400),
+            ASRDataSeg("Fed", 400, 500),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            apply_article_asr_corrections(ASRData(raw), context, output_dir=Path(tmp))
+            rejected = json.loads((Path(tmp) / "correction_rejected.json").read_text(encoding="utf-8"))
+            log = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        overlap_items = [item for item in rejected if item.get("reason") == "overlapping_candidate"]
+        self.assertTrue(overlap_items)
+        applied = [item for item in log if item.get("applied") and item.get("reason") == "high_confidence_article_glossary_match"]
+        self.assertTrue(all("start_word_index" in item and "end_word_index" in item for item in applied))
+
+
+def _candidate(
+    candidate_id,
+    start,
+    end,
+    original,
+    canonical,
+    score,
+):
+    return {
+        "candidate_id": candidate_id,
+        "start_word_index": start,
+        "end_word_index": end,
+        "original_words": original.split(),
+        "original_text": original,
+        "corrected_text": canonical,
+        "candidate_text": canonical,
+        "canonical_name": canonical,
+        "final_confidence": score,
+        "confidence": score,
+        "article_entity_present": True,
+        "evidence": {"evidence_sentence": canonical},
+    }
+
+
+def _word(text, start_time, end_time, start_index, end_index):
+    segment = ASRDataSeg(text, start_time, end_time)
+    segment._article_word_range = (start_index, end_index)
+    return segment
+
+
+def _corrected_word(text, start_time, end_time, start_index, end_index, canonical):
+    segment = _word(text, start_time, end_time, start_index, end_index)
+    segment._article_correction = {
+        "candidate_id": f"test-{start_index}-{end_index}",
+        "canonical_name": canonical,
+        "candidate_text": canonical,
+        "confidence": 0.99,
+        "final_confidence": 0.99,
+        "category": "person",
+        "source_key": "people",
+        "source_glossary": {"canonical_name": canonical, "category": "person"},
+    }
+    return segment
 
 
 if __name__ == "__main__":
