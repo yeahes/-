@@ -303,6 +303,7 @@ class ScreenSubtitleEditor:
         self._active_source_word_spans: Dict[int, tuple[int, int]] = {}
         self._active_source_segments_by_id: Dict[int, ASRDataSeg] = {}
         self._syntax_protected_cuts: set[tuple[int, int]] = set()
+        self._syntax_hard_cut_issues: Dict[tuple[int, int], List[str]] = {}
         self._syntax_nlp = None
         self._last_semantic_full_translations: Dict[int, str] = {}
         self._last_semantic_group_audit_contexts: Dict[str, Dict] = {}
@@ -316,6 +317,7 @@ class ScreenSubtitleEditor:
         self._boundary_snapshots: List[Dict] = []
         self._boundary_snapshot_changes: List[Dict] = []
         self._boundary_snapshot_item_sets: Dict[str, List[ScreenSubtitleItem]] = {}
+        self._pre_id_boundary_repairs: List[Dict] = []
         self.last_validation_summary: Optional[Dict] = None
 
     def _compose_prompt(self, base_prompt: str) -> str:
@@ -423,6 +425,7 @@ class ScreenSubtitleEditor:
         self._boundary_snapshots = []
         self._boundary_snapshot_changes = []
         self._boundary_snapshot_item_sets = {}
+        self._pre_id_boundary_repairs = []
         self._active_source_segments_by_id = {
             index: seg for index, seg in enumerate(asr_data.segments, 1)
         }
@@ -455,6 +458,7 @@ class ScreenSubtitleEditor:
             changed_by="_rebalance_edge_discourse_markers",
             previous_items=self._boundary_snapshot_items("_merge_short_display_segments"),
         )
+        items = self._validate_and_repair_final_pre_id_boundaries(items)
         items = self._assign_global_subtitle_ids(items)
         semantic_groups = self._semantic_translation_groups(items)
         items = self._translate_semantic_subtitle_groups(items)
@@ -697,7 +701,27 @@ class ScreenSubtitleEditor:
                 if balanced:
                     merged.extend(balanced)
                 else:
-                    merged.append(self._merge_subtitle_items(current, ordered[index + 1]))
+                    direct_merge = self._safe_direct_short_item_merge(
+                        current,
+                        ordered[index + 1],
+                    )
+                    if direct_merge:
+                        merged.append(direct_merge)
+                    else:
+                        self._record_pre_id_boundary_repair(
+                            repaired_by="_merge_short_display_segments",
+                            old_items=[current, ordered[index + 1]],
+                            new_items=None,
+                            evaluation=self._evaluate_item_boundary(
+                                current,
+                                ordered[index + 1],
+                            ),
+                            repair_reason="short_display_merge_no_legal_boundary",
+                            candidates_considered=[],
+                        )
+                        merged.append(current)
+                        index += 1
+                        continue
                 merge_count += 1
                 index += 2
                 continue
@@ -705,6 +729,22 @@ class ScreenSubtitleEditor:
             index += 1
         if merge_count:
             logger.info("Screen subtitle short display items merged before ids: %s", merge_count)
+        return merged
+
+    def _safe_direct_short_item_merge(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+    ) -> Optional[ScreenSubtitleItem]:
+        if left.subtitle_id or right.subtitle_id:
+            return None
+        if not self._items_are_continuous(left, right):
+            return None
+        if self._items_cross_speaker(left, right):
+            return None
+        merged = self._merge_subtitle_items(left, right)
+        if self._word_count(merged.original) > self.max_english_words:
+            return None
         return merged
 
     def _should_merge_short_display_item(
@@ -1024,7 +1064,7 @@ class ScreenSubtitleEditor:
                 return []
             return [merged]
 
-        best: Optional[tuple[int, int, int, List[ScreenSubtitleItem]]] = None
+        best: Optional[tuple[float, float, int, int, int, List[ScreenSubtitleItem]]] = None
         span_start = left.word_start
         span_end = right.word_end
         original_boundary = left.word_end
@@ -1037,25 +1077,41 @@ class ScreenSubtitleEditor:
             right_words = self._word_count(right_item.original)
             if left_words > self.max_english_words or right_words > self.max_english_words:
                 continue
+            if (
+                require_left_not_marker_only
+                and (
+                    self._standalone_discourse_marker(left_item.original)
+                    or self._is_short_backchannel_text(left_item.original)
+                )
+            ):
+                continue
             if self._is_ordinary_one_word_fragment(left_item.original) or self._is_ordinary_one_word_fragment(right_item.original):
                 continue
             if self._splits_discourse_marker(left_item.original, right_item.original):
-                continue
-            if require_left_not_marker_only and self._standalone_discourse_marker(left_item.original):
                 continue
             if (
                 require_left_not_trailing_marker
                 and self._has_weak_edge_discourse_marker(left_item.original)
             ):
                 continue
+            boundary = self._evaluate_stable_cut_boundary(
+                cut,
+                cut + 1,
+                source_start=span_start,
+                source_end=span_end,
+            )
+            if not boundary["legal"]:
+                continue
             score = (
+                len(boundary["soft_issues"]),
+                float(boundary["boundary_score"]),
                 abs(left_words - right_words),
                 abs(cut - original_boundary),
                 left_words + right_words,
             )
-            if best is None or score < best[:3]:
-                best = (score[0], score[1], score[2], [left_item, right_item])
-        return best[3] if best else []
+            if best is None or score < best[:5]:
+                best = (score[0], score[1], score[2], score[3], score[4], [left_item, right_item])
+        return best[5] if best else []
 
     def _item_from_word_span(
         self, word_start: int, word_end: int
@@ -1226,6 +1282,222 @@ class ScreenSubtitleEditor:
             issue["end"] = self._format_ms(timing[1])
         self._discourse_marker_orphans.append(issue)
 
+    def _validate_and_repair_final_pre_id_boundaries(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> List[ScreenSubtitleItem]:
+        result = self._sort_items_by_word_span(list(items))
+        index = 0
+        while index < len(result) - 1:
+            left = result[index]
+            right = result[index + 1]
+            evaluation = self._evaluate_item_boundary(left, right)
+            if evaluation["legal"]:
+                index += 1
+                continue
+            repaired = self._repair_pre_id_boundary_window(result, index, evaluation)
+            if repaired is None:
+                self._record_pre_id_boundary_repair(
+                    repaired_by="_validate_and_repair_final_pre_id_boundaries",
+                    old_items=[left, right],
+                    new_items=None,
+                    evaluation=evaluation,
+                    repair_reason="unresolved_hard_issue",
+                    candidates_considered=[],
+                )
+                index += 1
+                continue
+            start, end, new_items, candidates = repaired
+            old_items = result[start:end]
+            self._record_pre_id_boundary_repair(
+                repaired_by="_validate_and_repair_final_pre_id_boundaries",
+                old_items=old_items,
+                new_items=new_items,
+                evaluation=evaluation,
+                repair_reason="hard_syntax_boundary_repaired",
+                candidates_considered=candidates,
+            )
+            result[start:end] = new_items
+            index = max(0, start - 1)
+        return result
+
+    def _evaluate_item_boundary(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+    ) -> Dict:
+        if left.word_end is None or right.word_start is None:
+            return {
+                "legal": True,
+                "hard_issues": [],
+                "soft_issues": [],
+                "boundary_score": 0.0,
+                "protected_syntax": False,
+                "pause_ms": None,
+            }
+        return self._evaluate_stable_cut_boundary(
+            left.word_end,
+            right.word_start,
+            source_start=min(left.word_start, right.word_start),
+            source_end=max(left.word_end, right.word_end),
+        )
+
+    def _repair_pre_id_boundary_window(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        boundary_index: int,
+        evaluation: Dict,
+    ) -> Optional[tuple[int, int, List[ScreenSubtitleItem], List[Dict]]]:
+        attempts = [
+            (boundary_index, boundary_index + 2),
+            (max(0, boundary_index - 1), boundary_index + 2),
+            (boundary_index, min(len(items), boundary_index + 3)),
+        ]
+        seen = set()
+        for start, end in attempts:
+            if end - start < 2 or (start, end) in seen:
+                continue
+            seen.add((start, end))
+            window = list(items[start:end])
+            if not self._can_repair_pre_id_window(window):
+                continue
+            repaired, candidates = self._repartition_pre_id_window(window)
+            if not repaired:
+                continue
+            return start, end, repaired, candidates
+        return None
+
+    def _can_repair_pre_id_window(self, items: Sequence[ScreenSubtitleItem]) -> bool:
+        if len(items) < 2 or len(items) > 3:
+            return False
+        if any(item.subtitle_id for item in items):
+            return False
+        for left, right in zip(items, items[1:]):
+            if not self._items_are_continuous(left, right):
+                return False
+            if self._items_cross_speaker(left, right):
+                return False
+            pause = self._boundary_pause_ms(left, right)
+            if pause is not None and pause >= 450:
+                return False
+        return True
+
+    def _repartition_pre_id_window(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> tuple[List[ScreenSubtitleItem], List[Dict]]:
+        span_start = items[0].word_start
+        span_end = items[-1].word_end
+        if span_start is None or span_end is None or span_end <= span_start:
+            return [], []
+        target_count = len(items)
+        candidates_considered: List[Dict] = []
+        best: Optional[tuple[float, float, float, List[ScreenSubtitleItem]]] = None
+        if target_count == 2:
+            candidate_cuts = [(cut,) for cut in range(span_start, span_end)]
+        else:
+            candidate_cuts = [
+                (left_cut, right_cut)
+                for left_cut in range(span_start, span_end - 1)
+                for right_cut in range(left_cut + 1, span_end)
+            ]
+        for cuts in candidate_cuts:
+            ranges = self._ranges_from_cuts(span_start, span_end, cuts)
+            parts = [self._item_from_word_span(start, end) for start, end in ranges]
+            if any(part is None for part in parts):
+                continue
+            candidate_items = [part for part in parts if part is not None]
+            word_counts = [self._word_count(item.original) for item in candidate_items]
+            hard_issues: List[str] = []
+            boundary_scores: List[float] = []
+            for left, right in zip(candidate_items, candidate_items[1:]):
+                evaluation = self._evaluate_item_boundary(left, right)
+                hard_issues.extend(evaluation["hard_issues"])
+                boundary_scores.append(float(evaluation["boundary_score"]))
+            candidate_record = {
+                "cuts": [list(cut) for cut in zip(cuts, [cut + 1 for cut in cuts])],
+                "word_counts": word_counts,
+                "hard_issues": list(dict.fromkeys(hard_issues)),
+                "boundary_scores": boundary_scores,
+            }
+            candidates_considered.append(candidate_record)
+            if hard_issues:
+                continue
+            if any(count > self.max_english_words for count in word_counts):
+                continue
+            if any(self._is_ordinary_one_word_fragment(item.original) for item in candidate_items):
+                continue
+            if any(
+                self._splits_discourse_marker(left.original, right.original)
+                for left, right in zip(candidate_items, candidate_items[1:])
+            ):
+                continue
+            balance = max(word_counts) - min(word_counts)
+            score = (
+                balance,
+                sum(boundary_scores),
+                sum(abs(count - self.max_english_words * 0.72) for count in word_counts),
+            )
+            if best is None or score < best[:3]:
+                best = (score[0], score[1], score[2], candidate_items)
+        return (best[3], candidates_considered) if best else ([], candidates_considered)
+
+    @staticmethod
+    def _ranges_from_cuts(
+        span_start: int,
+        span_end: int,
+        cuts: Sequence[int],
+    ) -> List[tuple[int, int]]:
+        ranges: List[tuple[int, int]] = []
+        cursor = span_start
+        for cut in cuts:
+            ranges.append((cursor, cut))
+            cursor = cut + 1
+        ranges.append((cursor, span_end))
+        return ranges
+
+    def _record_pre_id_boundary_repair(
+        self,
+        *,
+        repaired_by: str,
+        old_items: Sequence[ScreenSubtitleItem],
+        new_items: Optional[Sequence[ScreenSubtitleItem]],
+        evaluation: Dict,
+        repair_reason: str,
+        candidates_considered: Sequence[Dict],
+    ) -> None:
+        old_cut = (
+            [old_items[0].word_end, old_items[1].word_start]
+            if len(old_items) >= 2
+            else None
+        )
+        new_cuts = [
+            [left.word_end, right.word_start]
+            for left, right in zip(new_items or [], (new_items or [])[1:])
+        ]
+        self._pre_id_boundary_repairs.append(
+            {
+                "repaired_by": repaired_by,
+                "old_cut_word_index": old_cut,
+                "new_cut_word_index": new_cuts,
+                "repair_reason": repair_reason,
+                "hard_issues": list(evaluation.get("hard_issues") or []),
+                "soft_issues": list(evaluation.get("soft_issues") or []),
+                "pause_ms": evaluation.get("pause_ms"),
+                "boundary_score": evaluation.get("boundary_score"),
+                "old_items": [
+                    self._item_to_span_dict(index, item)
+                    for index, item in enumerate(old_items, 1)
+                ],
+                "new_items": [
+                    self._item_to_span_dict(index, item)
+                    for index, item in enumerate(new_items or [], 1)
+                ],
+                "candidate_boundaries_considered": list(candidates_considered),
+                "unresolved_hard_issue": new_items is None,
+            }
+        )
+
     def _assign_global_subtitle_ids(
         self, items: Sequence[ScreenSubtitleItem]
     ) -> List[ScreenSubtitleItem]:
@@ -1383,8 +1655,13 @@ class ScreenSubtitleEditor:
                 continue
             left_text = self._normalize_text(left.original)
             right_text = self._normalize_text(right.original)
-            pause = self._boundary_pause_ms(left, right)
             cut = (int(left.word_end), int(right.word_start))
+            evaluation = self._evaluate_stable_cut_boundary(
+                cut[0],
+                cut[1],
+                source_start=min(left.word_start, right.word_start),
+                source_end=max(left.word_end, right.word_end),
+            )
             bad_reasons = self._boundary_bad_cut_reasons(left_text, right_text)
             syntax_reasons = self._syntax_boundary_reasons(left_text, right_text)
             confidence_score = min(0.95, 0.65 + 0.12 * len(syntax_reasons)) if syntax_reasons else 0.0
@@ -1403,11 +1680,14 @@ class ScreenSubtitleEditor:
                     ],
                     "left_word_count": self._word_count(left_text),
                     "right_word_count": self._word_count(right_text),
-                    "pause_ms": pause,
-                    "boundary_score": self._boundary_score_for_items(left, right),
+                    "pause_ms": evaluation["pause_ms"],
+                    "boundary_score": evaluation["boundary_score"],
+                    "legal": evaluation["legal"],
+                    "hard_issues": evaluation["hard_issues"],
+                    "soft_issues": evaluation["soft_issues"],
                     "bad_cut_reasons": bad_reasons,
                     "syntax_boundary_reasons": syntax_reasons,
-                    "protected_syntax_cut": cut in self._syntax_protected_cuts,
+                    "protected_syntax_cut": evaluation["protected_syntax"],
                     "high_confidence_syntax_bad_cut": bool(syntax_reasons and confidence_score >= 0.75),
                     "syntax_confidence_score": round(confidence_score, 2),
                 }
@@ -1859,7 +2139,15 @@ class ScreenSubtitleEditor:
                     + self._segment_boundary_score(abs_left, abs_right, start, end)
                 )
                 if left > 0:
-                    score += self._cut_boundary_score(abs_left - 1, abs_left, source_start=start, source_end=end)
+                    boundary = self._evaluate_stable_cut_boundary(
+                        abs_left - 1,
+                        abs_left,
+                        source_start=start,
+                        source_end=end,
+                    )
+                    if not boundary["legal"]:
+                        score += 100_000
+                    score += float(boundary["boundary_score"])
                 if score < dp[right][0]:
                     dp[right] = (score, left)
 
@@ -1995,6 +2283,191 @@ class ScreenSubtitleEditor:
             score += 24
         return score
 
+    def _evaluate_stable_cut_boundary(
+        self,
+        left: int,
+        right: int,
+        *,
+        source_start: Optional[int] = None,
+        source_end: Optional[int] = None,
+    ) -> Dict:
+        entries = self._active_word_entries
+        if not entries or left < 0 or right >= len(entries) or right != left + 1:
+            return {
+                "legal": True,
+                "hard_issues": [],
+                "soft_issues": [],
+                "boundary_score": 0.0,
+                "protected_syntax": False,
+                "pause_ms": None,
+            }
+        if source_start is None:
+            source_start = max(0, left - 8)
+        if source_end is None:
+            source_end = min(len(entries) - 1, right + 8)
+        pause_ms = self._word_pause_ms(left, right)
+        boundary_score = self._cut_boundary_score(
+            left,
+            right,
+            source_start=source_start,
+            source_end=source_end,
+        )
+        hard_issues = self._hard_stable_cut_issues(left, right, pause_ms)
+        soft_issues = self._soft_stable_cut_issues(left, right)
+        protected_syntax = (left, right) in self._syntax_protected_cuts
+        if protected_syntax and "protected_syntax_cut" not in hard_issues:
+            hard_issues.append("protected_syntax_cut")
+        return {
+            "legal": not hard_issues,
+            "hard_issues": hard_issues,
+            "soft_issues": soft_issues,
+            "boundary_score": round(float(boundary_score), 3),
+            "protected_syntax": protected_syntax,
+            "pause_ms": pause_ms,
+        }
+
+    def _hard_stable_cut_issues(
+        self,
+        left: int,
+        right: int,
+        pause_ms: Optional[int],
+    ) -> List[str]:
+        if pause_ms is not None and pause_ms >= 450:
+            return []
+        entries = self._active_word_entries
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        issues: List[str] = []
+        prepositions = {
+            "into", "of", "for", "with", "without", "in", "on", "at", "by",
+            "from", "to", "about", "around", "through", "over", "under",
+            "between", "among", "against", "within", "across",
+        }
+        if left_token in prepositions and right_token:
+            issues.append("preposition_object_split")
+        context_start = max(0, left - 4)
+        context_end = min(len(entries) - 1, right + 4)
+        context = [
+            self._clean_boundary_token(entries[index].get("token") or "")
+            for index in range(context_start, context_end + 1)
+        ]
+        boundary_offset = left - context_start
+        if self._boundary_inside_determiner_numeric_noun(context, boundary_offset):
+            issues.append("determiner_numeric_noun_split")
+        if self._boundary_inside_quantifier_phrase(context, boundary_offset):
+            issues.append("quantifier_phrase_split")
+        if self._is_adverb_adjective_boundary(left_token, right_token, pause_ms):
+            issues.append("adverb_adjective_split")
+        for issue in (getattr(self, "_syntax_hard_cut_issues", {}) or {}).get((left, right), []):
+            if issue not in issues:
+                issues.append(issue)
+        return issues
+
+    def _soft_stable_cut_issues(self, left: int, right: int) -> List[str]:
+        entries = self._active_word_entries
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        issues: List[str] = []
+        if left_token in {"you", "than"} and right_token:
+            issues.append("comparative_clause_split")
+        return issues
+
+    def _word_pause_ms(self, left: int, right: int) -> Optional[int]:
+        entries = self._active_word_entries
+        if not entries or left < 0 or right >= len(entries):
+            return None
+        return int(entries[right]["start_time"] - entries[left]["end_time"])
+
+    @classmethod
+    def _contains_determiner_numeric_noun(cls, tokens: Sequence[str]) -> bool:
+        for index in range(0, len(tokens) - 2):
+            if (
+                tokens[index] in cls._stable_determiners()
+                and cls._token_is_numeric_like(tokens[index + 1])
+                and cls._token_looks_noun_like(tokens[index + 2])
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _boundary_inside_determiner_numeric_noun(
+        cls,
+        tokens: Sequence[str],
+        boundary_offset: int,
+    ) -> bool:
+        for index in range(0, len(tokens) - 2):
+            if not (
+                tokens[index] in cls._stable_determiners()
+                and cls._token_is_numeric_like(tokens[index + 1])
+                and cls._token_looks_noun_like(tokens[index + 2])
+            ):
+                continue
+            if index <= boundary_offset < index + 2:
+                return True
+        return False
+
+    @classmethod
+    def _contains_quantifier_phrase(cls, tokens: Sequence[str]) -> bool:
+        return any(cls._boundary_inside_quantifier_phrase(tokens, offset) for offset in range(len(tokens) - 1))
+
+    @classmethod
+    def _boundary_inside_quantifier_phrase(
+        cls,
+        tokens: Sequence[str],
+        boundary_offset: int,
+    ) -> bool:
+        phrase_lengths = (4, 3, 2)
+        for length in phrase_lengths:
+            for index in range(0, len(tokens) - length + 1):
+                phrase = tuple(tokens[index:index + length])
+                if not cls._is_quantifier_phrase_tokens(phrase):
+                    continue
+                if index <= boundary_offset < index + length - 1:
+                    return True
+        return False
+
+    @staticmethod
+    def _stable_determiners() -> set:
+        return {"the", "a", "an", "this", "that", "these", "those", "our", "their", "its"}
+
+    @staticmethod
+    def _token_is_numeric_like(token: str) -> bool:
+        return bool(re.match(r"^(?:\d+(?:[.,]\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|hundred|thousand|million|billion)$", token or ""))
+
+    @staticmethod
+    def _token_looks_noun_like(token: str) -> bool:
+        if not token:
+            return False
+        return not token.endswith("ly") and token not in {"and", "or", "but", "to", "of", "in", "on", "for", "with"}
+
+    @staticmethod
+    def _is_quantifier_phrase_tokens(tokens: Sequence[str]) -> bool:
+        phrase = tuple(tokens)
+        if len(phrase) == 3 and phrase[:2] in {("a", "few"), ("one", "few")}:
+            return True
+        if len(phrase) == 4 and phrase[:3] == ("a", "couple", "of"):
+            return True
+        if len(phrase) == 2 and phrase in {("few", "thousand"), ("few", "hundred"), ("several", "thousand")}:
+            return True
+        return False
+
+    @staticmethod
+    def _is_adverb_adjective_boundary(
+        left_token: str,
+        right_token: str,
+        pause_ms: Optional[int],
+    ) -> bool:
+        if pause_ms is not None and pause_ms > 180:
+            return False
+        if not left_token.endswith("ly") or not right_token:
+            return False
+        adjective_endings = (
+            "able", "ible", "al", "ed", "ent", "ant", "ful", "ic",
+            "ive", "less", "ous", "ary", "ory",
+        )
+        common_adjectives = {"valuable", "concerned", "important", "likely", "clear", "specific"}
+        return right_token in common_adjectives or right_token.endswith(adjective_endings)
+
     @staticmethod
     def _looks_like_adjective_before_noun(left: str, right: str) -> bool:
         if not left or not right:
@@ -2091,7 +2564,14 @@ class ScreenSubtitleEditor:
                 best = right
                 best_score = float("inf")
                 for candidate in range(max(cursor, cursor + 5), right + 1):
-                    score = self._segment_boundary_score(cursor, candidate, cursor, end)
+                    boundary = self._evaluate_stable_cut_boundary(
+                        candidate,
+                        candidate + 1,
+                        source_start=cursor,
+                        source_end=end,
+                    )
+                    score = 100_000 if not boundary["legal"] else 0.0
+                    score += float(boundary["boundary_score"])
                     score += abs((candidate - cursor) - target)
                     if score < best_score:
                         best_score = score
@@ -2120,6 +2600,7 @@ class ScreenSubtitleEditor:
 
     def _prepare_syntax_cut_hints(self) -> None:
         self._syntax_protected_cuts = set()
+        self._syntax_hard_cut_issues = {}
         if not self._active_word_entries:
             return
         nlp = self._load_syntax_nlp()
@@ -2155,6 +2636,7 @@ class ScreenSubtitleEditor:
                     if token.i in doc_to_word
                 ]
                 self._protect_internal_boundaries(word_indices, protected)
+                self._protect_hard_noun_phrase_boundaries(chunk, doc_to_word)
 
             protected_deps = {
                 "amod", "compound", "det", "nummod", "poss", "quantmod",
@@ -2169,10 +2651,77 @@ class ScreenSubtitleEditor:
                 right = max(doc_to_word[token.i], doc_to_word[token.head.i])
                 if right - left <= 3:
                     self._protect_internal_boundaries(range(left, right + 1), protected)
+            self._protect_short_verb_complement_boundaries(doc, doc_to_word)
 
         self._syntax_protected_cuts = protected
         if protected:
             logger.info("Screen subtitle syntax cut hints: protected=%s", len(protected))
+
+    def _protect_hard_noun_phrase_boundaries(self, chunk, doc_to_word: Dict[int, int]) -> None:
+        word_indices = sorted(
+            doc_to_word[token.i]
+            for token in chunk
+            if token.i in doc_to_word
+        )
+        if len(word_indices) < 2 or len(word_indices) > 5:
+            return
+        tokens = [
+            self._clean_boundary_token(self._active_word_entries[index].get("token") or "")
+            for index in word_indices
+        ]
+        if self._contains_determiner_numeric_noun(tokens):
+            self._record_syntax_hard_issue_for_indices(
+                word_indices,
+                "determiner_numeric_noun_split",
+            )
+        if self._contains_quantifier_phrase(tokens):
+            self._record_syntax_hard_issue_for_indices(
+                word_indices,
+                "quantifier_phrase_split",
+            )
+
+    def _protect_short_verb_complement_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        complement_deps = {"obj", "dobj", "attr", "oprd", "prt"}
+        for token in doc:
+            if token.dep_ not in complement_deps:
+                continue
+            head = token.head
+            if head.i not in doc_to_word or token.i not in doc_to_word:
+                continue
+            if getattr(head, "pos_", "") not in {"VERB", "AUX"}:
+                continue
+            head_index = doc_to_word[head.i]
+            subtree_indices = sorted(
+                doc_to_word[item.i]
+                for item in token.subtree
+                if item.i in doc_to_word
+            )
+            if not subtree_indices:
+                continue
+            if min(subtree_indices) != head_index + 1:
+                continue
+            if len(subtree_indices) > 3:
+                continue
+            timing_gap = self._word_pause_ms(head_index, min(subtree_indices))
+            if timing_gap is not None and timing_gap > 180:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [head_index] + subtree_indices,
+                "short_verb_complement_split",
+            )
+
+    def _record_syntax_hard_issue_for_indices(
+        self,
+        word_indices: Sequence[int],
+        issue: str,
+    ) -> None:
+        ordered = sorted(set(int(index) for index in word_indices))
+        for left, right in zip(ordered, ordered[1:]):
+            if right != left + 1:
+                continue
+            self._syntax_hard_cut_issues.setdefault((left, right), [])
+            if issue not in self._syntax_hard_cut_issues[(left, right)]:
+                self._syntax_hard_cut_issues[(left, right)].append(issue)
 
     def _load_syntax_nlp(self):
         if self._syntax_nlp is not None:
@@ -2878,6 +3427,7 @@ class ScreenSubtitleEditor:
             "max_english_words": self.max_english_words,
             "stages": self._boundary_snapshots,
             "changes": self._boundary_snapshot_changes,
+            "pre_id_boundary_repairs": getattr(self, "_pre_id_boundary_repairs", []),
             "focus_phrases": self._boundary_focus_phrase_report(focus_phrases),
         }
 

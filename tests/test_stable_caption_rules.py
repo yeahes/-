@@ -28,6 +28,7 @@ def _editor(max_words=14):
     editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
     editor.max_english_words = max_words
     editor._syntax_protected_cuts = set()
+    editor._syntax_hard_cut_issues = {}
     editor._syntax_nlp = None
     editor._active_word_entries = []
     editor.coverage_report_path = None
@@ -41,6 +42,7 @@ def _editor(max_words=14):
     editor._boundary_snapshots = []
     editor._boundary_snapshot_changes = []
     editor._boundary_snapshot_item_sets = {}
+    editor._pre_id_boundary_repairs = []
     return editor
 
 
@@ -1261,6 +1263,226 @@ def test_discourse_marker_pre_id_pipeline_keeps_421_item_structure_errors_zero()
     assert editor._translation_structure_errors == []
 
 
+def test_balanced_split_does_not_create_preposition_object_boundary():
+    words = [
+        "Yeah,",
+        "so",
+        "Todd",
+        "is",
+        "the",
+        "founder",
+        "of",
+        "a",
+        "non-profit",
+        "and",
+        "the",
+        "author",
+        "of",
+        "a",
+        "book,",
+        "which",
+        "changed",
+        "the",
+        "field.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 18, 2)]
+
+    merged = editor._merge_short_display_segments(items)
+
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in merged)
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in merged)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+    for left, right in zip(merged, merged[1:]):
+        assert "preposition_object_split" not in editor._evaluate_item_boundary(left, right)["hard_issues"]
+
+
+def test_determiner_numeric_noun_boundary_is_hard_illegal():
+    editor = _marker_editor(["those", "200", "economists", "signed", "the", "letter."])
+
+    first = editor._evaluate_stable_cut_boundary(0, 1)
+    second = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "determiner_numeric_noun_split" in first["hard_issues"]
+    assert "determiner_numeric_noun_split" in second["hard_issues"]
+    assert not first["legal"]
+    assert not second["legal"]
+
+
+def test_quantifier_phrase_boundary_is_hard_illegal():
+    editor = _marker_editor(["a", "few", "thousand", "people", "arrived."])
+
+    first = editor._evaluate_stable_cut_boundary(0, 1)
+    second = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "quantifier_phrase_split" in first["hard_issues"]
+    assert "quantifier_phrase_split" in second["hard_issues"]
+    assert not first["legal"]
+    assert not second["legal"]
+
+
+def test_adverb_adjective_boundary_is_hard_illegal_without_pause():
+    editor = _marker_editor(["a", "highly", "valuable", "company", "emerged."])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "adverb_adjective_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_short_verb_complement_boundary_is_hard_when_syntax_marks_it():
+    editor = _marker_editor(["they", "made", "it", "quickly."])
+    editor._record_syntax_hard_issue_for_indices([1, 2], "short_verb_complement_split")
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "short_verb_complement_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_short_verb_possessive_complement_boundary_is_hard_when_syntax_marks_it():
+    editor = _marker_editor(["he", "navigated", "his", "way", "carefully."])
+    editor._record_syntax_hard_issue_for_indices([1, 2, 3], "short_verb_complement_split")
+
+    first = editor._evaluate_stable_cut_boundary(1, 2)
+    second = editor._evaluate_stable_cut_boundary(2, 3)
+
+    assert "short_verb_complement_split" in first["hard_issues"]
+    assert "short_verb_complement_split" in second["hard_issues"]
+    assert not first["legal"]
+    assert not second["legal"]
+
+
+def test_long_object_still_allows_legal_boundary():
+    editor = _marker_editor(
+        [
+            "they",
+            "built",
+            "a",
+            "large",
+            "durable",
+            "export",
+            "business",
+            "with",
+            "capital",
+            "partners",
+            "over",
+            "many",
+            "years.",
+        ]
+    )
+
+    evaluation = editor._evaluate_stable_cut_boundary(6, 7)
+
+    assert evaluation["hard_issues"] == []
+    assert evaluation["legal"]
+
+
+def test_final_pre_id_repair_removes_known_hard_boundary():
+    words = [
+        "Todd",
+        "is",
+        "the",
+        "founder",
+        "of",
+        "a",
+        "non-profit",
+        "and",
+        "the",
+        "author",
+        "of",
+        "a",
+        "book",
+        "about",
+        "risk.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 4, 1), _word_item(editor, 5, 14, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in repaired)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in repaired)
+    assert all(
+        editor._evaluate_item_boundary(left, right)["legal"]
+        for left, right in zip(repaired, repaired[1:])
+    )
+    assert editor._pre_id_boundary_repairs
+
+
+def test_final_pre_id_repair_does_not_cross_speaker_change():
+    words = ["founder", "of", "a", "non-profit", "built", "trust."]
+    editor = _marker_editor(words, max_words=14)
+    editor._active_source_segments_by_id[1].speaker = "A"
+    editor._active_source_segments_by_id[2].speaker = "B"
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 5, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [item.original for item in items]
+    assert editor._pre_id_boundary_repairs[-1]["unresolved_hard_issue"] is True
+
+
+def test_short_display_merge_keeps_original_when_no_safe_boundary_exists():
+    words = ["Yeah,", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"]
+    editor = _marker_editor(words, max_words=4)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 7, 2)]
+
+    with patch.object(editor, "_should_merge_short_display_item", return_value=True), patch.object(
+        editor, "_balanced_two_item_split", return_value=[]
+    ), patch.object(editor, "_safe_direct_short_item_merge", return_value=None):
+        merged = editor._merge_short_display_segments(items)
+
+    assert [item.original for item in merged] == [item.original for item in items]
+    assert editor._pre_id_boundary_repairs[-1]["repair_reason"] == "short_display_merge_no_legal_boundary"
+
+
+def test_final_pre_id_preserves_word_order_coverage_and_timestamps():
+    words = [
+        "This",
+        "became",
+        "a",
+        "highly",
+        "valuable",
+        "business",
+        "for",
+        "the",
+        "market",
+        "leaders.",
+    ]
+    editor = _marker_editor(words, max_words=8)
+    before_times = [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ]
+    items = [_word_item(editor, 0, 3, 1), _word_item(editor, 4, 9, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in repaired)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+    assert [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ] == before_times
+    assert repaired[0].subtitle_id is None
+
+
+def test_boundary_snapshot_payload_records_pre_id_repairs():
+    editor = _marker_editor(["founder", "of", "a", "non-profit"])
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 3, 2)]
+
+    editor._validate_and_repair_final_pre_id_boundaries(items)
+    payload = editor._boundary_snapshot_payload()
+
+    assert "pre_id_boundary_repairs" in payload
+    assert payload["pre_id_boundary_repairs"]
+
+
 def test_boundary_snapshots_record_stage_changes_before_subtitle_ids():
     editor = _marker_editor(["I", "mean,", "this", "market", "changed."])
     items = [
@@ -2187,6 +2409,18 @@ if __name__ == "__main__":
     test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed()
     test_discourse_marker_pre_id_pipeline_keeps_400_plus_english_chinese_id_sets_equal()
     test_discourse_marker_pre_id_pipeline_keeps_421_item_structure_errors_zero()
+    test_balanced_split_does_not_create_preposition_object_boundary()
+    test_determiner_numeric_noun_boundary_is_hard_illegal()
+    test_quantifier_phrase_boundary_is_hard_illegal()
+    test_adverb_adjective_boundary_is_hard_illegal_without_pause()
+    test_short_verb_complement_boundary_is_hard_when_syntax_marks_it()
+    test_short_verb_possessive_complement_boundary_is_hard_when_syntax_marks_it()
+    test_long_object_still_allows_legal_boundary()
+    test_final_pre_id_repair_removes_known_hard_boundary()
+    test_final_pre_id_repair_does_not_cross_speaker_change()
+    test_short_display_merge_keeps_original_when_no_safe_boundary_exists()
+    test_final_pre_id_preserves_word_order_coverage_and_timestamps()
+    test_boundary_snapshot_payload_records_pre_id_repairs()
     test_boundary_snapshots_record_stage_changes_before_subtitle_ids()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
