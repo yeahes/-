@@ -968,10 +968,156 @@ def test_overlong_discourse_marker_attachment_reselects_cutpoint():
 
     assert len(merged) == 2
     assert merged[0].original.startswith("Well, I mean, alpha")
-    assert ScreenSubtitleEditor._word_count(merged[0].original) == 14
-    assert merged[1].original == "lima mike november oscar papa"
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in merged)
+    assert all(ScreenSubtitleEditor._word_count(item.original) > 1 for item in merged)
+    assert merged[1].original == "golf hotel india juliet kilo lima mike november oscar papa"
     assert all(editor._standalone_discourse_marker(item.original) == "" for item in merged)
     assert editor._discourse_marker_orphans == []
+
+
+def test_discourse_marker_rebalance_does_not_leave_one_word_fragment():
+    content_words = [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+        "juliet",
+        "kilo",
+        "lima",
+        "mike",
+    ]
+    words = ["I", "mean,"] + content_words
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 14, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 2
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in merged)
+    assert all(ScreenSubtitleEditor._word_count(item.original) > 1 for item in merged)
+    assert merged[0].original.startswith("I mean, alpha")
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in merged)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+
+
+def test_trailing_discourse_marker_is_not_left_at_subtitle_end():
+    words = [
+        "which",
+        "is",
+        "now,",
+        "you",
+        "know,",
+        "a",
+        "standard",
+        "industry",
+        "playbook.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 4, 1), _word_item(editor, 5, 8, 2)]
+
+    rebalanced = editor._rebalance_edge_discourse_markers(items)
+
+    assert len(rebalanced) == 2
+    assert rebalanced[0].original == "which is now,"
+    assert rebalanced[1].original == "you know, a standard industry playbook."
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in rebalanced)
+    assert not editor._has_trailing_discourse_marker(rebalanced[0].original)
+
+
+def test_discourse_marker_phrase_is_not_split_during_rebalance():
+    words = [
+        "which",
+        "is",
+        "now,",
+        "you",
+        "know,",
+        "a",
+        "standard",
+        "industry",
+        "playbook.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 4, 1), _word_item(editor, 5, 8, 2)]
+
+    rebalanced = editor._rebalance_edge_discourse_markers(items)
+
+    joined = " ".join(item.original for item in rebalanced)
+    assert "you know" in joined.lower()
+    assert all(not item.original.lower().endswith(" you") for item in rebalanced)
+    assert all(not item.original.lower().startswith("know") for item in rebalanced)
+
+
+def test_trailing_discourse_marker_rebalances_two_long_items_without_word_loss():
+    words = [
+        "this",
+        "became",
+        "the",
+        "standard",
+        "industry",
+        "playbook,",
+        "you",
+        "know,",
+        "because",
+        "founders",
+        "needed",
+        "capital",
+        "talent",
+        "distribution",
+        "and",
+        "regulatory",
+        "cover.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [_word_item(editor, 0, 7, 1), _word_item(editor, 8, 16, 2)]
+
+    rebalanced = editor._rebalance_edge_discourse_markers(items)
+
+    assert len(rebalanced) == 2
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in rebalanced)
+    assert all(ScreenSubtitleEditor._word_count(item.original) > 1 for item in rebalanced)
+    assert not editor._has_trailing_discourse_marker(rebalanced[0].original)
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in rebalanced)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+
+
+def test_short_yeah_rebalances_with_long_following_sentence():
+    words = [
+        "Yeah,",
+        "they",
+        "were",
+        "clawing",
+        "their",
+        "way",
+        "out",
+        "of",
+        "extreme",
+        "poverty",
+        "during",
+        "China's",
+        "early",
+        "economic",
+        "transition.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    editor._active_word_entries[0]["end_time"] = 140
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 14, 2)]
+
+    merged = editor._merge_short_display_segments(items)
+
+    assert len(merged) == 2
+    assert merged[0].original.startswith("Yeah, they were clawing")
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in merged)
+    assert all(ScreenSubtitleEditor._word_count(item.original) > 1 for item in merged)
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in merged)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
 
 
 def test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed():
@@ -1012,6 +1158,31 @@ def test_discourse_marker_pre_id_pipeline_keeps_400_plus_english_chinese_id_sets
     assert len(assigned) == 405
     assert english_ids == [f"S{index:04d}" for index in range(1, 406)]
     assert english_ids == chinese_ids
+    assert editor._translation_structure_errors == []
+
+
+def test_discourse_marker_pre_id_pipeline_keeps_421_item_structure_errors_zero():
+    words = [f"word{index}" for index in range(1, 422)]
+    editor = _marker_editor(words, max_words=14)
+    items = [
+        ScreenSubtitleItem(
+            source_ids=[index],
+            original=f"English {index}.",
+            translated=f"zh-S{index:04d}",
+            word_start=index - 1,
+            word_end=index - 1,
+        )
+        for index in range(1, 422)
+    ]
+
+    items = editor._merge_standalone_discourse_markers(items)
+    items = editor._merge_short_display_segments(items)
+    items = editor._rebalance_edge_discourse_markers(items)
+    assigned = editor._assign_global_subtitle_ids(items)
+    editor._validate_final_item_translation_ids(assigned)
+
+    assert len(assigned) == 421
+    assert len({item.subtitle_id for item in assigned}) == 421
     assert editor._translation_structure_errors == []
 
 
@@ -1544,8 +1715,14 @@ if __name__ == "__main__":
     test_standalone_discourse_marker_does_not_cross_long_pause()
     test_standalone_discourse_marker_does_not_cross_speaker_change()
     test_overlong_discourse_marker_attachment_reselects_cutpoint()
+    test_discourse_marker_rebalance_does_not_leave_one_word_fragment()
+    test_trailing_discourse_marker_is_not_left_at_subtitle_end()
+    test_discourse_marker_phrase_is_not_split_during_rebalance()
+    test_trailing_discourse_marker_rebalances_two_long_items_without_word_loss()
+    test_short_yeah_rebalances_with_long_following_sentence()
     test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed()
     test_discourse_marker_pre_id_pipeline_keeps_400_plus_english_chinese_id_sets_equal()
+    test_discourse_marker_pre_id_pipeline_keeps_421_item_structure_errors_zero()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()

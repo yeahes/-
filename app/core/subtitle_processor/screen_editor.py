@@ -401,6 +401,7 @@ class ScreenSubtitleEditor:
         items = self._stable_cut_items(asr_data.segments)
         items = self._merge_standalone_discourse_markers(items)
         items = self._merge_short_display_segments(items)
+        items = self._rebalance_edge_discourse_markers(items)
         items = self._assign_global_subtitle_ids(items)
         semantic_groups = self._semantic_translation_groups(items)
         items = self._translate_semantic_subtitle_groups(items)
@@ -635,7 +636,15 @@ class ScreenSubtitleEditor:
                 short_ms,
                 merge_gap_ms,
             ):
-                merged.append(self._merge_subtitle_items(current, ordered[index + 1]))
+                balanced = self._balanced_two_item_split(
+                    current,
+                    ordered[index + 1],
+                    require_left_not_marker_only=True,
+                )
+                if balanced:
+                    merged.extend(balanced)
+                else:
+                    merged.append(self._merge_subtitle_items(current, ordered[index + 1]))
                 merge_count += 1
                 index += 2
                 continue
@@ -672,9 +681,18 @@ class ScreenSubtitleEditor:
         combined_words = self._word_tokens(
             self._join_subtitle_text(current.original, next_item.original)
         )
+        is_short_backchannel = self._is_short_backchannel_text(current.original)
         if len(combined_words) > max(1, self.max_english_words):
-            return False
-        return self._is_short_backchannel_text(current.original)
+            return bool(
+                is_short_backchannel
+                and
+                self._balanced_two_item_split(
+                    current,
+                    next_item,
+                    require_left_not_marker_only=True,
+                )
+            )
+        return is_short_backchannel
 
     def _should_merge_short_display_segment(
         self,
@@ -858,35 +876,14 @@ class ScreenSubtitleEditor:
             return combined, None
         if next_item.word_start is None or next_item.word_end is None:
             return None, None
-        allowed = max(1, self.max_english_words - self._word_count(marker.original))
-        split_end = min(next_item.word_end, next_item.word_start + allowed - 1)
-        if split_end < next_item.word_start:
-            return None, None
-        head_text = self._text_from_word_span(next_item.word_start, split_end)
-        if not self._normalize_text(head_text) or not re.search(r"[A-Za-z]", head_text):
-            return None, None
-        head = ScreenSubtitleItem(
-            source_ids=self._source_ids_for_word_range(next_item.word_start, split_end),
-            original=head_text,
-            translated="",
-            word_start=next_item.word_start,
-            word_end=split_end,
+        balanced = self._balanced_two_item_split(
+            marker,
+            next_item,
+            require_left_not_marker_only=True,
         )
-        merged = self._merge_subtitle_items(marker, head)
-        if self._word_count(merged.original) > self.max_english_words:
+        if not balanced:
             return None, None
-        remainder = None
-        if split_end < next_item.word_end:
-            remainder_text = self._text_from_word_span(split_end + 1, next_item.word_end)
-            if remainder_text:
-                remainder = ScreenSubtitleItem(
-                    source_ids=self._source_ids_for_word_range(split_end + 1, next_item.word_end),
-                    original=remainder_text,
-                    translated="",
-                    word_start=split_end + 1,
-                    word_end=next_item.word_end,
-                )
-        return merged, remainder
+        return balanced[0], balanced[1] if len(balanced) > 1 else None
 
     def _attach_marker_to_previous_item(
         self,
@@ -898,33 +895,122 @@ class ScreenSubtitleEditor:
             return combined, None
         if previous_item.word_start is None or previous_item.word_end is None:
             return None, None
-        allowed = max(1, self.max_english_words - self._word_count(marker.original))
-        split_start = max(previous_item.word_start, previous_item.word_end - allowed + 1)
-        tail_text = self._text_from_word_span(split_start, previous_item.word_end)
-        if not self._normalize_text(tail_text) or not re.search(r"[A-Za-z]", tail_text):
+        balanced = self._balanced_two_item_split(previous_item, marker)
+        if not balanced:
             return None, None
-        prefix = None
-        if split_start > previous_item.word_start:
-            prefix_text = self._text_from_word_span(previous_item.word_start, split_start - 1)
-            if prefix_text:
-                prefix = ScreenSubtitleItem(
-                    source_ids=self._source_ids_for_word_range(previous_item.word_start, split_start - 1),
-                    original=prefix_text,
-                    translated="",
-                    word_start=previous_item.word_start,
-                    word_end=split_start - 1,
-                )
-        tail = ScreenSubtitleItem(
-            source_ids=self._source_ids_for_word_range(split_start, previous_item.word_end),
-            original=tail_text,
+        if len(balanced) == 1:
+            return balanced[0], None
+        return balanced[1], balanced[0]
+
+    def _rebalance_edge_discourse_markers(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        merge_gap_ms: int = DISPLAY_SHORT_MERGE_GAP_MS,
+    ) -> List[ScreenSubtitleItem]:
+        ordered = self._sort_items_by_word_span(list(items))
+        if len(ordered) < 2:
+            return ordered
+        result: List[ScreenSubtitleItem] = []
+        index = 0
+        changed = 0
+        while index < len(ordered):
+            current = ordered[index]
+            if index + 1 < len(ordered):
+                next_item = ordered[index + 1]
+                if (
+                    self._has_trailing_discourse_marker(current.original)
+                    and self._can_attach_discourse_marker(current, next_item, merge_gap_ms)
+                    and not self._is_independent_discourse_answer(current, result[-1] if result else None, next_item)
+                ):
+                    balanced = self._balanced_two_item_split(
+                        current,
+                        next_item,
+                        require_left_not_trailing_marker=True,
+                        force_two_items=True,
+                    )
+                    if balanced:
+                        result.extend(balanced)
+                        index += 2
+                        changed += 1
+                        continue
+            result.append(current)
+            index += 1
+        if changed:
+            logger.info("Edge discourse markers rebalanced before ids: %s", changed)
+        return result
+
+    def _balanced_two_item_split(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+        *,
+        require_left_not_marker_only: bool = False,
+        require_left_not_trailing_marker: bool = False,
+        force_two_items: bool = False,
+    ) -> List[ScreenSubtitleItem]:
+        if left.word_start is None or left.word_end is None:
+            return []
+        if right.word_start is None or right.word_end is None:
+            return []
+        if right.word_start != left.word_end + 1:
+            return []
+        if left.subtitle_id or right.subtitle_id:
+            return []
+        merged = self._merge_subtitle_items(left, right)
+        total_words = self._word_count(merged.original)
+        if total_words <= self.max_english_words and not force_two_items:
+            if require_left_not_marker_only and self._standalone_discourse_marker(merged.original):
+                return []
+            if require_left_not_trailing_marker and self._has_trailing_discourse_marker(merged.original):
+                return []
+            return [merged]
+
+        best: Optional[tuple[int, int, int, List[ScreenSubtitleItem]]] = None
+        span_start = left.word_start
+        span_end = right.word_end
+        original_boundary = left.word_end
+        for cut in range(span_start, span_end):
+            left_item = self._item_from_word_span(span_start, cut)
+            right_item = self._item_from_word_span(cut + 1, span_end)
+            if not left_item or not right_item:
+                continue
+            left_words = self._word_count(left_item.original)
+            right_words = self._word_count(right_item.original)
+            if left_words > self.max_english_words or right_words > self.max_english_words:
+                continue
+            if self._is_ordinary_one_word_fragment(left_item.original) or self._is_ordinary_one_word_fragment(right_item.original):
+                continue
+            if self._splits_discourse_marker(left_item.original, right_item.original):
+                continue
+            if require_left_not_marker_only and self._standalone_discourse_marker(left_item.original):
+                continue
+            if (
+                require_left_not_trailing_marker
+                and self._has_weak_edge_discourse_marker(left_item.original)
+            ):
+                continue
+            score = (
+                abs(left_words - right_words),
+                abs(cut - original_boundary),
+                left_words + right_words,
+            )
+            if best is None or score < best[:3]:
+                best = (score[0], score[1], score[2], [left_item, right_item])
+        return best[3] if best else []
+
+    def _item_from_word_span(
+        self, word_start: int, word_end: int
+    ) -> Optional[ScreenSubtitleItem]:
+        text = self._text_from_word_span(word_start, word_end)
+        if not text or not re.search(r"[A-Za-z]", text):
+            return None
+        return ScreenSubtitleItem(
+            source_ids=self._source_ids_for_word_range(word_start, word_end),
+            original=text,
             translated="",
-            word_start=split_start,
-            word_end=previous_item.word_end,
+            word_start=word_start,
+            word_end=word_end,
         )
-        merged = self._merge_subtitle_items(tail, marker)
-        if self._word_count(merged.original) > self.max_english_words:
-            return None, None
-        return merged, prefix
 
     def _merge_subtitle_items(
         self, left: ScreenSubtitleItem, right: ScreenSubtitleItem
@@ -939,12 +1025,80 @@ class ScreenSubtitleEditor:
             word_end = left.word_end
         return ScreenSubtitleItem(
             source_ids=sorted(set(left.source_ids + right.source_ids)),
-            original=self._join_subtitle_text(left.original, right.original),
+            original=(
+                self._text_from_word_span(word_start, word_end)
+                if word_start is not None and word_end is not None
+                else self._join_subtitle_text(left.original, right.original)
+            ),
             translated=self._join_subtitle_text(left.translated, right.translated),
             word_start=word_start,
             word_end=word_end,
             subtitle_id=left.subtitle_id or right.subtitle_id,
         )
+
+    @classmethod
+    def _has_trailing_discourse_marker(cls, text: str) -> bool:
+        normalized = cls._normalize_text(text)
+        return bool(
+            re.search(
+                r"(?:^|[,;:\s])(?:i\s+mean|you\s+know|i\s+guess|well\s+i\s+mean)[,;:.!?]*$",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _has_weak_edge_discourse_marker(cls, text: str) -> bool:
+        if cls._has_trailing_discourse_marker(text):
+            return True
+        tokens = [word.lower() for word in cls._word_tokens(text)]
+        marker_phrases = (
+            ("i", "mean"),
+            ("you", "know"),
+            ("i", "guess"),
+            ("well", "i", "mean"),
+        )
+        for phrase in marker_phrases:
+            phrase_len = len(phrase)
+            for start in range(0, len(tokens) - phrase_len + 1):
+                if tuple(tokens[start:start + phrase_len]) != phrase:
+                    continue
+                words_after_marker = len(tokens) - (start + phrase_len)
+                if words_after_marker <= 1:
+                    return True
+        return False
+
+    @classmethod
+    def _is_ordinary_one_word_fragment(cls, text: str) -> bool:
+        if cls._word_count(text) != 1:
+            return False
+        if cls._standalone_discourse_marker(text) or cls._is_short_backchannel_text(text):
+            return False
+        return True
+
+    @classmethod
+    def _splits_discourse_marker(cls, left_text: str, right_text: str) -> bool:
+        left_words = cls._word_tokens(left_text)
+        right_words = cls._word_tokens(right_text)
+        if not left_words or not right_words:
+            return False
+        combined = [word.lower() for word in left_words[-3:] + right_words[:3]]
+        boundary = min(3, len(left_words))
+        marker_phrases = (
+            ("i", "mean"),
+            ("you", "know"),
+            ("i", "guess"),
+            ("well", "i", "mean"),
+        )
+        for phrase in marker_phrases:
+            phrase_len = len(phrase)
+            for start in range(0, len(combined) - phrase_len + 1):
+                end = start + phrase_len
+                if tuple(combined[start:end]) != phrase:
+                    continue
+                if start < boundary < end:
+                    return True
+        return False
 
     @staticmethod
     def _items_are_continuous(left: ScreenSubtitleItem, right: ScreenSubtitleItem) -> bool:
