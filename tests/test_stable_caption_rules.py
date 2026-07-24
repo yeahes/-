@@ -28,6 +28,7 @@ def _editor(max_words=14):
     editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
     editor.max_english_words = max_words
     editor._syntax_protected_cuts = set()
+    editor._syntax_nlp = None
     editor._active_word_entries = []
     editor.coverage_report_path = None
     editor.last_validation_summary = None
@@ -37,6 +38,9 @@ def _editor(max_words=14):
     editor._last_semantic_group_debug = []
     editor._last_semantic_group_audit_contexts = {}
     editor._last_semantic_group_id_by_subtitle_id = {}
+    editor._boundary_snapshots = []
+    editor._boundary_snapshot_changes = []
+    editor._boundary_snapshot_item_sets = {}
     return editor
 
 
@@ -1257,6 +1261,42 @@ def test_discourse_marker_pre_id_pipeline_keeps_421_item_structure_errors_zero()
     assert editor._translation_structure_errors == []
 
 
+def test_boundary_snapshots_record_stage_changes_before_subtitle_ids():
+    editor = _marker_editor(["I", "mean,", "this", "market", "changed."])
+    items = [
+        ScreenSubtitleItem([1], "I mean,", "", word_start=0, word_end=1),
+        ScreenSubtitleItem([1], "this market changed.", "", word_start=2, word_end=4),
+    ]
+    editor._capture_boundary_snapshot(
+        "_stable_cut_items",
+        items,
+        changed_by="_stable_cut_items",
+        previous_items=None,
+    )
+    merged = editor._merge_standalone_discourse_markers(items)
+    editor._capture_boundary_snapshot(
+        "_merge_standalone_discourse_markers",
+        merged,
+        changed_by="_merge_standalone_discourse_markers",
+        previous_items=editor._boundary_snapshot_items("_stable_cut_items"),
+    )
+
+    payload = editor._boundary_snapshot_payload()
+
+    assert [stage["stage"] for stage in payload["stages"]] == [
+        "_stable_cut_items",
+        "_merge_standalone_discourse_markers",
+    ]
+    assert payload["changes"][0]["change_type"] == "initial_dp_boundaries"
+    assert any(
+        change["created_or_modified_by"] == "_merge_standalone_discourse_markers"
+        for change in payload["changes"][1]["changes"]
+    )
+    assert all(item.subtitle_id is None for item in merged)
+    assert isinstance(payload["stages"][0]["boundaries"][0]["pause_ms"], int)
+    assert "boundary_score" in payload["stages"][0]["boundaries"][0]
+
+
 def test_podcast_template_prefers_stable_manifest_subtitle():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -2147,6 +2187,7 @@ if __name__ == "__main__":
     test_discourse_marker_ids_are_assigned_after_all_english_boundaries_are_fixed()
     test_discourse_marker_pre_id_pipeline_keeps_400_plus_english_chinese_id_sets_equal()
     test_discourse_marker_pre_id_pipeline_keeps_421_item_structure_errors_zero()
+    test_boundary_snapshots_record_stage_changes_before_subtitle_ids()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()

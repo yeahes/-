@@ -313,6 +313,9 @@ class ScreenSubtitleEditor:
         self._last_llm_raw_returns: List[Dict] = []
         self._last_semantic_group_debug: List[Dict] = []
         self._llm_cache_used: bool = False
+        self._boundary_snapshots: List[Dict] = []
+        self._boundary_snapshot_changes: List[Dict] = []
+        self._boundary_snapshot_item_sets: Dict[str, List[ScreenSubtitleItem]] = {}
         self.last_validation_summary: Optional[Dict] = None
 
     def _compose_prompt(self, base_prompt: str) -> str:
@@ -417,14 +420,41 @@ class ScreenSubtitleEditor:
         self._last_semantic_group_audit_contexts = {}
         self._last_semantic_group_id_by_subtitle_id = {}
         self._discourse_marker_orphans = []
+        self._boundary_snapshots = []
+        self._boundary_snapshot_changes = []
+        self._boundary_snapshot_item_sets = {}
         self._active_source_segments_by_id = {
             index: seg for index, seg in enumerate(asr_data.segments, 1)
         }
         self._llm_cache_used = False
         items = self._stable_cut_items(asr_data.segments)
+        self._capture_boundary_snapshot(
+            "_stable_cut_items",
+            items,
+            changed_by="_stable_cut_items",
+            previous_items=None,
+        )
         items = self._merge_standalone_discourse_markers(items)
+        self._capture_boundary_snapshot(
+            "_merge_standalone_discourse_markers",
+            items,
+            changed_by="_merge_standalone_discourse_markers",
+            previous_items=self._boundary_snapshot_items("_stable_cut_items"),
+        )
         items = self._merge_short_display_segments(items)
+        self._capture_boundary_snapshot(
+            "_merge_short_display_segments",
+            items,
+            changed_by="_merge_short_display_segments",
+            previous_items=self._boundary_snapshot_items("_merge_standalone_discourse_markers"),
+        )
         items = self._rebalance_edge_discourse_markers(items)
+        self._capture_boundary_snapshot(
+            "_rebalance_edge_discourse_markers",
+            items,
+            changed_by="_rebalance_edge_discourse_markers",
+            previous_items=self._boundary_snapshot_items("_merge_short_display_segments"),
+        )
         items = self._assign_global_subtitle_ids(items)
         semantic_groups = self._semantic_translation_groups(items)
         items = self._translate_semantic_subtitle_groups(items)
@@ -1215,6 +1245,217 @@ class ScreenSubtitleEditor:
                 )
             )
         return assigned
+
+    def _capture_boundary_snapshot(
+        self,
+        stage: str,
+        items: Sequence[ScreenSubtitleItem],
+        *,
+        changed_by: str,
+        previous_items: Optional[Sequence[ScreenSubtitleItem]],
+    ) -> None:
+        ordered = self._sort_items_by_word_span(list(items))
+        self._boundary_snapshot_item_sets[stage] = list(ordered)
+        boundaries = self._boundary_records_for_items(ordered, created_by=changed_by)
+        snapshot = {
+            "stage": stage,
+            "created_by": changed_by,
+            "item_count": len(ordered),
+            "boundary_count": len(boundaries),
+            "boundaries": boundaries,
+        }
+        self._boundary_snapshots.append(snapshot)
+        if previous_items is None:
+            self._boundary_snapshot_changes.append(
+                {
+                    "stage": stage,
+                    "created_by": changed_by,
+                    "change_type": "initial_dp_boundaries",
+                    "changes": [
+                        {
+                            "old_cut": None,
+                            "new_cut": record.get("cut"),
+                            "old_boundary": None,
+                            "new_boundary": record,
+                        }
+                        for record in boundaries
+                    ],
+                }
+            )
+            return
+        changes = self._boundary_changes_between_items(
+            previous_items,
+            ordered,
+            changed_by=changed_by,
+        )
+        self._boundary_snapshot_changes.append(
+            {
+                "stage": stage,
+                "created_by": changed_by,
+                "change_type": "postprocess_boundary_delta",
+                "changes": changes,
+            }
+        )
+
+    def _boundary_snapshot_items(self, stage: str) -> List[ScreenSubtitleItem]:
+        return list((getattr(self, "_boundary_snapshot_item_sets", {}) or {}).get(stage, []))
+
+    def _boundary_changes_between_items(
+        self,
+        previous_items: Sequence[ScreenSubtitleItem],
+        current_items: Sequence[ScreenSubtitleItem],
+        *,
+        changed_by: str,
+    ) -> List[Dict]:
+        previous_records = self._boundary_records_for_items(previous_items, created_by=changed_by)
+        current_records = self._boundary_records_for_items(current_items, created_by=changed_by)
+        previous_by_cut = {tuple(record["cut"]): record for record in previous_records}
+        current_by_cut = {tuple(record["cut"]): record for record in current_records}
+        removed_cuts = [cut for cut in previous_by_cut if cut not in current_by_cut]
+        added_cuts = [cut for cut in current_by_cut if cut not in previous_by_cut]
+        changes: List[Dict] = []
+        paired_added: set = set()
+        for removed_cut in removed_cuts:
+            old_record = previous_by_cut[removed_cut]
+            matching_added = [
+                cut
+                for cut in added_cuts
+                if cut not in paired_added
+                and self._boundary_ranges_overlap(old_record, current_by_cut[cut])
+            ]
+            if matching_added:
+                new_cut = min(matching_added, key=lambda cut: abs(int(cut[0]) - int(removed_cut[0])))
+                paired_added.add(new_cut)
+                changes.append(
+                    {
+                        "old_cut": removed_cut,
+                        "new_cut": new_cut,
+                        "old_boundary": old_record,
+                        "new_boundary": current_by_cut[new_cut],
+                        "created_or_modified_by": changed_by,
+                        "change_type": "modified_boundary",
+                    }
+                )
+            else:
+                changes.append(
+                    {
+                        "old_cut": removed_cut,
+                        "new_cut": None,
+                        "old_boundary": old_record,
+                        "new_boundary": None,
+                        "created_or_modified_by": changed_by,
+                        "change_type": "removed_boundary",
+                    }
+                )
+        for added_cut in added_cuts:
+            if added_cut in paired_added:
+                continue
+            changes.append(
+                {
+                    "old_cut": None,
+                    "new_cut": added_cut,
+                    "old_boundary": None,
+                    "new_boundary": current_by_cut[added_cut],
+                    "created_or_modified_by": changed_by,
+                    "change_type": "created_boundary",
+                }
+            )
+        return changes
+
+    @staticmethod
+    def _boundary_ranges_overlap(left: Dict, right: Dict) -> bool:
+        left_range = left.get("combined_word_range") or []
+        right_range = right.get("combined_word_range") or []
+        if len(left_range) != 2 or len(right_range) != 2:
+            return False
+        return int(left_range[0]) <= int(right_range[1]) and int(right_range[0]) <= int(left_range[1])
+
+    def _boundary_records_for_items(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        *,
+        created_by: str,
+    ) -> List[Dict]:
+        records: List[Dict] = []
+        ordered = self._sort_items_by_word_span(list(items))
+        for index, (left, right) in enumerate(zip(ordered, ordered[1:]), 1):
+            if left.word_end is None or right.word_start is None:
+                continue
+            left_text = self._normalize_text(left.original)
+            right_text = self._normalize_text(right.original)
+            pause = self._boundary_pause_ms(left, right)
+            cut = (int(left.word_end), int(right.word_start))
+            bad_reasons = self._boundary_bad_cut_reasons(left_text, right_text)
+            syntax_reasons = self._syntax_boundary_reasons(left_text, right_text)
+            confidence_score = min(0.95, 0.65 + 0.12 * len(syntax_reasons)) if syntax_reasons else 0.0
+            records.append(
+                {
+                    "index": index,
+                    "cut": list(cut),
+                    "created_or_modified_by": created_by,
+                    "left_english": left_text,
+                    "right_english": right_text,
+                    "left_word_range": [left.word_start, left.word_end],
+                    "right_word_range": [right.word_start, right.word_end],
+                    "combined_word_range": [
+                        min(left.word_start, right.word_start),
+                        max(left.word_end, right.word_end),
+                    ],
+                    "left_word_count": self._word_count(left_text),
+                    "right_word_count": self._word_count(right_text),
+                    "pause_ms": pause,
+                    "boundary_score": self._boundary_score_for_items(left, right),
+                    "bad_cut_reasons": bad_reasons,
+                    "syntax_boundary_reasons": syntax_reasons,
+                    "protected_syntax_cut": cut in self._syntax_protected_cuts,
+                    "high_confidence_syntax_bad_cut": bool(syntax_reasons and confidence_score >= 0.75),
+                    "syntax_confidence_score": round(confidence_score, 2),
+                }
+            )
+        return records
+
+    def _boundary_pause_ms(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+    ) -> Optional[int]:
+        left_timing = self._item_word_timing(left)
+        right_timing = self._item_word_timing(right)
+        if not left_timing or not right_timing:
+            return None
+        return int(right_timing[0] - left_timing[1])
+
+    def _boundary_score_for_items(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+    ) -> Optional[float]:
+        if left.word_start is None or left.word_end is None:
+            return None
+        if right.word_start is None or right.word_end is None:
+            return None
+        return round(
+            float(
+                self._cut_boundary_score(
+                    left.word_end,
+                    right.word_start,
+                    source_start=min(left.word_start, right.word_start),
+                    source_end=max(left.word_end, right.word_end),
+                )
+            ),
+            3,
+        )
+
+    def _boundary_bad_cut_reasons(self, left_text: str, right_text: str) -> List[str]:
+        if not left_text or not right_text:
+            return []
+        left_words = left_text.split()
+        right_words = right_text.split()
+        if not left_words or not right_words:
+            return []
+        previous_last = self._clean_boundary_token(left_words[-1])
+        current_first = self._clean_boundary_token(right_words[0])
+        return self._bad_cut_reasons(previous_last, current_first)
 
     @staticmethod
     def _item_subtitle_id(item: ScreenSubtitleItem, fallback_index: int) -> str:
@@ -2586,6 +2827,10 @@ class ScreenSubtitleEditor:
                 [self._item_to_span_dict(index, item) for index, item in enumerate(subtitle_items, 1)],
             )
             self._write_json_artifact(
+                artifact_dir / "stable-boundary-snapshots.json",
+                self._boundary_snapshot_payload(),
+            )
+            self._write_json_artifact(
                 artifact_dir / "translations.json",
                 [self._segment_to_dict(index, seg) for index, seg in enumerate(final_segments, 1)],
             )
@@ -2615,6 +2860,80 @@ class ScreenSubtitleEditor:
     @staticmethod
     def _write_json_artifact(path: Path, payload) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _boundary_snapshot_payload(self) -> Dict:
+        focus_phrases = [
+            "founder of a non-profit",
+            "made it to the top",
+            "highly valuable",
+            "those 200 economists",
+            "a few thousand",
+            "better than you found it",
+            "navigated his way",
+        ]
+        return {
+            "schema_version": 1,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "word_ledger_hash": self._word_ledger_hash(),
+            "max_english_words": self.max_english_words,
+            "stages": self._boundary_snapshots,
+            "changes": self._boundary_snapshot_changes,
+            "focus_phrases": self._boundary_focus_phrase_report(focus_phrases),
+        }
+
+    def _boundary_focus_phrase_report(self, phrases: Sequence[str]) -> List[Dict]:
+        reports: List[Dict] = []
+        for phrase in phrases:
+            phrase_tokens = [token.casefold() for token in self._word_tokens(phrase)]
+            if not phrase_tokens:
+                continue
+            occurrences = self._find_word_token_occurrences(phrase_tokens)
+            phrase_report = {
+                "phrase": phrase,
+                "occurrences": [],
+            }
+            for start, end in occurrences:
+                occurrence = {
+                    "word_range": [start, end],
+                    "surface": self._text_from_word_span(start, end),
+                    "stage_boundaries": [],
+                    "first_split_stage": "",
+                    "first_split_by": "",
+                }
+                for snapshot in self._boundary_snapshots:
+                    boundaries = [
+                        record
+                        for record in snapshot.get("boundaries", [])
+                        if start <= int(record.get("cut", [-1, -1])[0]) < end
+                    ]
+                    if boundaries and not occurrence["first_split_stage"]:
+                        occurrence["first_split_stage"] = snapshot.get("stage", "")
+                        occurrence["first_split_by"] = snapshot.get("created_by", "")
+                    occurrence["stage_boundaries"].append(
+                        {
+                            "stage": snapshot.get("stage", ""),
+                            "split_inside_phrase": bool(boundaries),
+                            "boundaries": boundaries,
+                        }
+                    )
+                phrase_report["occurrences"].append(occurrence)
+            reports.append(phrase_report)
+        return reports
+
+    def _find_word_token_occurrences(self, phrase_tokens: Sequence[str]) -> List[tuple[int, int]]:
+        ledger_tokens = [
+            self._clean_boundary_token(entry.get("token") or entry.get("surface") or "")
+            for entry in self._active_word_entries
+        ]
+        targets = [self._clean_boundary_token(token) for token in phrase_tokens]
+        result: List[tuple[int, int]] = []
+        size = len(targets)
+        if not ledger_tokens or not targets:
+            return result
+        for index in range(0, len(ledger_tokens) - size + 1):
+            if ledger_tokens[index:index + size] == targets:
+                result.append((index, index + size - 1))
+        return result
 
     def _word_ledger_payload(self, source_segments: Sequence[ASRDataSeg]) -> Dict:
         return {
