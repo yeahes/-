@@ -567,6 +567,7 @@ class SubtitleConfig:
     need_screen_subtitle_quality_check: bool = False
     screen_subtitle_max_cjk: int = 24
     screen_subtitle_max_english: int = 16
+    screen_subtitle_allocation_max_concurrency: int = 2
     custom_prompt_text: Optional[str] = None
 
 

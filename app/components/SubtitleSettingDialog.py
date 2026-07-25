@@ -122,7 +122,17 @@ class SubtitleSettingDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.stable_mode_status)
         self.viewLayout.addWidget(self.screen_quality_check_card)
         self.viewLayout.addWidget(self.screen_cjk_card)
+        self.allocation_concurrency_card = SpinBoxSettingCard(
+            cfg.screen_subtitle_allocation_max_concurrency,
+            FIF.TILES,
+            self.tr("中文分配并发"),
+            self.tr("只并发请求中文逐条分配；不改变字幕切分、提示词、ID 或最终写回。建议 2，最高 10。"),
+            minimum=1,
+            maximum=10,
+            parent=self,
+        )
         self.viewLayout.addWidget(self.screen_english_card)
+        self.viewLayout.addWidget(self.allocation_concurrency_card)
         self.viewLayout.addWidget(self.legacy_settings_status)
         self.viewLayout.addWidget(self.split_card)
         self.viewLayout.addWidget(self.split_type_card)

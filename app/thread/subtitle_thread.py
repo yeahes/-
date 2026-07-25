@@ -516,7 +516,7 @@ class SubtitleThread(QThread):
                         subtitle_config.need_screen_subtitle_quality_check
                         and not subtitle_config.screen_subtitle_stable_mode
                     ),
-                    allocation_max_concurrency=2,
+                    allocation_max_concurrency=subtitle_config.screen_subtitle_allocation_max_concurrency,
                     article_context_prompt=article_translation_prompt,
                     coverage_report_path=coverage_report_path,
                     update_callback=self.callback,

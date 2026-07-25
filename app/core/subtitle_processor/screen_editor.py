@@ -340,6 +340,7 @@ class ScreenSubtitleEditor:
         self._allocation_isolation_after: Dict = {}
         self._allocation_isolation_report: Dict = {}
         self._qa_review_points_path: str = ""
+        self._qa_review_points_count: int = 0
         self.last_validation_summary: Optional[Dict] = None
 
     def _compose_prompt(self, base_prompt: str) -> str:
@@ -2378,6 +2379,8 @@ class ScreenSubtitleEditor:
             "code_commit": self._current_git_commit(),
             "cache_used": self._llm_cache_used,
             "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
+            "allocation_max_concurrency": self.allocation_max_concurrency,
+            "qa_review_points_count": self._qa_review_points_count,
         }
         if self._qa_review_points_path:
             metadata["qa_review_points_srt"] = self._qa_review_points_path
@@ -3934,6 +3937,7 @@ class ScreenSubtitleEditor:
         final_segments: Sequence[ASRDataSeg],
     ) -> None:
         points = self._editor_review_points(final_segments)
+        self._qa_review_points_count = len(points)
         srt_path = report_path.parent / "qa-review-points.srt"
         artifact_dir = self._artifact_dir(report_path)
         artifact_dir.mkdir(parents=True, exist_ok=True)

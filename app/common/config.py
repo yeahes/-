@@ -275,6 +275,9 @@ class Config(QConfig):
     screen_subtitle_max_english = ConfigItem(
         "Subtitle", "ScreenSubtitleMaxEnglish", 12, RangeValidator(6, 40)
     )
+    screen_subtitle_allocation_max_concurrency = ConfigItem(
+        "Subtitle", "ScreenSubtitleAllocationMaxConcurrency", 2, RangeValidator(1, 10)
+    )
     stable_ts_alignment_enabled = ConfigItem(
         "Subtitle", "StableTsAlignmentEnabled", True, BoolValidator()
     )
