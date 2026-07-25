@@ -44,6 +44,7 @@ SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
 SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v2"
+SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v2"
 SEMANTIC_ALLOCATION_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_v2"
 SEMANTIC_ALLOCATION_RETRY_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_retry_v2"
 
@@ -8237,8 +8238,8 @@ class ScreenSubtitleEditor:
         if allocated:
             return self._apply_semantic_group_translations(items, groups, allocated)
 
-        logger.warning("语义组两阶段翻译失败，回退旧的一阶段语义组翻译")
-        return self._translate_semantic_subtitle_groups_single_stage(items, groups)
+        logger.warning("语义组两阶段翻译失败，保留冻结英文并交由结构门禁阻止渲染")
+        return items
 
     def _translate_semantic_group_full_translations(
         self, groups: Sequence[Dict]
@@ -8252,12 +8253,61 @@ class ScreenSubtitleEditor:
             for group in groups
         ]
         prompt = self._compose_prompt(SEMANTIC_FULL_TRANSLATION_PROMPT)
+        result: Dict[int, str] = {}
+        payload_chunks = self._semantic_allocation_payload_chunks(payload)
+        for payload_chunk in payload_chunks:
+            data = self._request_semantic_full_translation_chunk(
+                prompt,
+                payload_chunk,
+                cache_task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
+            )
+            result.update(self._semantic_full_translations_from_response(data))
+
+        missing_ids = [int(entry["id"]) for entry in payload if int(entry["id"]) not in result]
+        if missing_ids:
+            logger.warning("语义组完整翻译缺失，按单组重试: %s", missing_ids)
+        payload_by_id = {int(entry["id"]): entry for entry in payload}
+        for group_id in missing_ids:
+            retry_payload = [payload_by_id[group_id]]
+            data = self._request_semantic_full_translation_chunk(
+                prompt,
+                retry_payload,
+                cache_task=f"{SEMANTIC_FULL_TRANSLATION_CACHE_TASK}_retry",
+            )
+            result.update(self._semantic_full_translations_from_response(data))
+
+        final_missing_ids = [int(entry["id"]) for entry in payload if int(entry["id"]) not in result]
+        groups_by_id = {
+            int(group.get("id") or 0): group
+            for group in groups
+            if str(group.get("id", "")).isdigit()
+        }
+        for group_id in final_missing_ids:
+            group = groups_by_id.get(group_id)
+            expected_ids = self._group_expected_subtitle_ids(group) if group else []
+            self._record_translation_structure_error(
+                "translation_group_cardinality_mismatch",
+                group_id=group_id,
+                expected_ids=expected_ids,
+                returned_ids=[],
+                missing_ids=expected_ids,
+                message="LLM omitted semantic group full_translation after retry.",
+            )
+        return result
+
+    def _request_semantic_full_translation_chunk(
+        self,
+        prompt: str,
+        payload: Sequence[Dict],
+        *,
+        cache_task: str,
+    ) -> Optional[object]:
         cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
             temperature=0.2,
-            task="screen_subtitle_semantic_full_translation",
+            task=cache_task,
         )
         try:
             if cache_result:
@@ -8279,21 +8329,30 @@ class ScreenSubtitleEditor:
                     json.dumps(data, ensure_ascii=False),
                     self.model,
                     temperature=0.2,
-                    task="screen_subtitle_semantic_full_translation",
+                    task=cache_task,
                 )
+            self._last_llm_raw_returns.append(
+                {
+                    "task": cache_task,
+                    "data": data,
+                    "expected_group_ids": [entry.get("id") for entry in payload],
+                }
+            )
+            return data
         except Exception as e:
             logger.warning("语义组完整翻译失败: %s", str(e))
-            return {}
+            return None
 
+    def _semantic_full_translations_from_response(
+        self,
+        data: Optional[object],
+    ) -> Dict[int, str]:
+        if data is None:
+            return {}
         groups_data = data.get("groups", []) if isinstance(data, dict) else data
-        result: Dict[int, str] = {}
-        for group in groups_data:
-            if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
-                continue
-            translated = str(group.get("full_translation", "")).strip()
-            if translated:
-                result[int(group["id"])] = translated
-        return result
+        return self._semantic_full_translations_from_groups_data(
+            groups_data if isinstance(groups_data, list) else []
+        )
 
     @staticmethod
     def _semantic_full_translations_from_groups_data(

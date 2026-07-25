@@ -2213,6 +2213,52 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
     assert editor._translation_structure_errors == []
 
 
+def test_full_translation_requests_are_chunked_and_retry_missing_groups():
+    editor = _id_editor()
+    editor.batch_num = 2
+    items = editor._assign_global_subtitle_ids(_id_items(3))
+    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 4)]
+    calls = []
+
+    def request(prompt, payload, cache_task):
+        ids = [entry["id"] for entry in payload]
+        calls.append((cache_task, ids))
+        if ids == [1, 2]:
+            return {"groups": [{"id": 1, "full_translation": "full-1"}]}
+        return {
+            "groups": [
+                {"id": entry["id"], "full_translation": f"full-{entry['id']}"}
+                for entry in payload
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_full_translation_chunk", side_effect=request):
+        full_translations = editor._translate_semantic_group_full_translations(groups)
+
+    assert calls == [
+        ("screen_subtitle_semantic_full_translation_v2", [1, 2]),
+        ("screen_subtitle_semantic_full_translation_v2", [3]),
+        ("screen_subtitle_semantic_full_translation_v2_retry", [2]),
+    ]
+    assert full_translations == {1: "full-1", 2: "full-2", 3: "full-3"}
+    assert editor._translation_structure_errors == []
+
+
+def test_two_stage_translation_failure_does_not_fallback_to_single_stage():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2, translated="old-{index}"))
+
+    with patch.object(editor, "_translate_semantic_group_full_translations", return_value={}), patch.object(
+        editor,
+        "_translate_semantic_subtitle_groups_single_stage",
+        side_effect=AssertionError("single-stage fallback must not run"),
+    ):
+        result = editor._translate_semantic_subtitle_groups(items)
+
+    assert [item.subtitle_id for item in result] == ["S0001", "S0002"]
+    assert [item.translated for item in result] == ["old-1", "old-2"]
+
+
 def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_errors():
     editor = _id_editor()
     editor.batch_num = 24
