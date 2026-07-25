@@ -1108,6 +1108,32 @@ def test_short_sentence_bridges_small_gap_before_next_subtitle():
     assert adjusted[0].end_time == adjusted[1].start_time - 40
 
 
+def test_display_timing_bridges_regular_short_gap_before_next_subtitle():
+    segments = [
+        ASRDataSeg("That structural tightening is the key takeaway.", 1000, 4300, "ok"),
+        ASRDataSeg("Better administration yields higher compliance.", 4920, 8200, "ok"),
+    ]
+
+    adjusted = ScreenSubtitleEditor._apply_display_timing_padding(segments)
+
+    assert adjusted[0].end_time == adjusted[1].start_time - 40
+    assert adjusted[0].text == segments[0].text
+    assert adjusted[1].start_time == segments[1].start_time
+
+
+def test_display_timing_preserves_clear_long_pause():
+    segments = [
+        ASRDataSeg("That structural tightening is the key takeaway.", 1000, 4300, "ok"),
+        ASRDataSeg("Better administration yields higher compliance.", 5400, 8200, "ok"),
+    ]
+
+    adjusted = ScreenSubtitleEditor._apply_display_timing_padding(segments)
+
+    assert adjusted[0].end_time == 4750
+    assert adjusted[0].end_time < adjusted[1].start_time - 40
+    assert adjusted[1].start_time == segments[1].start_time - 80
+
+
 def test_standalone_discourse_marker_attaches_to_immediate_next_sentence():
     editor = _marker_editor(["I", "mean,", "this", "market", "changed."])
     items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 4, 2)]

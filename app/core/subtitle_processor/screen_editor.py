@@ -25,9 +25,10 @@ from app.core.utils.logger import setup_logger
 logger = setup_logger("screen_subtitle_editor")
 
 DISPLAY_LEAD_IN_MS = 80
-DISPLAY_TAIL_PADDING_MS = 180
+DISPLAY_TAIL_PADDING_MS = 450
 DISPLAY_MIN_GAP_MS = 40
 DISPLAY_MIN_DURATION_MS = 900
+DISPLAY_BRIDGE_GAP_MS = 700
 DISPLAY_SHORT_MERGE_MS = 700
 DISPLAY_SHORT_MERGE_GAP_MS = 500
 DISPLAY_SHORT_BRIDGE_GAP_MS = 2200
@@ -6100,6 +6101,7 @@ class ScreenSubtitleEditor:
         tail_padding_ms: int = DISPLAY_TAIL_PADDING_MS,
         min_gap_ms: int = DISPLAY_MIN_GAP_MS,
         min_duration_ms: int = DISPLAY_MIN_DURATION_MS,
+        bridge_gap_ms: int = DISPLAY_BRIDGE_GAP_MS,
         short_bridge_gap_ms: int = DISPLAY_SHORT_BRIDGE_GAP_MS,
     ) -> List[ASRDataSeg]:
         if not segments:
@@ -6131,6 +6133,11 @@ class ScreenSubtitleEditor:
                 end_time = min(end_time, next_start - min_gap_ms)
             if end_time < original_end:
                 end_time = original_end
+            if (
+                next_start is not None
+                and 0 < next_start - original_end <= bridge_gap_ms
+            ):
+                end_time = max(end_time, next_start - min_gap_ms)
             if (
                 next_start is not None
                 and original_end - original_start < min_duration_ms
