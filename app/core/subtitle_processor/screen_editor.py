@@ -335,6 +335,9 @@ class ScreenSubtitleEditor:
         self._boundary_snapshot_changes: List[Dict] = []
         self._boundary_snapshot_item_sets: Dict[str, List[ScreenSubtitleItem]] = {}
         self._pre_id_boundary_repairs: List[Dict] = []
+        self._allocation_isolation_before: Dict = {}
+        self._allocation_isolation_after: Dict = {}
+        self._allocation_isolation_report: Dict = {}
         self.last_validation_summary: Optional[Dict] = None
 
     def _compose_prompt(self, base_prompt: str) -> str:
@@ -449,6 +452,9 @@ class ScreenSubtitleEditor:
         self._boundary_snapshot_changes = []
         self._boundary_snapshot_item_sets = {}
         self._pre_id_boundary_repairs = []
+        self._allocation_isolation_before = {}
+        self._allocation_isolation_after = {}
+        self._allocation_isolation_report = {}
         self._active_source_segments_by_id = {
             index: seg for index, seg in enumerate(asr_data.segments, 1)
         }
@@ -501,6 +507,18 @@ class ScreenSubtitleEditor:
         segments = self._apply_display_timing_padding(segments)
         segments = self._order_segments_by_frozen_subtitle_ids(segments)
         self._validate_final_segment_translation_ids(segments)
+        self._allocation_isolation_after = self._allocation_isolation_snapshot(
+            stage="before_export",
+            source_segments=asr_data.segments,
+            items=items,
+            semantic_groups=semantic_groups,
+            full_translations=self._last_semantic_full_translations,
+            final_segments=segments,
+        )
+        self._allocation_isolation_report = self._build_allocation_isolation_report(
+            self._allocation_isolation_before,
+            self._allocation_isolation_after,
+        )
         self._write_stable_pipeline_artifacts(
             source_segments=asr_data.segments,
             semantic_groups=semantic_groups,
@@ -4409,6 +4427,10 @@ class ScreenSubtitleEditor:
                 self._last_allocation_unresolved,
             )
             self._write_json_artifact(
+                artifact_dir / "allocation-isolation-report.json",
+                self._allocation_isolation_report,
+            )
+            self._write_json_artifact(
                 artifact_dir / "semantic-group-debug.json",
                 self._last_semantic_group_debug,
             )
@@ -4581,6 +4603,171 @@ class ScreenSubtitleEditor:
         ]
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _allocation_isolation_snapshot(
+        self,
+        *,
+        stage: str,
+        source_segments: Sequence[ASRDataSeg],
+        items: Sequence[ScreenSubtitleItem],
+        semantic_groups: Sequence[Dict],
+        full_translations: Dict[int, str],
+        final_segments: Optional[Sequence[ASRDataSeg]] = None,
+    ) -> Dict:
+        source_payload = [
+            {
+                "index": index,
+                "start_ms": int(seg.start_time),
+                "end_ms": int(seg.end_time),
+                "text": seg.text,
+            }
+            for index, seg in enumerate(source_segments or [], 1)
+        ]
+        item_payload = [
+            {
+                "subtitle_id": item.subtitle_id or f"S{index:04d}",
+                "original": item.original,
+                "word_start": item.word_start,
+                "word_end": item.word_end,
+            }
+            for index, item in enumerate(items or [], 1)
+        ]
+        item_time_payload = [
+            {
+                "subtitle_id": item.subtitle_id or f"S{index:04d}",
+                "word_start": item.word_start,
+                "word_end": item.word_end,
+                "start_ms": self._item_boundary_time_ms(item, "start"),
+                "end_ms": self._item_boundary_time_ms(item, "end"),
+            }
+            for index, item in enumerate(items or [], 1)
+        ]
+        final_time_payload = [
+            {
+                "subtitle_id": self._segment_subtitle_id(seg, index),
+                "start_ms": int(seg.start_time),
+                "end_ms": int(seg.end_time),
+                "text": seg.text,
+            }
+            for index, seg in enumerate(final_segments or [], 1)
+        ]
+        group_payload = [
+            {
+                "semantic_group_id": f"G{int(group.get('id') or 0):04d}",
+                "expected_subtitle_ids": self._group_expected_subtitle_ids(group),
+                "full_english": " ".join(item.original for item in group.get("items", [])),
+            }
+            for group in semantic_groups or []
+        ]
+        full_translation_payload = [
+            {
+                "semantic_group_id": f"G{int(group_id):04d}",
+                "full_translation": text or "",
+            }
+            for group_id, text in sorted((full_translations or {}).items())
+        ]
+        word_timing_payload = [
+            [
+                index,
+                entry.get("surface") or entry.get("token") or "",
+                int(entry.get("start_time") or 0),
+                int(entry.get("end_time") or 0),
+            ]
+            for index, entry in enumerate(self._active_word_entries)
+        ]
+        return {
+            "stage": stage,
+            "asr_text_hash": self._stable_hash(source_payload),
+            "corrected_english_hash": self._stable_hash(source_payload),
+            "word_ledger_hash": self._word_ledger_hash(),
+            "english_text_hash": self._stable_hash(item_payload),
+            "word_timing_hash": self._stable_hash(word_timing_payload),
+            "subtitle_id_time_hash": self._stable_hash(item_time_payload),
+            "semantic_group_input_hash": self._stable_hash(group_payload),
+            "authoritative_full_translation_hash": self._stable_hash(full_translation_payload),
+            "final_subtitle_time_hash": self._stable_hash(final_time_payload) if final_segments is not None else "",
+            "payloads": {
+                "source_segments": source_payload,
+                "subtitle_items": item_payload,
+                "subtitle_id_times": item_time_payload,
+                "semantic_groups": group_payload,
+                "full_translations": full_translation_payload,
+                "word_timing": word_timing_payload,
+                "final_segments": final_time_payload,
+            },
+        }
+
+    def _build_allocation_isolation_report(self, before: Dict, after: Dict) -> Dict:
+        frozen_keys = [
+            "asr_text_hash",
+            "corrected_english_hash",
+            "word_ledger_hash",
+            "english_text_hash",
+            "word_timing_hash",
+            "subtitle_id_time_hash",
+            "semantic_group_input_hash",
+            "authoritative_full_translation_hash",
+        ]
+        changed_keys = [
+            key for key in frozen_keys if before.get(key) and after.get(key) and before.get(key) != after.get(key)
+        ]
+        first_differences = {
+            key: self._allocation_isolation_first_difference(before, after, key)
+            for key in changed_keys
+        }
+        return {
+            "schema_version": 1,
+            "status": "allocation_isolation_failed" if changed_keys else "passed",
+            "changed_keys": changed_keys,
+            "before": {key: before.get(key, "") for key in frozen_keys},
+            "after": {key: after.get(key, "") for key in frozen_keys},
+            "first_differences": first_differences,
+        }
+
+    @staticmethod
+    def _stable_hash(payload) -> str:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _allocation_isolation_first_difference(self, before: Dict, after: Dict, key: str) -> Dict:
+        payload_key = {
+            "asr_text_hash": "source_segments",
+            "corrected_english_hash": "source_segments",
+            "english_text_hash": "subtitle_items",
+            "subtitle_id_time_hash": "subtitle_id_times",
+            "semantic_group_input_hash": "semantic_groups",
+            "authoritative_full_translation_hash": "full_translations",
+            "word_timing_hash": "word_timing",
+            "word_ledger_hash": "word_timing",
+        }.get(key, "")
+        left = list((before.get("payloads") or {}).get(payload_key) or [])
+        right = list((after.get("payloads") or {}).get(payload_key) or [])
+        for index, (left_item, right_item) in enumerate(zip(left, right), 1):
+            if left_item != right_item:
+                return {
+                    "payload": payload_key,
+                    "index": index,
+                    "before": left_item,
+                    "after": right_item,
+                }
+        if len(left) != len(right):
+            return {
+                "payload": payload_key,
+                "index": min(len(left), len(right)) + 1,
+                "before_count": len(left),
+                "after_count": len(right),
+            }
+        return {"payload": payload_key, "reason": "hash_changed_but_first_difference_not_found"}
+
+    def _item_boundary_time_ms(self, item: ScreenSubtitleItem, side: str) -> int:
+        if not self._active_word_entries:
+            return 0
+        word_index = item.word_start if side == "start" else item.word_end
+        if word_index is None or word_index < 0 or word_index >= len(self._active_word_entries):
+            return 0
+        entry = self._active_word_entries[word_index]
+        key = "start_time" if side == "start" else "end_time"
+        return int(entry.get(key) or 0)
 
     def _semantic_groups_payload(self, groups: Sequence[Dict]) -> List[Dict]:
         payload: List[Dict] = []
@@ -8038,6 +8225,13 @@ class ScreenSubtitleEditor:
         self._last_semantic_full_translations = dict(full_translations)
         self._last_semantic_group_audit_contexts = self._semantic_group_audit_contexts(
             groups, full_translations
+        )
+        self._allocation_isolation_before = self._allocation_isolation_snapshot(
+            stage="before_allocation",
+            source_segments=list(getattr(self, "_active_source_segments_by_id", {}).values()),
+            items=items,
+            semantic_groups=groups,
+            full_translations=full_translations,
         )
         allocated = self._allocate_semantic_group_translations(groups, full_translations)
         if allocated:

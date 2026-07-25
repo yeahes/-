@@ -464,6 +464,87 @@ def test_validation_review_includes_allocation_unresolved_without_old_error_muta
     )
 
 
+def test_allocation_isolation_report_passes_when_only_chinese_changes():
+    editor = _id_editor()
+    editor._active_word_entries = [
+        {"surface": "Alice", "token": "alice", "start_time": 0, "end_time": 500},
+        {"surface": "arrived", "token": "arrived", "start_time": 500, "end_time": 1000},
+    ]
+    items = editor._assign_global_subtitle_ids(_id_items(1))
+    items[0].original = "Alice arrived."
+    items[0].translated = "old"
+    items[0].word_start = 0
+    items[0].word_end = 1
+    groups = [_id_group(1, 0, items)]
+    full_translations = {1: "Alice arrived."}
+    source = [ASRDataSeg("Alice arrived.", 0, 1000)]
+
+    before = editor._allocation_isolation_snapshot(
+        stage="before_allocation",
+        source_segments=source,
+        items=items,
+        semantic_groups=groups,
+        full_translations=full_translations,
+    )
+    items[0].translated = "new"
+    after = editor._allocation_isolation_snapshot(
+        stage="before_export",
+        source_segments=source,
+        items=items,
+        semantic_groups=groups,
+        full_translations=full_translations,
+        final_segments=[ASRDataSeg("Alice arrived.", 0, 1000, "new")],
+    )
+    report = editor._build_allocation_isolation_report(before, after)
+
+    assert report["status"] == "passed"
+    assert report["changed_keys"] == []
+
+
+def test_allocation_isolation_report_fails_on_english_boundary_change():
+    editor = _id_editor()
+    editor._active_word_entries = [
+        {"surface": "Alice", "token": "alice", "start_time": 0, "end_time": 500},
+        {"surface": "arrived", "token": "arrived", "start_time": 500, "end_time": 1000},
+    ]
+    items = editor._assign_global_subtitle_ids(_id_items(1))
+    items[0].original = "Alice arrived."
+    items[0].word_start = 0
+    items[0].word_end = 1
+    groups = [_id_group(1, 0, items)]
+    source = [ASRDataSeg("Alice arrived.", 0, 1000)]
+    before = editor._allocation_isolation_snapshot(
+        stage="before_allocation",
+        source_segments=source,
+        items=items,
+        semantic_groups=groups,
+        full_translations={1: "Alice arrived."},
+    )
+
+    changed_items = list(items)
+    changed_items[0] = ScreenSubtitleItem(
+        source_ids=items[0].source_ids,
+        original="Alice arrived today.",
+        translated=items[0].translated,
+        word_start=items[0].word_start,
+        word_end=items[0].word_end,
+        subtitle_id=items[0].subtitle_id,
+    )
+    changed_groups = [_id_group(1, 0, changed_items)]
+    after = editor._allocation_isolation_snapshot(
+        stage="before_export",
+        source_segments=source,
+        items=changed_items,
+        semantic_groups=changed_groups,
+        full_translations={1: "Alice arrived."},
+    )
+    report = editor._build_allocation_isolation_report(before, after)
+
+    assert report["status"] == "allocation_isolation_failed"
+    assert "english_text_hash" in report["changed_keys"]
+    assert report["first_differences"]["english_text_hash"]["index"] == 1
+
+
 def test_duplicate_chinese_is_warning_not_blocking():
     editor = _editor()
     segments = [
@@ -3262,6 +3343,8 @@ if __name__ == "__main__":
     test_chinese_reading_speed_error_is_reported_but_not_blocking()
     test_validation_report_adds_actionable_review_tiers_without_changing_status()
     test_validation_review_includes_allocation_unresolved_without_old_error_mutation()
+    test_allocation_isolation_report_passes_when_only_chinese_changes()
+    test_allocation_isolation_report_fails_on_english_boundary_change()
     test_duplicate_chinese_is_warning_not_blocking()
     test_overlong_english_segment_is_locally_split_without_llm()
     test_audit_parser_does_not_count_chinese_line_with_it_as_english()
