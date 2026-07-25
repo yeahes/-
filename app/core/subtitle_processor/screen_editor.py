@@ -4051,7 +4051,7 @@ class ScreenSubtitleEditor:
                 "\n".join(
                     [
                         str(index),
-                        f"{self._srt_timestamp(int(point.get('start_ms') or 0))} --> {self._srt_timestamp(int(point.get('end_ms') or 0))}",
+                        f"{ASRDataSeg._ms_to_srt_time(int(point.get('start_ms') or 0))} --> {ASRDataSeg._ms_to_srt_time(int(point.get('end_ms') or 0))}",
                         *lines,
                     ]
                 )
@@ -10140,7 +10140,7 @@ class ScreenSubtitleEditor:
 
         for index, item in enumerate(items):
             text = self._normalize_text(item.original)
-            if not text or not re.search(r"[A-Za-z]", text):
+            if not text:
                 if current:
                     self._append_semantic_group(groups, current_start, current)
                     current = []

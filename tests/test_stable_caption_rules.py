@@ -3151,6 +3151,51 @@ def test_empty_middle_translation_keeps_its_own_id_slot():
     assert final_errors and final_errors[0]["missing_subtitle_ids"] == ["S0002"]
 
 
+def test_numeric_only_subtitle_keeps_semantic_group_id_slot():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(
+        [
+            ScreenSubtitleItem(
+                original="Imports rose sharply.",
+                translated="",
+                start_ms=0,
+                end_ms=1000,
+                source_ids=[1],
+                word_start=0,
+                word_end=2,
+            ),
+            ScreenSubtitleItem(
+                original="70%.",
+                translated="",
+                start_ms=1000,
+                end_ms=1600,
+                source_ids=[2],
+                word_start=3,
+                word_end=3,
+            ),
+            ScreenSubtitleItem(
+                original="That is a wild jump.",
+                translated="",
+                start_ms=1600,
+                end_ms=2600,
+                source_ids=[3],
+                word_start=4,
+                word_end=8,
+            ),
+        ]
+    )
+
+    groups = editor._semantic_translation_groups(items)
+    grouped_ids = [
+        subtitle_id
+        for group in groups
+        for subtitle_id in editor._group_expected_subtitle_ids(group)
+    ]
+
+    assert grouped_ids == ["S0001", "S0002", "S0003"]
+    assert any(group["items"][0].original == "70%." for group in groups)
+
+
 def test_failed_group_does_not_shift_following_100_subtitles():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(104))
