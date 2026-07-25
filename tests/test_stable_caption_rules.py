@@ -3455,7 +3455,7 @@ def test_passed_validation_writes_final_output_and_manifest_metadata():
         assert (root / "output.srt").exists()
 
 
-def test_stable_reports_are_mirrored_to_source_audio_folder():
+def test_qa_review_srt_is_mirrored_to_source_audio_folder_only():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         source_dir = root / "source"
@@ -3490,11 +3490,14 @@ def test_stable_reports_are_mirrored_to_source_audio_folder():
             manifest_meta={"qa_review_points_srt": str(qa_path)},
         )
 
-        mirrored_manifest = source_dir / "stable-final-manifest.json"
-        manifest = json.loads(mirrored_manifest.read_text(encoding="utf-8"))
         assert (source_dir / "qa-review-points.srt").exists()
-        assert (source_dir / "coverage-report.txt").read_text(encoding="utf-8") == "coverage"
-        assert manifest["source_report_paths"]["qa_review_points_srt"].endswith("qa-review-points.srt")
+        assert not (source_dir / "coverage-report.txt").exists()
+        assert not (source_dir / "stable-final-manifest.json").exists()
+
+        work_manifest = json.loads((output_dir / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        assert work_manifest["source_report_paths"] == {
+            "qa_review_points_srt": str(source_dir / "qa-review-points.srt")
+        }
 
 
 def test_screen_manifest_metadata_includes_stage_timings():

@@ -273,7 +273,6 @@ class SubtitleThread(QThread):
         if manifest_meta:
             manifest.update(manifest_meta)
         source_report_paths = self._source_audio_report_paths(
-            coverage_report_path=coverage_report_path,
             qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
         )
         if source_report_paths:
@@ -285,8 +284,6 @@ class SubtitleThread(QThread):
             encoding="utf-8",
         )
         self._mirror_stable_reports_to_source_dir(
-            manifest_path=manifest_path,
-            coverage_report_path=coverage_report_path,
             qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
         )
         logger.info("Stable subtitle manifest saved: %s", manifest_path)
@@ -302,36 +299,25 @@ class SubtitleThread(QThread):
 
     def _source_audio_report_paths(
         self,
-        coverage_report_path: str | None,
         qa_review_points_path: str,
     ) -> dict:
         source_dir = self._source_audio_report_dir()
         if source_dir is None:
             return {}
-        paths = {
-            "manifest": source_dir / "stable-final-manifest.json",
-        }
-        if coverage_report_path:
-            paths["coverage_report"] = source_dir / "coverage-report.txt"
+        paths = {}
         if qa_review_points_path:
             paths["qa_review_points_srt"] = source_dir / "qa-review-points.srt"
         return {key: str(path) for key, path in paths.items()}
 
     def _mirror_stable_reports_to_source_dir(
         self,
-        manifest_path: Path,
-        coverage_report_path: str | None,
         qa_review_points_path: str,
     ) -> None:
         source_dir = self._source_audio_report_dir()
         if source_dir is None:
             return
         try:
-            report_sources = [
-                (manifest_path, source_dir / "stable-final-manifest.json"),
-            ]
-            if coverage_report_path:
-                report_sources.append((Path(coverage_report_path), source_dir / "coverage-report.txt"))
+            report_sources = []
             if qa_review_points_path:
                 report_sources.append((Path(qa_review_points_path), source_dir / "qa-review-points.srt"))
             for source, destination in report_sources:
