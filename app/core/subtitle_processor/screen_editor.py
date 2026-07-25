@@ -8441,7 +8441,15 @@ class ScreenSubtitleEditor:
                 retry_of=validation,
             )
             self._last_allocation_validation.append(retry_validation)
-            if retry_validation["valid"]:
+            retry_quality_check = self._is_retry_allocation_quality_upgrade(
+                entry,
+                allocation,
+                retry_allocation,
+                validation,
+                retry_validation,
+            )
+            retry_record["quality_comparison"] = retry_quality_check
+            if retry_validation["valid"] and retry_quality_check["accepted"]:
                 result[group_id] = retry_allocation
                 self._last_semantic_group_debug.extend(debug)
                 retry_record["success"] = True
@@ -8452,6 +8460,18 @@ class ScreenSubtitleEditor:
                         "allocation": dict(retry_allocation),
                         "source": "quality_retry",
                     }
+                )
+            elif retry_validation["valid"]:
+                self._record_allocation_quality_unresolved(
+                    entry,
+                    allocation,
+                    validation,
+                    "retry_rejected_due_to_quality_regression",
+                    extra={
+                        "retry_allocation": dict(retry_allocation or {}),
+                        "retry_validation": retry_validation,
+                        "quality_comparison": retry_quality_check,
+                    },
                 )
             else:
                 self._record_allocation_quality_unresolved(
@@ -8469,18 +8489,144 @@ class ScreenSubtitleEditor:
         allocation: Dict[str, str],
         validation: Dict,
         reason: str,
+        extra: Optional[Dict] = None,
     ) -> None:
         group_id = int(entry.get("id") or 0)
-        self._last_allocation_unresolved.append(
-            {
-                "semantic_group_id": f"G{group_id:04d}",
-                "reason": reason,
-                "issue_codes": list(validation.get("issue_codes") or []),
-                "full_english": entry.get("full_english", ""),
-                "full_translation": entry.get("full_translation", ""),
-                "allocation": dict(allocation or {}),
-            }
+        record = {
+            "semantic_group_id": f"G{group_id:04d}",
+            "reason": reason,
+            "issue_codes": list(validation.get("issue_codes") or []),
+            "full_english": entry.get("full_english", ""),
+            "full_translation": entry.get("full_translation", ""),
+            "allocation": dict(allocation or {}),
+        }
+        if extra:
+            record.update(extra)
+        self._last_allocation_unresolved.append(record)
+
+    def _is_retry_allocation_quality_upgrade(
+        self,
+        entry: Dict,
+        original_allocation: Dict[str, str],
+        retry_allocation: Dict[str, str],
+        original_validation: Dict,
+        retry_validation: Dict,
+    ) -> Dict:
+        high_confidence_codes = {
+            "adjacent_chinese_semantic_duplication",
+            "cross_id_semantic_leakage",
+            "group_allocation_information_omission",
+            "entity_allocation_mismatch",
+            "number_allocation_mismatch",
+            "negation_allocation_mismatch",
+            "unnatural_chinese_fragment",
+            "translation_group_cardinality_mismatch",
+        }
+        original_codes = set(original_validation.get("issue_codes") or [])
+        retry_codes = set(retry_validation.get("issue_codes") or [])
+        fixed_codes = sorted((original_codes - retry_codes) & high_confidence_codes)
+        new_codes = sorted((retry_codes - original_codes) & high_confidence_codes)
+        reasons: List[str] = []
+        if not fixed_codes:
+            reasons.append("no_high_confidence_issue_fixed")
+        if new_codes:
+            reasons.append("new_high_confidence_issue")
+
+        expected_ids = [
+            str(part.get("subtitle_id") or "").strip()
+            for part in list(entry.get("subtitle_parts") or [])
+        ]
+        regression_reasons = self._detect_retry_allocation_quality_regressions(
+            entry,
+            original_allocation or {},
+            retry_allocation or {},
+            expected_ids,
         )
+        reasons.extend(regression_reasons)
+        return {
+            "accepted": not reasons,
+            "fixed_issue_codes": fixed_codes,
+            "new_issue_codes": new_codes,
+            "reasons": reasons,
+        }
+
+    def _detect_retry_allocation_quality_regressions(
+        self,
+        entry: Dict,
+        original_allocation: Dict[str, str],
+        retry_allocation: Dict[str, str],
+        expected_ids: Sequence[str],
+    ) -> List[str]:
+        reasons: List[str] = []
+        original_texts = [
+            self._normalize_text(str(original_allocation.get(subtitle_id, "")))
+            for subtitle_id in expected_ids
+        ]
+        retry_texts = [
+            self._normalize_text(str(retry_allocation.get(subtitle_id, "")))
+            for subtitle_id in expected_ids
+        ]
+        if self._empty_allocation_slot_count(retry_texts) > self._empty_allocation_slot_count(original_texts):
+            reasons.append("new_empty_allocation_slot")
+        if len(self._detect_adjacent_chinese_duplication(expected_ids, retry_texts)) > len(
+            self._detect_adjacent_chinese_duplication(expected_ids, original_texts)
+        ):
+            reasons.append("new_adjacent_chinese_semantic_duplication")
+        if self._bad_allocation_fragment_count(retry_texts) > self._bad_allocation_fragment_count(original_texts):
+            reasons.append("new_unnatural_chinese_fragment")
+        original_merged = self._normalize_text("".join(original_texts))
+        retry_merged = self._normalize_text("".join(retry_texts))
+        full_translation = self._normalize_text(str(entry.get("full_translation") or ""))
+        original_coverage = self._allocation_information_coverage(full_translation, original_merged)
+        retry_coverage = self._allocation_information_coverage(full_translation, retry_merged)
+        if retry_coverage + 0.08 < original_coverage:
+            reasons.append("group_information_coverage_regressed")
+        if self._adjacent_language_naturalness_score(retry_texts) + 2 < self._adjacent_language_naturalness_score(original_texts):
+            reasons.append("adjacent_language_naturalness_regressed")
+        return reasons
+
+    @staticmethod
+    def _empty_allocation_slot_count(texts: Sequence[str]) -> int:
+        return sum(1 for text in texts if not (text or "").strip())
+
+    def _bad_allocation_fragment_count(self, texts: Sequence[str]) -> int:
+        total = len(texts)
+        return sum(
+            1
+            for index, text in enumerate(texts)
+            if text and self._is_bad_allocation_chinese_fragment(text, index, total)
+        )
+
+    def _allocation_information_coverage(self, full_translation: str, merged_allocation: str) -> float:
+        full = self._normalize_chinese_for_compare(full_translation)
+        merged = self._normalize_chinese_for_compare(merged_allocation)
+        if not full:
+            return 1.0
+        if not merged:
+            return 0.0
+        bag_overlap = self._character_bag_overlap(full, merged)
+        lcs_coverage = self._lcs_length(full, merged) / max(1, len(full))
+        return max(bag_overlap, lcs_coverage)
+
+    def _adjacent_language_naturalness_score(self, texts: Sequence[str]) -> int:
+        score = 0
+        normalized = [self._normalize_text(text) for text in texts]
+        for index, text in enumerate(normalized):
+            compact = re.sub(r"\s+", "", text or "")
+            if not compact:
+                score -= 4
+                continue
+            if len(compact) <= 2 and compact not in {"好的", "没错", "对", "是的", "真的"}:
+                score -= 2
+            if index + 1 < len(normalized):
+                pair = self._normalize_chinese_for_compare(text + normalized[index + 1])
+                if re.search(r"(.)\1{3,}", pair):
+                    score -= 1
+            if re.search(r"[，、：；]$", compact) and index == len(normalized) - 1:
+                score -= 2
+            if self._is_bad_allocation_chinese_fragment(text, index, len(normalized)):
+                score -= 2
+        return score
 
     def _validate_group_chinese_allocation(
         self,
@@ -8664,6 +8810,13 @@ class ScreenSubtitleEditor:
                     english_by_id,
                 ):
                     continue
+                if anchor_type == "entity" and not self._is_high_confidence_cross_id_semantic_leakage(
+                    expected_id,
+                    present_ids,
+                    [str(part.get("subtitle_id") or "").strip() for part in parts],
+                    allocation,
+                ):
+                    continue
                 code = (
                     "cross_id_semantic_leakage"
                     if anchor_type == "entity"
@@ -8678,6 +8831,35 @@ class ScreenSubtitleEditor:
                     }
                 )
         return issues
+
+    def _is_high_confidence_cross_id_semantic_leakage(
+        self,
+        expected_id: str,
+        present_ids: Sequence[str],
+        ordered_ids: Sequence[str],
+        allocation: Dict[str, str],
+    ) -> bool:
+        expected_text = self._normalize_text(str(allocation.get(expected_id, "")))
+        expected_norm = self._normalize_chinese_for_compare(expected_text)
+        if not expected_norm:
+            return True
+        expected_index = list(ordered_ids).index(expected_id) if expected_id in ordered_ids else -1
+        adjacent_ids = {
+            ordered_ids[index]
+            for index in (expected_index - 1, expected_index + 1)
+            if 0 <= index < len(ordered_ids)
+        }
+        present_norms = [
+            self._normalize_chinese_for_compare(str(allocation.get(subtitle_id, "")))
+            for subtitle_id in present_ids
+        ]
+        if any(expected_norm and expected_norm == present_norm for present_norm in present_norms):
+            return True
+        if len(expected_norm) <= 3 and adjacent_ids.intersection(present_ids):
+            return True
+        if adjacent_ids.intersection(present_ids):
+            return False
+        return len(expected_norm) <= 6
 
     @staticmethod
     def _is_allowed_adjacent_negation_allocation(

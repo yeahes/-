@@ -2507,6 +2507,98 @@ def test_allocation_quality_accepts_natural_subtitle_half_sentence():
     assert "unnatural_chinese_fragment" not in validation["issue_codes"]
 
 
+def test_allocation_retry_rejects_quality_regression_before_writeback():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(3))
+    items[0].original = "Alice arrived."
+    items[1].original = "Bob signed 42 contracts."
+    items[2].original = "Carol approved the long budget plan."
+    groups = [_id_group(1, 0, items)]
+    full_translations = {
+        1: "爱丽丝到了。鲍勃签了42份合同。卡罗尔批准了这份长期预算计划。",
+    }
+
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v2":
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "part_translations": [
+                            {"subtitle_id": "S0001", "zh": "爱丽丝到了。鲍勃签了42份合同。"},
+                            {"subtitle_id": "S0002", "zh": "鲍勃签了合同。"},
+                            {"subtitle_id": "S0003", "zh": "卡罗尔批准了这份长期预算计划。"},
+                        ],
+                    }
+                ]
+            }
+        return {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "爱丽丝到了。"},
+                        {"subtitle_id": "S0002", "zh": "鲍勃签了42份合同。"},
+                        {"subtitle_id": "S0003", "zh": "卡罗尔批准预算。"},
+                    ],
+                }
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations(groups, full_translations)
+
+    assert allocated[1]["S0003"] == "卡罗尔批准了这份长期预算计划。"
+    assert editor._last_allocation_retry_log[-1]["success"] is False
+    assert editor._last_allocation_unresolved[-1]["reason"] == "retry_rejected_due_to_quality_regression"
+
+
+def test_cross_id_leakage_requires_target_id_to_be_degraded():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "爱丽丝说明了背景。接着引用了Alice的原话。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Alice explained the context."},
+            {"subtitle_id": "S0002", "english": "Then they quoted her exact words."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "她说明了背景。",
+            "S0002": "接着引用了Alice的原话。",
+        },
+    )
+
+    assert validation["valid"]
+    assert "cross_id_semantic_leakage" not in validation["issue_codes"]
+
+
+def test_cross_id_leakage_flags_when_target_id_is_consumed_and_empty():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "Alice说明了背景。下一句继续展开。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Alice explained the context."},
+            {"subtitle_id": "S0002", "english": "The next sentence continued."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "",
+            "S0002": "Alice说明了背景。下一句继续展开。",
+        },
+    )
+
+    assert not validation["valid"]
+    assert "cross_id_semantic_leakage" in validation["issue_codes"]
+
+
 def test_allocation_quality_keeps_out_of_order_return_by_subtitle_id():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
@@ -3068,6 +3160,9 @@ if __name__ == "__main__":
     test_allocation_quality_allows_negation_with_adjacent_predicate_completion()
     test_allocation_quality_accepts_chinese_number_equivalents()
     test_allocation_quality_accepts_natural_subtitle_half_sentence()
+    test_allocation_retry_rejects_quality_regression_before_writeback()
+    test_cross_id_leakage_requires_target_id_to_be_degraded()
+    test_cross_id_leakage_flags_when_target_id_is_consumed_and_empty()
     test_allocation_quality_keeps_out_of_order_return_by_subtitle_id()
     test_allocation_quality_failed_group_does_not_shift_following_100_ids()
     test_compression_quality_regression_restores_previous_group_allocation()
