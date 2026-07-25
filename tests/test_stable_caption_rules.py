@@ -2828,6 +2828,67 @@ def test_allocation_retry_rejects_quality_regression_before_writeback():
     assert allocated[1]["S0003"] == "卡罗尔批准了这份长期预算计划。"
     assert editor._last_allocation_retry_log[-1]["success"] is False
     assert editor._last_allocation_unresolved[-1]["reason"] == "retry_rejected_due_to_quality_regression"
+    assert editor._last_allocation_retry_log[-1]["original_allocation"]
+    assert editor._last_allocation_retry_log[-1]["retry_allocation"]
+    assert editor._last_allocation_retry_log[-1]["quality_comparison"]["decision"] == "keep_original"
+
+
+def test_compare_allocation_candidates_accepts_strict_improvement_only():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "Alice arrived. Bob signed 42 contracts.",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Alice arrived."},
+            {"subtitle_id": "S0002", "english": "Bob signed 42 contracts."},
+        ],
+    }
+    original = {"S0001": "Bob signed 42 contracts.", "S0002": "Alice arrived."}
+    retry = {"S0001": "Alice arrived.", "S0002": "Bob signed 42 contracts."}
+    original_validation = editor._validate_group_chinese_allocation(entry, original)
+    retry_validation = editor._validate_group_chinese_allocation(entry, retry)
+
+    comparison = editor._compare_allocation_candidates(
+        original_allocation=original,
+        retry_allocation=retry,
+        group_context=entry,
+        original_validation=original_validation,
+        retry_validation=retry_validation,
+    )
+
+    assert comparison["accepted"]
+    assert comparison["decision"] == "accept_retry"
+    assert "number_allocation_mismatch" in comparison["fixed_issue_codes"]
+    assert comparison["new_issue_codes"] == []
+
+
+def test_compare_allocation_candidates_rejects_new_high_confidence_issue():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "Alice arrived. Bob signed 42 contracts.",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Alice arrived."},
+            {"subtitle_id": "S0002", "english": "Bob signed 42 contracts."},
+        ],
+    }
+    original = {"S0001": "Alice arrived.", "S0002": "Bob signed 42 contracts."}
+    retry = {"S0001": "Bob signed 42 contracts.", "S0002": "Alice arrived."}
+    original_validation = editor._validate_group_chinese_allocation(entry, original)
+    retry_validation = editor._validate_group_chinese_allocation(entry, retry)
+
+    comparison = editor._compare_allocation_candidates(
+        original_allocation=original,
+        retry_allocation=retry,
+        group_context=entry,
+        original_validation=original_validation,
+        retry_validation=retry_validation,
+    )
+
+    assert not comparison["accepted"]
+    assert comparison["decision"] == "keep_original"
+    assert "new_high_confidence_issue" in comparison["reasons"]
+    assert "number_allocation_mismatch" in comparison["new_issue_codes"]
 
 
 def test_cross_id_leakage_requires_target_id_to_be_degraded():
@@ -3447,6 +3508,8 @@ if __name__ == "__main__":
     test_allocation_quality_rejects_adjacent_number_when_target_line_is_empty()
     test_allocation_quality_accepts_natural_subtitle_half_sentence()
     test_allocation_retry_rejects_quality_regression_before_writeback()
+    test_compare_allocation_candidates_accepts_strict_improvement_only()
+    test_compare_allocation_candidates_rejects_new_high_confidence_issue()
     test_cross_id_leakage_requires_target_id_to_be_degraded()
     test_cross_id_leakage_flags_when_target_id_is_consumed_and_empty()
     test_allocation_quality_keeps_out_of_order_return_by_subtitle_id()

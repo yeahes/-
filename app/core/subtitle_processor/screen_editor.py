@@ -8827,14 +8827,18 @@ class ScreenSubtitleEditor:
                 retry_of=validation,
             )
             self._last_allocation_validation.append(retry_validation)
-            retry_quality_check = self._is_retry_allocation_quality_upgrade(
-                entry,
-                allocation,
-                retry_allocation,
-                validation,
-                retry_validation,
+            retry_quality_check = self._compare_allocation_candidates(
+                original_allocation=allocation,
+                retry_allocation=retry_allocation,
+                group_context=entry,
+                original_validation=validation,
+                retry_validation=retry_validation,
             )
             retry_record["quality_comparison"] = retry_quality_check
+            retry_record["original_allocation"] = dict(allocation or {})
+            retry_record["retry_allocation"] = dict(retry_allocation or {})
+            retry_record["original_validation"] = validation
+            retry_record["retry_validation"] = retry_validation
             if retry_validation["valid"] and retry_quality_check["accepted"]:
                 result[group_id] = retry_allocation
                 self._last_semantic_group_debug.extend(debug)
@@ -8898,6 +8902,23 @@ class ScreenSubtitleEditor:
         original_validation: Dict,
         retry_validation: Dict,
     ) -> Dict:
+        return self._compare_allocation_candidates(
+            original_allocation=original_allocation,
+            retry_allocation=retry_allocation,
+            group_context=entry,
+            original_validation=original_validation,
+            retry_validation=retry_validation,
+        )
+
+    def _compare_allocation_candidates(
+        self,
+        *,
+        original_allocation: Dict[str, str],
+        retry_allocation: Dict[str, str],
+        group_context: Dict,
+        original_validation: Dict,
+        retry_validation: Dict,
+    ) -> Dict:
         high_confidence_codes = {
             "adjacent_chinese_semantic_duplication",
             "cross_id_semantic_leakage",
@@ -8920,19 +8941,29 @@ class ScreenSubtitleEditor:
 
         expected_ids = [
             str(part.get("subtitle_id") or "").strip()
-            for part in list(entry.get("subtitle_parts") or [])
+            for part in list(group_context.get("subtitle_parts") or [])
         ]
         regression_reasons = self._detect_retry_allocation_quality_regressions(
-            entry,
+            group_context,
             original_allocation or {},
             retry_allocation or {},
             expected_ids,
         )
         reasons.extend(regression_reasons)
+        original_issue_count = len(original_codes & high_confidence_codes)
+        retry_issue_count = len(retry_codes & high_confidence_codes)
+        if retry_issue_count > original_issue_count:
+            reasons.append("high_confidence_issue_count_regressed")
         return {
             "accepted": not reasons,
+            "decision": "accept_retry" if not reasons else "keep_original",
             "fixed_issue_codes": fixed_codes,
             "new_issue_codes": new_codes,
+            "original_issue_codes": sorted(original_codes),
+            "retry_issue_codes": sorted(retry_codes),
+            "original_high_confidence_issue_count": original_issue_count,
+            "retry_high_confidence_issue_count": retry_issue_count,
+            "expected_subtitle_ids": expected_ids,
             "reasons": reasons,
         }
 
