@@ -3455,6 +3455,48 @@ def test_passed_validation_writes_final_output_and_manifest_metadata():
         assert (root / "output.srt").exists()
 
 
+def test_stable_reports_are_mirrored_to_source_audio_folder():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_dir = root / "source"
+        output_dir = root / "work" / "subtitle"
+        source_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
+        audio_path = source_dir / "sample.m4a"
+        audio_path.write_bytes(b"audio")
+        coverage_path = output_dir / "output-coverage-report.txt"
+        coverage_path.write_text("coverage", encoding="utf-8")
+        qa_path = output_dir / "qa-review-points.srt"
+        qa_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nQA\n", encoding="utf-8")
+
+        task = SubtitleTask(
+            subtitle_path=str(output_dir / "source.srt"),
+            video_path=str(audio_path),
+            output_path=str(output_dir / "output.srt"),
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        config = SubtitleConfig(
+            need_screen_subtitle_edit=True,
+            screen_subtitle_stable_mode=True,
+            subtitle_layout="original_top",
+        )
+
+        thread._save_stable_subtitle_outputs(
+            ASRData([ASRDataSeg("English 1.", 0, 1000, "译文")]),
+            config,
+            coverage_report_path=str(coverage_path),
+            validation_status="passed",
+            manifest_meta={"qa_review_points_srt": str(qa_path)},
+        )
+
+        mirrored_manifest = source_dir / "stable-final-manifest.json"
+        manifest = json.loads(mirrored_manifest.read_text(encoding="utf-8"))
+        assert (source_dir / "qa-review-points.srt").exists()
+        assert (source_dir / "coverage-report.txt").read_text(encoding="utf-8") == "coverage"
+        assert manifest["source_report_paths"]["qa_review_points_srt"].endswith("qa-review-points.srt")
+
+
 def test_screen_manifest_metadata_includes_stage_timings():
     class FakeScreenEditor:
         @staticmethod

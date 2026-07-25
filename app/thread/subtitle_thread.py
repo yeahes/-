@@ -2,6 +2,7 @@ import datetime
 import copy
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Dict
@@ -271,12 +272,73 @@ class SubtitleThread(QThread):
         }
         if manifest_meta:
             manifest.update(manifest_meta)
+        source_report_paths = self._source_audio_report_paths(
+            coverage_report_path=coverage_report_path,
+            qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
+        )
+        if source_report_paths:
+            manifest["source_report_dir"] = str(self._source_audio_report_dir())
+            manifest["source_report_paths"] = source_report_paths
         manifest_path = output_dir / "stable-final-manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        self._mirror_stable_reports_to_source_dir(
+            manifest_path=manifest_path,
+            coverage_report_path=coverage_report_path,
+            qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
+        )
         logger.info("Stable subtitle manifest saved: %s", manifest_path)
+
+    def _source_audio_report_dir(self) -> Path | None:
+        source_path = getattr(self.task, "video_path", None) or ""
+        if not source_path:
+            return None
+        source_dir = Path(source_path).parent
+        if not source_dir.exists():
+            return None
+        return source_dir
+
+    def _source_audio_report_paths(
+        self,
+        coverage_report_path: str | None,
+        qa_review_points_path: str,
+    ) -> dict:
+        source_dir = self._source_audio_report_dir()
+        if source_dir is None:
+            return {}
+        paths = {
+            "manifest": source_dir / "stable-final-manifest.json",
+        }
+        if coverage_report_path:
+            paths["coverage_report"] = source_dir / "coverage-report.txt"
+        if qa_review_points_path:
+            paths["qa_review_points_srt"] = source_dir / "qa-review-points.srt"
+        return {key: str(path) for key, path in paths.items()}
+
+    def _mirror_stable_reports_to_source_dir(
+        self,
+        manifest_path: Path,
+        coverage_report_path: str | None,
+        qa_review_points_path: str,
+    ) -> None:
+        source_dir = self._source_audio_report_dir()
+        if source_dir is None:
+            return
+        try:
+            report_sources = [
+                (manifest_path, source_dir / "stable-final-manifest.json"),
+            ]
+            if coverage_report_path:
+                report_sources.append((Path(coverage_report_path), source_dir / "coverage-report.txt"))
+            if qa_review_points_path:
+                report_sources.append((Path(qa_review_points_path), source_dir / "qa-review-points.srt"))
+            for source, destination in report_sources:
+                if source.exists() and source.resolve() != destination.resolve():
+                    shutil.copy2(source, destination)
+        except Exception as exc:
+            logger.warning("Mirroring subtitle reports to source audio folder failed: %s", exc)
 
     def _setup_api_config(self) -> SubtitleConfig:
         """设置API配置，返回SubtitleConfig"""
