@@ -4084,12 +4084,204 @@ class ScreenSubtitleEditor:
                 }
             )
 
-        return {
+        summary = {
             "status": "ERROR" if errors else ("WARNING" if warnings else "PASS"),
             "errors": errors,
             "warnings": warnings,
             "info": info,
         }
+        summary["review"] = self._validation_review_summary(errors, warnings, info)
+        return summary
+
+    def _validation_review_summary(
+        self,
+        errors: Sequence[Dict],
+        warnings: Sequence[Dict],
+        info: Sequence[Dict],
+    ) -> Dict:
+        entries: List[Dict] = []
+        for source_level, groups in (
+            ("error", errors),
+            ("warning", warnings),
+            ("info", info),
+        ):
+            for group in groups:
+                code = str(group.get("code") or "unknown")
+                items = group.get("items")
+                item_count = len(items) if isinstance(items, list) else (1 if items else 0)
+                severity = self._validation_review_severity(code, source_level)
+                affected_payload = items if items is not None else group
+                entries.append(
+                    {
+                        "severity": severity,
+                        "source_level": source_level,
+                        "code": code,
+                        "message": group.get("message", ""),
+                        "item_count": item_count,
+                        "action_required": severity in {"BLOCKER", "REVIEW"},
+                        "why_review": self._validation_review_reason(code, severity),
+                        "affected_subtitle_ids": self._validation_affected_subtitle_ids(affected_payload),
+                        "semantic_group_ids": self._validation_affected_semantic_group_ids(affected_payload),
+                    }
+                )
+
+        allocation_unresolved = list(getattr(self, "_last_allocation_unresolved", []) or [])
+        for record in allocation_unresolved:
+            issue_codes = [str(code) for code in record.get("issue_codes") or []]
+            severity = "BLOCKER" if self._allocation_unresolved_has_high_confidence_issue(issue_codes) else "REVIEW"
+            entries.append(
+                {
+                    "severity": severity,
+                    "source_level": "allocation_quality",
+                    "code": "allocation_quality_unresolved",
+                    "message": record.get("reason", ""),
+                    "item_count": 1,
+                    "action_required": True,
+                    "why_review": self._validation_review_reason("allocation_quality_unresolved", severity),
+                    "affected_subtitle_ids": self._validation_affected_subtitle_ids(record.get("allocation")),
+                    "semantic_group_ids": self._validation_affected_semantic_group_ids(record),
+                    "issue_codes": issue_codes,
+                }
+            )
+
+        counts = {"BLOCKER": 0, "REVIEW": 0, "INFO": 0}
+        for entry in entries:
+            counts[entry["severity"]] = counts.get(entry["severity"], 0) + int(entry.get("item_count") or 1)
+        return {
+            "schema_version": 1,
+            "summary": {
+                "blocker_count": counts.get("BLOCKER", 0),
+                "review_count": counts.get("REVIEW", 0),
+                "info_count": counts.get("INFO", 0),
+                "actionable_count": counts.get("BLOCKER", 0) + counts.get("REVIEW", 0),
+            },
+            "items": entries,
+        }
+
+    @staticmethod
+    def _validation_review_severity(code: str, source_level: str) -> str:
+        blocker_codes = {
+            "missing_translation",
+            "overlong_english",
+            "invalid_timing",
+            "subtitle_duration_invalid",
+            "translation_id_missing",
+            "translation_id_duplicate",
+            "translation_id_unknown",
+            "translation_group_cardinality_mismatch",
+            "final_translation_id_mismatch",
+            "allocation_quality_unresolved",
+        }
+        review_codes = {
+            "coverage_gap_unverified",
+            "reading_speed_error",
+            "suspicious_cut",
+            "translationese",
+            "reading_speed_warning",
+            "subtitle_duration_short_warning",
+            "duplicate_chinese",
+            "asr_suspicious",
+            "discourse_marker_orphan",
+            "syntax_boundary_audit",
+            "chinese_semantic_group_warning",
+        }
+        if code in blocker_codes or code.startswith("translation_id_"):
+            return "BLOCKER"
+        if code in review_codes or source_level == "warning":
+            return "REVIEW"
+        return "INFO"
+
+    @staticmethod
+    def _validation_review_reason(code: str, severity: str) -> str:
+        reasons = {
+            "missing_translation": "Chinese text is missing for one or more frozen subtitle IDs.",
+            "overlong_english": "English text exceeds the hard subtitle word limit.",
+            "invalid_timing": "Subtitle timestamps are invalid or overlapping.",
+            "subtitle_duration_invalid": "Subtitle duration is below the hard display limit.",
+            "translation_id_missing": "LLM allocation omitted an expected subtitle ID.",
+            "translation_id_duplicate": "LLM allocation returned the same subtitle ID more than once.",
+            "translation_id_unknown": "LLM allocation returned a subtitle ID outside the frozen set.",
+            "translation_group_cardinality_mismatch": "Returned allocation ID set differs from the expected group ID set.",
+            "final_translation_id_mismatch": "Final writeback ID set differs from frozen English subtitle IDs.",
+            "allocation_quality_unresolved": "A high-confidence allocation issue remained after retry or retry was rejected.",
+            "reading_speed_error": "A subtitle likely needs manual shortening or timing review.",
+            "suspicious_cut": "English boundary may split a phrase unnaturally.",
+            "syntax_boundary_audit": "A syntax-aware boundary rule flagged this cut.",
+            "chinese_semantic_group_warning": "Chinese group audit found a possible semantic or fluency issue.",
+            "asr_suspicious": "ASR text contains a suspicious token pattern.",
+            "duplicate_chinese": "Adjacent Chinese subtitles may repeat the same content.",
+        }
+        return reasons.get(code, f"{severity} validation item; inspect the grouped evidence.")
+
+    @staticmethod
+    def _validation_affected_subtitle_ids(payload) -> List[str]:
+        found: set[str] = set()
+
+        def collect(value) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(key, str) and re.fullmatch(r"S\d{4}", key):
+                        found.add(key)
+                    if key in {
+                        "subtitle_id",
+                        "left_subtitle_id",
+                        "right_subtitle_id",
+                    } and isinstance(item, str):
+                        found.add(item)
+                    elif key in {
+                        "subtitle_ids",
+                        "expected_subtitle_ids",
+                        "returned_subtitle_ids",
+                        "mapped_subtitle_ids",
+                        "missing_subtitle_ids",
+                        "duplicate_subtitle_ids",
+                        "unknown_subtitle_ids",
+                    } and isinstance(item, list):
+                        for subtitle_id in item:
+                            if isinstance(subtitle_id, str):
+                                found.add(subtitle_id)
+                    collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+
+        collect(payload)
+        return sorted(subtitle_id for subtitle_id in found if re.fullmatch(r"S\d{4}", subtitle_id))
+
+    @staticmethod
+    def _validation_affected_semantic_group_ids(payload) -> List[str]:
+        found: set[str] = set()
+
+        def collect(value) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "semantic_group_id" and isinstance(item, str):
+                        found.add(item)
+                    elif key == "semantic_group_ids" and isinstance(item, list):
+                        for group_id in item:
+                            if isinstance(group_id, str):
+                                found.add(group_id)
+                    collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+
+        collect(payload)
+        return sorted(group_id for group_id in found if re.fullmatch(r"G\d{4}", group_id))
+
+    @staticmethod
+    def _allocation_unresolved_has_high_confidence_issue(issue_codes: Sequence[str]) -> bool:
+        high_confidence_codes = {
+            "adjacent_chinese_semantic_duplication",
+            "cross_id_semantic_leakage",
+            "group_allocation_information_omission",
+            "entity_allocation_mismatch",
+            "number_allocation_mismatch",
+            "negation_allocation_mismatch",
+            "unnatural_chinese_fragment",
+            "translation_group_cardinality_mismatch",
+        }
+        return bool(set(issue_codes) & high_confidence_codes)
 
     @staticmethod
     def _timing_validation_issues(segments: Sequence[ASRDataSeg]) -> List[Dict]:

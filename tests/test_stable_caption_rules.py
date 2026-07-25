@@ -372,6 +372,98 @@ def test_chinese_reading_speed_error_is_reported_but_not_blocking():
     )
 
 
+def test_validation_report_adds_actionable_review_tiers_without_changing_status():
+    editor = _editor()
+    editor._translation_structure_errors = [
+        {
+            "code": "final_translation_id_mismatch",
+            "message": "final id mismatch",
+            "missing_subtitle_ids": ["S0002"],
+        }
+    ]
+    health = {
+        "overlong_english": [],
+        "bad_cuts": [],
+        "translationese": [],
+        "reading_speed_errors": [
+            {
+                "subtitle_id": "S0001",
+                "chars_per_second": 18.5,
+                "text": "too fast",
+            }
+        ],
+        "reading_speed_warnings": [],
+        "duration_errors": [],
+        "duration_warnings": [],
+        "duplicate_chinese": [],
+        "asr_suspicious": [],
+        "discourse_marker_orphans": [],
+        "syntax_boundary_audit": [],
+        "chinese_semantic_group_warnings": [],
+        "chinese_semantic_group_info": [],
+    }
+
+    summary = editor._validation_summary([], [], health, [ASRDataSeg("Hello.", 0, 1000, "Ni hao.")])
+    review_items = summary["review"]["items"]
+
+    assert summary["status"] == "ERROR"
+    assert any(item["code"] == "final_translation_id_mismatch" for item in summary["errors"])
+    assert any(
+        item["code"] == "final_translation_id_mismatch"
+        and item["severity"] == "BLOCKER"
+        and item["affected_subtitle_ids"] == ["S0002"]
+        for item in review_items
+    )
+    assert any(
+        item["code"] == "reading_speed_error"
+        and item["severity"] == "REVIEW"
+        and item["affected_subtitle_ids"] == ["S0001"]
+        for item in review_items
+    )
+    assert any(item["code"] == "subtitle_stats" and item["severity"] == "INFO" for item in review_items)
+    assert summary["review"]["summary"]["blocker_count"] >= 1
+    assert summary["review"]["summary"]["review_count"] >= 1
+
+
+def test_validation_review_includes_allocation_unresolved_without_old_error_mutation():
+    editor = _editor()
+    editor._last_allocation_unresolved = [
+        {
+            "semantic_group_id": "G0007",
+            "reason": "retry_quality_failed",
+            "issue_codes": ["number_allocation_mismatch"],
+            "allocation": {"S0010": "A", "S0011": "B"},
+        }
+    ]
+    health = {
+        "overlong_english": [],
+        "bad_cuts": [],
+        "translationese": [],
+        "reading_speed_errors": [],
+        "reading_speed_warnings": [],
+        "duration_errors": [],
+        "duration_warnings": [],
+        "duplicate_chinese": [],
+        "asr_suspicious": [],
+        "discourse_marker_orphans": [],
+        "syntax_boundary_audit": [],
+        "chinese_semantic_group_warnings": [],
+        "chinese_semantic_group_info": [],
+    }
+
+    summary = editor._validation_summary([], [], health, [ASRDataSeg("Hello.", 0, 1000, "Ni hao.")])
+
+    assert summary["errors"] == []
+    assert summary["status"] == "PASS"
+    assert any(
+        item["code"] == "allocation_quality_unresolved"
+        and item["severity"] == "BLOCKER"
+        and item["semantic_group_ids"] == ["G0007"]
+        and item["affected_subtitle_ids"] == ["S0010", "S0011"]
+        for item in summary["review"]["items"]
+    )
+
+
 def test_duplicate_chinese_is_warning_not_blocking():
     editor = _editor()
     segments = [
@@ -3064,6 +3156,8 @@ if __name__ == "__main__":
     test_coverage_gap_does_not_sum_natural_pauses()
     test_coverage_gap_blocks_single_long_uncovered_span()
     test_chinese_reading_speed_error_is_reported_but_not_blocking()
+    test_validation_report_adds_actionable_review_tiers_without_changing_status()
+    test_validation_review_includes_allocation_unresolved_without_old_error_mutation()
     test_duplicate_chinese_is_warning_not_blocking()
     test_overlong_english_segment_is_locally_split_without_llm()
     test_audit_parser_does_not_count_chinese_line_with_it_as_english()
