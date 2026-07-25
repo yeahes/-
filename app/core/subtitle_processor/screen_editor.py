@@ -9194,6 +9194,8 @@ class ScreenSubtitleEditor:
     @classmethod
     def _allocation_anchor_present(cls, value: str, anchor_type: str, chinese: str) -> bool:
         text = chinese or ""
+        if anchor_type == "negation" and cls._allocation_negation_present(text):
+            return True
         if anchor_type == "number":
             compact = re.sub(r"[,，\s]", "", text)
             value = (value or "").replace(",", "").replace(" ", "")
@@ -9202,7 +9204,22 @@ class ScreenSubtitleEditor:
             return any(variant and variant in compact for variant in cls._chinese_number_anchor_variants(value))
         if anchor_type == "negation":
             return bool(re.search(r"[不没无非未别勿]|不能|不会|不是|没有", text))
-        return value in text
+        return value in text or cls._normalized_entity_anchor(value) in cls._normalized_entity_anchor(text)
+
+    @staticmethod
+    def _allocation_negation_present(text: str) -> bool:
+        if not text:
+            return False
+        return bool(
+            re.search(
+                r"(?:不|没|无|非|未|别|勿|不能|不会|不是|没有|不再|不必|不用|无需|无法|并非|绝非)",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _normalized_entity_anchor(text: str) -> str:
+        return re.sub(r"[^0-9A-Za-z]+", "", text or "").lower()
 
     @staticmethod
     def _chinese_number_anchor_variants(value: str) -> List[str]:

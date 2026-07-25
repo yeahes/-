@@ -2518,6 +2518,45 @@ def test_allocation_quality_allows_negation_with_adjacent_predicate_completion()
     assert "negation_allocation_mismatch" not in validation["issue_codes"]
 
 
+def test_allocation_quality_accepts_common_chinese_negation_equivalents():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "你无需担心。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "You do not need to worry."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {"S0001": "你无需担心。"},
+    )
+
+    assert validation["valid"]
+    assert "negation_allocation_mismatch" not in validation["issue_codes"]
+
+
+def test_allocation_quality_accepts_entity_spacing_equivalent():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "OpenAI released the model.",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Open AI released the model."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {"S0001": "OpenAI released the model."},
+    )
+
+    assert validation["valid"]
+    assert "entity_allocation_mismatch" not in validation["issue_codes"]
+    assert "cross_id_semantic_leakage" not in validation["issue_codes"]
+
+
 def test_allocation_quality_accepts_chinese_number_equivalents():
     editor = _id_editor()
     percent_entry = {
@@ -3317,6 +3356,8 @@ if __name__ == "__main__":
     test_allocation_quality_rejects_adjacent_core_duplication()
     test_allocation_quality_detects_negation_misplacement()
     test_allocation_quality_allows_negation_with_adjacent_predicate_completion()
+    test_allocation_quality_accepts_common_chinese_negation_equivalents()
+    test_allocation_quality_accepts_entity_spacing_equivalent()
     test_allocation_quality_accepts_chinese_number_equivalents()
     test_allocation_quality_accepts_decimal_wan_number_equivalent()
     test_allocation_quality_allows_adjacent_number_when_target_line_is_not_degraded()
