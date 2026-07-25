@@ -3986,6 +3986,8 @@ class ScreenSubtitleEditor:
                         "chinese": segment.translated_text,
                     }
                 )
+            if not context:
+                continue
             points.append(
                 {
                     "code": "long_split_allocation_review",
@@ -3994,7 +3996,7 @@ class ScreenSubtitleEditor:
                     "issue_codes": issue_codes,
                     "reason": record.get("reason", ""),
                     "start_ms": int(first_segment.start_time),
-                    "end_ms": int(first_segment.end_time),
+                    "end_ms": int(context[-1].get("end_ms") or first_segment.end_time),
                     "full_english": record.get("full_english", ""),
                     "full_translation": record.get("full_translation", ""),
                     "context": context,
@@ -4025,18 +4027,26 @@ class ScreenSubtitleEditor:
     def _review_points_to_srt(self, points: Sequence[Dict]) -> str:
         blocks: List[str] = []
         for index, point in enumerate(points, 1):
-            subtitle_ids = ",".join(point.get("subtitle_ids") or [])
-            issue_codes = ",".join(point.get("issue_codes") or [])
+            subtitle_ids = self._compact_subtitle_id_list(point.get("subtitle_ids") or [])
+            issue_codes = " / ".join(
+                self._editor_review_issue_label(str(code))
+                for code in point.get("issue_codes") or []
+            )
             context = point.get("context") or []
-            first = context[0] if context else {}
             lines = [
                 f"[QA] {subtitle_ids} 中英对应待检查",
-                f"原因：{issue_codes}",
+                f"类型：{issue_codes}",
             ]
-            if first.get("english"):
-                lines.append(f"EN：{str(first.get('english'))[:90]}")
-            if first.get("chinese"):
-                lines.append(f"ZH：{str(first.get('chinese'))[:90]}")
+            if point.get("semantic_group_id"):
+                lines.append(f"组：{point.get('semantic_group_id')}")
+            for item in context[:3]:
+                subtitle_id = str(item.get("subtitle_id") or "")
+                english = self._clip_review_text(str(item.get("english") or ""), 54)
+                chinese = self._clip_review_text(str(item.get("chinese") or ""), 54)
+                lines.append(f"{subtitle_id} EN：{english}")
+                lines.append(f"{subtitle_id} ZH：{chinese}")
+            if len(context) > 3:
+                lines.append(f"... 另 {len(context) - 3} 条见 qa-review-points.json")
             blocks.append(
                 "\n".join(
                     [
@@ -4047,6 +4057,34 @@ class ScreenSubtitleEditor:
                 )
             )
         return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+    @staticmethod
+    def _clip_review_text(text: str, max_chars: int) -> str:
+        compact = " ".join(str(text or "").split())
+        if len(compact) <= max_chars:
+            return compact
+        return compact[: max(0, max_chars - 1)].rstrip() + "…"
+
+    @staticmethod
+    def _compact_subtitle_id_list(subtitle_ids: Sequence[str]) -> str:
+        ids = [str(subtitle_id) for subtitle_id in subtitle_ids if re.fullmatch(r"S\d{4}", str(subtitle_id))]
+        if len(ids) >= 2:
+            numbers = [int(subtitle_id[1:]) for subtitle_id in ids]
+            if numbers == list(range(numbers[0], numbers[-1] + 1)):
+                return f"{ids[0]}-{ids[-1]}"
+        return ",".join(ids)
+
+    @staticmethod
+    def _editor_review_issue_label(issue_code: str) -> str:
+        labels = {
+            "cross_id_semantic_leakage": "信息串条",
+            "group_allocation_information_omission": "信息遗漏",
+            "entity_allocation_mismatch": "实体错位",
+            "number_allocation_mismatch": "数字错位",
+            "negation_allocation_mismatch": "否定错位",
+            "adjacent_chinese_semantic_duplication": "相邻重复",
+        }
+        return labels.get(issue_code, issue_code)
 
     def has_blocking_validation_errors(self) -> bool:
         return bool(self._translation_structure_errors)

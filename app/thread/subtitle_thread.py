@@ -2,6 +2,7 @@ import datetime
 import copy
 import json
 import os
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -48,12 +49,22 @@ class SubtitleThread(QThread):
         self.subtitle_length = 0
         self.finished_subtitle_length = 0
         self.custom_prompt_text = ""
+        self._stage_timings_seconds: Dict[str, float] = {}
         # 初始化数据库和服务使用管理器
         self.db_manager = DatabaseManager(CACHE_PATH)
         self.service_manager = ServiceUsageManager(self.db_manager)
 
     def set_custom_prompt_text(self, text: str):
         self.custom_prompt_text = text
+
+    def _record_stage_duration(self, stage: str, started_at: float) -> None:
+        self._stage_timings_seconds[stage] = round(max(0.0, time.perf_counter() - started_at), 3)
+
+    def _screen_manifest_metadata(self, screen_editor: ScreenSubtitleEditor) -> dict:
+        metadata = screen_editor.manifest_metadata()
+        metadata["stage_timings_seconds"] = dict(self._stage_timings_seconds)
+        metadata["stage_timings_total_seconds"] = round(sum(self._stage_timings_seconds.values()), 3)
+        return metadata
 
     @staticmethod
     def _subtitle_layout_names() -> Dict[str, str]:
@@ -326,12 +337,17 @@ class SubtitleThread(QThread):
 
             subtitle_config = self.task.subtitle_config
 
+            stage_started = time.perf_counter()
             asr_raw = ASRData.from_subtitle_file(subtitle_path)
             asr_data = asr_raw
             word_time_asr_data = None
             article_output_dir = self._article_output_dir()
             self._save_stage_json(article_output_dir, "asr_raw.json", asr_raw)
+            self._record_stage_duration("load_subtitle", stage_started)
+
+            stage_started = time.perf_counter()
             article_context = self._resolve_article_context(subtitle_config, article_output_dir)
+            self._record_stage_duration("article_context", stage_started)
             article_translation_prompt = ""
             if (
                 str(getattr(self.task, "article_reference_text", "") or "").strip()
@@ -346,6 +362,7 @@ class SubtitleThread(QThread):
                 str(getattr(self.task, "article_reference_text", "") or "").strip()
                 and bool(getattr(self.task, "use_article_reference_assist", False))
             ):
+                stage_started = time.perf_counter()
                 try:
                     asr_corrected = apply_article_asr_corrections(
                         asr_raw,
@@ -358,14 +375,17 @@ class SubtitleThread(QThread):
                 except Exception as exc:
                     logger.warning("Article ASR correction failed, using original ASR: %s", exc)
                     self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
+                self._record_stage_duration("article_asr_correction", stage_started)
             else:
                 self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
 
             # 1. 分割成字词级时间戳（对于非断句字幕且开启分割选项）
+            stage_started = time.perf_counter()
             if subtitle_config.need_split and not asr_data.is_word_timestamp():
                 asr_data.split_to_word_segments()
             if asr_data.is_word_timestamp():
                 word_time_asr_data = copy.deepcopy(asr_data)
+            self._record_stage_duration("word_timestamp_prepare", stage_started)
 
             # 获取API配置，会先检查可用性（优先使用设置的API，其次使用自带的公益API）
             if (
@@ -384,10 +404,12 @@ class SubtitleThread(QThread):
                     )
                 )
             ):
+                stage_started = time.perf_counter()
                 self.progress.emit(2, self.tr("开始验证API配置..."))
                 subtitle_config = self._setup_api_config()
                 os.environ["OPENAI_BASE_URL"] = subtitle_config.base_url
                 os.environ["OPENAI_API_KEY"] = subtitle_config.api_key
+                self._record_stage_duration("api_setup", stage_started)
 
             # 2. 重新断句（对于字词级字幕）
             stable_screen_mode = (
@@ -395,6 +417,7 @@ class SubtitleThread(QThread):
                 and subtitle_config.screen_subtitle_stable_mode
             )
             if asr_data.is_word_timestamp() and not stable_screen_mode:
+                stage_started = time.perf_counter()
                 self.progress.emit(5, self.tr("字幕断句..."))
                 logger.info("正在字幕断句...")
                 screen_edit_mode = subtitle_config.need_screen_subtitle_edit
@@ -426,6 +449,7 @@ class SubtitleThread(QThread):
                 asr_data = splitter.split_subtitle(asr_data)
                 asr_data.save(save_path=split_path)
                 self.update_all.emit(asr_data.to_json())
+                self._record_stage_duration("split_subtitle", stage_started)
             self._save_stage_json(article_output_dir, "segmented_english.json", asr_data)
 
             # 3. 优化字幕
@@ -436,6 +460,7 @@ class SubtitleThread(QThread):
             self.subtitle_length = len(asr_data.segments)
 
             if subtitle_config.need_optimize:
+                stage_started = time.perf_counter()
                 self.progress.emit(0, self.tr("优化字幕..."))
                 logger.info("正在优化字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
@@ -448,6 +473,7 @@ class SubtitleThread(QThread):
                 )
                 asr_data = optimizer.optimize_subtitle(asr_data)
                 self.update_all.emit(asr_data.to_json())
+                self._record_stage_duration("optimize_subtitle", stage_started)
 
             # 4. 翻译字幕
             translator_map = {
@@ -465,6 +491,7 @@ class SubtitleThread(QThread):
                     "跳过普通翻译：上屏短字幕校正将基于语义粗切字幕直接完成翻译和细切"
                 )
             if should_translate_before_screen_edit:
+                stage_started = time.perf_counter()
                 self.progress.emit(0, self.tr("翻译字幕..."))
                 logger.info("正在翻译字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
@@ -487,11 +514,13 @@ class SubtitleThread(QThread):
                 ):
                     asr_data.remove_punctuation()
                 self.update_all.emit(asr_data.to_json())
+                self._record_stage_duration("translate_subtitle", stage_started)
             self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
 
             # 5. 上屏短字幕校正
             coverage_report_path = None
             if subtitle_config.need_screen_subtitle_edit:
+                stage_started = time.perf_counter()
                 self.progress.emit(0, self.tr("上屏短字幕校正..."))
                 if any(seg.translated_text for seg in asr_data.segments):
                     logger.info("正在进行上屏短字幕校正...")
@@ -522,6 +551,7 @@ class SubtitleThread(QThread):
                     update_callback=self.callback,
                 )
                 asr_data = screen_editor.edit(asr_data, word_time_asr_data=word_time_asr_data)
+                self._record_stage_duration("screen_subtitle_edit", stage_started)
                 if screen_editor.has_blocking_validation_errors():
                     message = screen_editor.blocking_validation_message()
                     self._save_stable_subtitle_outputs(
@@ -530,7 +560,7 @@ class SubtitleThread(QThread):
                         coverage_report_path=coverage_report_path,
                         validation_status="failed",
                         validation_summary=screen_editor.last_validation_summary,
-                        manifest_meta=screen_editor.manifest_metadata(),
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
                     )
                     raise RuntimeError(
                         self.tr(
@@ -562,18 +592,20 @@ class SubtitleThread(QThread):
                     logger.info(f"字幕保存到 {save_path}")
 
             # 6. 保存字幕
+            stage_started = time.perf_counter()
             asr_data.save(
                 save_path=self.task.output_path,
                 ass_style=subtitle_config.subtitle_style,
                 layout=subtitle_config.subtitle_layout,
             )
             self._save_stage_json(article_output_dir, "final_subtitles.json", asr_data)
+            self._record_stage_duration("final_subtitle_save", stage_started)
             self._save_stable_subtitle_outputs(
                 asr_data,
                 subtitle_config,
                 coverage_report_path=coverage_report_path,
                 validation_status="passed",
-                manifest_meta=screen_editor.manifest_metadata(),
+                manifest_meta=self._screen_manifest_metadata(screen_editor),
             )
             logger.info(f"字幕保存到 {self.task.output_path}")
 

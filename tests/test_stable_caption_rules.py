@@ -3115,9 +3115,12 @@ def test_editor_review_points_only_include_long_split_allocation_mismatch():
     points = editor._editor_review_points(segments)
     assert len(points) == 1
     assert points[0]["subtitle_ids"] == ["S0001", "S0002"]
+    assert points[0]["end_ms"] == segments[1].end_time
     srt = editor._review_points_to_srt(points)
-    assert "[QA] S0001,S0002 中英对应待检查" in srt
-    assert "number_allocation_mismatch" in srt
+    assert "[QA] S0001-S0002" in srt
+    assert "G0001" in srt
+    assert "S0001 EN" in srt
+    assert "S0002 EN" in srt
     assert "S0003" not in srt
 
 
@@ -3405,6 +3408,22 @@ def test_passed_validation_writes_final_output_and_manifest_metadata():
         assert manifest["cache_used"] is False
         assert manifest["prompt_version"] == "global-subtitle-id-v2"
         assert (root / "output.srt").exists()
+
+
+def test_screen_manifest_metadata_includes_stage_timings():
+    class FakeScreenEditor:
+        @staticmethod
+        def manifest_metadata():
+            return {"translation_model": "deepseek-v4-flash"}
+
+    thread = SubtitleThread.__new__(SubtitleThread)
+    thread._stage_timings_seconds = {"screen_subtitle_edit": 12.345, "final_subtitle_save": 0.5}
+
+    metadata = thread._screen_manifest_metadata(FakeScreenEditor())
+
+    assert metadata["translation_model"] == "deepseek-v4-flash"
+    assert metadata["stage_timings_seconds"]["screen_subtitle_edit"] == 12.345
+    assert metadata["stage_timings_total_seconds"] == 12.845
 
 
 def test_id_bound_mapping_has_no_drift_over_400_subtitles():
