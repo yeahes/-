@@ -2576,6 +2576,71 @@ def test_allocation_quality_accepts_chinese_number_equivalents():
     assert "number_allocation_mismatch" not in economists_validation["issue_codes"]
 
 
+def test_allocation_quality_accepts_decimal_wan_number_equivalent():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "salary is about 7.7万美元。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "salary is about 77 000 dollars."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {"S0001": "salary is about 7.7万美元。"},
+    )
+
+    assert validation["valid"]
+    assert "number_allocation_mismatch" not in validation["issue_codes"]
+
+
+def test_allocation_quality_allows_adjacent_number_when_target_line_is_not_degraded():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "You save lives, about 20 times more.",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "you save about 20 times more lives"},
+            {"subtitle_id": "S0002", "english": "than the baseline."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "you save lives,",
+            "S0002": "about 20 times more than the baseline.",
+        },
+    )
+
+    assert validation["valid"]
+    assert "number_allocation_mismatch" not in validation["issue_codes"]
+
+
+def test_allocation_quality_rejects_adjacent_number_when_target_line_is_empty():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "You save lives, about 20 times more.",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "you save about 20 times more lives"},
+            {"subtitle_id": "S0002", "english": "than the baseline."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "",
+            "S0002": "you save lives, about 20 times more than the baseline.",
+        },
+    )
+
+    assert not validation["valid"]
+    assert "number_allocation_mismatch" in validation["issue_codes"]
+
+
 def test_allocation_quality_accepts_natural_subtitle_half_sentence():
     editor = _id_editor()
     entry = {
@@ -3253,6 +3318,9 @@ if __name__ == "__main__":
     test_allocation_quality_detects_negation_misplacement()
     test_allocation_quality_allows_negation_with_adjacent_predicate_completion()
     test_allocation_quality_accepts_chinese_number_equivalents()
+    test_allocation_quality_accepts_decimal_wan_number_equivalent()
+    test_allocation_quality_allows_adjacent_number_when_target_line_is_not_degraded()
+    test_allocation_quality_rejects_adjacent_number_when_target_line_is_empty()
     test_allocation_quality_accepts_natural_subtitle_half_sentence()
     test_allocation_retry_rejects_quality_regression_before_writeback()
     test_cross_id_leakage_requires_target_id_to_be_degraded()

@@ -8850,7 +8850,14 @@ class ScreenSubtitleEditor:
                 continue
             if self._is_bad_allocation_chinese_fragment(text, offset, len(ordered_texts)):
                 issue_codes.append("unnatural_chinese_fragment")
-                issues.append({"subtitle_id": expected_ids[offset], "text": text})
+                issues.append(
+                    {
+                        "code": "unnatural_chinese_fragment",
+                        "subtitle_id": expected_ids[offset],
+                        "text": text,
+                        "reason": "local_chinese_fragment_failed_quality_check",
+                    }
+                )
 
         duplicate_pairs = self._detect_adjacent_chinese_duplication(expected_ids, ordered_texts)
         if duplicate_pairs:
@@ -8979,22 +8986,45 @@ class ScreenSubtitleEditor:
                 for subtitle_id, zh in allocation.items()
                 if self._allocation_anchor_present(value, anchor_type, zh)
             ]
+            expected_english = english_by_id.get(expected_id, "")
             if not present_ids:
                 if anchor_type in {"number", "negation"} or (
                     anchor_type == "entity"
                     and self._allocation_anchor_present(value, anchor_type, str(entry.get("full_translation") or ""))
                 ):
+                    full_translation_has_anchor = self._allocation_anchor_present(
+                        value,
+                        anchor_type,
+                        str(entry.get("full_translation") or ""),
+                    )
                     issues.append(
                         {
                             "code": f"{anchor_type}_allocation_mismatch",
                             "anchor": value,
+                            "anchor_type": anchor_type,
                             "expected_subtitle_id": expected_id,
                             "actual_subtitle_ids": [],
                             "reason": "anchor_missing",
+                            "failure_kind": "missing",
+                            "expected_english": expected_english,
+                            "expected_chinese": allocation.get(expected_id, ""),
+                            "full_translation_has_anchor": full_translation_has_anchor,
+                            "present_scan": self._allocation_anchor_presence_scan(
+                                value,
+                                anchor_type,
+                                allocation,
+                            ),
                         }
                     )
                 continue
             if expected_id not in present_ids:
+                if anchor_type == "number" and self._is_allowed_adjacent_number_allocation(
+                    expected_id,
+                    present_ids,
+                    [str(part.get("subtitle_id") or "").strip() for part in parts],
+                    allocation,
+                ):
+                    continue
                 if anchor_type == "negation" and self._is_allowed_adjacent_negation_allocation(
                     expected_id,
                     present_ids,
@@ -9018,11 +9048,40 @@ class ScreenSubtitleEditor:
                     {
                         "code": code,
                         "anchor": value,
+                        "anchor_type": anchor_type,
                         "expected_subtitle_id": expected_id,
                         "actual_subtitle_ids": present_ids,
+                        "reason": "anchor_present_on_different_subtitle_id",
+                        "failure_kind": "misplaced",
+                        "expected_english": expected_english,
+                        "expected_chinese": allocation.get(expected_id, ""),
+                        "actual_chinese": {
+                            subtitle_id: allocation.get(subtitle_id, "")
+                            for subtitle_id in present_ids
+                        },
+                        "present_scan": self._allocation_anchor_presence_scan(
+                            value,
+                            anchor_type,
+                            allocation,
+                        ),
                     }
                 )
         return issues
+
+    def _allocation_anchor_presence_scan(
+        self,
+        value: str,
+        anchor_type: str,
+        allocation: Dict[str, str],
+    ) -> List[Dict]:
+        return [
+            {
+                "subtitle_id": subtitle_id,
+                "present": self._allocation_anchor_present(value, anchor_type, zh),
+                "text": zh,
+            }
+            for subtitle_id, zh in allocation.items()
+        ]
 
     def _is_high_confidence_cross_id_semantic_leakage(
         self,
@@ -9052,6 +9111,35 @@ class ScreenSubtitleEditor:
         if adjacent_ids.intersection(present_ids):
             return False
         return len(expected_norm) <= 6
+
+    def _is_allowed_adjacent_number_allocation(
+        self,
+        expected_id: str,
+        present_ids: Sequence[str],
+        ordered_ids: Sequence[str],
+        allocation: Dict[str, str],
+    ) -> bool:
+        if expected_id not in ordered_ids:
+            return False
+        expected_index = list(ordered_ids).index(expected_id)
+        following_id = ordered_ids[expected_index + 1] if expected_index + 1 < len(ordered_ids) else ""
+        if following_id not in set(present_ids):
+            return False
+        expected_text = self._normalize_text(str(allocation.get(expected_id, "")))
+        expected_norm = self._normalize_chinese_for_compare(expected_text)
+        if not expected_norm:
+            return False
+        present_norms = [
+            self._normalize_chinese_for_compare(str(allocation.get(subtitle_id, "")))
+            for subtitle_id in present_ids
+        ]
+        if any(expected_norm and expected_norm == present_norm for present_norm in present_norms):
+            return False
+        return not self._is_bad_allocation_chinese_fragment(
+            expected_text,
+            expected_index,
+            len(ordered_ids),
+        )
 
     @staticmethod
     def _is_allowed_adjacent_negation_allocation(
@@ -9176,6 +9264,7 @@ class ScreenSubtitleEditor:
             variants.add(f"{number // 10000}万")
         if number % 1000 == 0 and number >= 1000:
             variants.add(f"{number // 1000}千")
+        variants.update(ScreenSubtitleEditor._decimal_wan_number_variants(number))
         if is_percent:
             variants.update({f"百分之{item}" for item in list(variants)})
             if number == 100:
@@ -9185,6 +9274,16 @@ class ScreenSubtitleEditor:
             if number == 100:
                 variants.add("百分之百")
         return sorted(variants, key=len, reverse=True)
+
+    @staticmethod
+    def _decimal_wan_number_variants(number: int) -> List[str]:
+        if number < 10000 or number % 1000 != 0:
+            return []
+        wan_value = number / 10000
+        if wan_value.is_integer():
+            return []
+        text = f"{wan_value:g}万"
+        return [text, f"{text}美元"]
 
     @staticmethod
     def _character_bag_overlap(left: str, right: str) -> float:
