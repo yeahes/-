@@ -339,6 +339,7 @@ class ScreenSubtitleEditor:
         self._allocation_isolation_before: Dict = {}
         self._allocation_isolation_after: Dict = {}
         self._allocation_isolation_report: Dict = {}
+        self._qa_review_points_path: str = ""
         self.last_validation_summary: Optional[Dict] = None
 
     def _compose_prompt(self, base_prompt: str) -> str:
@@ -2372,12 +2373,15 @@ class ScreenSubtitleEditor:
             return ""
 
     def manifest_metadata(self) -> Dict:
-        return {
+        metadata = {
             "translation_model": self.model,
             "code_commit": self._current_git_commit(),
             "cache_used": self._llm_cache_used,
             "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
         }
+        if self._qa_review_points_path:
+            metadata["qa_review_points_srt"] = self._qa_review_points_path
+        return metadata
 
     def _group_expected_subtitle_ids(self, group: Dict) -> List[str]:
         return [
@@ -3919,9 +3923,126 @@ class ScreenSubtitleEditor:
                 lines.append("未发现覆盖缺口、缺中文字幕、英文超长、明显坏切点、常见翻译腔、阅读速度异常、中文重复或 ASR 可疑文本。")
             report_path.write_text("\n".join(lines), encoding="utf-8")
             self._write_validation_artifact(report_path, validation_summary)
+            self._write_editor_review_points_srt(report_path, final_segments or [])
             logger.info("上屏字幕覆盖报告已保存 / Coverage report saved: %s", report_path)
         except Exception as e:
             logger.warning("上屏字幕覆盖报告保存失败 / Coverage report save failed: %s", str(e))
+
+    def _write_editor_review_points_srt(
+        self,
+        report_path: Path,
+        final_segments: Sequence[ASRDataSeg],
+    ) -> None:
+        points = self._editor_review_points(final_segments)
+        srt_path = report_path.parent / "qa-review-points.srt"
+        artifact_dir = self._artifact_dir(report_path)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_srt_path = artifact_dir / "qa-review-points.srt"
+        artifact_json_path = artifact_dir / "qa-review-points.json"
+        self._qa_review_points_path = str(srt_path)
+        srt_text = self._review_points_to_srt(points)
+        try:
+            srt_path.write_text(srt_text, encoding="utf-8-sig")
+            artifact_srt_path.write_text(srt_text, encoding="utf-8-sig")
+            self._write_json_artifact(artifact_json_path, points)
+        except Exception as e:
+            logger.warning("剪辑检查点字幕保存失败 / QA review SRT save failed: %s", str(e))
+
+    def _editor_review_points(self, final_segments: Sequence[ASRDataSeg]) -> List[Dict]:
+        segments_by_id = {
+            self._segment_subtitle_id(segment, index): segment
+            for index, segment in enumerate(final_segments, 1)
+        }
+        points: List[Dict] = []
+        for record in getattr(self, "_last_allocation_unresolved", []) or []:
+            issue_codes = [str(code) for code in record.get("issue_codes") or []]
+            if not self._is_editor_visible_allocation_issue(record, issue_codes):
+                continue
+            allocation = record.get("allocation") if isinstance(record.get("allocation"), dict) else {}
+            subtitle_ids = sorted(
+                [str(subtitle_id) for subtitle_id in allocation if re.fullmatch(r"S\d{4}", str(subtitle_id))],
+                key=lambda subtitle_id: int(subtitle_id[1:]),
+            )
+            if not subtitle_ids:
+                continue
+            first_segment = segments_by_id.get(subtitle_ids[0])
+            if first_segment is None:
+                continue
+            context = []
+            for subtitle_id in subtitle_ids:
+                segment = segments_by_id.get(subtitle_id)
+                if segment is None:
+                    continue
+                context.append(
+                    {
+                        "subtitle_id": subtitle_id,
+                        "start_ms": int(segment.start_time),
+                        "end_ms": int(segment.end_time),
+                        "english": segment.text,
+                        "chinese": segment.translated_text,
+                    }
+                )
+            points.append(
+                {
+                    "code": "long_split_allocation_review",
+                    "semantic_group_id": record.get("semantic_group_id", ""),
+                    "subtitle_ids": subtitle_ids,
+                    "issue_codes": issue_codes,
+                    "reason": record.get("reason", ""),
+                    "start_ms": int(first_segment.start_time),
+                    "end_ms": int(first_segment.end_time),
+                    "full_english": record.get("full_english", ""),
+                    "full_translation": record.get("full_translation", ""),
+                    "context": context,
+                }
+            )
+        points.sort(key=lambda point: int(point["subtitle_ids"][0][1:]) if point.get("subtitle_ids") else 0)
+        return points
+
+    def _is_editor_visible_allocation_issue(
+        self,
+        record: Dict,
+        issue_codes: Sequence[str],
+    ) -> bool:
+        relevant_codes = {
+            "cross_id_semantic_leakage",
+            "group_allocation_information_omission",
+            "entity_allocation_mismatch",
+            "number_allocation_mismatch",
+            "negation_allocation_mismatch",
+            "adjacent_chinese_semantic_duplication",
+        }
+        if not (set(issue_codes) & relevant_codes):
+            return False
+        full_english = str(record.get("full_english") or "")
+        allocation = record.get("allocation") if isinstance(record.get("allocation"), dict) else {}
+        return len(allocation) >= 2 or word_count(full_english) >= self.max_english_words * 2
+
+    def _review_points_to_srt(self, points: Sequence[Dict]) -> str:
+        blocks: List[str] = []
+        for index, point in enumerate(points, 1):
+            subtitle_ids = ",".join(point.get("subtitle_ids") or [])
+            issue_codes = ",".join(point.get("issue_codes") or [])
+            context = point.get("context") or []
+            first = context[0] if context else {}
+            lines = [
+                f"[QA] {subtitle_ids} 中英对应待检查",
+                f"原因：{issue_codes}",
+            ]
+            if first.get("english"):
+                lines.append(f"EN：{str(first.get('english'))[:90]}")
+            if first.get("chinese"):
+                lines.append(f"ZH：{str(first.get('chinese'))[:90]}")
+            blocks.append(
+                "\n".join(
+                    [
+                        str(index),
+                        f"{self._srt_timestamp(int(point.get('start_ms') or 0))} --> {self._srt_timestamp(int(point.get('end_ms') or 0))}",
+                        *lines,
+                    ]
+                )
+            )
+        return "\n\n".join(blocks) + ("\n" if blocks else "")
 
     def has_blocking_validation_errors(self) -> bool:
         return bool(self._translation_structure_errors)

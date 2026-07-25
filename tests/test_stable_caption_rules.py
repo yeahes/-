@@ -49,6 +49,7 @@ def _editor(max_words=14):
     editor._boundary_snapshot_changes = []
     editor._boundary_snapshot_item_sets = {}
     editor._pre_id_boundary_repairs = []
+    editor._qa_review_points_path = ""
     return editor
 
 
@@ -3077,6 +3078,47 @@ def test_compression_quality_regression_restores_previous_group_allocation():
 
     assert [seg.translated_text for seg in restored] == ["爱丽丝到了。", "鲍勃离开了。"]
     assert editor._last_allocation_unresolved[-1]["reason"] == "postprocess_allocation_quality_regression_restored"
+
+
+def test_editor_review_points_only_include_long_split_allocation_mismatch():
+    editor = _id_editor()
+    segments = []
+    for index in range(1, 5):
+        seg = ASRDataSeg(
+            text=f"English {index}",
+            start_time=index * 1000,
+            end_time=index * 1000 + 800,
+            translated_text=f"中文{index}",
+        )
+        seg.subtitle_id = f"S{index:04d}"
+        segments.append(seg)
+
+    editor._last_allocation_unresolved = [
+        {
+            "semantic_group_id": "G0001",
+            "reason": "retry_quality_failed",
+            "issue_codes": ["number_allocation_mismatch"],
+            "full_english": "Then in the 2000 s they joined the World Trade Organisation.",
+            "full_translation": "然后，在21世纪初，中国加入了世界贸易组织。",
+            "allocation": {"S0001": "然后，在21世纪初，", "S0002": "中国加入了世界贸易组织。"},
+        },
+        {
+            "semantic_group_id": "G0002",
+            "reason": "retry_quality_failed",
+            "issue_codes": ["unnatural_chinese_fragment"],
+            "full_english": "Short answer.",
+            "full_translation": "短回答。",
+            "allocation": {"S0003": "短回答。"},
+        },
+    ]
+
+    points = editor._editor_review_points(segments)
+    assert len(points) == 1
+    assert points[0]["subtitle_ids"] == ["S0001", "S0002"]
+    srt = editor._review_points_to_srt(points)
+    assert "[QA] S0001,S0002 中英对应待检查" in srt
+    assert "number_allocation_mismatch" in srt
+    assert "S0003" not in srt
 
 
 def test_empty_middle_translation_keeps_its_own_id_slot():
