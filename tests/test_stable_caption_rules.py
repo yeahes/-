@@ -1111,7 +1111,7 @@ def test_short_sentence_bridges_small_gap_before_next_subtitle():
 def test_display_timing_bridges_regular_short_gap_before_next_subtitle():
     segments = [
         ASRDataSeg("That structural tightening is the key takeaway.", 1000, 4300, "ok"),
-        ASRDataSeg("Better administration yields higher compliance.", 4920, 8200, "ok"),
+        ASRDataSeg("Better administration yields higher compliance.", 5120, 8200, "ok"),
     ]
 
     adjusted = ScreenSubtitleEditor._apply_display_timing_padding(segments)
@@ -1124,7 +1124,7 @@ def test_display_timing_bridges_regular_short_gap_before_next_subtitle():
 def test_display_timing_preserves_clear_long_pause():
     segments = [
         ASRDataSeg("That structural tightening is the key takeaway.", 1000, 4300, "ok"),
-        ASRDataSeg("Better administration yields higher compliance.", 5400, 8200, "ok"),
+        ASRDataSeg("Better administration yields higher compliance.", 5600, 8200, "ok"),
     ]
 
     adjusted = ScreenSubtitleEditor._apply_display_timing_padding(segments)
