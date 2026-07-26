@@ -3,6 +3,8 @@ from typing import List
 
 
 WORD_RE = re.compile(r"[A-Za-z]+(?:[-'][A-Za-z]+)?|\d+(?:\.\d+)?")
+TARGET_ENGLISH_WORD_LIMIT = 14
+HARD_ENGLISH_WORD_LIMIT = 16
 
 
 def word_count(text: str) -> int:

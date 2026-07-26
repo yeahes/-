@@ -50,9 +50,11 @@ Output:
 Rules:
 
 - Full group translation comes first.
-- Allocation maps the full Chinese meaning back to fixed subtitle IDs.
+- Allocation maps the full Chinese meaning back to fixed global subtitle IDs.
 - English IDs, timing, and order are immutable during Chinese translation.
 - Missing Chinese is a validation issue.
+- LLM allocation responses must include `subtitle_id` for each returned Chinese line.
+- Returned, missing, duplicate, and unknown subtitle IDs are recorded as structure errors.
 
 ## Stage 4: Timing and Display Stabilization
 
@@ -83,12 +85,20 @@ Outputs:
 - `subtitle-spans.json`
 - `word-ledger.json`
 - `semantic-groups.json`
+- `allocation-inputs.json`
+- `allocation-raw-returns.json`
+- `allocation-validation.json`
+- `allocation-retry-log.json`
+- `allocation-final.json`
+- `allocation-unresolved.json`
+- `translation-structure-errors.json`
 
 Validation checks:
 
 - English coverage gaps.
 - Missing Chinese.
 - Overlong English.
+- Translation ID mismatch, missing ID, duplicate ID, unknown ID, or group cardinality mismatch.
 - Suspicious cuts.
 - Timing gaps and very short displays through audit scripts.
 

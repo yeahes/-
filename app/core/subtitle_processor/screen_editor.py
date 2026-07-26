@@ -18,7 +18,11 @@ from openai import OpenAI
 from app.config import CACHE_PATH
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.storage.cache_manager import CacheManager
-from app.core.subtitle_processor.text_metrics import word_count, word_tokens
+from app.core.subtitle_processor.text_metrics import (
+    HARD_ENGLISH_WORD_LIMIT,
+    word_count,
+    word_tokens,
+)
 from app.core.utils import json_repair
 from app.core.utils.logger import setup_logger
 
@@ -509,6 +513,11 @@ class ScreenSubtitleEditor:
         )
         segments = self._repair_abnormal_timing_gaps(segments)
         segments = self._apply_display_timing_padding(segments)
+        segments = self._compress_fast_chinese_segments(
+            segments,
+            semantic_groups=semantic_groups,
+            subtitle_items=items,
+        )
         segments = self._order_segments_by_frozen_subtitle_ids(segments)
         self._validate_final_segment_translation_ids(segments)
         self._allocation_isolation_after = self._allocation_isolation_snapshot(
@@ -5003,16 +5012,18 @@ class ScreenSubtitleEditor:
         self, segments: Sequence[ASRDataSeg]
     ) -> List[Dict]:
         issues: List[Dict] = []
+        hard_limit = max(int(self.max_english_words or 0), HARD_ENGLISH_WORD_LIMIT)
         for seg in segments:
             text = self._normalize_text(seg.text)
             word_count = self._word_count(text)
-            if word_count <= self.max_english_words:
+            if word_count <= hard_limit:
                 continue
             issues.append(
                 {
                     "start": self._format_ms(seg.start_time),
                     "end": self._format_ms(seg.end_time),
                     "word_count": word_count,
+                    "hard_limit": hard_limit,
                     "text": text,
                 }
             )
@@ -5100,6 +5111,8 @@ class ScreenSubtitleEditor:
         nxt = current_tokens[1] if len(current_tokens) > 1 else ""
         prev2 = previous_tokens[-2] if len(previous_tokens) > 1 else ""
         reasons: List[str] = []
+        if self._is_abbreviation_name_boundary(previous_text, current_text):
+            reasons.append("abbreviation_name_split")
 
         prepositions = {
             "into", "of", "for", "with", "without", "in", "on", "at", "by",
@@ -5158,6 +5171,8 @@ class ScreenSubtitleEditor:
         current = current_text.strip()
         if not previous or not current:
             return True
+        if self._is_abbreviation_name_boundary(previous, current):
+            return False
         previous_words = self._word_tokens(previous)
         current_words = self._word_tokens(current)
         normalized_current = re.sub(r"[^a-z'\s]", " ", current.lower()).strip()
@@ -5174,6 +5189,17 @@ class ScreenSubtitleEditor:
             "ok", "absolutely", "what question", "how so", "why",
         }
         return normalized_previous in short_responses or normalized_current in short_responses
+
+    @staticmethod
+    def _is_abbreviation_name_boundary(previous_text: str, current_text: str) -> bool:
+        previous = (previous_text or "").strip()
+        current = (current_text or "").strip()
+        if not previous or not current:
+            return False
+        return bool(
+            re.search(r"\b(?:St|Mt|Mr|Mrs|Ms|Dr|Prof|Jr|Sr)\.$", previous)
+            and re.match(r"[A-Z][A-Za-z'-]{2,}\b", current)
+        )
 
     @staticmethod
     def _previous_looks_like_subject(text: str) -> bool:
@@ -5927,6 +5953,24 @@ class ScreenSubtitleEditor:
                     "medium",
                 ),
                 (
+                    r"\bgeographing\s+arbitrage\b",
+                    "asr_semantic_nonsense",
+                    "疑似ASR把 geographic arbitrage 识别成不成立的表达",
+                    "high",
+                ),
+                (
+                    r"\bsafety\s+nuts\b",
+                    "asr_semantic_nonsense",
+                    "疑似ASR把 safety nets 识别成不成立的表达",
+                    "high",
+                ),
+                (
+                    r"\bstate-of\s+the-art\b|\bstate\s+of-the-art\b",
+                    "asr_hyphenation_suspicious",
+                    "疑似ASR或切分破坏了固定形容词 state-of-the-art",
+                    "medium",
+                ),
+                (
                     r"\b(in|by)\s+20\d{2},\s+[^.?!]{0,80}\bban\b",
                     "asr_tense_or_inflection_suspicious",
                     "时间状语附近出现可疑动词原形，建议回听确认",
@@ -6460,6 +6504,7 @@ class ScreenSubtitleEditor:
             "Use full_translation as the authority. English is only for locating meaning.\n"
             "Read the whole sense_group and adjacent parts before compressing the target.\n"
             "The target Chinese must be natural, concise, and independently understandable when possible.\n"
+            "If the target is overloaded and an adjacent same-group subtitle is much shorter, prefer moving dependent meaning into that adjacent subtitle.\n"
             "Avoid title-like fragments and dangling clauses such as 而若..., 如果..., 因为..., 对于..., 在..., 把..., 将..., 意味着..., 的..., 以及...\n"
             "Keep facts, numbers, names, negation, contrast, causality, modality, and core conclusions.\n"
             "Return pure JSON:\n"
@@ -6520,6 +6565,7 @@ class ScreenSubtitleEditor:
                 "Do not change English, IDs, order, timing, or subtitle count.\n"
                 "Return only existing indices from sense_group.parts. Keep every returned line natural and readable.\n"
                 "The concatenated group Chinese must preserve the core meaning and form a complete Chinese sentence.\n"
+                "Balance Chinese reading load across the same-group subtitles according to each part duration.\n"
                 "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
             )
             try:
@@ -6568,6 +6614,7 @@ class ScreenSubtitleEditor:
                 "Use full_translation as the authority. Do not translate freely from English.\n"
                 "Do not change English, IDs, order, timing, or subtitle count.\n"
                 "Prefer direct complete Chinese sentences. Keep core actions and conclusions.\n"
+                "Balance overloaded Chinese lines into adjacent same-group subtitle IDs when that preserves meaning better than overcompressing one line.\n"
                 "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
             )
             try:
@@ -7107,7 +7154,7 @@ class ScreenSubtitleEditor:
         translated = self._normalize_text(seg.translated_text)
         zh_chars = len(re.findall(r"[\u4e00-\u9fff]", translated))
         duration_ms = max(1, int(seg.end_time) - int(seg.start_time))
-        if duration_ms < 1200 or zh_chars < 12:
+        if duration_ms < 900 or zh_chars < 12:
             return False
         return zh_chars / (duration_ms / 1000.0) > CHINESE_CPS_ERROR
 
@@ -9381,7 +9428,7 @@ class ScreenSubtitleEditor:
             return {}
         lcs = self._lcs_length(full, merged)
         coverage = lcs / max(1, len(full))
-        if coverage < 0.62:
+        if coverage < 0.50:
             return {
                 "reason": "low_full_translation_coverage",
                 "coverage": round(coverage, 3),
@@ -9711,6 +9758,12 @@ class ScreenSubtitleEditor:
         def int_to_zh(num: int) -> str:
             if num < 10000:
                 return small_to_zh(num)
+            if num >= 100000000:
+                high, low = divmod(num, 100000000)
+                result = int_to_zh(high) + "\u4ebf"
+                if low:
+                    result += ("\u96f6" if low < 10000000 else "") + int_to_zh(low)
+                return result
             high, low = divmod(num, 10000)
             result = small_to_zh(high) + "万"
             if low:

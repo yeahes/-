@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-07-23
+Last updated: 2026-07-26
 
 ## Working
 
@@ -11,13 +11,16 @@ Last updated: 2026-07-23
 - Regression smoke tests exist in `tests/test_stable_caption_rules.py`.
 - Generated subtitle audits exist in `tests/audit_stable_outputs.py`.
 - A single regression entry exists: `runtime\python.exe scripts\run_regression.py`.
-- Current known local samples `222`, `777`, and `999` audit as `WARNING`, not `ERROR`.
+- Allocation now uses global subtitle IDs (`S0001`, `S0002`, ...), not positional lists, for Chinese writeback.
+- Allocation artifacts record inputs, raw returns, validation, retry logs, final mappings, unresolved groups, and structure errors.
+- The current local `work-dir` samples `222`, `777`, and `999` are not present in this checkout, so `tests\audit_stable_outputs.py 222 777 999` reports `MISSING`.
 
 ## In Progress
 
 - Reducing coupling in `screen_editor.py`.
 - Making final SRT/ASS output and video synthesis use the same stable subtitle.
 - Converting discussion-derived rules into tests and docs.
+- Verifying long-audio Chinese allocation drift with fresh generated outputs.
 
 ## Known Issues
 
@@ -26,6 +29,8 @@ Last updated: 2026-07-23
 - Existing generated outputs under `work-dir` may be stale unless regenerated after code changes.
 - Some ASR/stable-ts word timings can be too short or contain gaps.
 - Chinese translation quality still depends on LLM output and prompt stability.
+- Validation blocking is strongest for translation-structure errors; confirm any new ERROR class is wired to synthesis blocking before relying on it.
+- Git has no `checkpoint-2026-07-23` tag or branch in this checkout.
 
 ## Current Production Recommendation
 
@@ -46,7 +51,12 @@ Avoid:
 
 ## Next Recommended Task
 
-Create fixture-based regression samples for the stable subtitle engine:
+First, add a regression test for validation blocking consistency:
+
+- if final validation summary is `ERROR`, stable outputs should preserve failure artifacts and block rendering;
+- failed outputs should not silently write a renderable final ASS.
+
+Then create fixture-based regression samples for the stable subtitle engine:
 
 - long clause
 - because/which/that clause

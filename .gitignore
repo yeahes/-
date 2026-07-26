@@ -33,3 +33,7 @@ _pystand_static.int
 .vscode/
 .DS_Store
 Thumbs.db
+*.lnk
+
+# Generated test reports
+tests/caption_audit/out/

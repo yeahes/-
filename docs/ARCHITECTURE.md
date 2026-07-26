@@ -29,6 +29,7 @@ audio input
 - `app/core/subtitle_processor/screen_editor.py`
   - Current main stable subtitle engine.
   - Performs local English cutting, semantic grouping, Chinese translation allocation, timing padding, validation, and artifact writing.
+  - Uses frozen global subtitle IDs for Chinese allocation and final validation.
   - High regression risk. Avoid broad edits.
 
 - `app/thread/video_synthesis_thread.py`
@@ -57,6 +58,10 @@ audio input
 - Chinese translation is unnatural:
   - Inspect semantic translation prompts and allocation.
   - Do not alter English segmentation for a Chinese-only problem.
+
+- Chinese subtitle drifts against English after many lines:
+  - Inspect `allocation-inputs.json`, `allocation-raw-returns.json`, `allocation-validation.json`, `translation-structure-errors.json`, then final SRT.
+  - Verify every allocation response is keyed by global `subtitle_id`; do not diagnose this as a reading-speed problem first.
 
 - Video output uses old subtitle:
   - Inspect `stable-final-manifest.json` and `resolve_podcast_template_subtitle`.

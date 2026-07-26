@@ -7,7 +7,10 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
 
-from app.core.subtitle_processor.text_metrics import word_count as shared_word_count
+from app.core.subtitle_processor.text_metrics import (
+    HARD_ENGLISH_WORD_LIMIT,
+    word_count as shared_word_count,
+)
 
 SUBTITLE_DURATION_INVALID_MS = 150
 SUBTITLE_DURATION_ERROR_MS = 250
@@ -99,7 +102,7 @@ def parse_srt(path: Path) -> list[CaptionCue]:
 
 def audit_srt(
     path: Path,
-    max_words: int = 14,
+    max_words: int = HARD_ENGLISH_WORD_LIMIT,
     gap_warning_ms: int = 1200,
     gap_error_ms: int = 1500,
     min_duration_ms: int = 900,
@@ -191,6 +194,7 @@ def audit_srt(
                     cue,
                     f"英文 {word_count} 词，超过 {max_words} 词硬上限",
                     word_count=word_count,
+                    hard_limit=max_words,
                 )
             )
         if cue.english and not cue.chinese:
@@ -239,6 +243,10 @@ def has_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
 
+def has_chinese_punctuation(text: str) -> bool:
+    return bool(re.search(r"[\u3000-\u303f\uff00-\uffef]", text or ""))
+
+
 def count_words(text: str) -> int:
     return shared_word_count(text)
 
@@ -251,7 +259,11 @@ def split_bilingual_body(body: Iterable[str]) -> tuple[str, str]:
         return (lines[0], "") if has_english(lines[0]) else ("", lines[0])
 
     first_chinese_index = next(
-        (index for index, line in enumerate(lines) if has_chinese(line)),
+        (
+            index
+            for index, line in enumerate(lines)
+            if has_chinese(line) or (has_chinese_punctuation(line) and not has_english(line))
+        ),
         None,
     )
     if first_chinese_index is not None:
@@ -442,6 +454,24 @@ def _asr_suspicious_issues(cues: Iterable[CaptionCue]) -> tuple[list[dict], list
                 r"\bpollution control trigger\b",
                 "asr_subject_verb_agreement",
                 "?????????????control trigger",
+                "medium",
+            ),
+            (
+                r"\bgeographing\s+arbitrage\b",
+                "asr_semantic_nonsense",
+                "疑似ASR把 geographic arbitrage 识别成不成立的表达",
+                "high",
+            ),
+            (
+                r"\bsafety\s+nuts\b",
+                "asr_semantic_nonsense",
+                "疑似ASR把 safety nets 识别成不成立的表达",
+                "high",
+            ),
+            (
+                r"\bstate-of\s+the-art\b|\bstate\s+of-the-art\b",
+                "asr_hyphenation_suspicious",
+                "疑似ASR或切分破坏了固定形容词 state-of-the-art",
                 "medium",
             ),
             (
@@ -728,6 +758,8 @@ def _syntax_boundary_reasons(previous_text: str, current_text: str) -> list[str]
     cur = cur_tokens[0]
     prev2 = prev_tokens[-2] if len(prev_tokens) > 1 else ""
     reasons: list[str] = []
+    if _is_abbreviation_name_boundary(previous, current):
+        reasons.append("abbreviation_name_split")
     prepositions = {"into", "of", "for", "with", "without", "in", "on", "at", "by", "from", "to", "about", "around", "through", "over", "under", "between", "among", "against", "within", "across"}
     determiners = {"the", "a", "an", "this", "that", "these", "those", "our", "their", "its"}
     particles = {"down", "up", "out", "off", "in", "on", "away", "back", "over"}
@@ -766,6 +798,8 @@ def _word_tokens(text: str) -> list[str]:
 
 
 def _is_safe_independent_boundary(previous: str, current: str) -> bool:
+    if _is_abbreviation_name_boundary(previous, current):
+        return False
     prev_words = _word_tokens(previous)
     cur_words = _word_tokens(current)
     cur_norm = re.sub(r"[^a-z'\s]", " ", current.lower()).strip()
@@ -778,6 +812,13 @@ def _is_safe_independent_boundary(previous: str, current: str) -> bool:
     short_responses = {"right", "yeah", "yes", "no", "exactly", "precisely", "okay", "ok", "absolutely", "what question", "how so", "why"}
     prev_norm = re.sub(r"[^a-z'\s]", " ", previous.lower()).strip()
     return prev_norm in short_responses or cur_norm in short_responses
+
+
+def _is_abbreviation_name_boundary(previous: str, current: str) -> bool:
+    return bool(
+        re.search(r"\b(?:St|Mt|Mr|Mrs|Ms|Dr|Prof|Jr|Sr)\.$", (previous or "").strip())
+        and re.match(r"[A-Z][A-Za-z'-]{2,}\b", (current or "").strip())
+    )
 
 
 def _previous_looks_like_subject(text: str) -> bool:

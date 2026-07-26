@@ -17,6 +17,7 @@ from app.thread.subtitle_thread import SubtitleThread
 from app.thread.video_synthesis_thread import resolve_podcast_template_subtitle
 from tests.caption_audit.metrics import (
     CaptionCue,
+    audit_srt,
     _chinese_semantic_group_issues,
     _syntax_boundary_reasons,
     split_bilingual_body,
@@ -1061,6 +1062,9 @@ def test_asr_suspicious_phrases_are_reported_without_fixing_text():
     segments = [
         ASRDataSeg("That caught me total off guard.", 1000, 3000, "ok"),
         ASRDataSeg("Seeds away the mirror.", 4000, 6000, "ok"),
+        ASRDataSeg("It is geographing arbitrage.", 7000, 9000, "ok"),
+        ASRDataSeg("They need stronger safety nuts.", 10000, 12000, "ok"),
+        ASRDataSeg("A state-of the-art system arrived.", 13000, 15000, "ok"),
     ]
 
     issues = editor._asr_suspicious_issues(segments)
@@ -1068,6 +1072,104 @@ def test_asr_suspicious_phrases_are_reported_without_fixing_text():
 
     assert "asr_ungrammatical_collocation" in codes
     assert "asr_semantic_nonsense" in codes
+    assert "asr_hyphenation_suspicious" in codes
+
+
+def test_abbreviation_name_boundary_is_syntax_warning():
+    editor = _editor()
+
+    assert "abbreviation_name_split" in editor._syntax_boundary_reasons("St.", "Gallen is a city.")
+    assert "abbreviation_name_split" in _syntax_boundary_reasons("Dr.", "Smith explains it.")
+
+
+def test_caption_audit_uses_16_word_hard_limit():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        srt = Path(temp_dir) / "soft-limit.srt"
+        sixteen_words = "One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen."
+        seventeen_words = "One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen."
+        srt.write_text(
+            "\n".join(
+                [
+                    "1",
+                    "00:00:00,000 --> 00:00:04,000",
+                    sixteen_words,
+                    "十六词可以接受。",
+                    "",
+                    "2",
+                    "00:00:04,000 --> 00:00:08,000",
+                    seventeen_words,
+                    "十七词超过硬上限。",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        report = audit_srt(srt)
+    overlong = [issue for issue in report["errors"] if issue["code"] == "overlong_english"]
+
+    assert len(overlong) == 1
+    assert overlong[0]["index"] == 2
+    assert overlong[0]["word_count"] == 17
+    assert overlong[0]["hard_limit"] == 16
+
+
+def test_caption_audit_keeps_numeric_percent_chinese_line():
+    english, chinese = split_bilingual_body(["70%.", "70%。"])
+
+    assert english == "70%."
+    assert chinese == "70%。"
+
+
+def test_large_number_anchor_variants_do_not_crash():
+    variants = ScreenSubtitleEditor._chinese_number_anchor_variants("1000000000")
+
+    assert variants
+
+
+def test_concise_group_allocation_is_not_rejected_by_coverage_only():
+    editor = _id_editor()
+    entry = {
+        "id": 96,
+        "full_english": "So Beijing gets to look under the hood of Washington's best AI and vice versa.",
+        "full_translation": "于是，北京可以了解华盛顿最优秀人工智能的内部情况，反之亦然。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0152", "english": "So Beijing gets to look under the hood"},
+            {"subtitle_id": "S0153", "english": "of Washington's best AI and vice versa."},
+        ],
+    }
+    allocation = {
+        "S0152": "于是，北京可窥华盛顿最优AI内部，",
+        "S0153": "反之亦然。",
+    }
+
+    validation = editor._validate_group_chinese_allocation(entry, allocation)
+
+    assert validation["valid"]
+    assert "group_allocation_information_omission" not in validation["issue_codes"]
+
+    stronger_compression = {
+        "S0152": "于是，北京可窥探华盛顿顶尖AI内部",
+        "S0153": "反之亦然。",
+    }
+    stronger_validation = editor._validate_group_chinese_allocation(
+        entry, stronger_compression
+    )
+
+    assert stronger_validation["valid"]
+    assert "group_allocation_information_omission" not in stronger_validation["issue_codes"]
+
+
+def test_short_but_severe_chinese_speed_triggers_repair():
+    editor = _id_editor()
+    seg = ASRDataSeg(
+        "simply can't patch?",
+        0,
+        1220,
+        "无论如何也修补不了的漏洞，会发生什么？",
+    )
+
+    assert editor._is_severe_chinese_speed(seg)
 
 
 def test_short_subtitle_gets_minimum_display_duration_when_room_allows():
@@ -3655,6 +3757,12 @@ if __name__ == "__main__":
     test_short_backchannel_duration_is_warning_not_error()
     test_short_regular_sentence_duration_remains_error()
     test_asr_suspicious_phrases_are_reported_without_fixing_text()
+    test_abbreviation_name_boundary_is_syntax_warning()
+    test_caption_audit_uses_16_word_hard_limit()
+    test_caption_audit_keeps_numeric_percent_chinese_line()
+    test_large_number_anchor_variants_do_not_crash()
+    test_concise_group_allocation_is_not_rejected_by_coverage_only()
+    test_short_but_severe_chinese_speed_triggers_repair()
     test_short_subtitle_gets_minimum_display_duration_when_room_allows()
     test_short_backchannel_merges_with_following_segment()
     test_short_sentence_bridges_small_gap_before_next_subtitle()

@@ -28,9 +28,8 @@ Result:
 - stable caption smoke tests: pass
 - syntax check: pass
 - known output audit: completed
-- 222: WARNING, no gap errors, no overlong English, no missing Chinese
-- 777: WARNING, no gap errors, no overlong English, no missing Chinese
-- 999: WARNING, one 1400 ms gap warning, no gap errors, no overlong English, no missing Chinese
+- 2026-07-26 recheck: stable caption smoke tests pass; syntax check passes.
+- 2026-07-26 recheck: local samples `222`, `777`, and `999` are currently `MISSING` in `work-dir`, so their current quality is not verified by `tests\audit_stable_outputs.py`.
 
 ## Current Decisions
 
@@ -43,10 +42,11 @@ Result:
 
 - Existing `work-dir` outputs may be stale after code changes.
 - `screen_editor.py` remains too coupled for large changes without fixture tests.
+- Local sample availability is not stable; prefer fixture-backed tests for repeatable validation.
 
 ## Next Action
 
-Add fixture-based tests so future changes do not rely on existing `work-dir` samples only.
+First make validation blocking consistent for every final `ERROR` status, then add fixture-based tests so future changes do not rely on existing `work-dir` samples only.
 
 ## Files Changed
 
