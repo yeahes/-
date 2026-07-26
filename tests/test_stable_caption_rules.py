@@ -3628,6 +3628,56 @@ def test_qa_review_srt_is_mirrored_to_source_audio_folder_only():
         }
 
 
+def test_user_subtitle_exports_are_saved_to_source_audio_folder():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_dir = root / "source"
+        output_dir = root / "work" / "subtitle"
+        source_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
+        audio_path = source_dir / "sample-audio.m4a"
+        audio_path.write_bytes(b"audio")
+
+        task = SubtitleTask(
+            subtitle_path=str(output_dir / "source.srt"),
+            video_path=str(audio_path),
+            output_path=str(output_dir / "output.srt"),
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        config = SubtitleConfig(
+            need_screen_subtitle_edit=True,
+            screen_subtitle_stable_mode=True,
+            subtitle_layout="translation_top",
+        )
+
+        thread._save_stable_subtitle_outputs(
+            ASRData([ASRDataSeg("English line.", 0, 1000, "中文行。")]),
+            config,
+            validation_status="passed",
+        )
+
+        bilingual = source_dir / "sample-audio-双语字幕.srt"
+        chinese = source_dir / "sample-audio-中文字幕.srt"
+        english = source_dir / "sample-audio-英文字幕.srt"
+        assert bilingual.exists()
+        assert chinese.exists()
+        assert english.exists()
+        bilingual_text = bilingual.read_text(encoding="utf-8-sig")
+        assert "English line.\n中文行。" in bilingual_text
+        assert "中文行。" in chinese.read_text(encoding="utf-8-sig")
+        assert "English line." not in chinese.read_text(encoding="utf-8-sig")
+        assert "English line." in english.read_text(encoding="utf-8-sig")
+        assert "中文行。" not in english.read_text(encoding="utf-8-sig")
+
+        manifest = json.loads((output_dir / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        assert manifest["source_subtitle_paths"] == {
+            "bilingual_original_top_srt": str(bilingual),
+            "only_translation_srt": str(chinese),
+            "only_original_srt": str(english),
+        }
+
+
 def test_screen_manifest_metadata_includes_stage_timings():
     class FakeScreenEditor:
         @staticmethod
@@ -3859,6 +3909,7 @@ if __name__ == "__main__":
     test_multiple_semantic_groups_apply_by_id_without_drift()
     test_full_merge_repair_chain_keeps_400_plus_ids_without_drift()
     test_passed_validation_writes_final_output_and_manifest_metadata()
+    test_user_subtitle_exports_are_saved_to_source_audio_folder()
     test_id_bound_mapping_has_no_drift_over_400_subtitles()
     test_non_structural_validation_errors_still_write_stable_artifacts()
     test_runtime_module_import_path_is_available()

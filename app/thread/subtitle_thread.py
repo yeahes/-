@@ -275,9 +275,13 @@ class SubtitleThread(QThread):
         source_report_paths = self._source_audio_report_paths(
             qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
         )
+        source_subtitle_paths = self._write_source_audio_subtitle_exports(asr_data)
         if source_report_paths:
             manifest["source_report_dir"] = str(self._source_audio_report_dir())
             manifest["source_report_paths"] = source_report_paths
+        if source_subtitle_paths:
+            manifest["source_subtitle_dir"] = str(self._source_audio_report_dir())
+            manifest["source_subtitle_paths"] = source_subtitle_paths
         manifest_path = output_dir / "stable-final-manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -287,6 +291,44 @@ class SubtitleThread(QThread):
             qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
         )
         logger.info("Stable subtitle manifest saved: %s", manifest_path)
+
+    def _source_audio_subtitle_paths(self) -> dict:
+        source_dir = self._source_audio_report_dir()
+        source_path = getattr(self.task, "video_path", None) or ""
+        if source_dir is None or not source_path:
+            return {}
+        source_stem = Path(source_path).stem
+        return {
+            "bilingual_original_top_srt": str(source_dir / f"{source_stem}-双语字幕.srt"),
+            "only_translation_srt": str(source_dir / f"{source_stem}-中文字幕.srt"),
+            "only_original_srt": str(source_dir / f"{source_stem}-英文字幕.srt"),
+        }
+
+    def _write_source_audio_subtitle_exports(self, asr_data: ASRData) -> dict:
+        paths = self._source_audio_subtitle_paths()
+        if not paths:
+            return {}
+        try:
+            self._write_stable_srt(
+                asr_data,
+                Path(paths["bilingual_original_top_srt"]),
+                "original_top",
+            )
+            self._write_stable_srt(
+                asr_data,
+                Path(paths["only_translation_srt"]),
+                "only_translation",
+            )
+            self._write_stable_srt(
+                asr_data,
+                Path(paths["only_original_srt"]),
+                "only_original",
+            )
+            logger.info("Source audio subtitle exports saved: %s", paths)
+        except Exception as exc:
+            logger.warning("Saving source audio subtitle exports failed: %s", exc)
+            return {}
+        return paths
 
     def _source_audio_report_dir(self) -> Path | None:
         source_path = getattr(self.task, "video_path", None) or ""
