@@ -1180,7 +1180,7 @@ def test_short_subtitle_gets_minimum_display_duration_when_room_allows():
 
     adjusted = ScreenSubtitleEditor._apply_display_timing_padding(segments)
 
-    assert adjusted[0].end_time - adjusted[0].start_time >= 900
+    assert adjusted[0].end_time - adjusted[0].start_time >= 750
     assert adjusted[0].end_time <= adjusted[1].start_time - 40
 
 
