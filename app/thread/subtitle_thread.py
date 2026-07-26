@@ -294,14 +294,12 @@ class SubtitleThread(QThread):
 
     def _source_audio_subtitle_paths(self) -> dict:
         source_dir = self._source_audio_report_dir()
-        source_path = getattr(self.task, "video_path", None) or ""
-        if source_dir is None or not source_path:
+        if source_dir is None:
             return {}
-        source_stem = Path(source_path).stem
         return {
-            "bilingual_original_top_srt": str(source_dir / f"{source_stem}-双语字幕.srt"),
-            "only_translation_srt": str(source_dir / f"{source_stem}-中文字幕.srt"),
-            "only_original_srt": str(source_dir / f"{source_stem}-英文字幕.srt"),
+            "bilingual_original_top_srt": str(source_dir / "双语字幕.srt"),
+            "only_translation_srt": str(source_dir / "中文字幕.srt"),
+            "only_original_srt": str(source_dir / "英文字幕.srt"),
         }
 
     def _write_source_audio_subtitle_exports(self, asr_data: ASRData) -> dict:

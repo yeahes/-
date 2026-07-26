@@ -3657,9 +3657,9 @@ def test_user_subtitle_exports_are_saved_to_source_audio_folder():
             validation_status="passed",
         )
 
-        bilingual = source_dir / "sample-audio-双语字幕.srt"
-        chinese = source_dir / "sample-audio-中文字幕.srt"
-        english = source_dir / "sample-audio-英文字幕.srt"
+        bilingual = source_dir / "双语字幕.srt"
+        chinese = source_dir / "中文字幕.srt"
+        english = source_dir / "英文字幕.srt"
         assert bilingual.exists()
         assert chinese.exists()
         assert english.exists()
