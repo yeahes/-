@@ -276,7 +276,7 @@ class Config(QConfig):
         "Subtitle", "ScreenSubtitleMaxEnglish", 12, RangeValidator(6, 40)
     )
     screen_subtitle_allocation_max_concurrency = ConfigItem(
-        "Subtitle", "ScreenSubtitleAllocationMaxConcurrency", 3, RangeValidator(1, 10)
+        "Subtitle", "ScreenSubtitleAllocationMaxConcurrency", 4, RangeValidator(1, 10)
     )
     screen_subtitle_allocation_batch_size = ConfigItem(
         "Subtitle", "ScreenSubtitleAllocationBatchSize", 16, RangeValidator(6, 24)
