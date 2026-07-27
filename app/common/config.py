@@ -288,7 +288,7 @@ class Config(QConfig):
         "Subtitle",
         "TimelineAlignmentBackend",
         "stable-ts",
-        OptionsValidator(["stable-ts", "whisperx"]),
+        OptionsValidator(["stable-ts", "whisperx", "whisperx-time-only"]),
     )
     stable_ts_alignment_model = OptionsConfigItem(
         "Subtitle",

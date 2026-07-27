@@ -24,6 +24,9 @@ from app.core.article_context import (
 from app.core.subtitle_processor.split import SubtitleSplitter
 from app.core.subtitle_processor.summarization import SubtitleSummarizer
 from app.core.subtitle_processor.optimize import SubtitleOptimizer
+from app.core.subtitle_processor.stable_ts_alignment import (
+    align_subtitle_segments_with_whisperx_time_only,
+)
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor
 from app.core.subtitle_processor.translate import TranslatorFactory, TranslatorType
 from app.core.utils.logger import setup_logger
@@ -77,6 +80,46 @@ class SubtitleThread(QThread):
         metadata["stage_timings_seconds"] = dict(self._stage_timings_seconds)
         metadata["stage_timings_total_seconds"] = round(sum(self._stage_timings_seconds.values()), 3)
         return metadata
+
+    @staticmethod
+    def _timeline_alignment_backend() -> str:
+        try:
+            return os.getenv(
+                "VIDEOCAPTIONER_ALIGNMENT_BACKEND",
+                str(cfg.timeline_alignment_backend.value or "stable-ts"),
+            ).strip().lower()
+        except Exception:
+            return os.getenv("VIDEOCAPTIONER_ALIGNMENT_BACKEND", "stable-ts").strip().lower()
+
+    def _apply_whisperx_time_only_if_enabled(self, asr_data: ASRData) -> ASRData:
+        if self._timeline_alignment_backend() != "whisperx-time-only":
+            return asr_data
+        audio_path = getattr(self.task, "video_path", None) or ""
+        if not audio_path or not Path(audio_path).exists():
+            logger.warning("WhisperX time-only skipped: source audio is missing: %s", audio_path)
+            return asr_data
+        try:
+            stage_started = time.perf_counter()
+            self.progress.emit(92, self.tr("WhisperX最终时间轴对齐..."))
+            aligned = align_subtitle_segments_with_whisperx_time_only(
+                audio_path,
+                asr_data,
+                language="en",
+                callback=None,
+            )
+            self._record_stage_duration("whisperx_time_only_alignment", stage_started)
+            if not aligned or not aligned.has_data() or len(aligned.segments) != len(asr_data.segments):
+                logger.warning("WhisperX time-only did not produce a complete subtitle timeline")
+                return asr_data
+            for old, new in zip(asr_data.segments, aligned.segments):
+                if old.text != new.text or old.translated_text != new.translated_text:
+                    logger.warning("WhisperX time-only rejected: subtitle text changed during mapping")
+                    return asr_data
+            logger.info("WhisperX time-only applied to final subtitle timings")
+            return aligned
+        except Exception as exc:
+            logger.warning("WhisperX time-only failed, keeping original timings: %s", exc)
+            return asr_data
 
     @staticmethod
     def _subtitle_layout_names() -> Dict[str, str]:
@@ -670,6 +713,7 @@ class SubtitleThread(QThread):
                         + "\n"
                         + message
                     )
+                asr_data = self._apply_whisperx_time_only_if_enabled(asr_data)
                 self.update_all.emit(asr_data.to_json())
                 self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
 

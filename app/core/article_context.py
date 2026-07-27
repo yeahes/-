@@ -1063,7 +1063,7 @@ def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -
         return False
     if candidate["final_confidence"] < high_confidence:
         return False
-    if not _candidate_stays_in_article_scope(candidate):
+    if _article_scope_rejection_reason(candidate):
         return False
     return len(candidate.get("matched_conditions") or []) >= 2
 
@@ -1073,31 +1073,154 @@ def _not_applied_reason(candidate: Dict[str, Any], high_confidence: float) -> st
         return "self_replacement_skipped"
     if candidate["final_confidence"] < high_confidence:
         return "below_high_confidence_threshold"
-    if not _candidate_stays_in_article_scope(candidate):
-        return "ordinary_text_not_article_proper_noun_scope"
+    scope_reason = _article_scope_rejection_reason(candidate)
+    if scope_reason:
+        return scope_reason
     return "lower_scored_overlap_candidate"
 
 
 def _candidate_stays_in_article_scope(candidate: Dict[str, Any]) -> bool:
+    return not _article_scope_rejection_reason(candidate)
+
+
+def _article_scope_rejection_reason(candidate: Dict[str, Any]) -> str:
     original = str(candidate.get("original_text", "") or "")
     corrected = str(candidate.get("candidate_text", "") or "")
     original_tokens = _word_tokens(original)
     corrected_tokens = _word_tokens(corrected)
     if not original_tokens or not corrected_tokens:
-        return False
+        return "ordinary_text_not_article_proper_noun_scope"
 
     if "exact_alias_match" in (candidate.get("matched_conditions") or []):
-        return _exact_alias_can_auto_apply(candidate)
+        return "" if _exact_alias_can_auto_apply(candidate) else "alias_would_degrade_canonical_match"
+
+    conservative_reason = _conservative_person_name_rejection_reason(candidate)
+    if conservative_reason:
+        return conservative_reason
 
     if not candidate.get("entity_gate_passed"):
         if _high_confidence_article_entity_candidate(candidate):
-            return True
-        return False
+            return ""
+        return "ordinary_text_not_article_proper_noun_scope"
 
     if len(original_tokens) == 1 and len(corrected_tokens) == 1:
         if not _single_token_candidate_stays_in_scope(original_tokens[0], corrected_tokens[0], candidate):
-            return False
-    return True
+            return "ordinary_text_not_article_proper_noun_scope"
+    return ""
+
+
+def _conservative_person_name_rejection_reason(candidate: Dict[str, Any]) -> str:
+    if not _candidate_is_person_name(candidate):
+        return ""
+    original_tokens = _word_tokens(str(candidate.get("original_text", "") or ""))
+    corrected_tokens = _word_tokens(str(candidate.get("candidate_text", "") or ""))
+    if not original_tokens or not corrected_tokens:
+        return ""
+    if len(original_tokens) < len(corrected_tokens):
+        if not _single_token_is_canonical_edge(original_tokens, corrected_tokens):
+            return "token_count_expansion_without_canonical_support"
+    if _ambiguous_minor_person_spelling_change(original_tokens, corrected_tokens):
+        return "capitalized_name_ambiguous"
+    return ""
+
+
+def _single_token_is_canonical_edge(
+    original_tokens: Sequence[str],
+    corrected_tokens: Sequence[str],
+) -> bool:
+    if len(original_tokens) != 1 or len(corrected_tokens) <= 1:
+        return False
+    original = _normalize_entity_gate_token(original_tokens[0])
+    canonical_edges = {
+        _normalize_entity_gate_token(corrected_tokens[0]),
+        _normalize_entity_gate_token(corrected_tokens[-1]),
+    }
+    return bool(original) and original in canonical_edges
+
+
+def _candidate_is_person_name(candidate: Dict[str, Any]) -> bool:
+    source = candidate.get("source_glossary") or {}
+    source_key = str(source.get("source_key", candidate.get("source_key", "")) or "").casefold()
+    category = str(source.get("category", candidate.get("category", "")) or "").casefold()
+    return source_key == "people" or category in {
+        "analyst",
+        "author",
+        "historical figure",
+        "person",
+        "people",
+        "poet",
+        "writer",
+    }
+
+
+def _ambiguous_minor_person_spelling_change(
+    original_tokens: Sequence[str],
+    corrected_tokens: Sequence[str],
+) -> bool:
+    if len(original_tokens) != len(corrected_tokens) or len(original_tokens) < 2:
+        return False
+    if _entity_initials(original_tokens) != _entity_initials(corrected_tokens):
+        return False
+    if not all(_token_is_capitalized_name_piece(token) for token in original_tokens + list(corrected_tokens)):
+        return False
+    changed = [
+        (original, corrected)
+        for original, corrected in zip(original_tokens, corrected_tokens)
+        if _normalize_entity_gate_token(original) != _normalize_entity_gate_token(corrected)
+    ]
+    if len(changed) == 1:
+        original, corrected = changed[0]
+        return _edit_distance(
+            _normalize_entity_gate_token(original),
+            _normalize_entity_gate_token(corrected),
+            max_distance=1,
+        ) <= 1
+    if len(changed) == 2:
+        distances = [
+            _edit_distance(
+                _normalize_entity_gate_token(original),
+                _normalize_entity_gate_token(corrected),
+                max_distance=2,
+            )
+            for original, corrected in changed
+        ]
+        short_name_expanded = any(
+            len(_normalize_entity_gate_token(original)) <= 2
+            and len(_normalize_entity_gate_token(corrected)) > len(_normalize_entity_gate_token(original))
+            for original, corrected in changed
+        )
+        return short_name_expanded and max(distances) <= 2
+    return False
+
+
+def _token_is_capitalized_name_piece(token: str) -> bool:
+    core = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", token or "")
+    core = re.sub(r"(?:'|\u2019)s$", "", core, flags=re.IGNORECASE)
+    return bool(core) and core[:1].isupper() and re.search(r"[a-z]", core) is not None
+
+
+def _edit_distance(left: str, right: str, *, max_distance: int = 2) -> int:
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        row_min = current[0]
+        for right_index, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            value = min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                previous[right_index - 1] + cost,
+            )
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > max_distance:
+            return max_distance + 1
+        previous = current
+    return previous[-1]
 
 
 def _high_confidence_article_entity_candidate(candidate: Dict[str, Any]) -> bool:
@@ -1533,11 +1656,9 @@ def _correct_segment_text(
                         )
                     )
             elif confidence >= review_confidence:
-                reason = (
-                    "low_confidence_review_only"
-                    if _candidate_stays_in_article_scope(scored)
-                    else "ordinary_text_not_article_proper_noun_scope"
-                )
+                reason = _not_applied_reason(scored, high_confidence)
+                if reason == "lower_scored_overlap_candidate":
+                    reason = "low_confidence_review_only"
                 logs.append(
                     _replacement_log(
                         phrase,

@@ -196,6 +196,8 @@ def align_to_word_timestamps(
         if aligned and aligned.has_data():
             return aligned
         logger.warning("WhisperX alignment unavailable; falling back to stable-ts")
+    elif backend == "whisperx-time-only":
+        logger.info("WhisperX time-only selected; using stable-ts for cutting word timestamps")
 
     python_path = _find_stable_ts_python()
     if not python_path:
@@ -409,6 +411,282 @@ def _align_with_whisperx(
         if callback:
             callback(98, "WhisperX词级对齐完成")
         return aligned
+
+
+def align_subtitle_segments_with_whisperx_time_only(
+    audio_path: str,
+    subtitle_data: ASRData,
+    language: str = "en",
+    callback=None,
+    lead_in_ms: int = 80,
+    tail_padding_ms: int = 450,
+    min_gap_ms: int = 40,
+    min_duration_ms: int = 800,
+) -> Optional[ASRData]:
+    """Return subtitle_data with WhisperX-derived times while preserving text.
+
+    This is intentionally separate from the word timestamp backend used for
+    stable cutting. It maps each final subtitle line to a monotonic range of
+    WhisperX words and only replaces start/end times.
+    """
+    language = (language or "").lower()
+    if language not in {"en", "english"}:
+        logger.info("WhisperX time-only skipped for non-English language: %s", language)
+        return None
+    if not subtitle_data or not subtitle_data.segments:
+        return None
+    transcript = _collect_transcript(subtitle_data)
+    if len(WORD_RE.findall(transcript)) < 3:
+        logger.info("WhisperX time-only skipped: transcript is too short")
+        return None
+    aligned_words = _run_whisperx_words(audio_path, subtitle_data, language, callback=callback)
+    if not aligned_words:
+        return None
+    remapped = _make_whisperx_subtitle_segments(
+        subtitle_data.segments,
+        aligned_words,
+        lead_in_ms=lead_in_ms,
+        tail_padding_ms=tail_padding_ms,
+        min_duration_ms=min_duration_ms,
+    )
+    if not remapped.segments:
+        return None
+    _repair_subtitle_timing_sequence(remapped.segments, min_gap_ms=min_gap_ms)
+    _pad_short_subtitle_timing_sequence(
+        remapped.segments,
+        min_gap_ms=min_gap_ms,
+        min_duration_ms=min_duration_ms,
+    )
+    changed = sum(
+        1
+        for old, new in zip(subtitle_data.segments, remapped.segments)
+        if int(old.start_time) != int(new.start_time) or int(old.end_time) != int(new.end_time)
+    )
+    logger.info(
+        "WhisperX time-only mapping completed: subtitles=%s changed=%s",
+        len(remapped.segments),
+        changed,
+    )
+    return remapped
+
+
+def _run_whisperx_words(
+    audio_path: str,
+    asr_data: ASRData,
+    language: str,
+    callback=None,
+) -> List[dict]:
+    python_path = _find_whisperx_python()
+    if not python_path:
+        logger.warning("WhisperX time-only skipped: whisperx runtime is not installed")
+        return []
+    if callback:
+        callback(92, "WhisperX最终时间轴对齐...")
+
+    worker = Path(__file__).resolve()
+    source_segments = _asr_payload_segments(asr_data)
+    with tempfile.TemporaryDirectory(prefix="vc_whisperx_time_only_") as tmp:
+        tmp_dir = Path(tmp)
+        input_path = tmp_dir / "input.json"
+        output_path = tmp_dir / "words.json"
+        input_path.write_text(
+            json.dumps(
+                {
+                    "audio_path": str(audio_path),
+                    "segments": source_segments,
+                    "language": "en",
+                    "device": os.getenv("VIDEOCAPTIONER_WHISPERX_DEVICE", "cuda"),
+                    "max_chunk_ms": int(os.getenv("VIDEOCAPTIONER_WHISPERX_MAX_CHUNK_MS", "30000")),
+                    "interpolate_method": os.getenv("VIDEOCAPTIONER_WHISPERX_INTERPOLATE", "nearest"),
+                    "output_path": str(output_path),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONPATH"] = str(_project_root())
+        cmd = [str(python_path), str(worker), "--worker-whisperx", str(input_path)]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            logger.warning("WhisperX time-only failed: %s", result.stderr[-2000:])
+            return []
+        if not output_path.exists():
+            logger.warning("WhisperX time-only failed: worker produced no output")
+            return []
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        words = payload.get("words") or []
+        expected_words = len(WORD_RE.findall(_collect_transcript(asr_data)))
+        if len(words) < max(3, int(expected_words * 0.6)):
+            logger.warning("WhisperX time-only rejected: too few aligned words, got %s", len(words))
+            return []
+        logger.info(
+            "WhisperX time-only raw alignment completed: raw_words=%s elapsed=%s device=%s",
+            len(words),
+            payload.get("elapsed_seconds"),
+            payload.get("device"),
+        )
+        if callback:
+            callback(98, "WhisperX最终时间轴完成")
+        return words
+
+
+def _subtitle_tokens(text: str) -> List[str]:
+    return [_normalize_word(token) for token in WORD_RE.findall(text or "") if _normalize_word(token)]
+
+
+def _find_token_sequence(
+    aligned_norms: Sequence[str],
+    tokens: Sequence[str],
+    cursor: int,
+    window: int = 40,
+) -> Optional[tuple[int, int]]:
+    if not tokens:
+        return None
+    max_start = min(len(aligned_norms), cursor + window)
+    for start in range(cursor, max_start):
+        if aligned_norms[start : start + len(tokens)] == list(tokens):
+            return start, start + len(tokens)
+    # Some ASR punctuation/number normalization differs. Fall back to a compact
+    # local subsequence match without moving backwards.
+    best: Optional[tuple[int, int, int]] = None
+    local_end = min(len(aligned_norms), cursor + max(window, len(tokens) + 20))
+    for start in range(cursor, local_end):
+        ti = 0
+        end = start
+        for index in range(start, local_end):
+            if aligned_norms[index] == tokens[ti]:
+                ti += 1
+                end = index + 1
+                if ti == len(tokens):
+                    span = end - start
+                    best = (start, end, span)
+                    break
+        if best is not None:
+            break
+    if best is None:
+        return None
+    return best[0], best[1]
+
+
+def _make_whisperx_subtitle_segments(
+    source_segments: Sequence[ASRDataSeg],
+    aligned_words: Sequence[dict],
+    lead_in_ms: int,
+    tail_padding_ms: int,
+    min_duration_ms: int,
+) -> ASRData:
+    aligned_norms = [
+        _normalize_word(str(word.get("text") or word.get("word") or ""))
+        for word in aligned_words
+    ]
+    mapped: List[ASRDataSeg] = []
+    cursor = 0
+    matched = 0
+    for seg in source_segments:
+        tokens = _subtitle_tokens(seg.text or "")
+        word_range = _find_token_sequence(aligned_norms, tokens, cursor)
+        if word_range:
+            start_index, end_index = word_range
+            first = aligned_words[start_index]
+            last = aligned_words[end_index - 1]
+            start = int(round(float(first["start"]) * 1000)) - int(lead_in_ms)
+            end = int(round(float(last["end"]) * 1000)) + int(tail_padding_ms)
+            cursor = end_index
+            matched += 1
+        else:
+            start = int(seg.start_time)
+            end = int(seg.end_time)
+        start = max(0, start)
+        if end <= start:
+            end = start + max(120, int(min_duration_ms))
+        elif end - start < int(min_duration_ms):
+            end = start + int(min_duration_ms)
+        mapped.append(
+            ASRDataSeg(
+                text=seg.text,
+                translated_text=seg.translated_text,
+                start_time=start,
+                end_time=end,
+            )
+        )
+    logger.info(
+        "WhisperX subtitle time-only source mapping: subtitles=%s matched=%s raw_words=%s",
+        len(source_segments),
+        matched,
+        len(aligned_words),
+    )
+    return ASRData(mapped)
+
+
+def _repair_subtitle_timing_sequence(
+    segments: Sequence[ASRDataSeg],
+    min_gap_ms: int,
+) -> None:
+    for index in range(len(segments) - 1):
+        current = segments[index]
+        nxt = segments[index + 1]
+        latest_end = max(current.start_time + 120, nxt.start_time - int(min_gap_ms))
+        if current.end_time > latest_end:
+            current.end_time = latest_end
+        if nxt.start_time <= current.end_time:
+            nxt.start_time = current.end_time + int(min_gap_ms)
+        if nxt.end_time <= nxt.start_time:
+            nxt.end_time = nxt.start_time + 120
+
+
+def _pad_short_subtitle_timing_sequence(
+    segments: Sequence[ASRDataSeg],
+    min_gap_ms: int,
+    min_duration_ms: int,
+) -> None:
+    """Extend ultra-short mapped subtitles without changing text or order."""
+    if not segments:
+        return
+    gap = int(min_gap_ms)
+    target_duration = int(min_duration_ms)
+    for index, seg in enumerate(segments):
+        start = max(0, int(seg.start_time))
+        end = max(start + 1, int(seg.end_time))
+        if end - start >= target_duration:
+            continue
+        previous_limit = (
+            max(0, int(segments[index - 1].end_time)) + gap
+            if index > 0
+            else 0
+        )
+        next_limit = (
+            max(0, int(segments[index + 1].start_time)) - gap
+            if index + 1 < len(segments)
+            else None
+        )
+
+        desired_end = start + target_duration
+        if next_limit is None or desired_end <= next_limit:
+            seg.start_time = start
+            seg.end_time = desired_end
+            continue
+
+        target_start = end - target_duration
+        if target_start >= previous_limit:
+            seg.start_time = target_start
+            seg.end_time = end
+            continue
+
+        span_end = max(end, next_limit)
+        if span_end - previous_limit > end - start:
+            seg.start_time = previous_limit
+            seg.end_time = span_end
 
 
 def _worker_extract_words(result) -> List[dict]:

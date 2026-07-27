@@ -221,7 +221,7 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
         self.assertIsNotNone(_find_article_evidence("People’s Daily praised him.", "People's Daily"))
         self.assertIsNotNone(_find_article_evidence("People鈥檚 Daily praised him.", "People's Daily"))
 
-    def test_article_entities_correct_people_works_awards_media_and_platforms(self):
+    def test_article_entities_correct_people_works_awards_media_and_platforms_without_degrading_plausible_names(self):
         article = (
             "Hu Anyan and Fan Yusu were discussed by Lizzi Lee. "
             "The Lu Xun Literary Prize recognized migrant worker writing. "
@@ -268,19 +268,35 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
                 context,
                 output_dir=Path(tmp),
             )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
 
         self.assertEqual(
             [seg.text for seg in corrected.segments],
             [
-                "Hu Anyan released a book.",
-                "Fan Yusu described factory life.",
-                "Lizzi Lee analyzed the trend.",
+                "Hu Anyin released a book.",
+                "Fan Yuzu described factory life.",
+                "Lizzie Li analyzed the trend.",
                 "The Lu Xun Literary Prize matters.",
                 "Adrift in the South was cited.",
                 "People's Daily and Douyin covered it.",
                 "On Douban, readers responded.",
                 "on",
             ],
+        )
+        reasons = {item["original_text"]: item["reason"] for item in logs if not item.get("applied")}
+        self.assertEqual(reasons["Hu Anyin"], "capitalized_name_ambiguous")
+        self.assertEqual(reasons["Fan Yuzu"], "capitalized_name_ambiguous")
+        lizzie_reasons = {
+            item["reason"]
+            for item in logs
+            if not item.get("applied") and str(item.get("original_text", "")).startswith("Lizzie")
+        }
+        self.assertTrue(
+            lizzie_reasons
+            & {
+                "capitalized_name_ambiguous",
+                "token_count_expansion_without_canonical_support",
+            }
         )
 
     def test_save_article_artifacts_writes_raw_response_and_audit(self):

@@ -75,8 +75,8 @@ class TranscriptionSettingCard(QWidget):
             cfg.timeline_alignment_backend,
             FIF.ROBOT,
             self.tr("时间轴对齐后端"),
-            self.tr("stable-ts为默认；WhisperX为实验后端，失败时自动回退"),
-            texts=["stable-ts", "whisperx"],
+            self.tr("stable-ts为默认；WhisperX time-only只在最终阶段替换时间，不改变切分和翻译"),
+            texts=["stable-ts", "whisperx", "whisperx-time-only"],
             parent=self.timeline_group,
         )
         self.stable_ts_model_card = ComboBoxSettingCard(
@@ -127,7 +127,7 @@ class TranscriptionSettingCard(QWidget):
                 self.tr("转录后重新生成英文词级时间轴；会变慢，但切分后的字幕更容易贴近音频")
             )
             self.timeline_backend_card.setContent(
-                self.tr("stable-ts为默认；WhisperX为实验后端，失败时自动回退")
+                self.tr("stable-ts为默认；whisperx会参与切分，whisperx-time-only只替换最终时间")
             )
             self.stable_ts_model_card.setContent(
                 self.tr("模型越大越慢；large-v3-turbo为当前默认")

@@ -1,13 +1,14 @@
 # Current State
 
-Last updated: 2026-07-27
+Last updated: 2026-07-28
 
 ## Working
 
 - E-drive working copy is the active project.
 - Stable mode uses local English segmentation from word-level timestamps.
-- Timeline alignment now supports selectable backends: `stable-ts` (default) and experimental `whisperx`.
+- Timeline alignment now supports selectable backends: `stable-ts` (default), experimental `whisperx`, and `whisperx-time-only`.
 - WhisperX runs through the isolated `whisperx-runtime` environment and falls back to stable-ts/original timing if unavailable.
+- `whisperx-time-only` keeps stable-ts as the cutting timestamp backend, then applies WhisperX only to final subtitle start/end times.
 - LLM translation is limited to Chinese generation/allocation.
 - Podcast template can resolve subtitles from `stable-final-manifest.json`.
 - Regression smoke tests exist in `tests/test_stable_caption_rules.py`.
@@ -30,7 +31,8 @@ Last updated: 2026-07-27
 - Current tests are smoke/regression tests, not full fixture coverage.
 - Existing generated outputs under `work-dir` may be stale unless regenerated after code changes.
 - Some ASR/stable-ts word timings can be too short or contain gaps.
-- WhisperX integration currently changes only word timestamp alignment; it should remain optional until more samples are compared.
+- Full `whisperx` backend changes word timestamp alignment before stable cutting, so English boundaries and downstream Chinese can change.
+- `whisperx-time-only` is the lower-risk WhisperX mode for samples where timing improves but existing cutting/translation should remain stable.
 - Chinese translation quality still depends on LLM output and prompt stability.
 - Validation blocking is strongest for translation-structure errors; confirm any new ERROR class is wired to synthesis blocking before relying on it.
 - Git has no `checkpoint-2026-07-23` tag or branch in this checkout.
@@ -41,7 +43,9 @@ Use:
 
 - Stable mode on.
 - stable-ts/time alignment on when available.
-- Keep `stable-ts` as the default alignment backend; use `whisperx` as an experimental backend for samples with subtitle early-disappear timing issues.
+- Keep `stable-ts` as the default alignment backend.
+- Prefer `whisperx-time-only` when WhisperX timing is better but stable-ts cutting/translation should be preserved.
+- Use full `whisperx` only as an experimental backend when boundary changes are acceptable.
 - Candidate quality check off.
 - Preserve backchannels.
 - Use `stable-final-manifest.json` for podcast template synthesis.
@@ -66,6 +70,14 @@ Result:
 - Stable subtitle output passed validation: `subtitle_count=303`, `translation_structure_errors=[]`, `render_blocked=false`.
 - Final SRT timing audit: `overlap_count=0`, `gap_gt800=1`, `gap_gt1000=0`, `empty_chinese=0`.
 - Podcast learning template video rendered successfully to the source audio folder.
+
+## Latest WhisperX Time-Only Change
+
+- Added `whisperx-time-only` backend.
+- In transcript alignment, this mode still uses stable-ts word timestamps for stable cutting.
+- After screen subtitle editing, it runs WhisperX against the final subtitle text and only updates `start_time`/`end_time`.
+- The application rejects the time-only result if subtitle count, English text, or Chinese text changes.
+- Regression coverage verifies that final text and translation are preserved while timing is retimed.
 
 ## Next Recommended Task
 

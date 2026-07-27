@@ -2991,6 +2991,10 @@ class ScreenSubtitleEditor:
             issues.append("determiner_head_phrase_split")
         if self._is_particle_or_preposition_complement_split(left_token, right_token):
             issues.append("particle_or_preposition_complement_split")
+        if self._is_time_range_continuation_split(left, right):
+            issues.append("time_range_continuation_split")
+        elif self._is_stranded_leading_complement_split(left, right, pause_ms):
+            issues.append("stranded_leading_complement_split")
         if self._is_negation_or_emphasis_boundary(left_token, right_token):
             issues.append("negation_or_emphasis_fragment")
         if self._is_adverb_adjective_boundary(left_token, right_token, pause_ms):
@@ -3218,6 +3222,67 @@ class ScreenSubtitleEditor:
         }
         adverbial_particles = {"straight", "directly", "right"}
         return left in adverbial_particles and right in prepositions
+
+    def _is_time_range_continuation_split(self, left: int, right: int) -> bool:
+        entries = self._active_word_entries
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        if right_token != "to":
+            return False
+        if left_token not in {"m", "am", "pm", "a.m", "p.m"}:
+            return False
+        if right + 1 >= len(entries):
+            return False
+        next_token = self._clean_boundary_token(entries[right + 1].get("token") or "")
+        return self._token_is_numeric_like(next_token) or self._token_is_digits_like(next_token)
+
+    def _is_stranded_leading_complement_split(
+        self,
+        left: int,
+        right: int,
+        pause_ms: Optional[int],
+    ) -> bool:
+        if pause_ms is not None and pause_ms >= 450:
+            return False
+        entries = self._active_word_entries
+        left_surface = str(entries[left].get("surface") or "")
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        if right_token not in {"of", "with", "about", "to"}:
+            return False
+        if re.search(r"[.!?]\s*$", left_surface or ""):
+            return False
+        if right_token == "to":
+            return self._right_boundary_starts_infinitive_phrase(right)
+        if right_token == "with":
+            return self._left_boundary_takes_with_complement(left_token)
+        return bool(left_token) and self._token_looks_noun_like(left_token)
+
+    def _right_boundary_starts_infinitive_phrase(self, right: int) -> bool:
+        entries = self._active_word_entries
+        if right + 1 >= len(entries):
+            return False
+        next_token = self._clean_boundary_token(entries[right + 1].get("token") or "")
+        if not next_token:
+            return False
+        common_infinitive_verbs = {
+            "be", "build", "construct", "create", "do", "earn", "explain",
+            "get", "go", "hire", "keep", "make", "move", "read", "see",
+            "take", "use", "work", "write",
+        }
+        return next_token in common_infinitive_verbs or next_token.endswith("e")
+
+    @staticmethod
+    def _left_boundary_takes_with_complement(left_token: str) -> bool:
+        return left_token in {
+            "met",
+            "filled",
+            "dealing",
+            "faced",
+            "facing",
+            "popular",
+            "concerned",
+        } or left_token.endswith("ed")
 
     @staticmethod
     def _is_negation_or_emphasis_boundary(left: str, right: str) -> bool:

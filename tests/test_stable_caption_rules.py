@@ -11,7 +11,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
-from app.core.subtitle_processor.stable_ts_alignment import _make_whisperx_word_segments
+from app.core.subtitle_processor.stable_ts_alignment import (
+    _make_whisperx_subtitle_segments,
+    _make_whisperx_word_segments,
+    _pad_short_subtitle_timing_sequence,
+    _repair_subtitle_timing_sequence,
+)
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.entities import SubtitleConfig, SubtitleTask
 from app.thread.subtitle_thread import SubtitleThread
@@ -2092,6 +2097,41 @@ def test_final_gate_blocks_negation_emphasis_split():
     assert not evaluation["legal"]
 
 
+def test_final_gate_blocks_stranded_leading_of_complement():
+    editor = _marker_editor(["the", "mechanics", "of", "resilience"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "stranded_leading_complement_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_stranded_leading_with_complement():
+    editor = _marker_editor(["was", "met", "with", "hostility"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "stranded_leading_complement_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_time_range_to_continuation():
+    editor = _marker_editor(["working", "9", "a", "m.", "to", "9", "p", "m."])
+
+    evaluation = editor._evaluate_stable_cut_boundary(3, 4)
+
+    assert "time_range_continuation_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_allows_sentence_initial_to_me_after_punctuation():
+    editor = _marker_editor(["brutal.", "To", "me", "that", "is", "clear"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert "stranded_leading_complement_split" not in evaluation["hard_issues"]
+
+
 def test_final_fragment_gate_repairs_incomplete_interrogative_fragment():
     editor = _marker_editor(["How", "on", "earth", "do", "you", "know", "this?"], max_words=14)
     items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 6, 2)]
@@ -3376,6 +3416,66 @@ def test_failed_group_does_not_shift_following_100_subtitles():
     assert all(item.translated == f"zh-{item.subtitle_id}" for item in applied[4:])
 
 
+def test_whisperx_time_only_preserves_text_and_translation_while_retiming():
+    source = [
+        ASRDataSeg("Welcome to today's Deep Dive.", 1000, 2500, "欢迎收看今天的深度解读。"),
+        ASRDataSeg("We are unpacking the story.", 2600, 4300, "我们正在解读这个故事。"),
+    ]
+    aligned_words = [
+        {"text": "Welcome", "start": 1.22, "end": 1.45},
+        {"text": "to", "start": 1.46, "end": 1.56},
+        {"text": "today's", "start": 1.57, "end": 1.82},
+        {"text": "Deep", "start": 1.83, "end": 2.03},
+        {"text": "Dive", "start": 2.04, "end": 2.25},
+        {"text": "We", "start": 2.92, "end": 3.05},
+        {"text": "are", "start": 3.06, "end": 3.18},
+        {"text": "unpacking", "start": 3.19, "end": 3.55},
+        {"text": "the", "start": 3.56, "end": 3.66},
+        {"text": "story", "start": 3.67, "end": 3.96},
+    ]
+
+    remapped = _make_whisperx_subtitle_segments(
+        source,
+        aligned_words,
+        lead_in_ms=80,
+        tail_padding_ms=450,
+        min_duration_ms=800,
+    )
+    _repair_subtitle_timing_sequence(remapped.segments, min_gap_ms=40)
+
+    assert len(remapped.segments) == len(source)
+    assert [seg.text for seg in remapped.segments] == [seg.text for seg in source]
+    assert [seg.translated_text for seg in remapped.segments] == [
+        seg.translated_text for seg in source
+    ]
+    assert remapped.segments[0].start_time == 1140
+    assert remapped.segments[0].end_time == 2700
+    assert remapped.segments[1].start_time == 2840
+    assert remapped.segments[1].end_time == 4410
+    assert remapped.segments[0].end_time + 40 <= remapped.segments[1].start_time
+
+
+def test_whisperx_time_only_pads_ultra_short_subtitle_when_neighbor_room_exists():
+    segments = [
+        ASRDataSeg("Before.", 0, 2400, "之前。"),
+        ASRDataSeg("Oh, I see.", 2600, 3060, "哦，我明白了。"),
+        ASRDataSeg("After this point.", 3980, 5200, "之后。"),
+    ]
+
+    _repair_subtitle_timing_sequence(segments, min_gap_ms=40)
+    _pad_short_subtitle_timing_sequence(
+        segments,
+        min_gap_ms=40,
+        min_duration_ms=800,
+    )
+
+    assert segments[1].text == "Oh, I see."
+    assert segments[1].translated_text == "哦，我明白了。"
+    assert segments[1].end_time - segments[1].start_time >= 800
+    assert segments[0].end_time + 40 <= segments[1].start_time
+    assert segments[1].end_time + 40 <= segments[2].start_time
+
+
 def test_failed_validation_does_not_write_final_output_file():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -3854,6 +3954,7 @@ if __name__ == "__main__":
     test_short_subtitle_gets_minimum_display_duration_when_room_allows()
     test_short_backchannel_merges_with_following_segment()
     test_short_sentence_bridges_small_gap_before_next_subtitle()
+    test_whisperx_time_only_pads_ultra_short_subtitle_when_neighbor_room_exists()
     test_standalone_discourse_marker_attaches_to_immediate_next_sentence()
     test_trailing_standalone_discourse_marker_attaches_to_previous_sentence()
     test_standalone_discourse_marker_does_not_cross_long_pause()
@@ -3905,6 +4006,10 @@ if __name__ == "__main__":
     test_final_gate_blocks_compound_noun_split()
     test_final_gate_blocks_modifier_noun_head_split()
     test_final_gate_blocks_negation_emphasis_split()
+    test_final_gate_blocks_stranded_leading_of_complement()
+    test_final_gate_blocks_stranded_leading_with_complement()
+    test_final_gate_blocks_time_range_to_continuation()
+    test_final_gate_allows_sentence_initial_to_me_after_punctuation()
     test_final_fragment_gate_repairs_incomplete_interrogative_fragment()
     test_final_repair_does_not_create_adjacent_subject_fragment()
     test_final_repair_does_not_create_ordinary_one_word_fragment()
@@ -3952,4 +4057,5 @@ if __name__ == "__main__":
     test_non_structural_validation_errors_still_write_stable_artifacts()
     test_runtime_module_import_path_is_available()
     test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
+    test_whisperx_time_only_preserves_text_and_translation_while_retiming()
     print("stable caption rule smoke tests passed")
