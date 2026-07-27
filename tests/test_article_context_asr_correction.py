@@ -226,7 +226,7 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             "Hu Anyan and Fan Yusu were discussed by Lizzi Lee. "
             "The Lu Xun Literary Prize recognized migrant worker writing. "
             "Adrift in the South became a memoir. "
-            "People’s Daily and Douyin both appeared in the article."
+            "People’s Daily, Douyin, and Douban all appeared in the article."
         )
         context = enrich_article_context_with_evidence(
             {
@@ -246,6 +246,7 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
                 ],
                 "platforms": [
                     {"canonical_name": "Douyin", "aliases": [], "category": "social media platform"},
+                    {"canonical_name": "Douban", "aliases": [], "category": "social media platform"},
                 ],
             },
             article,
@@ -257,6 +258,8 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             ASRDataSeg("The Lusun Literary Prize matters.", 900, 1100),
             ASRDataSeg("A Drift in the South was cited.", 1200, 1400),
             ASRDataSeg("People's Daily and Duyin covered it.", 1500, 1700),
+            ASRDataSeg("On Duben, readers responded.", 1800, 2000),
+            ASRDataSeg("on", 2100, 2200),
         ]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,6 +278,8 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
                 "The Lu Xun Literary Prize matters.",
                 "Adrift in the South was cited.",
                 "People's Daily and Douyin covered it.",
+                "On Douban, readers responded.",
+                "on",
             ],
         )
 

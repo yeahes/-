@@ -1245,11 +1245,27 @@ def _single_token_candidate_stays_in_scope(
         return True
     if has_inner_uppercase and phonetic_similarity >= 0.9:
         return True
+    if (
+        same_initial
+        and _single_token_platform_candidate(candidate)
+        and string_similarity >= 0.7
+        and phonetic_similarity >= 0.95
+    ):
+        return True
     if same_initial and string_similarity >= 0.8:
         return True
     if original_token == original_token.lower() and not re.search(r"['&.-]", original_token):
         return False
     return False
+
+
+def _single_token_platform_candidate(candidate: Dict[str, Any]) -> bool:
+    source = candidate.get("source_glossary") or {}
+    source_key = str(source.get("source_key", candidate.get("source_key", "")) or "").casefold()
+    category = str(source.get("category", candidate.get("category", "")) or "").casefold()
+    if source_key in {"platforms", "media_outlets"}:
+        return True
+    return category in {"platform", "platforms", "social media platform", "media outlet"}
 
 
 _COMMON_LOWERCASE_WORD_PROTECTION = {
