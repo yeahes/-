@@ -5,6 +5,7 @@ import statistics
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -12,8 +13,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 
 
 WORD_RE = re.compile(
@@ -29,6 +28,14 @@ LANGUAGE_MAP = {
     "zh": "Chinese",
     "chinese": "Chinese",
 }
+
+
+@dataclass
+class Segment:
+    text: str
+    start_time: int
+    end_time: int
+    translated_text: str = ""
 
 
 def _read_json(path: Path):
@@ -49,7 +56,7 @@ def _tokenize(text: str) -> List[str]:
     return [token for token in WORD_RE.findall(text or "") if token.strip()]
 
 
-def _load_segments_json(path: Path) -> List[ASRDataSeg]:
+def _load_segments_json(path: Path) -> List[Segment]:
     data = _read_json(path)
     if isinstance(data, dict) and "segments" in data and isinstance(data["segments"], list):
         items = data["segments"]
@@ -60,7 +67,7 @@ def _load_segments_json(path: Path) -> List[ASRDataSeg]:
     else:
         raise ValueError(f"Unsupported JSON shape: {path}")
 
-    segments: List[ASRDataSeg] = []
+    segments: List[Segment] = []
     for item in items:
         text = (
             item.get("text")
@@ -84,12 +91,32 @@ def _load_segments_json(path: Path) -> List[ASRDataSeg]:
             end_ms = int(round(float(end) * 1000))
         if end_ms <= start_ms:
             end_ms = start_ms + 1
-        segments.append(ASRDataSeg(str(text), start_ms, end_ms))
+        segments.append(Segment(str(text), start_ms, end_ms))
     return sorted(segments, key=lambda seg: (seg.start_time, seg.end_time))
 
 
-def _load_srt(path: Path) -> List[ASRDataSeg]:
-    return ASRData.from_srt(path.read_text(encoding="utf-8-sig")).segments
+def _parse_srt_time(text: str) -> int:
+    match = re.match(r"(\d{2}):(\d{2}):(\d{1,2})[,.](\d{3})", text.strip())
+    if not match:
+        raise ValueError(f"Invalid SRT timestamp: {text}")
+    hours, minutes, seconds, millis = map(int, match.groups())
+    return hours * 3_600_000 + minutes * 60_000 + seconds * 1000 + millis
+
+
+def _load_srt(path: Path) -> List[Segment]:
+    text = path.read_text(encoding="utf-8-sig")
+    segments: List[Segment] = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.splitlines()
+        if len(lines) < 3 or "-->" not in lines[1]:
+            continue
+        left, right = [part.strip() for part in lines[1].split("-->", 1)]
+        start = _parse_srt_time(left)
+        end = _parse_srt_time(right)
+        original = lines[2].strip()
+        translated = lines[3].strip() if len(lines) >= 4 else ""
+        segments.append(Segment(original, start, end, translated))
+    return segments
 
 
 def _load_audio_slice(audio_path: Path, start_ms: int, end_ms: int):
@@ -152,7 +179,7 @@ def _find_ffmpeg() -> Optional[Path]:
 
 
 def _make_chunks(
-    words: Sequence[ASRDataSeg],
+    words: Sequence[Segment],
     max_chunk_ms: int,
     pad_ms: int,
 ) -> List[Dict]:
@@ -219,22 +246,38 @@ def _load_qwen_aligner(model_name: str, device: str, dtype_name: str):
 
 
 def _extract_qwen_words(result) -> List[Dict]:
-    # Qwen returns list-like timestamp units. Each unit exposes text/start_time/end_time.
-    units = result[0] if result and isinstance(result, list) and result and isinstance(result[0], list) else result
+    # Qwen returns List[ForcedAlignResult], and each result carries its aligned
+    # units under .items. Keep dict/list fallbacks so the lab can tolerate
+    # minor qwen-asr serialization changes.
+    units = []
+    for block in result or []:
+        if isinstance(block, dict):
+            block_units = block.get("items") or block.get("segments") or block.get("words") or []
+        else:
+            block_units = getattr(block, "items", None)
+            if block_units is None and isinstance(block, list):
+                block_units = block
+        units.extend(block_units or [])
+
     words: List[Dict] = []
     for item in units or []:
-        text = str(getattr(item, "text", "")).strip()
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("word") or "").strip()
+            start = float(item.get("start_time", item.get("start", 0.0)) or 0.0)
+            end = float(item.get("end_time", item.get("end", start)) or start)
+        else:
+            text = str(getattr(item, "text", "")).strip()
+            start = float(getattr(item, "start_time", 0.0))
+            end = float(getattr(item, "end_time", start))
         if not text:
             continue
-        start = float(getattr(item, "start_time", 0.0))
-        end = float(getattr(item, "end_time", start))
         words.append({"text": text, "start": start, "end": max(end, start)})
     return words
 
 
 def run_qwen_alignment(
     audio_path: Path,
-    stable_words: Sequence[ASRDataSeg],
+    stable_words: Sequence[Segment],
     output_dir: Path,
     language: str,
     model_name: str,
@@ -308,7 +351,7 @@ def run_qwen_alignment(
 
 
 def compare_word_ledgers(
-    stable_words: Sequence[ASRDataSeg],
+    stable_words: Sequence[Segment],
     qwen_words: Sequence[Dict],
 ) -> Dict:
     stable_norms = [_normalize_token(seg.text) for seg in stable_words]
