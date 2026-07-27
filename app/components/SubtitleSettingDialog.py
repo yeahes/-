@@ -126,7 +126,7 @@ class SubtitleSettingDialog(MessageBoxBase):
             cfg.screen_subtitle_allocation_max_concurrency,
             FIF.TILES,
             self.tr("中文分配并发"),
-            self.tr("只并发请求中文逐条分配；不改变字幕切分、提示词、ID 或最终写回。建议 4，最高 10。"),
+            self.tr("只并发请求中文逐条分配；不改变字幕切分、提示词、ID 或最终写回。建议 3，最高 10。"),
             minimum=1,
             maximum=10,
             parent=self,
