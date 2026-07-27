@@ -9,9 +9,11 @@ from app.core.article_context import (
     analyze_article_text,
     apply_article_asr_corrections,
     build_article_glossary,
+    empty_article_context,
     enrich_article_context_with_evidence,
     save_article_artifacts,
     _dedupe_adjacent_canonical_entity_overlap,
+    _find_article_evidence,
     _resolve_overlapping_article_correction_candidates,
 )
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
@@ -205,6 +207,76 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
         self.assertEqual(pop["aliases"], ["Popmart"])
         self.assertTrue(pop["canonical_in_article"] is False)
         self.assertNotIn("asr_disabled_reason", pop)
+
+    def test_empty_context_contains_article_entity_categories(self):
+        context = empty_article_context()
+
+        self.assertIn("books_and_works", context)
+        self.assertIn("awards", context)
+        self.assertIn("media_outlets", context)
+        self.assertIn("platforms", context)
+
+    def test_article_evidence_matches_curly_and_mojibake_apostrophes(self):
+        self.assertIsNotNone(_find_article_evidence("People's Daily praised him.", "People's Daily"))
+        self.assertIsNotNone(_find_article_evidence("People’s Daily praised him.", "People's Daily"))
+        self.assertIsNotNone(_find_article_evidence("People鈥檚 Daily praised him.", "People's Daily"))
+
+    def test_article_entities_correct_people_works_awards_media_and_platforms(self):
+        article = (
+            "Hu Anyan and Fan Yusu were discussed by Lizzi Lee. "
+            "The Lu Xun Literary Prize recognized migrant worker writing. "
+            "Adrift in the South became a memoir. "
+            "People’s Daily and Douyin both appeared in the article."
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {"canonical_name": "Hu Anyan", "aliases": [], "category": "writer"},
+                    {"canonical_name": "Fan Yusu", "aliases": [], "category": "writer"},
+                    {"canonical_name": "Lizzi Lee", "aliases": [], "category": "analyst"},
+                ],
+                "books_and_works": [
+                    {"canonical_name": "Adrift in the South", "aliases": [], "category": "memoir"},
+                ],
+                "awards": [
+                    {"canonical_name": "Lu Xun Literary Prize", "aliases": [], "category": "literary award"},
+                ],
+                "media_outlets": [
+                    {"canonical_name": "People's Daily", "aliases": [], "category": "media outlet"},
+                ],
+                "platforms": [
+                    {"canonical_name": "Douyin", "aliases": [], "category": "social media platform"},
+                ],
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Hu Anyin released a book.", 100, 200),
+            ASRDataSeg("Fan Yuzu described factory life.", 300, 500),
+            ASRDataSeg("Lizzie Li analyzed the trend.", 600, 800),
+            ASRDataSeg("The Lusun Literary Prize matters.", 900, 1100),
+            ASRDataSeg("A Drift in the South was cited.", 1200, 1400),
+            ASRDataSeg("People's Daily and Duyin covered it.", 1500, 1700),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+
+        self.assertEqual(
+            [seg.text for seg in corrected.segments],
+            [
+                "Hu Anyan released a book.",
+                "Fan Yusu described factory life.",
+                "Lizzi Lee analyzed the trend.",
+                "The Lu Xun Literary Prize matters.",
+                "Adrift in the South was cited.",
+                "People's Daily and Douyin covered it.",
+            ],
+        )
 
     def test_save_article_artifacts_writes_raw_response_and_audit(self):
         article = "DeepSeek was founded by Liang Wenfeng."

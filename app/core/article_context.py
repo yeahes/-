@@ -17,9 +17,22 @@ from app.core.utils.logger import setup_logger
 
 logger = setup_logger("article_context")
 
-ARTICLE_CONTEXT_SCHEMA_VERSION = 1
+ARTICLE_CONTEXT_SCHEMA_VERSION = 2
 ARTICLE_RAW_RESPONSE_KEY = "_raw_response"
 ARTICLE_ANALYSIS_META_KEY = "_analysis_meta"
+ARTICLE_ENTITY_KEYS = (
+    "people",
+    "companies",
+    "brands",
+    "organisations",
+    "places",
+    "books_and_works",
+    "awards",
+    "media_outlets",
+    "platforms",
+    "technical_terms",
+    "numbers_and_dates",
+)
 ARTICLE_CONTEXT_PROMPT = """
 You analyze an English reference article for subtitle production.
 
@@ -34,11 +47,15 @@ Return strict JSON only with these keys:
   "brands": [],
   "organisations": [],
   "places": [],
+  "books_and_works": [],
+  "awards": [],
+  "media_outlets": [],
+  "platforms": [],
   "technical_terms": [],
   "numbers_and_dates": []
 }
 
-Each object in people, companies, brands, organisations, places, technical_terms, and numbers_and_dates must contain:
+Each object in people, companies, brands, organisations, places, books_and_works, awards, media_outlets, platforms, technical_terms, and numbers_and_dates must contain:
 {
   "canonical_name": "",
   "chinese_name": "",
@@ -50,6 +67,11 @@ Rules:
 - Keep canonical_name in English when the article uses English.
 - chinese_name should be a concise Simplified Chinese rendering when obvious, otherwise "".
 - aliases should include obvious abbreviations, spellings, or product shorthand found in the article.
+- Extract all named people, books, poems, essays, memoirs, awards, media outlets, organisations, platforms, companies, and named products mentioned in the article.
+- Put books, poetry collections, poems, essays, memoirs, films, programs, and article titles in books_and_works, not brands.
+- Put literary prizes and other named awards in awards, not organisations.
+- Put newspapers, broadcasters, magazines, and named media outlets in media_outlets.
+- Put apps and social platforms in platforms unless they are clearly companies.
 - numbers_and_dates includes numbers, years, percentages, currencies, valuations, and money amounts.
 - Do not add facts not supported by the article.
 - Do not output markdown.
@@ -76,13 +98,7 @@ def empty_article_context() -> Dict[str, Any]:
         "schema_version": ARTICLE_CONTEXT_SCHEMA_VERSION,
         "title": "",
         "summary": "",
-        "people": [],
-        "companies": [],
-        "brands": [],
-        "organisations": [],
-        "places": [],
-        "technical_terms": [],
-        "numbers_and_dates": [],
+        **{key: [] for key in ARTICLE_ENTITY_KEYS},
     }
 
 
@@ -92,15 +108,7 @@ def normalize_article_context(data: Any) -> Dict[str, Any]:
     result = empty_article_context()
     result["title"] = str(data.get("title", "") or "").strip()
     result["summary"] = str(data.get("summary", "") or "").strip()
-    for key in (
-        "people",
-        "companies",
-        "brands",
-        "organisations",
-        "places",
-        "technical_terms",
-        "numbers_and_dates",
-    ):
+    for key in ARTICLE_ENTITY_KEYS:
         result[key] = [_normalize_term(item, key) for item in data.get(key, []) if isinstance(item, dict)]
     if data.get(ARTICLE_RAW_RESPONSE_KEY) is not None:
         result[ARTICLE_RAW_RESPONSE_KEY] = str(data.get(ARTICLE_RAW_RESPONSE_KEY) or "")
@@ -247,15 +255,7 @@ def load_article_context(path: str | Path) -> Dict[str, Any]:
 def enrich_article_context_with_evidence(context: Dict[str, Any], article_text: str) -> Dict[str, Any]:
     normalized = normalize_article_context(context)
     cleaned = clean_article_text(article_text)
-    for key in (
-        "people",
-        "companies",
-        "brands",
-        "organisations",
-        "places",
-        "technical_terms",
-        "numbers_and_dates",
-    ):
+    for key in ARTICLE_ENTITY_KEYS:
         enriched_items = []
         for item in normalized.get(key, []):
             enriched = dict(item)
@@ -291,15 +291,7 @@ def build_article_context_audit(context: Dict[str, Any]) -> Dict[str, Any]:
     unsupported_entities = []
     unsupported_aliases = []
     category_counts: Dict[str, int] = {}
-    for key in (
-        "people",
-        "companies",
-        "brands",
-        "organisations",
-        "places",
-        "technical_terms",
-        "numbers_and_dates",
-    ):
+    for key in ARTICLE_ENTITY_KEYS:
         for item in normalized.get(key, []):
             category = str(item.get("category", "") or key)
             category_counts[category] = category_counts.get(category, 0) + 1
@@ -335,7 +327,12 @@ def _find_article_evidence(article_text: str, phrase: str) -> Optional[Dict[str,
     phrase = str(phrase or "").strip()
     if not article_text or not phrase:
         return None
-    pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(phrase)}(?![A-Za-z0-9])", re.IGNORECASE)
+    article_text = _normalize_article_punctuation(article_text)
+    phrase = _normalize_article_punctuation(phrase)
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9]){_article_phrase_pattern(phrase)}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
     match = pattern.search(article_text)
     if not match:
         return None
@@ -355,6 +352,20 @@ def _find_article_evidence(article_text: str, phrase: str) -> Optional[Dict[str,
         "end_char": match.end(),
         "evidence_sentence": sentence,
     }
+
+
+def _normalize_article_punctuation(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u9225\u6a9a", "'s")
+        .replace("\u9225?", "'")
+    )
 
 
 def _glossary_term_for_matching(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -377,15 +388,7 @@ def build_article_glossary(context: Dict[str, Any]) -> List[Dict[str, Any]]:
     normalized = normalize_article_context(context)
     terms: List[Dict[str, Any]] = []
     seen = set()
-    for key in (
-        "people",
-        "companies",
-        "brands",
-        "organisations",
-        "places",
-        "technical_terms",
-        "numbers_and_dates",
-    ):
+    for key in ARTICLE_ENTITY_KEYS:
         for item in normalized.get(key, []):
             canonical = item.get("canonical_name", "")
             if not canonical:
@@ -846,26 +849,58 @@ def _carry_trailing_punctuation(text: str, source_text: str) -> str:
 
 def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     terms = []
-    allowed_categories = {
-        "person",
+    asr_source_keys = {
         "people",
+        "companies",
+        "brands",
+        "organisations",
+        "places",
+        "books_and_works",
+        "awards",
+        "media_outlets",
+        "platforms",
+    }
+    allowed_categories = {
+        "analyst",
+        "app",
+        "author",
+        "award",
+        "book",
+        "books_and_works",
+        "city",
         "company",
         "companies",
-        "brand",
-        "brands",
-        "product",
-        "products",
+        "country",
+        "essay",
+        "historical figure",
+        "institution",
+        "institutions",
+        "list",
+        "literary award",
+        "media outlet",
+        "memoir",
         "organisation",
         "organisations",
         "organization",
         "organizations",
+        "person",
+        "people",
         "place",
         "places",
-        "location",
-        "locations",
-        "institution",
-        "institutions",
-        "list",
+        "platform",
+        "platforms",
+        "poem",
+        "poet",
+        "poetry collection",
+        "brand",
+        "brands",
+        "product",
+        "products",
+        "region",
+        "research center",
+        "social media platform",
+        "think tank",
+        "writer",
     }
     for term in glossary:
         if term.get("asr_correction_enabled") is False:
@@ -873,8 +908,11 @@ def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, 
         canonical = str(term.get("canonical_name", "") or "").strip()
         if not canonical or not re.search(r"[A-Za-z0-9]", canonical):
             continue
+        source_key = str(term.get("source_key", "") or "").strip().casefold()
         category = str(term.get("category", "") or "").strip().casefold()
-        if category and category not in allowed_categories:
+        if source_key and source_key not in asr_source_keys:
+            continue
+        if not source_key and category and category not in allowed_categories:
             continue
         variants = [canonical]
         for alias in term.get("aliases") or []:
@@ -1004,6 +1042,7 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
             "canonical_name": term["source"].get("canonical_name", ""),
             "chinese_name": term["source"].get("chinese_name", ""),
             "category": term["source"].get("category", ""),
+            "source_key": term["source"].get("source_key", ""),
             "aliases": term["source"].get("aliases", []),
         },
     }
@@ -1051,12 +1090,78 @@ def _candidate_stays_in_article_scope(candidate: Dict[str, Any]) -> bool:
         return _exact_alias_can_auto_apply(candidate)
 
     if not candidate.get("entity_gate_passed"):
+        if _high_confidence_article_entity_candidate(candidate):
+            return True
         return False
 
     if len(original_tokens) == 1 and len(corrected_tokens) == 1:
         if not _single_token_candidate_stays_in_scope(original_tokens[0], corrected_tokens[0], candidate):
             return False
     return True
+
+
+def _high_confidence_article_entity_candidate(candidate: Dict[str, Any]) -> bool:
+    source = candidate.get("source_glossary") or {}
+    source_key = str(source.get("source_key", "") or "").casefold()
+    category = str(source.get("category", "") or "").casefold()
+    high_precision_sources = {
+        "people",
+        "companies",
+        "brands",
+        "organisations",
+        "places",
+        "books_and_works",
+        "awards",
+        "media_outlets",
+        "platforms",
+    }
+    high_precision_categories = {
+        "analyst",
+        "author",
+        "book",
+        "literary award",
+        "media outlet",
+        "memoir",
+        "poem",
+        "poet",
+        "poetry collection",
+        "research center",
+        "social media platform",
+        "think tank",
+        "writer",
+    }
+    if source_key not in high_precision_sources and category not in high_precision_categories:
+        return False
+    original = str(candidate.get("original_text", "") or "")
+    corrected = str(candidate.get("candidate_text", "") or "")
+    if not re.search(r"[A-Z]", original):
+        return False
+    original_tokens = _word_tokens(original)
+    corrected_tokens = _word_tokens(corrected)
+    if not original_tokens or not corrected_tokens:
+        return False
+    if (
+        original_tokens[-1].casefold() in {"and", "or", "but", "for", "of", "to", "with", "in", "on", "at", "by"}
+        and original_tokens[-1].casefold() != corrected_tokens[-1].casefold()
+    ):
+        return False
+    if (
+        original_tokens[0].casefold() in {"a", "an", "the", "and", "or", "but", "for", "of", "to", "with", "in", "on", "at", "by"}
+        and original_tokens[0].casefold() != corrected_tokens[0].casefold()
+    ):
+        return False
+    if abs(len(original_tokens) - len(corrected_tokens)) > 1:
+        return False
+    string_similarity = float(candidate.get("string_similarity") or 0)
+    phonetic_similarity = float(candidate.get("phonetic_similarity") or 0)
+    same_initials = _entity_initials(original_tokens) == _entity_initials(corrected_tokens)
+    if same_initials and max(string_similarity, phonetic_similarity) >= 0.82:
+        return True
+    return string_similarity >= 0.86 and phonetic_similarity >= 0.82
+
+
+def _entity_initials(tokens: Sequence[str]) -> str:
+    return "".join((token[:1] or "").casefold() for token in tokens if token)
 
 
 def _exact_alias_can_auto_apply(candidate: Dict[str, Any]) -> bool:
@@ -1268,18 +1373,6 @@ _ENTITY_BLOCKING_FUNCTION_WORDS = {
 }
 
 
-def _replacement_text_for_original(original_text: str, canonical: str) -> str:
-    trailing_punctuation = ""
-    match = re.search(r"([,.;:!?]+)$", original_text or "")
-    if match and not str(canonical or "").endswith(match.group(1)):
-        trailing_punctuation = match.group(1)
-    if re.search(r"(?:'|’)s\b", original_text or "", re.IGNORECASE) and not re.search(
-        r"(?:'|’)s\b", canonical or "", re.IGNORECASE
-    ):
-        return f"{canonical}'s{trailing_punctuation}"
-    return f"{canonical}{trailing_punctuation}"
-
-
 def _join_asr_words(words: Sequence[str]) -> str:
     text = " ".join(str(word or "").strip() for word in words if str(word or "").strip())
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
@@ -1303,9 +1396,54 @@ def _phonetic_key(text: str) -> str:
     raw = raw.replace("ee", "i")
     raw = raw.replace("ea", "i")
     raw = raw.replace("ck", "k")
+    raw = raw.replace("z", "s")
     raw = re.sub(r"[aeiouy]+", "a", raw)
     raw = re.sub(r"(.)\1+", r"\1", raw)
     return raw
+
+
+def _article_phrase_pattern(phrase: str) -> str:
+    phrase = str(phrase or "")
+    pieces = []
+    index = 0
+    while index < len(phrase):
+        chunk = phrase[index : index + 2]
+        if chunk.casefold() in {"'s", "?s"}:
+            pieces.append(r"(?:'s|`s|\?s)")
+            index += 2
+            continue
+        char = phrase[index]
+        if char in {"'", "\u2019", "\u2018", "`"}:
+            pieces.append(r"(?:['`])")
+        elif char.isspace():
+            pieces.append(r"\s+")
+        else:
+            pieces.append(re.escape(char))
+        index += 1
+    return "".join(pieces)
+
+
+def _replacement_text_for_original(original_text: str, canonical: str) -> str:
+    trailing_punctuation = ""
+    match = re.search(r"([,.;:!?]+)$", original_text or "")
+    if match and not str(canonical or "").endswith(match.group(1)):
+        trailing_punctuation = match.group(1)
+    possessive_pattern = r"(?:'|\u2019|\u2018|`)s\b"
+    if re.search(possessive_pattern, original_text or "", re.IGNORECASE) and not re.search(
+        possessive_pattern, canonical or "", re.IGNORECASE
+    ):
+        return f"{canonical}'s{trailing_punctuation}"
+    return f"{canonical}{trailing_punctuation}"
+
+
+def _remove_accidental_article_before_entity(text: str) -> str:
+    # ASR may split a title such as "Adrift" into "A Drift"; after correction,
+    # that can temporarily produce "A Adrift".
+    return re.sub(
+        r"\bA\s+(A[A-Za-z]+(?:\s+(?:and|for|from|in|of|on|the|to|with|[A-Z][A-Za-z]+)){0,8})\b",
+        r"\1",
+        text or "",
+    )
 
 
 def _correct_segment_text(
@@ -1395,7 +1533,7 @@ def _correct_segment_text(
                         extra=scored,
                     )
                 )
-    return result, logs
+    return _remove_accidental_article_before_entity(result), logs
 
 
 def _candidate_phrases(text: str, canonical: str) -> List[str]:
@@ -1405,6 +1543,8 @@ def _candidate_phrases(text: str, canonical: str) -> List[str]:
     window_sizes = [word_count]
     if word_count >= 2:
         window_sizes = [word_count + 1, word_count]
+    if word_count >= 3:
+        window_sizes.append(word_count - 1)
     for window_size in window_sizes:
         for index in range(0, max(0, len(tokens) - window_size + 1)):
             phrase = text[tokens[index].start() : tokens[index + window_size - 1].end()]
@@ -1472,6 +1612,7 @@ def _replacement_log(
             "canonical_name": term.get("canonical_name", ""),
             "chinese_name": term.get("chinese_name", ""),
             "category": term.get("category", ""),
+            "source_key": term.get("source_key", ""),
             "aliases": term.get("aliases", []),
         },
         "applied": applied,
