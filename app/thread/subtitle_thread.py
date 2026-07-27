@@ -714,6 +714,33 @@ class SubtitleThread(QThread):
                         + message
                     )
                 asr_data = self._apply_whisperx_time_only_if_enabled(asr_data)
+                final_duration_errors = screen_editor._subtitle_duration_issues(
+                    asr_data.segments,
+                    "ERROR",
+                )
+                if final_duration_errors:
+                    validation_summary = {
+                        "errors": [
+                            {
+                                "code": "subtitle_duration_invalid",
+                                "message": self.tr("最终时间轴存在严重短字幕。"),
+                                "items": final_duration_errors,
+                            }
+                        ],
+                        "warnings": [],
+                        "info": [],
+                    }
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=validation_summary,
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                    )
+                    raise RuntimeError(
+                        self.tr("最终时间轴存在严重短字幕，已停止后续合成。")
+                    )
                 self.update_all.emit(asr_data.to_json())
                 self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
 

@@ -1665,6 +1665,10 @@ class ScreenSubtitleEditor:
             issues.append("incomplete_short_fragment")
         if self._is_standalone_transition_text(text):
             issues.append("standalone_transition_fragment")
+        if word_count == 1 and words[0] in {"and", "but", "or", "so"}:
+            issues.append("standalone_connector_fragment")
+        if word_count == 1 and words[0] in {"itself", "himself", "herself", "themselves", "ourselves"}:
+            issues.append("trailing_reflexive_fragment")
         if self._internal_sentence_transition_word_index(item) is not None:
             issues.append("transition_attached_to_previous_sentence")
         if word_count == 1 and self._is_plain_content_word(words[0]):
@@ -1859,6 +1863,8 @@ class ScreenSubtitleEditor:
             "pronoun_only_fragment",
             "incomplete_interrogative_fragment",
             "negation_or_emphasis_fragment",
+            "standalone_connector_fragment",
+            "trailing_reflexive_fragment",
         }
         if len(items) != 2:
             return []
@@ -1942,7 +1948,7 @@ class ScreenSubtitleEditor:
                 "boundary_scores": boundary_scores,
             }
             candidates_considered.append(candidate_record)
-            if hard_issues:
+            if hard_issues or hard_fragment_issues:
                 continue
             if any(count > self.max_english_words for count in word_counts):
                 continue
@@ -2991,6 +2997,8 @@ class ScreenSubtitleEditor:
             issues.append("determiner_head_phrase_split")
         if self._is_particle_or_preposition_complement_split(left_token, right_token):
             issues.append("particle_or_preposition_complement_split")
+        if self._is_phrasal_verb_particle_split(left_token, right_token):
+            issues.append("phrasal_verb_particle_split")
         if self._is_time_range_continuation_split(left, right):
             issues.append("time_range_continuation_split")
         elif self._is_stranded_leading_complement_split(left, right, pause_ms):
@@ -3222,6 +3230,34 @@ class ScreenSubtitleEditor:
         }
         adverbial_particles = {"straight", "directly", "right"}
         return left in adverbial_particles and right in prepositions
+
+    @staticmethod
+    def _is_phrasal_verb_particle_split(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        phrasal_pairs = {
+            ("look", "at"),
+            ("looks", "at"),
+            ("looked", "at"),
+            ("looking", "at"),
+            ("refer", "to"),
+            ("refers", "to"),
+            ("referred", "to"),
+            ("referring", "to"),
+            ("focus", "on"),
+            ("focuses", "on"),
+            ("focused", "on"),
+            ("focusing", "on"),
+            ("deal", "with"),
+            ("deals", "with"),
+            ("dealt", "with"),
+            ("dealing", "with"),
+            ("relate", "to"),
+            ("relates", "to"),
+            ("related", "to"),
+            ("relating", "to"),
+        }
+        return (left, right) in phrasal_pairs
 
     def _is_time_range_continuation_split(self, left: int, right: int) -> bool:
         entries = self._active_word_entries

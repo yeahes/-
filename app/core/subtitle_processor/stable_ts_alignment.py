@@ -677,6 +677,16 @@ def _pad_short_subtitle_timing_sequence(
             seg.end_time = desired_end
             continue
 
+        if index + 1 < len(segments):
+            nxt = segments[index + 1]
+            shifted_next_start = desired_end + gap
+            next_min_duration = max(800, target_duration)
+            if int(nxt.end_time) - shifted_next_start >= next_min_duration:
+                seg.start_time = start
+                seg.end_time = desired_end
+                nxt.start_time = shifted_next_start
+                continue
+
         target_start = end - target_duration
         if target_start >= previous_limit:
             seg.start_time = target_start

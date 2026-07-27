@@ -2124,6 +2124,15 @@ def test_final_gate_blocks_time_range_to_continuation():
     assert not evaluation["legal"]
 
 
+def test_final_gate_blocks_phrasal_verb_particle_split():
+    editor = _marker_editor(["we", "really", "have", "to", "look", "at", "the", "mechanics"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(4, 5)
+
+    assert "phrasal_verb_particle_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
 def test_final_gate_allows_sentence_initial_to_me_after_punctuation():
     editor = _marker_editor(["brutal.", "To", "me", "that", "is", "clear"])
 
@@ -2166,6 +2175,43 @@ def test_final_repair_does_not_create_ordinary_one_word_fragment():
 
     assert not any(editor._is_ordinary_one_word_fragment(item.original) for item in repaired)
     assert all(ScreenSubtitleEditor._word_count(item.original) <= 5 for item in repaired)
+
+
+def test_final_fragment_gate_repairs_connector_and_reflexive_fragments():
+    words = [
+        "And",
+        "another",
+        "Douban",
+        "user",
+        "made",
+        "a",
+        "sharp",
+        "observation",
+        "about",
+        "the",
+        "writing",
+        "itself.",
+    ]
+    editor = _marker_editor(words, max_words=14)
+    items = [
+        _word_item(editor, 0, 0, 1),
+        _word_item(editor, 1, 10, 2),
+        _word_item(editor, 11, 11, 3),
+    ]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert " ".join(item.original for item in repaired).replace(" .", ".") == " ".join(words)
+    assert not any(item.original == "And" for item in repaired)
+    assert not any(item.original == "itself." for item in repaired)
+    assert all(
+        editor._evaluate_item_pair_for_final_boundary(
+            left,
+            right,
+            repaired[index - 1] if index > 0 else None,
+        )["legal"]
+        for index, (left, right) in enumerate(zip(repaired, repaired[1:]))
+    )
 
 
 def test_final_fragment_gate_records_unresolved_when_no_legal_solution():
@@ -3476,6 +3522,30 @@ def test_whisperx_time_only_pads_ultra_short_subtitle_when_neighbor_room_exists(
     assert segments[1].end_time + 40 <= segments[2].start_time
 
 
+def test_whisperx_time_only_pads_ultra_short_subtitle_by_shifting_roomy_next_start():
+    segments = [
+        ASRDataSeg("A tribute to the working people.", 30000, 32282, "对劳动人民的致敬。"),
+        ASRDataSeg("And", 32322, 32442, "另一位"),
+        ASRDataSeg("another Douban user made a sharp observation.", 32482, 37005, "豆瓣用户提出了观察。"),
+    ]
+
+    _pad_short_subtitle_timing_sequence(
+        segments,
+        min_gap_ms=40,
+        min_duration_ms=800,
+    )
+
+    assert segments[1].end_time - segments[1].start_time >= 800
+    assert segments[0].end_time + 40 <= segments[1].start_time
+    assert segments[1].end_time + 40 <= segments[2].start_time
+    assert segments[2].end_time - segments[2].start_time >= 800
+    assert [seg.text for seg in segments] == [
+        "A tribute to the working people.",
+        "And",
+        "another Douban user made a sharp observation.",
+    ]
+
+
 def test_failed_validation_does_not_write_final_output_file():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -3955,6 +4025,7 @@ if __name__ == "__main__":
     test_short_backchannel_merges_with_following_segment()
     test_short_sentence_bridges_small_gap_before_next_subtitle()
     test_whisperx_time_only_pads_ultra_short_subtitle_when_neighbor_room_exists()
+    test_whisperx_time_only_pads_ultra_short_subtitle_by_shifting_roomy_next_start()
     test_standalone_discourse_marker_attaches_to_immediate_next_sentence()
     test_trailing_standalone_discourse_marker_attaches_to_previous_sentence()
     test_standalone_discourse_marker_does_not_cross_long_pause()
@@ -4009,10 +4080,12 @@ if __name__ == "__main__":
     test_final_gate_blocks_stranded_leading_of_complement()
     test_final_gate_blocks_stranded_leading_with_complement()
     test_final_gate_blocks_time_range_to_continuation()
+    test_final_gate_blocks_phrasal_verb_particle_split()
     test_final_gate_allows_sentence_initial_to_me_after_punctuation()
     test_final_fragment_gate_repairs_incomplete_interrogative_fragment()
     test_final_repair_does_not_create_adjacent_subject_fragment()
     test_final_repair_does_not_create_ordinary_one_word_fragment()
+    test_final_fragment_gate_repairs_connector_and_reflexive_fragments()
     test_final_fragment_gate_records_unresolved_when_no_legal_solution()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
