@@ -92,6 +92,7 @@ def _id_editor():
     editor.model = "test-model"
     editor.timeout = 5
     editor.batch_num = 24
+    editor.allocation_batch_size = 24
     editor.allocation_max_concurrency = 1
     editor.cache_manager = _NoCache()
     editor.client = None
@@ -104,6 +105,8 @@ def _id_editor():
     editor.article_context_prompt = ""
     editor._frozen_subtitle_ids = []
     editor._llm_cache_used = False
+    editor._llm_cache_stats = {}
+    editor._allocation_runtime_stats = {}
     return editor
 
 
@@ -2308,6 +2311,7 @@ def test_allocation_parser_recovers_orphan_subtitle_rows_by_global_id():
 def test_allocation_requests_large_payload_in_small_id_bound_chunks():
     editor = _id_editor()
     editor.batch_num = 50
+    editor.allocation_batch_size = 24
     items = editor._assign_global_subtitle_ids(_id_items(25))
     groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 26)]
     full_translations = {index: f"full-{index}" for index in range(1, 26)}
@@ -2345,6 +2349,7 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
 def test_full_translation_requests_are_chunked_and_retry_missing_groups():
     editor = _id_editor()
     editor.batch_num = 2
+    editor.allocation_batch_size = 2
     items = editor._assign_global_subtitle_ids(_id_items(3))
     groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 4)]
     calls = []
@@ -2391,6 +2396,7 @@ def test_two_stage_translation_failure_does_not_fallback_to_single_stage():
 def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_errors():
     editor = _id_editor()
     editor.batch_num = 24
+    editor.allocation_batch_size = 24
     items = editor._assign_global_subtitle_ids(_id_items(3))
     groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 4)]
     full_translations = {index: f"full-{index}" for index in range(1, 4)}
@@ -2444,6 +2450,7 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
 def test_allocation_concurrency_merges_out_of_order_batches_by_id():
     editor = _id_editor()
     editor.batch_num = 2
+    editor.allocation_batch_size = 2
     editor.allocation_max_concurrency = 2
     items = editor._assign_global_subtitle_ids(_id_items(4))
     groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
@@ -2490,6 +2497,7 @@ def test_allocation_concurrency_merges_out_of_order_batches_by_id():
 def test_allocation_concurrency_retries_one_failed_batch_without_dropping_completed_batches():
     editor = _id_editor()
     editor.batch_num = 2
+    editor.allocation_batch_size = 2
     editor.allocation_max_concurrency = 2
     items = editor._assign_global_subtitle_ids(_id_items(4))
     groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
@@ -2547,6 +2555,7 @@ def test_allocation_concurrency_retries_one_failed_batch_without_dropping_comple
 def test_allocation_concurrency_records_duplicate_and_unknown_ids_after_retry_failure():
     editor = _id_editor()
     editor.batch_num = 2
+    editor.allocation_batch_size = 2
     editor.allocation_max_concurrency = 2
     items = editor._assign_global_subtitle_ids(_id_items(2))
     groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 3)]
@@ -2582,6 +2591,7 @@ def test_allocation_concurrency_records_duplicate_and_unknown_ids_after_retry_fa
 def test_allocation_concurrency_uses_mixed_cache_hits_without_worker_cache_writes():
     editor = _id_editor()
     editor.batch_num = 2
+    editor.allocation_batch_size = 2
     editor.allocation_max_concurrency = 2
     cached_payload = {
         "groups": [
@@ -2621,12 +2631,19 @@ def test_allocation_concurrency_uses_mixed_cache_hits_without_worker_cache_write
     }
     assert editor._llm_cache_used is True
     assert len(editor.cache_manager.set_calls) == 1
+    assert editor._llm_cache_stats["screen_subtitle_semantic_translation_allocation_v2"] == {"hit": 1, "miss": 1}
+    assert editor._allocation_runtime_stats["batch_size"] == 2
+    assert editor._allocation_runtime_stats["batch_count"] == 2
+    assert editor._allocation_runtime_stats["cached_batch_count"] == 1
+    assert editor._allocation_runtime_stats["pending_batch_count"] == 1
+    assert editor._allocation_runtime_stats["actual_max_workers"] == 1
     assert editor._translation_structure_errors == []
 
 
 def test_allocation_concurrency_preserves_400_plus_subtitle_ids_without_drift():
     editor = _id_editor()
     editor.batch_num = 24
+    editor.allocation_batch_size = 24
     editor.allocation_max_concurrency = 2
     items = editor._assign_global_subtitle_ids(_id_items(432))
     groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 433)]

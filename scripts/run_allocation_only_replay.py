@@ -5,6 +5,11 @@ import shutil
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -153,6 +158,7 @@ def main() -> int:
     parser.add_argument("--base-url", default=None, help="OpenAI-compatible API base URL. Defaults to env or app config.")
     parser.add_argument("--api-key", default=None, help="OpenAI-compatible API key. Defaults to env or app config.")
     parser.add_argument("--allocation-max-concurrency", type=int, default=2)
+    parser.add_argument("--allocation-batch-size", type=int, default=16)
     parser.add_argument("--fresh-cache", action="store_true", help="Use an empty replay cache for allocation requests.")
     args = parser.parse_args()
 
@@ -183,6 +189,7 @@ def main() -> int:
         enable_stable_mode=True,
         enable_quality_check=False,
         allocation_max_concurrency=args.allocation_max_concurrency,
+        allocation_batch_size=args.allocation_batch_size,
     )
     if args.fresh_cache:
         cache_dir = output_dir / "allocation-cache"
@@ -204,6 +211,8 @@ def main() -> int:
     editor._last_allocation_retry_log = []
     editor._last_allocation_final = []
     editor._last_allocation_unresolved = []
+    editor._llm_cache_stats = {}
+    editor._allocation_runtime_stats = {}
 
     groups = _groups_from_artifacts(semantic_groups)
     items = _items_from_spans(subtitle_spans)
@@ -241,6 +250,9 @@ def main() -> int:
         "code_commit": ScreenSubtitleEditor._current_git_commit(),
         "fresh_cache": bool(args.fresh_cache),
         "allocation_max_concurrency": args.allocation_max_concurrency,
+        "allocation_batch_size": args.allocation_batch_size,
+        "llm_cache_stats": editor._llm_cache_stats,
+        "allocation_runtime_stats": editor._allocation_runtime_stats,
         "credential_source": credential_source,
         "subtitle_count": len(items),
         "semantic_group_count": len(groups),

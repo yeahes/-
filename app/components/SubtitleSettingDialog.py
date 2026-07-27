@@ -126,13 +126,23 @@ class SubtitleSettingDialog(MessageBoxBase):
             cfg.screen_subtitle_allocation_max_concurrency,
             FIF.TILES,
             self.tr("中文分配并发"),
-            self.tr("只并发请求中文逐条分配；不改变字幕切分、提示词、ID 或最终写回。建议 2，最高 10。"),
+            self.tr("只并发请求中文逐条分配；不改变字幕切分、提示词、ID 或最终写回。建议 3，最高 10。"),
             minimum=1,
             maximum=10,
             parent=self,
         )
+        self.allocation_batch_size_card = SpinBoxSettingCard(
+            cfg.screen_subtitle_allocation_batch_size,
+            FIF.TILES,
+            self.tr("中文分配批大小"),
+            self.tr("每次请求分配的语义组数量；较小更稳，较大可能单次返回更慢。默认 16。"),
+            minimum=6,
+            maximum=24,
+            parent=self,
+        )
         self.viewLayout.addWidget(self.screen_english_card)
         self.viewLayout.addWidget(self.allocation_concurrency_card)
+        self.viewLayout.addWidget(self.allocation_batch_size_card)
         self.viewLayout.addWidget(self.legacy_settings_status)
         self.viewLayout.addWidget(self.split_card)
         self.viewLayout.addWidget(self.split_type_card)
@@ -142,7 +152,7 @@ class SubtitleSettingDialog(MessageBoxBase):
         # 设置间距
 
         self.viewLayout.setSpacing(10)
-        self.setMinimumSize(920, 760)
+        self.setMinimumSize(920, 820)
         self.resize(920, 760)
 
         # 设置窗口标题

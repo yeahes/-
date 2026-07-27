@@ -11,7 +11,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from string import Template
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from openai import OpenAI
 
@@ -263,6 +263,7 @@ class AllocationBatchResult:
     errors: List[Dict]
     debug: List[Dict]
     error_message: str = ""
+    cache_hit: bool = False
 
 
 class ScreenSubtitleEditor:
@@ -299,6 +300,7 @@ class ScreenSubtitleEditor:
         article_context_prompt: str = "",
         update_callback: Optional[Callable[[Dict], None]] = None,
         allocation_max_concurrency: int = 1,
+        allocation_batch_size: int = 16,
     ):
         self.model = model
         self.target_language = target_language
@@ -314,6 +316,7 @@ class ScreenSubtitleEditor:
         self.article_context_prompt = (article_context_prompt or "").strip()
         self.update_callback = update_callback
         self.allocation_max_concurrency = max(1, int(allocation_max_concurrency or 1))
+        self.allocation_batch_size = min(24, max(1, int(allocation_batch_size or 16)))
         self.cache_manager = CacheManager(str(CACHE_PATH))
         self.client = self._init_client()
         self._active_word_entries: List[Dict] = []
@@ -336,6 +339,8 @@ class ScreenSubtitleEditor:
         self._last_allocation_retry_log: List[Dict] = []
         self._last_allocation_final: List[Dict] = []
         self._last_allocation_unresolved: List[Dict] = []
+        self._llm_cache_stats: Dict[str, Dict[str, int]] = {}
+        self._allocation_runtime_stats: Dict[str, Any] = {}
         self._llm_cache_used: bool = False
         self._boundary_snapshots: List[Dict] = []
         self._boundary_snapshot_changes: List[Dict] = []
@@ -463,6 +468,8 @@ class ScreenSubtitleEditor:
         self._allocation_isolation_before = {}
         self._allocation_isolation_after = {}
         self._allocation_isolation_report = {}
+        self._llm_cache_stats = {}
+        self._allocation_runtime_stats = {}
         self._active_source_segments_by_id = {
             index: seg for index, seg in enumerate(asr_data.segments, 1)
         }
@@ -2390,11 +2397,22 @@ class ScreenSubtitleEditor:
             "cache_used": self._llm_cache_used,
             "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
             "allocation_max_concurrency": self.allocation_max_concurrency,
+            "allocation_batch_size": self.allocation_batch_size,
+            "llm_cache_stats": self._llm_cache_stats,
+            "allocation_runtime_stats": self._allocation_runtime_stats,
             "qa_review_points_count": self._qa_review_points_count,
         }
         if self._qa_review_points_path:
             metadata["qa_review_points_srt"] = self._qa_review_points_path
         return metadata
+
+    def _record_llm_cache_stat(self, task: str, hit: bool) -> None:
+        key = str(task or "unknown")
+        stats = self._llm_cache_stats.setdefault(key, {"hit": 0, "miss": 0})
+        stats["hit" if hit else "miss"] += 1
+
+    def _record_allocation_runtime_stat(self, key: str, value: Any) -> None:
+        self._allocation_runtime_stats[str(key)] = value
 
     def _group_expected_subtitle_ids(self, group: Dict) -> List[str]:
         return [
@@ -4540,6 +4558,10 @@ class ScreenSubtitleEditor:
                 "max_cjk_chars": self.max_cjk_chars,
                 "max_english_words": self.max_english_words,
                 "enable_quality_check": self.enable_quality_check,
+                "allocation_max_concurrency": self.allocation_max_concurrency,
+                "allocation_batch_size": self.allocation_batch_size,
+                "llm_cache_stats": self._llm_cache_stats,
+                "allocation_runtime_stats": self._allocation_runtime_stats,
                 "source_segment_count": len(source_segments),
                 "word_count": len(self._active_word_entries),
                 "subtitle_count": len(final_segments),
@@ -8526,11 +8548,14 @@ class ScreenSubtitleEditor:
             temperature=0.2,
             task=cache_task,
         )
+        started = time.perf_counter()
         try:
             if cache_result:
                 self._llm_cache_used = True
+                self._record_llm_cache_stat(cache_task, True)
                 data = json.loads(cache_result)
             else:
+                self._record_llm_cache_stat(cache_task, False)
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
@@ -8548,12 +8573,22 @@ class ScreenSubtitleEditor:
                     temperature=0.2,
                     task=cache_task,
                 )
+            elapsed = time.perf_counter() - started
             self._last_llm_raw_returns.append(
                 {
                     "task": cache_task,
                     "data": data,
                     "expected_group_ids": [entry.get("id") for entry in payload],
+                    "cache_hit": bool(cache_result),
+                    "elapsed_seconds": round(elapsed, 3),
                 }
+            )
+            logger.info(
+                "Semantic full translation batch completed: task=%s groups=%s cache_hit=%s elapsed=%.3fs",
+                cache_task,
+                len(payload),
+                bool(cache_result),
+                elapsed,
             )
             return data
         except Exception as e:
@@ -8638,6 +8673,18 @@ class ScreenSubtitleEditor:
                 payload_chunks,
                 expected_groups_by_id,
             )
+        self._record_allocation_runtime_stat("batch_size", self.allocation_batch_size)
+        self._record_allocation_runtime_stat("batch_count", len(payload_chunks))
+        self._record_allocation_runtime_stat("pending_batch_count", len(payload_chunks))
+        self._record_allocation_runtime_stat("cached_batch_count", 0)
+        self._record_allocation_runtime_stat("actual_max_workers", 1)
+        logger.info(
+            "Semantic allocation batches: total=%s pending=%s cached=0 configured_concurrency=%s actual_workers=1 batch_size=%s",
+            len(payload_chunks),
+            len(payload_chunks),
+            self.allocation_max_concurrency,
+            self.allocation_batch_size,
+        )
         for payload_chunk in payload_chunks:
             chunk_result, complete, data = self._request_and_parse_allocation_chunk(
                 prompt,
@@ -8690,6 +8737,20 @@ class ScreenSubtitleEditor:
                 results_by_batch[batch_id] = cached
 
         max_workers = max(1, min(self.allocation_max_concurrency, len(pending)))
+        self._record_allocation_runtime_stat("batch_size", self.allocation_batch_size)
+        self._record_allocation_runtime_stat("batch_count", len(payload_chunks))
+        self._record_allocation_runtime_stat("pending_batch_count", len(pending))
+        self._record_allocation_runtime_stat("cached_batch_count", len(results_by_batch))
+        self._record_allocation_runtime_stat("actual_max_workers", max_workers if pending else 0)
+        logger.info(
+            "Semantic allocation batches: total=%s pending=%s cached=%s configured_concurrency=%s actual_workers=%s batch_size=%s",
+            len(payload_chunks),
+            len(pending),
+            len(results_by_batch),
+            self.allocation_max_concurrency,
+            max_workers if pending else 0,
+            self.allocation_batch_size,
+        )
         if pending:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
@@ -8727,6 +8788,16 @@ class ScreenSubtitleEditor:
                             cache_task=SEMANTIC_ALLOCATION_CACHE_TASK,
                         )
                     results_by_batch[batch_id] = batch_result
+                    logger.info(
+                        "Semantic allocation batch finished: batch=%s/%s groups=%s cache_hit=%s elapsed=%.3fs complete=%s error=%s",
+                        batch_id,
+                        len(payload_chunks),
+                        len(payload_chunk),
+                        batch_result.cache_hit,
+                        batch_result.elapsed_seconds,
+                        batch_result.complete,
+                        bool(batch_result.error_message),
+                    )
 
         merged: Dict[int, Dict[str, str]] = {}
         for batch_id, payload_chunk in enumerate(payload_chunks, 1):
@@ -8754,6 +8825,7 @@ class ScreenSubtitleEditor:
                     "batch_id": batch_id,
                     "elapsed_seconds": round(batch_result.elapsed_seconds, 3),
                     "error_message": batch_result.error_message,
+                    "cache_hit": batch_result.cache_hit,
                 }
             )
             self._last_allocation_raw_returns.append(
@@ -8764,6 +8836,7 @@ class ScreenSubtitleEditor:
                     "batch_id": batch_id,
                     "elapsed_seconds": round(batch_result.elapsed_seconds, 3),
                     "error_message": batch_result.error_message,
+                    "cache_hit": batch_result.cache_hit,
                 }
             )
 
@@ -8848,6 +8921,7 @@ class ScreenSubtitleEditor:
             cache_task=cache_task,
         )
         elapsed = time.perf_counter() - started
+        self._record_llm_cache_stat(cache_task, False)
         if data is None:
             return AllocationBatchResult(
                 batch_id=batch_id,
@@ -8859,6 +8933,7 @@ class ScreenSubtitleEditor:
                 errors=[],
                 debug=[],
                 error_message=error_message,
+                cache_hit=False,
             )
         translations, complete, errors, debug = self._parse_allocation_chunk_data_isolated(
             payload_chunk,
@@ -8875,6 +8950,7 @@ class ScreenSubtitleEditor:
             errors=errors,
             debug=debug,
             error_message=error_message,
+            cache_hit=False,
         )
 
     def _load_cached_allocation_batch(
@@ -8896,6 +8972,7 @@ class ScreenSubtitleEditor:
         if not cache_result:
             return None
         self._llm_cache_used = True
+        self._record_llm_cache_stat(cache_task, True)
         started = time.perf_counter()
         try:
             data = json.loads(cache_result)
@@ -8916,6 +8993,7 @@ class ScreenSubtitleEditor:
             elapsed_seconds=time.perf_counter() - started,
             errors=errors,
             debug=debug,
+            cache_hit=True,
         )
 
     def _store_allocation_batch_cache(
@@ -9867,7 +9945,7 @@ class ScreenSubtitleEditor:
     def _semantic_allocation_payload_chunks(
         self, payload: Sequence[Dict]
     ) -> List[List[Dict]]:
-        batch_size = min(24, max(1, int(self.batch_num or 24)))
+        batch_size = min(24, max(1, int(self.allocation_batch_size or 16)))
         return [
             list(payload[index : index + batch_size])
             for index in range(0, len(payload), batch_size)
@@ -9887,10 +9965,19 @@ class ScreenSubtitleEditor:
             temperature=0.2,
             task=cache_task,
         )
+        started = time.perf_counter()
         try:
             if cache_result:
                 self._llm_cache_used = True
+                self._record_llm_cache_stat(cache_task, True)
+                logger.info(
+                    "Semantic allocation batch loaded from cache: task=%s groups=%s elapsed=%.3fs",
+                    cache_task,
+                    len(payload),
+                    time.perf_counter() - started,
+                )
                 return json.loads(cache_result)
+            self._record_llm_cache_stat(cache_task, False)
             data, _ = self._request_semantic_translation_allocation_api_only(
                 prompt,
                 payload,
@@ -9904,6 +9991,12 @@ class ScreenSubtitleEditor:
                 self.model,
                 temperature=0.2,
                 task=cache_task,
+            )
+            logger.info(
+                "Semantic allocation batch completed: task=%s groups=%s cache_hit=False elapsed=%.3fs",
+                cache_task,
+                len(payload),
+                time.perf_counter() - started,
             )
             return data
         except Exception as e:

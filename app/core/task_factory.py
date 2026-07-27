@@ -208,6 +208,7 @@ class TaskFactory:
             screen_subtitle_max_cjk=cfg.screen_subtitle_max_cjk.value,
             screen_subtitle_max_english=cfg.screen_subtitle_max_english.value,
             screen_subtitle_allocation_max_concurrency=cfg.screen_subtitle_allocation_max_concurrency.value,
+            screen_subtitle_allocation_batch_size=cfg.screen_subtitle_allocation_batch_size.value,
             # 字幕提示
             custom_prompt_text=cfg.custom_prompt_text.value,
         )
