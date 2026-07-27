@@ -66,10 +66,18 @@ class TranscriptionSettingCard(QWidget):
         self.timeline_group = SettingCardGroup(self.tr("转录时间轴增强"), self)
         self.stable_ts_alignment_card = SwitchSettingCard(
             FIF.ALIGNMENT,
-            self.tr("stable-ts时间轴对齐"),
-            self.tr("转录后用stable-ts重新生成英文词级时间轴；FasterWhisper可用，Qwen3-ASR会自动跳过"),
+            self.tr("词级时间轴对齐"),
+            self.tr("转录后重新生成英文词级时间轴；FasterWhisper可用，Qwen3-ASR会自动跳过"),
             cfg.stable_ts_alignment_enabled,
             self.timeline_group,
+        )
+        self.timeline_backend_card = ComboBoxSettingCard(
+            cfg.timeline_alignment_backend,
+            FIF.ROBOT,
+            self.tr("时间轴对齐后端"),
+            self.tr("stable-ts为默认；WhisperX为实验后端，失败时自动回退"),
+            texts=["stable-ts", "whisperx"],
+            parent=self.timeline_group,
         )
         self.stable_ts_model_card = ComboBoxSettingCard(
             cfg.stable_ts_alignment_model,
@@ -80,6 +88,7 @@ class TranscriptionSettingCard(QWidget):
             parent=self.timeline_group,
         )
         self.timeline_group.addSettingCard(self.stable_ts_alignment_card)
+        self.timeline_group.addSettingCard(self.timeline_backend_card)
         self.timeline_group.addSettingCard(self.stable_ts_model_card)
         self.main_layout.addWidget(self.timeline_group)
         self._sync_stable_ts_cards(cfg.transcribe_model.value.value)
@@ -101,17 +110,24 @@ class TranscriptionSettingCard(QWidget):
     def _sync_stable_ts_cards(self, model_name: str):
         is_qwen3 = model_name == TranscribeModelEnum.QWEN3_ASR.value
         self.stable_ts_alignment_card.setEnabled(not is_qwen3)
+        self.timeline_backend_card.setEnabled(not is_qwen3)
         self.stable_ts_model_card.setEnabled(not is_qwen3)
         if is_qwen3:
             self.stable_ts_alignment_card.setContent(
                 self.tr("Qwen3-ASR已使用ForcedAligner生成词级时间轴；这里会自动跳过，避免重复对齐")
+            )
+            self.timeline_backend_card.setContent(
+                self.tr("当前转录模型为Qwen3-ASR时不需要额外时间轴后端")
             )
             self.stable_ts_model_card.setContent(
                 self.tr("当前转录模型为Qwen3-ASR时不需要stable-ts模型")
             )
         else:
             self.stable_ts_alignment_card.setContent(
-                self.tr("转录后用stable-ts重新生成英文词级时间轴；会变慢，但切分后的字幕更容易贴近音频")
+                self.tr("转录后重新生成英文词级时间轴；会变慢，但切分后的字幕更容易贴近音频")
+            )
+            self.timeline_backend_card.setContent(
+                self.tr("stable-ts为默认；WhisperX为实验后端，失败时自动回退")
             )
             self.stable_ts_model_card.setContent(
                 self.tr("模型越大越慢；large-v3-turbo为当前默认")

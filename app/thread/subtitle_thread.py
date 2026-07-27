@@ -63,6 +63,17 @@ class SubtitleThread(QThread):
 
     def _screen_manifest_metadata(self, screen_editor: ScreenSubtitleEditor) -> dict:
         metadata = screen_editor.manifest_metadata()
+        try:
+            from app.common.config import cfg
+
+            metadata["timeline_alignment_backend"] = os.getenv(
+                "VIDEOCAPTIONER_ALIGNMENT_BACKEND",
+                str(cfg.timeline_alignment_backend.value or "stable-ts"),
+            )
+        except Exception:
+            metadata["timeline_alignment_backend"] = os.getenv(
+                "VIDEOCAPTIONER_ALIGNMENT_BACKEND", "stable-ts"
+            )
         metadata["stage_timings_seconds"] = dict(self._stage_timings_seconds)
         metadata["stage_timings_total_seconds"] = round(sum(self._stage_timings_seconds.values()), 3)
         return metadata

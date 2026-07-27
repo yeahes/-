@@ -284,6 +284,12 @@ class Config(QConfig):
     stable_ts_alignment_enabled = ConfigItem(
         "Subtitle", "StableTsAlignmentEnabled", True, BoolValidator()
     )
+    timeline_alignment_backend = OptionsConfigItem(
+        "Subtitle",
+        "TimelineAlignmentBackend",
+        "stable-ts",
+        OptionsValidator(["stable-ts", "whisperx"]),
+    )
     stable_ts_alignment_model = OptionsConfigItem(
         "Subtitle",
         "StableTsAlignmentModel",

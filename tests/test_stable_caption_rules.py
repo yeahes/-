@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
+from app.core.subtitle_processor.stable_ts_alignment import _make_whisperx_word_segments
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.entities import SubtitleConfig, SubtitleTask
 from app.thread.subtitle_thread import SubtitleThread
@@ -3784,6 +3785,26 @@ def test_runtime_module_import_path_is_available():
     assert "Audit stable bilingual subtitle outputs" in result.stdout
 
 
+def test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback():
+    source = [
+        ASRDataSeg("A", 100, 200),
+        ASRDataSeg("56-year-old", 200, 400),
+        ASRDataSeg("speaker,", 400, 600),
+        ASRDataSeg("continues.", 600, 800),
+    ]
+    aligned_words = [
+        {"text": "A", "start": 0.12, "end": 0.22},
+        {"text": "speaker", "start": 0.42, "end": 0.62},
+        {"text": "continues", "start": 0.64, "end": 0.88},
+    ]
+
+    mapped = _make_whisperx_word_segments(source, aligned_words)
+
+    assert [seg.text for seg in mapped.segments] == [seg.text for seg in source]
+    assert [seg.start_time for seg in mapped.segments] == [120, 200, 420, 640]
+    assert [seg.end_time for seg in mapped.segments] == [220, 400, 620, 880]
+
+
 if __name__ == "__main__":
     test_preposition_phrase_is_not_stranded()
     test_number_and_policy_sentence_keeps_readable_boundaries()
@@ -3930,4 +3951,5 @@ if __name__ == "__main__":
     test_id_bound_mapping_has_no_drift_over_400_subtitles()
     test_non_structural_validation_errors_still_write_stable_artifacts()
     test_runtime_module_import_path_is_available()
+    test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
     print("stable caption rule smoke tests passed")

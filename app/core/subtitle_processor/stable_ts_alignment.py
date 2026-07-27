@@ -1,22 +1,35 @@
 import json
+import importlib.util
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.utils.logger import setup_logger
 
 logger = setup_logger("stable_ts_alignment")
 
 WORD_RE = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)?|\d+(?:[.,]\d+)?")
+
+
+def _load_asr_classes():
+    module_path = PROJECT_ROOT / "app" / "core" / "bk_asr" / "asr_data.py"
+    spec = importlib.util.spec_from_file_location("_vc_asr_data", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load ASR data module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ASRData, module.ASRDataSeg
+
+
+ASRData, ASRDataSeg = _load_asr_classes()
 
 
 def _project_root() -> Path:
@@ -33,6 +46,10 @@ def _bundled_runtime_python() -> Path:
 
 def _stable_ts_cache_dir() -> Path:
     return _project_root() / "AppData" / "models" / "stable-ts"
+
+
+def _whisperx_runtime_python() -> Path:
+    return _project_root() / "whisperx-runtime" / "Scripts" / "python.exe"
 
 
 def _is_python_executable(path: Path) -> bool:
@@ -59,6 +76,37 @@ def _find_stable_ts_python() -> Optional[Path]:
         try:
             result = subprocess.run(
                 [str(candidate), "-c", "import stable_whisper"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                timeout=20,
+            )
+            if result.returncode == 0:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _find_whisperx_python() -> Optional[Path]:
+    env_path = os.getenv("VIDEOCAPTIONER_WHISPERX_PYTHON")
+    candidates = []
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(_whisperx_runtime_python())
+    current_executable = Path(sys.executable)
+    if _is_python_executable(current_executable):
+        candidates.append(current_executable)
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if not _is_python_executable(candidate):
+            logger.warning("WhisperX python candidate skipped: not a Python executable: %s", candidate)
+            continue
+        try:
+            result = subprocess.run(
+                [str(candidate), "-c", "import whisperx, torch"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -101,6 +149,15 @@ def _make_word_segments(words: List[dict]) -> ASRData:
     return ASRData(segments)
 
 
+def _configured_alignment_backend() -> str:
+    try:
+        from app.common.config import cfg
+
+        return str(cfg.timeline_alignment_backend.value or "stable-ts").strip().lower()
+    except Exception:
+        return os.getenv("VIDEOCAPTIONER_ALIGNMENT_BACKEND", "stable-ts").strip().lower()
+
+
 def align_to_word_timestamps(
     audio_path: str,
     asr_data: ASRData,
@@ -108,12 +165,12 @@ def align_to_word_timestamps(
     model_name: Optional[str] = None,
     callback=None,
 ) -> Optional[ASRData]:
-    """Return stable-ts word-level ASRData, or None when alignment is unavailable."""
+    """Return aligned word-level ASRData, or None when alignment is unavailable."""
     try:
         from app.common.config import cfg
 
         if not cfg.stable_ts_alignment_enabled.value:
-            logger.info("Stable-ts alignment disabled in GUI settings")
+            logger.info("Timeline alignment disabled in GUI settings")
             return None
         configured_model = cfg.stable_ts_alignment_model.value
     except Exception:
@@ -130,8 +187,15 @@ def align_to_word_timestamps(
 
     transcript = _collect_transcript(asr_data)
     if len(WORD_RE.findall(transcript)) < 3:
-        logger.info("Stable-ts alignment skipped: transcript is too short")
+        logger.info("Timeline alignment skipped: transcript is too short")
         return None
+
+    backend = os.getenv("VIDEOCAPTIONER_ALIGNMENT_BACKEND", _configured_alignment_backend()).strip().lower()
+    if backend == "whisperx":
+        aligned = _align_with_whisperx(audio_path, asr_data, language, transcript, callback=callback)
+        if aligned and aligned.has_data():
+            return aligned
+        logger.warning("WhisperX alignment unavailable; falling back to stable-ts")
 
     python_path = _find_stable_ts_python()
     if not python_path:
@@ -211,6 +275,142 @@ def align_to_word_timestamps(
         return aligned
 
 
+def _asr_payload_segments(asr_data: ASRData) -> List[dict]:
+    segments = []
+    for index, seg in enumerate(asr_data.segments):
+        text = (seg.text or "").strip()
+        if not text:
+            continue
+        segments.append(
+            {
+                "index": index,
+                "text": text,
+                "norm": _normalize_word(text),
+                "start": max(0, int(seg.start_time)) / 1000.0,
+                "end": max(0, int(seg.end_time)) / 1000.0,
+                "start_ms": int(seg.start_time),
+                "end_ms": int(seg.end_time),
+            }
+        )
+    return segments
+
+
+def _make_whisperx_word_segments(
+    source_segments: Sequence[ASRDataSeg],
+    aligned_words: Sequence[dict],
+) -> ASRData:
+    if not source_segments or not aligned_words:
+        return ASRData([])
+    aligned_norms = [_normalize_word(str(word.get("text") or word.get("word") or "")) for word in aligned_words]
+    cursor = 0
+    mapped: List[ASRDataSeg] = []
+    matched = 0
+    for seg in source_segments:
+        source_text = (seg.text or "").strip()
+        source_norm = _normalize_word(source_text)
+        matched_index = None
+        if source_norm:
+            for index in range(cursor, min(len(aligned_words), cursor + 8)):
+                if aligned_norms[index] == source_norm:
+                    matched_index = index
+                    break
+        if matched_index is not None:
+            word = aligned_words[matched_index]
+            start = int(round(float(word["start"]) * 1000))
+            end = int(round(float(word["end"]) * 1000))
+            cursor = matched_index + 1
+            matched += 1
+        else:
+            start = int(seg.start_time)
+            end = int(seg.end_time)
+        if end <= start:
+            end = start + 120
+        mapped.append(ASRDataSeg(text=source_text, start_time=start, end_time=end))
+    logger.info(
+        "WhisperX source text mapping completed: source=%s aligned=%s matched=%s",
+        len(source_segments),
+        len(aligned_words),
+        matched,
+    )
+    return ASRData(mapped)
+
+
+def _align_with_whisperx(
+    audio_path: str,
+    asr_data: ASRData,
+    language: str,
+    transcript: str,
+    callback=None,
+) -> Optional[ASRData]:
+    python_path = _find_whisperx_python()
+    if not python_path:
+        logger.warning("WhisperX alignment skipped: whisperx runtime is not installed")
+        return None
+    if callback:
+        callback(92, "WhisperX词级对齐...")
+
+    worker = Path(__file__).resolve()
+    source_segments = _asr_payload_segments(asr_data)
+    with tempfile.TemporaryDirectory(prefix="vc_whisperx_") as tmp:
+        tmp_dir = Path(tmp)
+        input_path = tmp_dir / "input.json"
+        output_path = tmp_dir / "words.json"
+        input_path.write_text(
+            json.dumps(
+                {
+                    "audio_path": str(audio_path),
+                    "segments": source_segments,
+                    "language": "en",
+                    "device": os.getenv("VIDEOCAPTIONER_WHISPERX_DEVICE", "cuda"),
+                    "max_chunk_ms": int(os.getenv("VIDEOCAPTIONER_WHISPERX_MAX_CHUNK_MS", "30000")),
+                    "interpolate_method": os.getenv("VIDEOCAPTIONER_WHISPERX_INTERPOLATE", "nearest"),
+                    "output_path": str(output_path),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONPATH"] = str(_project_root())
+        cmd = [str(python_path), str(worker), "--worker-whisperx", str(input_path)]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            logger.warning("WhisperX alignment failed: %s", result.stderr[-2000:])
+            return None
+        if not output_path.exists():
+            logger.warning("WhisperX alignment failed: worker produced no output")
+            return None
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        words = payload.get("words") or []
+        aligned = _make_whisperx_word_segments(asr_data.segments, words)
+        expected_words = len(WORD_RE.findall(transcript))
+        if len(words) < max(3, int(expected_words * 0.6)):
+            logger.warning("WhisperX alignment rejected: too few aligned words, got %s", len(words))
+            return None
+        zeroish = sum(1 for seg in aligned.segments if seg.end_time <= seg.start_time + 5)
+        logger.info(
+            "WhisperX alignment completed: raw_words=%s mapped_words=%s zeroish=%s elapsed=%s device=%s",
+            len(words),
+            len(aligned.segments),
+            zeroish,
+            payload.get("elapsed_seconds"),
+            payload.get("device"),
+        )
+        if callback:
+            callback(98, "WhisperX词级对齐完成")
+        return aligned
+
+
 def _worker_extract_words(result) -> List[dict]:
     words: List[dict] = []
     for seg in result.segments:
@@ -229,6 +429,67 @@ def _worker_extract_words(result) -> List[dict]:
                     "start": start,
                     "end": end,
                     "duration": max(0.0, end - start),
+                }
+            )
+    return words
+
+
+def _worker_find_ffmpeg() -> Optional[Path]:
+    candidates = [
+        _project_root() / "resource" / "bin" / "ffmpeg.exe",
+        _project_root() / "resource" / "bin" / "Faster-Whisper-XXL" / "ffmpeg.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _worker_make_whisperx_chunks(segments: Sequence[Dict], max_chunk_ms: int) -> List[dict]:
+    if not segments:
+        return []
+    chunks: List[dict] = []
+    start_index = 0
+    while start_index < len(segments):
+        chunk_start_ms = int(segments[start_index].get("start_ms", 0))
+        end_index = start_index
+        while end_index + 1 < len(segments):
+            candidate_end_ms = int(segments[end_index + 1].get("end_ms", chunk_start_ms))
+            if candidate_end_ms - chunk_start_ms > max_chunk_ms:
+                break
+            end_index += 1
+        chunk_segments = list(segments[start_index : end_index + 1])
+        chunks.append(
+            {
+                "start": float(chunk_segments[0].get("start", 0.0)),
+                "end": float(chunk_segments[-1].get("end", chunk_segments[0].get("start", 0.0))),
+                "text": " ".join(str(seg.get("text") or "").strip() for seg in chunk_segments if str(seg.get("text") or "").strip()),
+            }
+        )
+        start_index = end_index + 1
+    return chunks
+
+
+def _worker_extract_whisperx_words(result: Dict) -> List[dict]:
+    words: List[dict] = []
+    for segment in result.get("segments", []) or []:
+        for word in segment.get("words", []) or []:
+            text = str(word.get("word") or word.get("text") or "").strip()
+            if not text or "start" not in word or "end" not in word:
+                continue
+            start = float(word["start"])
+            end = float(word["end"])
+            if end <= start:
+                end = start + 0.02
+            words.append(
+                {
+                    "i": len(words),
+                    "text": text,
+                    "norm": _normalize_word(text),
+                    "start": start,
+                    "end": end,
+                    "duration": max(0.0, end - start),
+                    "score": word.get("score"),
                 }
             )
     return words
@@ -266,6 +527,59 @@ def _run_worker(input_path: str) -> int:
     return 0
 
 
+def _run_whisperx_worker(input_path: str) -> int:
+    import time
+
+    import torch
+    import whisperx
+
+    payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
+    ffmpeg = _worker_find_ffmpeg()
+    if ffmpeg:
+        os.environ["PATH"] = str(ffmpeg.parent) + os.pathsep + os.environ.get("PATH", "")
+
+    device = payload.get("device") or "cuda"
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+
+    started_at = time.perf_counter()
+    chunks = _worker_make_whisperx_chunks(
+        payload.get("segments") or [],
+        int(payload.get("max_chunk_ms") or 30000),
+    )
+    audio = whisperx.load_audio(str(payload["audio_path"]))
+    model_a, metadata = whisperx.load_align_model(
+        language_code=payload.get("language") or "en",
+        device=device,
+    )
+    result = whisperx.align(
+        chunks,
+        model_a,
+        metadata,
+        audio,
+        device,
+        interpolate_method=payload.get("interpolate_method") or "nearest",
+        return_char_alignments=False,
+    )
+    words = _worker_extract_whisperx_words(result)
+    output = {
+        "backend": "whisperx",
+        "device": device,
+        "chunk_count": len(chunks),
+        "word_count": len(words),
+        "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+        "ffmpeg": str(ffmpeg) if ffmpeg else None,
+        "words": words,
+    }
+    Path(payload["output_path"]).write_text(
+        json.dumps(output, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--worker":
         raise SystemExit(_run_worker(sys.argv[2]))
+    if len(sys.argv) == 3 and sys.argv[1] == "--worker-whisperx":
+        raise SystemExit(_run_whisperx_worker(sys.argv[2]))

@@ -30,6 +30,7 @@ Result:
 - known output audit: completed
 - 2026-07-26 recheck: stable caption smoke tests pass; syntax check passes.
 - 2026-07-26 recheck: local samples `222`, `777`, and `999` are currently `MISSING` in `work-dir`, so their current quality is not verified by `tests\audit_stable_outputs.py`.
+- 2026-07-27 WhisperX backend check: FasterWhisper plus WhisperX CUDA alignment completed on `外卖骑手诗人的走红，标志着中国农民工文学的兴起`; subtitle validation passed, video synthesis completed, final SRT had no overlaps and no >1000ms gaps.
 
 ## Current Decisions
 
@@ -37,6 +38,7 @@ Result:
 - Stable mode should skip candidate quality check.
 - Backchannels should be preserved by default.
 - Synthesis should resolve subtitles through `stable-final-manifest.json`.
+- Timeline alignment defaults to stable-ts; WhisperX is available as an experimental backend with failure fallback.
 
 ## Current Risk
 

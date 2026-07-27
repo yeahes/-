@@ -122,9 +122,9 @@ class TranscriptThread(QThread):
                     )
                     if aligned_data and aligned_data.has_data():
                         asr_data = aligned_data
-                        logger.info("stable-ts词级时间轴已应用到转录结果")
+                        logger.info("词级时间轴对齐已应用到转录结果")
                     else:
-                        logger.info("stable-ts词级时间轴未应用，继续使用原转录时间轴")
+                        logger.info("词级时间轴对齐未应用，继续使用原转录时间轴")
 
             # 如果是BIJIAN或JIANYING模型，增加使用次数
             if self.task.transcribe_config.transcribe_model in [
