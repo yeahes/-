@@ -203,8 +203,9 @@ class TaskFactory:
             # 字幕优化
             need_remove_punctuation=cfg.needs_remove_punctuation.value,
             need_screen_subtitle_edit=cfg.need_screen_subtitle_edit.value,
-            screen_subtitle_stable_mode=cfg.need_screen_subtitle_edit.value,
+            screen_subtitle_stable_mode=cfg.screen_subtitle_stable_mode.value,
             need_screen_subtitle_quality_check=cfg.need_screen_subtitle_quality_check.value,
+            screen_subtitle_safe_auto_repair=cfg.screen_subtitle_safe_auto_repair.value,
             screen_subtitle_max_cjk=cfg.screen_subtitle_max_cjk.value,
             screen_subtitle_max_english=cfg.screen_subtitle_max_english.value,
             screen_subtitle_allocation_max_concurrency=cfg.screen_subtitle_allocation_max_concurrency.value,
@@ -232,8 +233,10 @@ class TaskFactory:
     ) -> SynthesisTask:
         """创建视频合成任务"""
         if cfg.podcast_learning_template.value:
+            template_name = cfg.podcast_template_style.value or "暗色播客"
+            prefix = "【文章单词模板】" if template_name == "文章单词" else "【英语学习模板】"
             output_path = str(
-                Path(video_path).parent / f"【英语学习模板】{Path(video_path).stem}.mp4"
+                Path(video_path).parent / f"{prefix}{Path(video_path).stem}.mp4"
             )
         elif need_next_task:
             output_path = str(
@@ -248,6 +251,7 @@ class TaskFactory:
             need_video=cfg.need_video.value,
             soft_subtitle=cfg.soft_subtitle.value,
             podcast_learning_template=cfg.podcast_learning_template.value,
+            podcast_template_style=cfg.podcast_template_style.value,
             subtitle_render_mode=cfg.subtitle_render_mode.value,
             subtitle_layout=cfg.subtitle_layout.value,
             rounded_style={

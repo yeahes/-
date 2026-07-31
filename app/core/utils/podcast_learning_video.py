@@ -10,7 +10,7 @@ from pathlib import Path
 from openai import OpenAI
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
-from app.config import BIN_PATH, RESOURCE_PATH
+from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
 from app.core.entities import LLMServiceEnum
 from app.core.utils.json_repair import loads as repair_json_loads
 
@@ -20,15 +20,55 @@ HEIGHT = 1080
 FPS = 25
 SX = WIDTH / 1879
 SY = HEIGHT / 1056
+ARTICLE_WIDTH = 1600
+ARTICLE_HEIGHT = 900
 
 TEMPLATE_DIR = RESOURCE_PATH / "podcast_template"
+ARTICLE_TEMPLATE_DIR = TEMPLATE_DIR / "article_vocab"
 BACKGROUND = TEMPLATE_DIR / "background.png"
 AVATAR_SOURCE = TEMPLATE_DIR / "hosts.png"
 FONT_GANTARI = TEMPLATE_DIR / "Gantari-wght.ttf"
+FONT_READEX_MEDIUM = (
+    ARTICLE_TEMPLATE_DIR / "ReadexPro-Medium.ttf"
+    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-Medium.ttf").exists()
+    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
+)
+FONT_READEX_SEMIBOLD = (
+    ARTICLE_TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
+    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-SemiBold.ttf").exists()
+    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
+)
+FONT_READEX_BOLD = (
+    ARTICLE_TEMPLATE_DIR / "ReadexPro-Bold.ttf"
+    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-Bold.ttf").exists()
+    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
+)
+FONT_READEX_REGULAR = (
+    ARTICLE_TEMPLATE_DIR / "ReadexPro-Regular.ttf"
+    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-Regular.ttf").exists()
+    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
+)
+FONT_HANCHAN_BOLD = (
+    ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicBold.otf"
+    if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicBold.otf").exists()
+    else TEMPLATE_DIR / "ChillYunmoGothicBold.otf"
+)
+FONT_HANCHAN_MEDIUM = (
+    ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicMedium.otf"
+    if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicMedium.otf").exists()
+    else TEMPLATE_DIR / "ChillYunmoGothicMedium.otf"
+)
+ARTICLE_LOGO = (
+    ARTICLE_TEMPLATE_DIR / "economist_logo.png"
+    if (ARTICLE_TEMPLATE_DIR / "economist_logo.png").exists()
+    else TEMPLATE_DIR / "economist_logo.png"
+)
+ARTICLE_TIP_ICON = ARTICLE_TEMPLATE_DIR / "Vector.png"
 FONT_DIR = Path.home() / "AppData" / "Local" / "Microsoft" / "Windows" / "Fonts"
 FONT_DOUYIN = FONT_DIR / "douyinmeihaoti.otf"
 FONT_YAHEI = Path("C:/Windows/Fonts/msyh.ttc")
 FONT_SEGOE = Path("C:/Windows/Fonts/segoeui.ttf")
+FONT_CAMBRIA = Path("C:/Windows/Fonts/cambria.ttc")
 FFMPEG = BIN_PATH / "ffmpeg.exe"
 
 TITLE_TEXT = "为什么人工智能会改变教育?"
@@ -38,10 +78,12 @@ TITLE_CENTER_Y0 = 234
 TITLE_MAX_FONT_SIZE = 70
 TITLE_MIN_FONT_SIZE = 40
 BLUE = (0, 234, 255, 255)
+ARTICLE_BLUE = (47, 111, 237, 255)
 MUTED = (153, 153, 153, 255)
 WHITE = (245, 248, 255, 255)
+TITLE_FILL = (255, 255, 255, 179)
 SUBTITLE_EN = (220, 224, 232, 255)
-SUBTITLE_ZH = (202, 206, 214, 255)
+SUBTITLE_ZH = (186, 191, 200, 255)
 SUBTITLE_EN_SHADOW = (0, 0, 0, 52)
 SUBTITLE_EN_SHADOW_BLUR = 5
 VOCAB_CARD_CENTER_X0 = 940
@@ -52,7 +94,7 @@ EN_SUBTITLE_CENTER_Y0 = 700
 ZH_SUBTITLE_CENTER_Y0 = 912
 SUBTITLE_FADE_SECONDS = 0.22
 SUBTITLE_MIN_ALPHA = 175
-VOCAB_PROMPT_VERSION = 2
+VOCAB_PROMPT_VERSION = 3
 
 BREAK_BEFORE_WORDS = {
     "about", "above", "across", "after", "against", "although", "among", "around",
@@ -125,11 +167,38 @@ def cjk_font(size: int) -> ImageFont.FreeTypeFont:
     return font(FONT_DOUYIN if FONT_DOUYIN.exists() else FONT_YAHEI, size)
 
 
+def article_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
+    if weight >= 700 and FONT_READEX_BOLD.exists():
+        return font(FONT_READEX_BOLD, size, weight)
+    if weight >= 600 and FONT_READEX_SEMIBOLD.exists():
+        return font(FONT_READEX_SEMIBOLD, size, weight)
+    if weight >= 500 and FONT_READEX_MEDIUM.exists():
+        return font(FONT_READEX_MEDIUM, size, weight)
+    if FONT_READEX_REGULAR.exists():
+        return font(FONT_READEX_REGULAR, size, weight)
+    return font(FONT_GANTARI, size, weight)
+
+
+def article_cjk_font(size: int, weight: int = 700) -> ImageFont.FreeTypeFont:
+    if weight >= 700 and FONT_HANCHAN_BOLD.exists():
+        return font(FONT_HANCHAN_BOLD, size, weight)
+    if FONT_HANCHAN_MEDIUM.exists():
+        return font(FONT_HANCHAN_MEDIUM, size, weight)
+    return font(FONT_DOUYIN if FONT_DOUYIN.exists() else FONT_YAHEI, size)
+
+
 def text_w(draw: ImageDraw.ImageDraw, text: str, fnt: ImageFont.FreeTypeFont) -> int:
     if not text:
         return 0
     box = draw.textbbox((0, 0), text, font=fnt)
     return box[2] - box[0]
+
+
+def text_h(draw: ImageDraw.ImageDraw, text: str, fnt: ImageFont.FreeTypeFont) -> int:
+    if not text:
+        return 0
+    box = draw.textbbox((0, 0), text, font=fnt)
+    return box[3] - box[1]
 
 
 def parse_ts(ts: str) -> float:
@@ -195,22 +264,53 @@ def fit_cover(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return img.crop(((nw - sw) // 2, (nh - sh) // 2, (nw + sw) // 2, (nh + sh) // 2))
 
 
-def make_base() -> Image.Image:
-    bg = fit_cover(Image.open(BACKGROUND).convert("RGB"), (WIDTH, HEIGHT))
+def fit_contain(img: Image.Image, size: tuple[int, int], fill=(232, 237, 243)) -> Image.Image:
+    iw, ih = img.size
+    sw, sh = size
+    scale = min(sw / iw, sh / ih)
+    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+    resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (sw, sh), fill)
+    canvas.paste(resized, ((sw - nw) // 2, (sh - nh) // 2))
+    return canvas
+
+
+def make_base(background_path: str | Path | None = None) -> Image.Image:
+    bg_path = Path(background_path) if background_path else BACKGROUND
+    if not bg_path.exists():
+        bg_path = BACKGROUND
+    bg = fit_cover(Image.open(bg_path).convert("RGB"), (WIDTH, HEIGHT))
     bg = bg.filter(ImageFilter.GaussianBlur(10))
     bg = ImageEnhance.Contrast(bg).enhance(0.84)
     img = bg.convert("RGBA")
     overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     d = ImageDraw.Draw(overlay, "RGBA")
-    d.rectangle((0, 0, WIDTH, HEIGHT), fill=(0, 0, 0, 155))
+    d.rectangle((0, 0, WIDTH, HEIGHT), fill=(6, 21, 38, 175))
     for y in range(HEIGHT):
         alpha = int(22 + 132 * (y / HEIGHT))
-        d.line((0, y, WIDTH, y), fill=(0, 0, 0, alpha))
+        d.line((0, y, WIDTH, y), fill=(6, 21, 38, alpha))
     img = Image.alpha_composite(img, overlay)
     noise = Image.effect_noise((WIDTH, HEIGHT), 1.6).convert("L")
     noise = ImageChops.add(noise, Image.new("L", (WIDTH, HEIGHT), 128), scale=1.0, offset=-128)
     noise_rgba = Image.merge("RGBA", (noise, noise, noise, Image.new("L", (WIDTH, HEIGHT), 18)))
     return Image.alpha_composite(img, noise_rgba)
+
+
+def make_article_image(background_path: str | Path | None, size: tuple[int, int]) -> Image.Image:
+    bg_path = Path(background_path) if background_path else None
+    if bg_path and bg_path.exists():
+        try:
+            return fit_cover(Image.open(bg_path).convert("RGB"), size)
+        except Exception:
+            pass
+    placeholder = Image.new("RGB", size, (220, 234, 246))
+    d = ImageDraw.Draw(placeholder, "RGBA")
+    w, h = size
+    d.rectangle((0, int(h * 0.64), w, h), fill=(200, 216, 232, 255))
+    d.ellipse((int(w * 0.68), int(h * 0.18), int(w * 0.83), int(h * 0.42)), fill=(255, 255, 255, 210))
+    fnt = font(FONT_GANTARI, max(24, int(w * 0.035)), 650)
+    d.text((int(w * 0.07), int(h * 0.40)), "Article image area", font=fnt, fill=(16, 35, 61, 255))
+    return placeholder
 
 
 def crop_circle(src: Image.Image, box: tuple[int, int, int, int], size: int) -> Image.Image:
@@ -315,6 +415,11 @@ def subtitle_hash(cues: list[Cue]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def vocab_source_hash(cues: list[Cue]) -> str:
+    raw = "\n".join(f"{cue.index}\t{cue.en}" for cue in cues)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def current_llm_config() -> tuple[str, str, str]:
     from app.common.config import cfg
 
@@ -361,7 +466,10 @@ def normalize_vocab_plan(raw_items, cues: list[Cue]) -> dict[int, dict]:
         word = str(item.get("word") or "").strip()
         phonetic = str(item.get("phonetic") or "").strip()[:36]
         level = str(item.get("level") or "").strip()[:20]
-        meaning = str(item.get("meaning") or "").strip()[:28]
+        pos = str(item.get("part_of_speech") or item.get("pos") or "").strip()[:12]
+        meaning = str(item.get("meaning") or "").strip()[:40]
+        definition = str(item.get("definition") or "").strip()[:120]
+        tip = str(item.get("tip") or "").strip()[:120]
         if not cue or not word or not meaning:
             continue
         key_match = re.search(r"[A-Za-z]+(?:['-][A-Za-z]+)?", word)
@@ -376,7 +484,10 @@ def normalize_vocab_plan(raw_items, cues: list[Cue]) -> dict[int, dict]:
             "word": word[:24].capitalize(),
             "phonetic": phonetic,
             "level": level or "核心词",
+            "pos": pos or "n.",
             "meaning": meaning,
+            "definition": definition or "A useful word for understanding the sentence.",
+            "tip": tip or "Notice how this word shapes the sentence meaning.",
         }
     return plan
 
@@ -390,12 +501,20 @@ def load_or_generate_vocab_plan(
     if not enabled:
         return {}
 
-    source_hash = subtitle_hash(cues)
+    source_hash = vocab_source_hash(cues)
+    legacy_source_hash = subtitle_hash(cues)
     cache_path = Path(subtitle_path).with_suffix(".vocab_cards.json")
-    if cache_path.exists():
+    global_cache_dir = CACHE_PATH / "podcast_vocab_cards"
+    global_cache_path = global_cache_dir / f"{source_hash}.json"
+    for candidate in (cache_path, global_cache_path):
+        if not candidate.exists():
+            continue
         try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("source_hash") == source_hash and cached.get("prompt_version") == VOCAB_PROMPT_VERSION:
+            cached = json.loads(candidate.read_text(encoding="utf-8"))
+            cached_hash = cached.get("source_hash")
+            if cached_hash in {source_hash, legacy_source_hash} and cached.get("prompt_version") == VOCAB_PROMPT_VERSION:
+                if progress_callback:
+                    progress_callback(4, "智能单词卡命中缓存")
                 return normalize_vocab_plan(cached.get("cards", []), cues)
         except Exception:
             pass
@@ -416,17 +535,21 @@ def load_or_generate_vocab_plan(
 要求：
 - 只选择较难、信息量高、对理解句子有帮助的词。
 - 避免过于常见的词、口头语、专有名词和重复出现太多的词。
-- 每条字幕最多选1个词，不需要每条都选。
+- 按连续语义意群挑词；每个意群最多选1个词，不需要每条字幕都选。
+- cue_index填这个词首次出现的字幕序号；该词会显示到下一个单词卡出现。
 - 总数控制在18到32个之间；短字幕可更少。
 - word必须是该字幕原文中真实出现的英文词或词形。
 - phonetic给出英式或美式音标，必须带 / /，例如 /ˈreɡjələtɔːri/。
 - meaning先给出原文语境下的中文意思，如有常见其他含义，用 / 补充。
+- pos给出词性缩写，例如 n.、v.、adj.。
+- definition给出一句适合英语学习者的英文解释，尽量短。
+- tip给出一句学习提示，说明这个词在原句中的理解重点。
 - level使用 CET-4、CET-6、IELTS、TOEFL、GRE、专业词 之一。
 - 只返回JSON数组，不要解释。
 
 格式：
 [
-  {{"cue_index": 12, "word": "regulatory", "phonetic": "/ˈreɡjələtɔːri/", "level": "IELTS", "meaning": "adj. 监管的/调节的"}}
+  {{"cue_index": 12, "word": "regulatory", "phonetic": "/ˈreɡjələtɔːri/", "level": "IELTS", "pos": "adj.", "meaning": "监管的/调节的", "definition": "Related to rules or official control.", "tip": "It often describes systems controlled by laws or institutions."}}
 ]
 
 英文字幕：
@@ -445,14 +568,19 @@ def load_or_generate_vocab_plan(
         )
         content = response.choices[0].message.content or ""
         cards = extract_json_array(content)
-        cache_path.write_text(
-            json.dumps(
-                {"source_hash": source_hash, "prompt_version": VOCAB_PROMPT_VERSION, "model": model, "cards": cards},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        payload = {
+            "source_hash": source_hash,
+            "prompt_version": VOCAB_PROMPT_VERSION,
+            "model": model,
+            "cards": cards,
+        }
+        cache_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        for candidate in (cache_path, global_cache_path):
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text(cache_text, encoding="utf-8")
+            except Exception:
+                pass
         if progress_callback:
             progress_callback(4, "智能单词卡生成完成")
         return normalize_vocab_plan(cards, cues)
@@ -594,7 +722,8 @@ def draw_vocab_card(img: Image.Image, item: dict) -> None:
     x0, y0, _, _ = rect
     word = str(item["word"]).strip().capitalize()
     word_font = font(FONT_GANTARI, 52, 650)
-    phonetic_font = font(FONT_SEGOE if FONT_SEGOE.exists() else FONT_GANTARI, 27, 430)
+    phonetic_path = FONT_CAMBRIA if FONT_CAMBRIA.exists() else FONT_SEGOE
+    phonetic_font = font(phonetic_path if phonetic_path.exists() else FONT_GANTARI, 27, 430)
     level_font = font(FONT_GANTARI, 22, 650)
     meaning_font = cjk_font(28)
     word_x = x0 + scx(23)
@@ -662,7 +791,7 @@ def draw_frame(
         ((title_left + title_right) // 2, scy(TITLE_CENTER_Y0)),
         title,
         title_font,
-        MUTED,
+        TITLE_FILL,
         anchor="mm",
         stroke_width=0,
     )
@@ -682,7 +811,7 @@ def draw_frame(
         draw_highlighted_line(img, d, WIDTH // 2, en_start_y + idx * line_gap, line, key, en_font, subtitle_alpha)
 
     if cue.zh:
-        zh_font = cjk_font(52)
+        zh_font = cjk_font(50)
         zh_lines = wrap_zh(d, cue.zh, zh_font, en_width)
         zh_gap = 66
         zh_start_y = scy(ZH_SUBTITLE_CENTER_Y0) - (len(zh_lines) - 1) * zh_gap // 2
@@ -705,6 +834,343 @@ def draw_frame(
     return img
 
 
+def fit_article_en_font(draw, text: str, max_width: int) -> ImageFont.FreeTypeFont:
+    for size in range(58, 39, -2):
+        fnt = article_en_font(size, 600)
+        lines = wrap_en(draw, text, fnt, max_width)
+        if len(lines) <= 2 and all(text_w(draw, line, fnt) <= max_width for line in lines):
+            return fnt
+    return article_en_font(40, 600)
+
+
+def fit_article_font_to_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_size: int,
+    min_size: int,
+    factory,
+) -> ImageFont.FreeTypeFont:
+    for size in range(max_size, min_size - 1, -2):
+        fnt = factory(size)
+        if text_w(draw, text, fnt) <= max_width:
+            return fnt
+    return factory(min_size)
+
+
+def fit_article_wrapped_font(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_lines: int,
+    max_size: int,
+    min_size: int,
+    factory,
+    wrapper,
+) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+    for size in range(max_size, min_size - 1, -2):
+        fnt = factory(size)
+        lines = wrapper(draw, text, fnt, max_width)
+        if len(lines) <= max_lines and all(text_w(draw, line, fnt) <= max_width for line in lines):
+            return fnt, lines
+    fnt = factory(min_size)
+    return fnt, wrapper(draw, text, fnt, max_width)[:max_lines]
+
+
+def draw_article_panel(
+    img: Image.Image,
+    rect: tuple[int, int, int, int],
+    radius: int,
+    fill_color: tuple[int, int, int, int],
+    stroke_color=(230, 222, 208, 255),
+) -> None:
+    x0, y0, x1, y1 = rect
+    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow, "RGBA")
+    sd.rounded_rectangle((x0, y0 + 4, x1, y1 + 4), radius=radius, fill=(0, 0, 0, 13))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(16))
+    img.alpha_composite(shadow)
+    d = ImageDraw.Draw(img, "RGBA")
+    d.rounded_rectangle(rect, radius=radius, fill=fill_color, outline=stroke_color, width=1)
+
+
+def draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    fill: tuple[int, int, int, int],
+    width: int = 1,
+    dash: int = 9,
+    gap: int = 8,
+) -> None:
+    x0, y0 = start
+    x1, y1 = end
+    if y0 != y1:
+        draw.line((x0, y0, x1, y1), fill=fill, width=width)
+        return
+    x = x0
+    while x < x1:
+        draw.line((x, y0, min(x + dash, x1), y1), fill=fill, width=width)
+        x += dash + gap
+
+
+def paste_rounded(img: Image.Image, src: Image.Image, box: tuple[int, int, int, int], radius: int) -> None:
+    x0, y0, x1, y1 = box
+    src = src.convert("RGBA").resize((x1 - x0, y1 - y0), Image.Resampling.LANCZOS)
+    mask = Image.new("L", src.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, src.size[0] - 1, src.size[1] - 1), radius=radius, fill=255)
+    img.paste(src, (x0, y0), mask)
+
+
+def draw_economist_logo(img: Image.Image, position: tuple[int, int] = (31, 33)) -> None:
+    x, y = position
+    if ARTICLE_LOGO.exists():
+        try:
+            logo = Image.open(ARTICLE_LOGO).convert("RGBA").resize((100, 50), Image.Resampling.LANCZOS)
+            img.alpha_composite(logo, (x, y))
+            return
+        except Exception:
+            pass
+    d = ImageDraw.Draw(img, "RGBA")
+    d.rectangle((x, y, x + 100, y + 50), fill=(229, 0, 0, 255))
+    logo_font = cjk_font(18)
+    draw_stroked_text(d, (x + 50, y + 25), "The\nEconomist", logo_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
+
+
+def normalize_article_date(date_text: str) -> str:
+    date = (date_text or "").strip() or "Jul 23rd 2026"
+    month_map = {
+        "january": "Jan",
+        "february": "Feb",
+        "march": "Mar",
+        "april": "Apr",
+        "may": "May",
+        "june": "Jun",
+        "july": "Jul",
+        "august": "Aug",
+        "september": "Sep",
+        "october": "Oct",
+        "november": "Nov",
+        "december": "Dec",
+    }
+    match = re.match(r"^([A-Za-z]+)(\b.*)$", date)
+    if match:
+        month = month_map.get(match.group(1).lower())
+        if month:
+            return month + match.group(2)
+    return date
+
+
+def decorate_article_cover(article_image: Image.Image, date_text: str) -> Image.Image:
+    cover = article_image.convert("RGBA").copy()
+    d = ImageDraw.Draw(cover, "RGBA")
+    draw_economist_logo(cover, (0, 0))
+    date = normalize_article_date(date_text)
+    date_rect = (673, 0, 854, 44)
+    d.rectangle(date_rect, fill=(234, 241, 255, 255))
+    date_font = fit_article_font_to_width(
+        d,
+        date,
+        166,
+        24,
+        16,
+        lambda size: article_en_font(size, 500),
+    )
+    date_x = (date_rect[0] + date_rect[2]) // 2
+    date_y = date_rect[1] + (date_rect[3] - text_h(d, date, date_font)) // 2 - 2
+    draw_stroked_text(d, (date_x, date_y), date, date_font, (47, 111, 237, 255), anchor="ma", stroke_width=0)
+    return cover
+
+
+def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int, int, int, int]) -> None:
+    d = ImageDraw.Draw(img, "RGBA")
+    draw_article_panel(img, rect, 16, (255, 253, 248, 255))
+    word = str((item or {}).get("word") or "Vocabulary").strip().capitalize()
+    phonetic = str((item or {}).get("phonetic") or "/ˈvɑːkjəbəleri/").strip()
+    pos = str((item or {}).get("part_of_speech") or (item or {}).get("pos") or "n.").strip()
+    meaning = str((item or {}).get("meaning") or "n. 核心词汇/重点表达").strip()
+    definition = str((item or {}).get("definition") or "A typical example or pattern of something.").strip()
+    tip = str((item or {}).get("tip") or "Keep your aspirations high and your steps steady.").strip()
+
+    word_font = fit_article_font_to_width(
+        d,
+        word,
+        620,
+        68,
+        44,
+        lambda size: article_en_font(size, 700),
+    )
+    phonetic_path = FONT_CAMBRIA if FONT_CAMBRIA.exists() else FONT_SEGOE
+    phonetic_font = fit_article_font_to_width(
+        d,
+        phonetic,
+        620,
+        32,
+        22,
+        lambda size: font(phonetic_path if phonetic_path.exists() else FONT_GANTARI, size, 400),
+    )
+    meaning_font, meaning_lines = fit_article_wrapped_font(
+        d,
+        meaning,
+        596,
+        2,
+        40,
+        28,
+        lambda size: article_cjk_font(size, 500),
+        wrap_zh,
+    )
+    pos_font = fit_article_font_to_width(
+        d,
+        pos[:8],
+        44,
+        24,
+        16,
+        lambda size: article_en_font(size, 600),
+    )
+    def_font, definition_lines = fit_article_wrapped_font(
+        d,
+        definition,
+        540,
+        2,
+        28,
+        20,
+        lambda size: article_en_font(size, 500),
+        wrap_en,
+    )
+    tip_label_font = article_en_font(28, 700)
+    tip_body_font, tip_lines = fit_article_wrapped_font(
+        d,
+        tip,
+        524,
+        2,
+        24,
+        18,
+        lambda size: article_en_font(size, 400),
+        wrap_en,
+    )
+
+    draw_stroked_text(d, (940, 32), word, word_font, (47, 111, 237, 255), stroke_width=0)
+    draw_stroked_text(d, (940, 126), phonetic, phonetic_font, (122, 132, 147, 255), stroke_width=0)
+    draw_dashed_line(d, (940, 188), (1560, 188), fill=(122, 132, 147, 150), width=1)
+
+    for idx, line in enumerate(meaning_lines[:2]):
+        draw_stroked_text(d, (940, 212 + idx * int(meaning_font.size * 1.18)), line, meaning_font, (79, 91, 107, 255), stroke_width=0)
+
+    d.rounded_rectangle((940, 284, 1004, 320), radius=4, fill=(234, 241, 255, 255))
+    draw_stroked_text(d, (972, 288), pos[:8], pos_font, (47, 111, 237, 255), anchor="ma", stroke_width=0)
+    for idx, line in enumerate(definition_lines[:2]):
+        draw_stroked_text(d, (1020, 292 + idx * 36), line, def_font, (122, 132, 147, 255), stroke_width=0)
+
+    d.rounded_rectangle((940, 387, 1560, 506), radius=8, fill=(234, 241, 255, 255))
+    if ARTICLE_TIP_ICON.exists():
+        try:
+            icon = Image.open(ARTICLE_TIP_ICON).convert("RGBA").resize((48, 48), Image.Resampling.LANCZOS)
+            img.alpha_composite(icon, (956, 403))
+        except Exception:
+            d.ellipse((956, 403, 1004, 451), fill=(47, 111, 237, 255))
+            bulb_font = article_en_font(28, 700)
+            draw_stroked_text(d, (980, 428), "!", bulb_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
+    else:
+        d.ellipse((956, 403, 1004, 451), fill=(47, 111, 237, 255))
+        bulb_font = article_en_font(28, 700)
+        draw_stroked_text(d, (980, 428), "!", bulb_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
+    draw_stroked_text(d, (1020, 403), "TIP", tip_label_font, (47, 111, 237, 255), stroke_width=0)
+    for idx, line in enumerate(tip_lines[:2]):
+        draw_stroked_text(d, (1020, 436 + idx * int(tip_body_font.size * 1.28)), line, tip_body_font, (122, 132, 147, 255), stroke_width=0)
+
+
+def active_article_vocab(vocab_plan: dict[int, dict] | None, cue_index: int) -> dict | None:
+    if not vocab_plan:
+        return None
+    eligible = [idx for idx in vocab_plan if idx <= cue_index]
+    if not eligible:
+        return None
+    return vocab_plan.get(max(eligible))
+
+
+def draw_article_frame(
+    article_image: Image.Image,
+    cue: Cue | None,
+    vocab_plan: dict[int, dict] | None = None,
+    subtitle_alpha: int = 255,
+    show_vocab: bool = False,
+    title_text: str = TITLE_TEXT,
+    date_text: str = "Jul 23rd 2026",
+) -> Image.Image:
+    img = Image.new("RGBA", (ARTICLE_WIDTH, ARTICLE_HEIGHT), (247, 243, 234, 255))
+    d = ImageDraw.Draw(img, "RGBA")
+
+    draw_article_panel(img, (16, 16, 900, 530), 16, (255, 253, 248, 255))
+    cover = decorate_article_cover(article_image, date_text)
+    paste_rounded(img, cover, (31, 33, 885, 513), 8)
+
+    vocab_rect = (916, 16, 1584, 530)
+    vocab = active_article_vocab(vocab_plan, cue.index) if cue and show_vocab else None
+    if cue and show_vocab and not vocab:
+        vocab = find_vocab(cue.en)
+    draw_article_vocab_card(img, vocab, vocab_rect)
+
+    draw_article_panel(img, (16, 546, 1584, 884), 16, (241, 236, 227, 255))
+
+    if cue:
+        key = vocab["key"] if vocab else None
+        en_x = 68
+        en_width = 1455
+        en_font = fit_article_en_font(d, cue.en, en_width)
+        en_lines = wrap_en(d, cue.en, en_font, en_width)[:2]
+        zh_font = article_cjk_font(46, 700)
+        zh_width = 1032
+        zh_lines = wrap_zh(d, cue.zh, zh_font, zh_width)[:2] if cue.zh else []
+        en_gap = int(en_font.size * 1.16)
+        zh_gap = 58
+        en_count = max(1, len(en_lines))
+        zh_count = max(0, len(zh_lines))
+        if en_count == 1 and zh_count <= 1:
+            en_y, zh_y = 604, 766
+        elif en_count == 2 and zh_count <= 1:
+            en_y, zh_y = 570, 772
+        elif en_count == 1 and zh_count == 2:
+            en_y, zh_y = 586, 736
+        else:
+            en_y, zh_y = 560, 736
+        for idx, line in enumerate(en_lines):
+            fill = with_alpha((42, 63, 93, 255), subtitle_alpha)
+            if key and key.lower() in line.lower():
+                draw_highlighted_article_line(d, en_x + en_width // 2, en_y + idx * en_gap, line, key, en_font, fill, with_alpha(ARTICLE_BLUE, subtitle_alpha))
+            else:
+                line_x = en_x + (en_width - text_w(d, line, en_font)) // 2
+                draw_stroked_text(d, (line_x, en_y + idx * en_gap), line, en_font, fill, stroke_width=0)
+        if zh_lines:
+            zh_fill = with_alpha((65, 81, 104, 255), subtitle_alpha)
+            for idx, line in enumerate(zh_lines):
+                draw_stroked_text(d, (280 + zh_width // 2, zh_y + idx * zh_gap), line, zh_font, zh_fill, anchor="ma", stroke_width=0)
+    return img
+
+
+def draw_highlighted_article_line(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    line: str,
+    key: str,
+    fnt,
+    fill,
+    highlight_fill,
+) -> None:
+    lower = line.lower()
+    start = lower.find(key.lower())
+    if start < 0:
+        draw_stroked_text(draw, (x, y), line, fnt, fill, stroke_width=0)
+        return
+    end = start + len(key)
+    widths = [text_w(draw, part, fnt) for part in (line[:start], line[start:end], line[end:])]
+    cursor = x - sum(widths) // 2
+    for idx, part in enumerate((line[:start], line[start:end], line[end:])):
+        if part:
+            draw_stroked_text(draw, (cursor, y), part, fnt, highlight_fill if idx == 1 else fill, stroke_width=0)
+            cursor += text_w(draw, part, fnt)
+
+
 def render_podcast_learning_video(
     media_path: str,
     subtitle_path: str,
@@ -725,8 +1191,20 @@ def render_podcast_learning_video(
     )
     duration = min(get_duration(media_path), max(cue.end for cue in cues) + 0.5)
     frames = int(math.ceil(duration * FPS))
-    base = make_base()
-    male, female = make_avatars()
+    background_value = getattr(cfg, "podcast_template_background", None)
+    background_path = background_value.value if background_value else ""
+    cover_value = getattr(cfg, "podcast_template_cover", None)
+    cover_path = cover_value.value if cover_value else ""
+    date_value = getattr(cfg, "podcast_template_date", None)
+    date_text = date_value.value if date_value else "Jul 23rd 2026"
+    template_style_value = getattr(cfg, "podcast_template_style", None)
+    template_style = template_style_value.value if template_style_value else "暗色播客"
+    is_article_template = template_style == "文章单词"
+    out_width = ARTICLE_WIDTH if is_article_template else WIDTH
+    out_height = ARTICLE_HEIGHT if is_article_template else HEIGHT
+    base = None if is_article_template else make_base(background_path)
+    article_image = make_article_image(cover_path, (854, 480)) if is_article_template else None
+    male, female = (None, None) if is_article_template else make_avatars()
     title_text = (cfg.podcast_template_title.value or TITLE_TEXT).strip() or TITLE_TEXT
 
     cmd = [
@@ -739,7 +1217,7 @@ def render_podcast_learning_video(
         "-pix_fmt",
         "rgb24",
         "-s",
-        f"{WIDTH}x{HEIGHT}",
+        f"{out_width}x{out_height}",
         "-r",
         str(FPS),
         "-i",
@@ -781,18 +1259,29 @@ def render_podcast_learning_video(
             t = frame_index / FPS
             cue, last_index = active_cue(cues, t, last_index)
             alpha = fade_alpha(cue, t)
-            cue_key = (cue.start, cue.end, cue.en, cue.zh, alpha, title_text) if cue else (None, title_text)
+            cue_key = (template_style, cue.start, cue.end, cue.en, cue.zh, alpha, title_text) if cue else (template_style, None, title_text)
             if cue_key != last_cue_key:
-                frame = draw_frame(
-                    base,
-                    male,
-                    female,
-                    cue,
-                    vocab_plan,
-                    alpha,
-                    cfg.podcast_template_ai_vocab.value,
-                    title_text,
-                ).convert("RGB")
+                if is_article_template:
+                    frame = draw_article_frame(
+                        article_image,
+                        cue,
+                        vocab_plan,
+                        alpha,
+                        cfg.podcast_template_ai_vocab.value,
+                        title_text,
+                        date_text,
+                    ).convert("RGB")
+                else:
+                    frame = draw_frame(
+                        base,
+                        male,
+                        female,
+                        cue,
+                        vocab_plan,
+                        alpha,
+                        cfg.podcast_template_ai_vocab.value,
+                        title_text,
+                    ).convert("RGB")
                 cached_frame_bytes = frame.tobytes()
                 last_cue_key = cue_key
             process.stdin.write(cached_frame_bytes)

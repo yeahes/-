@@ -565,6 +565,7 @@ class SubtitleConfig:
     need_screen_subtitle_edit: bool = False
     screen_subtitle_stable_mode: bool = True
     need_screen_subtitle_quality_check: bool = False
+    screen_subtitle_safe_auto_repair: bool = False
     screen_subtitle_max_cjk: int = 24
     screen_subtitle_max_english: int = 16
     screen_subtitle_allocation_max_concurrency: int = 3
@@ -579,6 +580,7 @@ class SynthesisConfig:
     need_video: bool = True
     soft_subtitle: bool = True
     podcast_learning_template: bool = False
+    podcast_template_style: str = "暗色播客"
     subtitle_render_mode: str = "ASS样式"
     subtitle_layout: str = "译文在上"
     rounded_style: dict = field(default_factory=dict)

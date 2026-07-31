@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import QApplication, QFileDialog, QHBoxLayout, QVBoxLayout,
 from qfluentwidgets import Action, BodyLabel, CardWidget, CommandBar
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
+    ComboBox,
     InfoBar,
     InfoBarPosition,
     LineEdit,
@@ -109,6 +110,15 @@ class VideoSynthesisInterface(QWidget):
         self.video_layout.addWidget(self.video_button)
         self.config_layout.addLayout(self.video_layout)
 
+        self.podcast_style_layout = QHBoxLayout()
+        self.podcast_style_layout.setSpacing(15)
+        self.podcast_style_label = BodyLabel(self.tr("模板样式"), self)
+        self.podcast_style_combo = ComboBox(self)
+        self.podcast_style_combo.addItems([self.tr("暗色播客"), self.tr("文章单词")])
+        self.podcast_style_layout.addWidget(self.podcast_style_label)
+        self.podcast_style_layout.addWidget(self.podcast_style_combo)
+        self.config_layout.addLayout(self.podcast_style_layout)
+
         self.podcast_title_layout = QHBoxLayout()
         self.podcast_title_layout.setSpacing(15)
         self.podcast_title_label = BodyLabel(self.tr("模板标题"), self)
@@ -119,6 +129,41 @@ class VideoSynthesisInterface(QWidget):
         self.podcast_title_layout.addWidget(self.podcast_title_label)
         self.podcast_title_layout.addWidget(self.podcast_title_input)
         self.config_layout.addLayout(self.podcast_title_layout)
+
+        self.podcast_background_layout = QHBoxLayout()
+        self.podcast_background_layout.setSpacing(15)
+        self.podcast_background_label = BodyLabel(self.tr("模板背景图"), self)
+        self.podcast_background_input = LineEdit(self)
+        self.podcast_background_input.setPlaceholderText(
+            self.tr("可选；建议使用16:9图片，如1440x810或1920x1080")
+        )
+        self.podcast_background_button = PushButton(self.tr("浏览"))
+        self.podcast_background_layout.addWidget(self.podcast_background_label)
+        self.podcast_background_layout.addWidget(self.podcast_background_input)
+        self.podcast_background_layout.addWidget(self.podcast_background_button)
+        self.config_layout.addLayout(self.podcast_background_layout)
+
+        self.podcast_cover_layout = QHBoxLayout()
+        self.podcast_cover_layout.setSpacing(15)
+        self.podcast_cover_label = BodyLabel(self.tr("文章封面图"), self)
+        self.podcast_cover_input = LineEdit(self)
+        self.podcast_cover_input.setPlaceholderText(
+            self.tr("文章单词模板使用；建议1280x720")
+        )
+        self.podcast_cover_button = PushButton(self.tr("浏览"))
+        self.podcast_cover_layout.addWidget(self.podcast_cover_label)
+        self.podcast_cover_layout.addWidget(self.podcast_cover_input)
+        self.podcast_cover_layout.addWidget(self.podcast_cover_button)
+        self.config_layout.addLayout(self.podcast_cover_layout)
+
+        self.podcast_date_layout = QHBoxLayout()
+        self.podcast_date_layout.setSpacing(15)
+        self.podcast_date_label = BodyLabel(self.tr("模板日期"), self)
+        self.podcast_date_input = LineEdit(self)
+        self.podcast_date_input.setPlaceholderText(self.tr("例如 Jul 23rd 2026"))
+        self.podcast_date_layout.addWidget(self.podcast_date_label)
+        self.podcast_date_layout.addWidget(self.podcast_date_input)
+        self.config_layout.addLayout(self.podcast_date_layout)
 
         self.main_layout.addWidget(self.config_card)
 
@@ -238,11 +283,61 @@ class VideoSynthesisInterface(QWidget):
         """
         )
 
+        self.podcast_background_input.focusOutEvent = lambda e: super(
+            LineEdit, self.podcast_background_input
+        ).focusOutEvent(e)
+        self.podcast_background_input.paintEvent = lambda e: super(
+            LineEdit, self.podcast_background_input
+        ).paintEvent(e)
+        self.podcast_background_input.setStyleSheet(
+            self.podcast_background_input.styleSheet()
+            + """
+            QLineEdit {
+                border-radius: 15px;
+                padding: 0 20px;
+                background-color: transparent;
+                border: 1px solid rgba(255,255, 255, 0.08);
+            }
+            QLineEdit:focus[transparent=true] {
+                border: 1px solid rgba(47,141, 99, 0.48);
+            }
+        """
+        )
+        for line_edit in (self.podcast_cover_input, self.podcast_date_input):
+            line_edit.focusOutEvent = lambda e, widget=line_edit: super(
+                LineEdit, widget
+            ).focusOutEvent(e)
+            line_edit.paintEvent = lambda e, widget=line_edit: super(
+                LineEdit, widget
+            ).paintEvent(e)
+            line_edit.setStyleSheet(
+                line_edit.styleSheet()
+                + """
+                QLineEdit {
+                    border-radius: 15px;
+                    padding: 0 20px;
+                    background-color: transparent;
+                    border: 1px solid rgba(255,255, 255, 0.08);
+                }
+                QLineEdit:focus[transparent=true] {
+                    border: 1px solid rgba(47,141, 99, 0.48);
+                }
+            """
+            )
+
     def setup_signals(self):
         # 文件选择相关信号
         self.subtitle_button.clicked.connect(self.choose_subtitle_file)
         self.video_button.clicked.connect(self.choose_video_file)
+        self.podcast_style_combo.currentTextChanged.connect(self.save_podcast_style)
         self.podcast_title_input.editingFinished.connect(self.save_podcast_title)
+        self.podcast_background_button.clicked.connect(self.choose_podcast_background)
+        self.podcast_background_input.editingFinished.connect(
+            self.save_podcast_background
+        )
+        self.podcast_cover_button.clicked.connect(self.choose_podcast_cover)
+        self.podcast_cover_input.editingFinished.connect(self.save_podcast_cover)
+        self.podcast_date_input.editingFinished.connect(self.save_podcast_date)
 
         # 合成和文件夹相关信号
         self.synthesize_button.clicked.connect(
@@ -261,7 +356,32 @@ class VideoSynthesisInterface(QWidget):
             cfg.podcast_learning_template.value
         )
         self.ai_vocab_action.setChecked(cfg.podcast_template_ai_vocab.value)
+        self.podcast_style_combo.setCurrentText(cfg.podcast_template_style.value)
         self.podcast_title_input.setText(cfg.podcast_template_title.value)
+        self.podcast_background_input.setText(cfg.podcast_template_background.value)
+        self.podcast_cover_input.setText(cfg.podcast_template_cover.value)
+        self.podcast_date_input.setText(cfg.podcast_template_date.value)
+        self.update_podcast_template_fields()
+
+    def set_layout_visible(self, layout, visible: bool):
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget:
+                widget.setVisible(visible)
+            elif child_layout:
+                self.set_layout_visible(child_layout, visible)
+
+    def update_podcast_template_fields(self):
+        enabled = self.podcast_learning_template_action.isChecked()
+        is_article = self.podcast_style_combo.currentText() == self.tr("文章单词")
+        self.ai_vocab_action.setVisible(enabled)
+        self.set_layout_visible(self.podcast_style_layout, enabled)
+        self.set_layout_visible(self.podcast_title_layout, enabled and not is_article)
+        self.set_layout_visible(self.podcast_background_layout, enabled and not is_article)
+        self.set_layout_visible(self.podcast_cover_layout, enabled and is_article)
+        self.set_layout_visible(self.podcast_date_layout, enabled and is_article)
 
     def on_soft_subtitle_changed(self, checked: bool):
         """处理软字幕选项变更"""
@@ -279,6 +399,7 @@ class VideoSynthesisInterface(QWidget):
         if checked:
             cfg.set(cfg.need_video, True)
             self.need_video_action.setChecked(True)
+        self.update_podcast_template_fields()
 
     def on_ai_vocab_changed(self, checked: bool):
         cfg.set(cfg.podcast_template_ai_vocab, checked)
@@ -288,9 +409,48 @@ class VideoSynthesisInterface(QWidget):
             self.podcast_learning_template_action.setChecked(True)
             cfg.set(cfg.need_video, True)
             self.need_video_action.setChecked(True)
+        self.update_podcast_template_fields()
 
     def save_podcast_title(self):
         cfg.set(cfg.podcast_template_title, self.podcast_title_input.text().strip())
+
+    def save_podcast_style(self):
+        cfg.set(cfg.podcast_template_style, self.podcast_style_combo.currentText())
+        self.update_podcast_template_fields()
+
+    def save_podcast_background(self):
+        cfg.set(
+            cfg.podcast_template_background,
+            self.podcast_background_input.text().strip(),
+        )
+
+    def save_podcast_cover(self):
+        cfg.set(cfg.podcast_template_cover, self.podcast_cover_input.text().strip())
+
+    def save_podcast_date(self):
+        cfg.set(cfg.podcast_template_date, self.podcast_date_input.text().strip())
+
+    def choose_podcast_background(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr("选择模板背景图"),
+            "",
+            self.tr("图片文件") + " (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        if file_path:
+            self.podcast_background_input.setText(file_path)
+            self.save_podcast_background()
+
+    def choose_podcast_cover(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr("选择文章封面图"),
+            "",
+            self.tr("图片文件") + " (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        if file_path:
+            self.podcast_cover_input.setText(file_path)
+            self.save_podcast_cover()
 
     def choose_subtitle_file(self):
         # 构建文件过滤器
@@ -323,7 +483,11 @@ class VideoSynthesisInterface(QWidget):
             self.video_input.setText(file_path)
 
     def create_task(self):
+        self.save_podcast_style()
         self.save_podcast_title()
+        self.save_podcast_background()
+        self.save_podcast_cover()
+        self.save_podcast_date()
         subtitle_file = self.subtitle_input.text()
         video_file = self.video_input.text()
         if not subtitle_file or not video_file:
@@ -437,6 +601,25 @@ class VideoSynthesisInterface(QWidget):
                 InfoBar.success(
                     self.tr("导入成功"),
                     self.tr("字幕文件已放入输入框"),
+                    duration=2000,
+                    parent=self,
+                )
+                break
+            elif (
+                cfg.podcast_learning_template.value
+                and file_ext in {"png", "jpg", "jpeg", "webp", "bmp"}
+            ):
+                if self.podcast_style_combo.currentText() == self.tr("文章单词"):
+                    self.podcast_cover_input.setText(file_path)
+                    self.save_podcast_cover()
+                    message = self.tr("文章封面图已放入输入框")
+                else:
+                    self.podcast_background_input.setText(file_path)
+                    self.save_podcast_background()
+                    message = self.tr("模板背景图已放入输入框")
+                InfoBar.success(
+                    self.tr("导入成功"),
+                    message,
                     duration=2000,
                     parent=self,
                 )
