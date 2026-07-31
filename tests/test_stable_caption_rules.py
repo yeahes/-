@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -2560,6 +2560,60 @@ def test_podcast_template_uses_frozen_task_configuration():
     assert kwargs["date_text"] == "Jul 31st 2026"
 
 
+def test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths():
+    article_image = Image.new(
+        "RGB",
+        (
+            podcast_learning_video.acx(854),
+            podcast_learning_video.acy(480),
+        ),
+    )
+    cue = podcast_learning_video.Cue(
+        1,
+        0.0,
+        2.0,
+        "A compact English subtitle.",
+        "这是一条应优先保持单行显示的中文字幕。",
+        "male",
+    )
+    original_wrap_zh = podcast_learning_video.wrap_zh
+    widths = []
+
+    def capture_wrap_zh(draw, text, fnt, max_width):
+        widths.append(max_width)
+        return original_wrap_zh(draw, text, fnt, max_width)
+
+    with patch.object(podcast_learning_video, "wrap_zh", side_effect=capture_wrap_zh), \
+         patch.object(podcast_learning_video, "draw_article_vocab_card") as draw_card:
+        frame = podcast_learning_video.draw_article_frame(
+            article_image,
+            cue,
+            vocab_plan={},
+            show_vocab=True,
+        )
+
+    assert frame.size == (1920, 1080)
+    assert podcast_learning_video.acx(1455) in widths
+    assert not draw_card.called
+
+
+def test_article_template_tip_font_and_wrapper_support_chinese_text():
+    font = podcast_learning_video.article_mixed_font(24)
+    assert Path(font.path).name.lower() == "msyh.ttc"
+
+    draw = ImageDraw.Draw(Image.new("RGB", (800, 300)))
+    lines = podcast_learning_video.wrap_article_mixed_text(
+        draw,
+        "playbook 不再是体育术语，常比喻一套现成的宣传策略。",
+        font,
+        300,
+    )
+
+    assert "".join(lines).replace(" ", "") == "playbook不再是体育术语，常比喻一套现成的宣传策略。"
+    assert len(lines) >= 2
+    assert not any(line in "，。！？；：、" for line in lines)
+
+
 def test_stable_srt_writer_keeps_bilingual_original_top():
     with tempfile.TemporaryDirectory() as temp_dir:
         path = Path(temp_dir) / "stable-final-original-top.srt"
@@ -5039,6 +5093,8 @@ if __name__ == "__main__":
     test_podcast_template_ignores_blocked_stable_manifest_subtitle()
     test_podcast_template_preserves_full_media_duration_when_subtitles_end_early()
     test_podcast_template_uses_frozen_task_configuration()
+    test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths()
+    test_article_template_tip_font_and_wrapper_support_chinese_text()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()
     test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()

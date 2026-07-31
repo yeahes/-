@@ -20,8 +20,12 @@ HEIGHT = 1080
 FPS = 25
 SX = WIDTH / 1879
 SY = HEIGHT / 1056
-ARTICLE_WIDTH = 1600
-ARTICLE_HEIGHT = 900
+ARTICLE_DESIGN_WIDTH = 1600
+ARTICLE_DESIGN_HEIGHT = 900
+ARTICLE_WIDTH = 1920
+ARTICLE_HEIGHT = 1080
+ARTICLE_SCALE_X = ARTICLE_WIDTH / ARTICLE_DESIGN_WIDTH
+ARTICLE_SCALE_Y = ARTICLE_HEIGHT / ARTICLE_DESIGN_HEIGHT
 
 TEMPLATE_DIR = RESOURCE_PATH / "podcast_template"
 ARTICLE_TEMPLATE_DIR = TEMPLATE_DIR / "article_vocab"
@@ -151,6 +155,19 @@ def scy(value: float) -> int:
     return round(value * SY)
 
 
+def acx(value: float) -> int:
+    return round(value * ARTICLE_SCALE_X)
+
+
+def acy(value: float) -> int:
+    return round(value * ARTICLE_SCALE_Y)
+
+
+def article_rect(*values: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = values
+    return acx(x0), acy(y0), acx(x1), acy(y1)
+
+
 def font(path: Path, size: int, weight: int | None = None) -> ImageFont.FreeTypeFont:
     if not path.exists():
         path = FONT_YAHEI
@@ -168,6 +185,7 @@ def cjk_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 def article_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
+    size = acx(size)
     if weight >= 700 and FONT_READEX_BOLD.exists():
         return font(FONT_READEX_BOLD, size, weight)
     if weight >= 600 and FONT_READEX_SEMIBOLD.exists():
@@ -180,11 +198,16 @@ def article_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
 
 
 def article_cjk_font(size: int, weight: int = 700) -> ImageFont.FreeTypeFont:
+    size = acx(size)
     if weight >= 700 and FONT_HANCHAN_BOLD.exists():
         return font(FONT_HANCHAN_BOLD, size, weight)
     if FONT_HANCHAN_MEDIUM.exists():
         return font(FONT_HANCHAN_MEDIUM, size, weight)
     return font(FONT_DOUYIN if FONT_DOUYIN.exists() else FONT_YAHEI, size)
+
+
+def article_mixed_font(size: int, weight: int = 400) -> ImageFont.FreeTypeFont:
+    return font(FONT_YAHEI, acx(size), weight)
 
 
 def text_w(draw: ImageDraw.ImageDraw, text: str, fnt: ImageFont.FreeTypeFont) -> int:
@@ -835,6 +858,7 @@ def draw_frame(
 
 
 def fit_article_en_font(draw, text: str, max_width: int) -> ImageFont.FreeTypeFont:
+    max_width = acx(max_width)
     for size in range(58, 39, -2):
         fnt = article_en_font(size, 600)
         lines = wrap_en(draw, text, fnt, max_width)
@@ -851,6 +875,7 @@ def fit_article_font_to_width(
     min_size: int,
     factory,
 ) -> ImageFont.FreeTypeFont:
+    max_width = acx(max_width)
     for size in range(max_size, min_size - 1, -2):
         fnt = factory(size)
         if text_w(draw, text, fnt) <= max_width:
@@ -868,6 +893,7 @@ def fit_article_wrapped_font(
     factory,
     wrapper,
 ) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+    max_width = acx(max_width)
     for size in range(max_size, min_size - 1, -2):
         fnt = factory(size)
         lines = wrapper(draw, text, fnt, max_width)
@@ -875,6 +901,30 @@ def fit_article_wrapped_font(
             return fnt, lines
     fnt = factory(min_size)
     return fnt, wrapper(draw, text, fnt, max_width)[:max_lines]
+
+
+def wrap_article_mixed_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*|\s+|.", text.strip())
+    lines: list[str] = []
+    current = ""
+    for token in tokens:
+        candidate = current + token
+        if token in "，。！？；：、" and current:
+            current = candidate
+            continue
+        if current and text_w(draw, candidate, fnt) > max_width:
+            lines.append(current.rstrip())
+            current = token.lstrip()
+        else:
+            current = candidate
+    if current.strip():
+        lines.append(current.rstrip())
+    return lines or [""]
 
 
 def draw_article_panel(
@@ -887,8 +937,8 @@ def draw_article_panel(
     x0, y0, x1, y1 = rect
     shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow, "RGBA")
-    sd.rounded_rectangle((x0, y0 + 4, x1, y1 + 4), radius=radius, fill=(0, 0, 0, 13))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(16))
+    sd.rounded_rectangle((x0, y0 + acy(4), x1, y1 + acy(4)), radius=radius, fill=(0, 0, 0, 13))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(acx(16)))
     img.alpha_composite(shadow)
     d = ImageDraw.Draw(img, "RGBA")
     d.rounded_rectangle(rect, radius=radius, fill=fill_color, outline=stroke_color, width=1)
@@ -905,6 +955,9 @@ def draw_dashed_line(
 ) -> None:
     x0, y0 = start
     x1, y1 = end
+    width = acx(width)
+    dash = acx(dash)
+    gap = acx(gap)
     if y0 != y1:
         draw.line((x0, y0, x1, y1), fill=fill, width=width)
         return
@@ -926,15 +979,15 @@ def draw_economist_logo(img: Image.Image, position: tuple[int, int] = (31, 33)) 
     x, y = position
     if ARTICLE_LOGO.exists():
         try:
-            logo = Image.open(ARTICLE_LOGO).convert("RGBA").resize((100, 50), Image.Resampling.LANCZOS)
+            logo = Image.open(ARTICLE_LOGO).convert("RGBA").resize((acx(100), acy(50)), Image.Resampling.LANCZOS)
             img.alpha_composite(logo, (x, y))
             return
         except Exception:
             pass
     d = ImageDraw.Draw(img, "RGBA")
-    d.rectangle((x, y, x + 100, y + 50), fill=(229, 0, 0, 255))
-    logo_font = cjk_font(18)
-    draw_stroked_text(d, (x + 50, y + 25), "The\nEconomist", logo_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
+    d.rectangle((x, y, x + acx(100), y + acy(50)), fill=(229, 0, 0, 255))
+    logo_font = article_mixed_font(18)
+    draw_stroked_text(d, (x + acx(50), y + acy(25)), "The\nEconomist", logo_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
 
 
 def normalize_article_date(date_text: str) -> str:
@@ -966,7 +1019,7 @@ def decorate_article_cover(article_image: Image.Image, date_text: str) -> Image.
     d = ImageDraw.Draw(cover, "RGBA")
     draw_economist_logo(cover, (0, 0))
     date = normalize_article_date(date_text)
-    date_rect = (673, 0, 854, 44)
+    date_rect = article_rect(673, 0, 854, 44)
     d.rectangle(date_rect, fill=(234, 241, 255, 255))
     date_font = fit_article_font_to_width(
         d,
@@ -977,20 +1030,20 @@ def decorate_article_cover(article_image: Image.Image, date_text: str) -> Image.
         lambda size: article_en_font(size, 500),
     )
     date_x = (date_rect[0] + date_rect[2]) // 2
-    date_y = date_rect[1] + (date_rect[3] - text_h(d, date, date_font)) // 2 - 2
+    date_y = date_rect[1] + (date_rect[3] - text_h(d, date, date_font)) // 2 - acy(2)
     draw_stroked_text(d, (date_x, date_y), date, date_font, (47, 111, 237, 255), anchor="ma", stroke_width=0)
     return cover
 
 
 def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int, int, int, int]) -> None:
     d = ImageDraw.Draw(img, "RGBA")
-    draw_article_panel(img, rect, 16, (255, 253, 248, 255))
-    word = str((item or {}).get("word") or "Vocabulary").strip().capitalize()
-    phonetic = str((item or {}).get("phonetic") or "/ˈvɑːkjəbəleri/").strip()
-    pos = str((item or {}).get("part_of_speech") or (item or {}).get("pos") or "n.").strip()
-    meaning = str((item or {}).get("meaning") or "n. 核心词汇/重点表达").strip()
-    definition = str((item or {}).get("definition") or "A typical example or pattern of something.").strip()
-    tip = str((item or {}).get("tip") or "Keep your aspirations high and your steps steady.").strip()
+    draw_article_panel(img, rect, acx(16), (255, 253, 248, 255))
+    word = str(item.get("word") or "").strip().capitalize()
+    phonetic = str(item.get("phonetic") or "").strip()
+    pos = str(item.get("part_of_speech") or item.get("pos") or "").strip()
+    meaning = str(item.get("meaning") or "").strip()
+    definition = str(item.get("definition") or "").strip()
+    tip = str(item.get("tip") or "").strip()
 
     word_font = fit_article_font_to_width(
         d,
@@ -1045,38 +1098,38 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
         2,
         24,
         18,
-        lambda size: article_en_font(size, 400),
-        wrap_en,
+        lambda size: article_mixed_font(size, 400),
+        wrap_article_mixed_text,
     )
 
-    draw_stroked_text(d, (940, 32), word, word_font, (47, 111, 237, 255), stroke_width=0)
-    draw_stroked_text(d, (940, 126), phonetic, phonetic_font, (122, 132, 147, 255), stroke_width=0)
-    draw_dashed_line(d, (940, 188), (1560, 188), fill=(122, 132, 147, 150), width=1)
+    draw_stroked_text(d, (acx(940), acy(32)), word, word_font, (47, 111, 237, 255), stroke_width=0)
+    draw_stroked_text(d, (acx(940), acy(126)), phonetic, phonetic_font, (122, 132, 147, 255), stroke_width=0)
+    draw_dashed_line(d, (acx(940), acy(188)), (acx(1560), acy(188)), fill=(122, 132, 147, 150), width=1)
 
     for idx, line in enumerate(meaning_lines[:2]):
-        draw_stroked_text(d, (940, 212 + idx * int(meaning_font.size * 1.18)), line, meaning_font, (79, 91, 107, 255), stroke_width=0)
+        draw_stroked_text(d, (acx(940), acy(212) + idx * int(meaning_font.size * 1.18)), line, meaning_font, (79, 91, 107, 255), stroke_width=0)
 
-    d.rounded_rectangle((940, 284, 1004, 320), radius=4, fill=(234, 241, 255, 255))
-    draw_stroked_text(d, (972, 288), pos[:8], pos_font, (47, 111, 237, 255), anchor="ma", stroke_width=0)
+    d.rounded_rectangle(article_rect(940, 284, 1004, 320), radius=acx(4), fill=(234, 241, 255, 255))
+    draw_stroked_text(d, (acx(972), acy(288)), pos[:8], pos_font, (47, 111, 237, 255), anchor="ma", stroke_width=0)
     for idx, line in enumerate(definition_lines[:2]):
-        draw_stroked_text(d, (1020, 292 + idx * 36), line, def_font, (122, 132, 147, 255), stroke_width=0)
+        draw_stroked_text(d, (acx(1020), acy(292 + idx * 36)), line, def_font, (122, 132, 147, 255), stroke_width=0)
 
-    d.rounded_rectangle((940, 387, 1560, 506), radius=8, fill=(234, 241, 255, 255))
+    d.rounded_rectangle(article_rect(940, 387, 1560, 506), radius=acx(8), fill=(234, 241, 255, 255))
     if ARTICLE_TIP_ICON.exists():
         try:
-            icon = Image.open(ARTICLE_TIP_ICON).convert("RGBA").resize((48, 48), Image.Resampling.LANCZOS)
-            img.alpha_composite(icon, (956, 403))
+            icon = Image.open(ARTICLE_TIP_ICON).convert("RGBA").resize((acx(48), acy(48)), Image.Resampling.LANCZOS)
+            img.alpha_composite(icon, (acx(956), acy(403)))
         except Exception:
-            d.ellipse((956, 403, 1004, 451), fill=(47, 111, 237, 255))
+            d.ellipse(article_rect(956, 403, 1004, 451), fill=(47, 111, 237, 255))
             bulb_font = article_en_font(28, 700)
-            draw_stroked_text(d, (980, 428), "!", bulb_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
+            draw_stroked_text(d, (acx(980), acy(428)), "!", bulb_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
     else:
-        d.ellipse((956, 403, 1004, 451), fill=(47, 111, 237, 255))
+        d.ellipse(article_rect(956, 403, 1004, 451), fill=(47, 111, 237, 255))
         bulb_font = article_en_font(28, 700)
-        draw_stroked_text(d, (980, 428), "!", bulb_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
-    draw_stroked_text(d, (1020, 403), "TIP", tip_label_font, (47, 111, 237, 255), stroke_width=0)
+        draw_stroked_text(d, (acx(980), acy(428)), "!", bulb_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
+    draw_stroked_text(d, (acx(1020), acy(403)), "TIP", tip_label_font, (47, 111, 237, 255), stroke_width=0)
     for idx, line in enumerate(tip_lines[:2]):
-        draw_stroked_text(d, (1020, 436 + idx * int(tip_body_font.size * 1.28)), line, tip_body_font, (122, 132, 147, 255), stroke_width=0)
+        draw_stroked_text(d, (acx(1020), acy(436) + idx * int(tip_body_font.size * 1.28)), line, tip_body_font, (122, 132, 147, 255), stroke_width=0)
 
 
 def active_article_vocab(vocab_plan: dict[int, dict] | None, cue_index: int) -> dict | None:
@@ -1100,27 +1153,30 @@ def draw_article_frame(
     img = Image.new("RGBA", (ARTICLE_WIDTH, ARTICLE_HEIGHT), (247, 243, 234, 255))
     d = ImageDraw.Draw(img, "RGBA")
 
-    draw_article_panel(img, (16, 16, 900, 530), 16, (255, 253, 248, 255))
+    draw_article_panel(img, article_rect(16, 16, 900, 530), acx(16), (255, 253, 248, 255))
     cover = decorate_article_cover(article_image, date_text)
-    paste_rounded(img, cover, (31, 33, 885, 513), 8)
+    paste_rounded(img, cover, article_rect(31, 33, 885, 513), acx(8))
 
-    vocab_rect = (916, 16, 1584, 530)
+    vocab_rect = article_rect(916, 16, 1584, 530)
     vocab = active_article_vocab(vocab_plan, cue.index) if cue and show_vocab else None
     if cue and show_vocab and not vocab:
         vocab = find_vocab(cue.en)
-    draw_article_vocab_card(img, vocab, vocab_rect)
+    if vocab:
+        draw_article_vocab_card(img, vocab, vocab_rect)
+    else:
+        draw_article_panel(img, vocab_rect, acx(16), (255, 253, 248, 255))
 
-    draw_article_panel(img, (16, 546, 1584, 884), 16, (241, 236, 227, 255))
+    draw_article_panel(img, article_rect(16, 546, 1584, 884), acx(16), (241, 236, 227, 255))
 
     if cue:
         key = vocab["key"] if vocab else None
         en_x = 68
         en_width = 1455
         en_font = fit_article_en_font(d, cue.en, en_width)
-        en_lines = wrap_en(d, cue.en, en_font, en_width)[:2]
+        en_lines = wrap_en(d, cue.en, en_font, acx(en_width))[:2]
         zh_font = article_cjk_font(46, 700)
-        zh_width = 1032
-        zh_lines = wrap_zh(d, cue.zh, zh_font, zh_width)[:2] if cue.zh else []
+        zh_width = 1455
+        zh_lines = wrap_zh(d, cue.zh, zh_font, acx(zh_width))[:2] if cue.zh else []
         en_gap = int(en_font.size * 1.16)
         zh_gap = 58
         en_count = max(1, len(en_lines))
@@ -1136,14 +1192,14 @@ def draw_article_frame(
         for idx, line in enumerate(en_lines):
             fill = with_alpha((42, 63, 93, 255), subtitle_alpha)
             if key and key.lower() in line.lower():
-                draw_highlighted_article_line(d, en_x + en_width // 2, en_y + idx * en_gap, line, key, en_font, fill, with_alpha(ARTICLE_BLUE, subtitle_alpha))
+                draw_highlighted_article_line(d, acx(en_x + en_width // 2), acy(en_y) + idx * en_gap, line, key, en_font, fill, with_alpha(ARTICLE_BLUE, subtitle_alpha))
             else:
-                line_x = en_x + (en_width - text_w(d, line, en_font)) // 2
-                draw_stroked_text(d, (line_x, en_y + idx * en_gap), line, en_font, fill, stroke_width=0)
+                line_x = acx(en_x) + (acx(en_width) - text_w(d, line, en_font)) // 2
+                draw_stroked_text(d, (line_x, acy(en_y) + idx * en_gap), line, en_font, fill, stroke_width=0)
         if zh_lines:
             zh_fill = with_alpha((65, 81, 104, 255), subtitle_alpha)
             for idx, line in enumerate(zh_lines):
-                draw_stroked_text(d, (280 + zh_width // 2, zh_y + idx * zh_gap), line, zh_font, zh_fill, anchor="ma", stroke_width=0)
+                draw_stroked_text(d, (acx(280 + zh_width // 2), acy(zh_y) + idx * acy(zh_gap)), line, zh_font, zh_fill, anchor="ma", stroke_width=0)
     return img
 
 
@@ -1201,7 +1257,7 @@ def render_podcast_learning_video(
     out_width = ARTICLE_WIDTH if is_article_template else WIDTH
     out_height = ARTICLE_HEIGHT if is_article_template else HEIGHT
     base = None if is_article_template else make_base(background_path)
-    article_image = make_article_image(cover_path, (854, 480)) if is_article_template else None
+    article_image = make_article_image(cover_path, (acx(854), acy(480))) if is_article_template else None
     male, female = (None, None) if is_article_template else make_avatars()
     title_text = (title_text or TITLE_TEXT).strip() or TITLE_TEXT
     date_text = (date_text or "Jul 23rd 2026").strip() or "Jul 23rd 2026"
