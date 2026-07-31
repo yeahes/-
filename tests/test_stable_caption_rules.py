@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -20,9 +22,10 @@ from app.core.subtitle_processor.stable_ts_alignment import (
     _whisperx_mapping_is_complete,
 )
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
-from app.core.entities import SubtitleConfig, SubtitleTask
+from app.core.entities import SynthesisConfig, SynthesisTask, SubtitleConfig, SubtitleTask
 from app.thread.subtitle_thread import SubtitleThread
-from app.thread.video_synthesis_thread import resolve_podcast_template_subtitle
+from app.thread.video_synthesis_thread import VideoSynthesisThread, resolve_podcast_template_subtitle
+from app.core.utils import podcast_learning_video
 from tests.caption_audit.metrics import (
     CaptionCue,
     audit_srt,
@@ -2480,6 +2483,81 @@ def test_podcast_template_ignores_blocked_stable_manifest_subtitle():
         resolved = resolve_podcast_template_subtitle("C:/tmp/222.m4a", str(ass))
 
         assert Path(resolved) == ass
+
+
+def test_podcast_template_preserves_full_media_duration_when_subtitles_end_early():
+    class _FakeStdin:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, payload):
+            self.frames.append(payload)
+
+        def close(self):
+            pass
+
+    class _FakeProcess:
+        def __init__(self):
+            self.stdin = _FakeStdin()
+
+        def wait(self):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            raise AssertionError("successful template process must not be killed")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        srt = root / "short.srt"
+        srt.write_text(
+            "1\n00:00:00,000 --> 00:00:00,200\nHello.\n你好。\n",
+            encoding="utf-8",
+        )
+        process = _FakeProcess()
+        with patch.object(podcast_learning_video, "get_duration", return_value=3.0), \
+             patch.object(podcast_learning_video, "FPS", 1), \
+             patch.object(podcast_learning_video, "make_base", return_value=Image.new("RGBA", (2, 2))), \
+             patch.object(podcast_learning_video, "make_avatars", return_value=(None, None)), \
+             patch.object(podcast_learning_video, "draw_frame", return_value=Image.new("RGB", (2, 2))), \
+             patch.object(podcast_learning_video.subprocess, "Popen", return_value=process):
+            podcast_learning_video.render_podcast_learning_video(
+                "source.m4a",
+                str(srt),
+                str(root / "output.mp4"),
+            )
+
+        assert len(process.stdin.frames) == 3
+
+
+def test_podcast_template_uses_frozen_task_configuration():
+    config = SynthesisConfig(
+        podcast_learning_template=True,
+        podcast_template_style="文章单词",
+        podcast_template_ai_vocab=True,
+        podcast_template_title="Frozen title",
+        podcast_template_background="C:/images/background.png",
+        podcast_template_cover="C:/images/cover.png",
+        podcast_template_date="Jul 31st 2026",
+    )
+    task = SynthesisTask(
+        video_path="C:/media/input.m4a",
+        subtitle_path="C:/media/input.srt",
+        output_path="C:/media/output.mp4",
+        synthesis_config=config,
+    )
+    with patch("app.thread.video_synthesis_thread.render_podcast_learning_video") as render:
+        VideoSynthesisThread(task).run()
+
+    kwargs = render.call_args.kwargs
+    assert kwargs["template_style"] == "文章单词"
+    assert kwargs["show_ai_vocab"] is True
+    assert kwargs["title_text"] == "Frozen title"
+    assert kwargs["background_path"] == "C:/images/background.png"
+    assert kwargs["cover_path"] == "C:/images/cover.png"
+    assert kwargs["date_text"] == "Jul 31st 2026"
 
 
 def test_stable_srt_writer_keeps_bilingual_original_top():
@@ -4959,6 +5037,8 @@ if __name__ == "__main__":
     test_final_fragment_gate_records_unresolved_when_no_legal_solution()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_podcast_template_ignores_blocked_stable_manifest_subtitle()
+    test_podcast_template_preserves_full_media_duration_when_subtitles_end_early()
+    test_podcast_template_uses_frozen_task_configuration()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()
     test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()

@@ -1175,37 +1175,36 @@ def render_podcast_learning_video(
     media_path: str,
     subtitle_path: str,
     output_path: str,
+    template_style: str = "暗色播客",
+    show_ai_vocab: bool = False,
+    title_text: str = "",
+    background_path: str = "",
+    cover_path: str = "",
+    date_text: str = "",
     progress_callback=None,
 ) -> None:
     cues = parse_srt(subtitle_path)
     if not cues:
         raise RuntimeError("字幕文件没有可用内容")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    from app.common.config import cfg
-
     vocab_plan = load_or_generate_vocab_plan(
         subtitle_path,
         cues,
-        cfg.podcast_template_ai_vocab.value,
+        show_ai_vocab,
         progress_callback=progress_callback,
     )
-    duration = min(get_duration(media_path), max(cue.end for cue in cues) + 0.5)
+    # The template is a video presentation of the source media, not a subtitle
+    # clip. Keep the entire audio/video even when its final subtitle ends early.
+    duration = get_duration(media_path)
     frames = int(math.ceil(duration * FPS))
-    background_value = getattr(cfg, "podcast_template_background", None)
-    background_path = background_value.value if background_value else ""
-    cover_value = getattr(cfg, "podcast_template_cover", None)
-    cover_path = cover_value.value if cover_value else ""
-    date_value = getattr(cfg, "podcast_template_date", None)
-    date_text = date_value.value if date_value else "Jul 23rd 2026"
-    template_style_value = getattr(cfg, "podcast_template_style", None)
-    template_style = template_style_value.value if template_style_value else "暗色播客"
     is_article_template = template_style == "文章单词"
     out_width = ARTICLE_WIDTH if is_article_template else WIDTH
     out_height = ARTICLE_HEIGHT if is_article_template else HEIGHT
     base = None if is_article_template else make_base(background_path)
     article_image = make_article_image(cover_path, (854, 480)) if is_article_template else None
     male, female = (None, None) if is_article_template else make_avatars()
-    title_text = (cfg.podcast_template_title.value or TITLE_TEXT).strip() or TITLE_TEXT
+    title_text = (title_text or TITLE_TEXT).strip() or TITLE_TEXT
+    date_text = (date_text or "Jul 23rd 2026").strip() or "Jul 23rd 2026"
 
     cmd = [
         str(FFMPEG),
@@ -1267,7 +1266,7 @@ def render_podcast_learning_video(
                         cue,
                         vocab_plan,
                         alpha,
-                        cfg.podcast_template_ai_vocab.value,
+                        show_ai_vocab,
                         title_text,
                         date_text,
                     ).convert("RGB")
@@ -1279,7 +1278,7 @@ def render_podcast_learning_video(
                         cue,
                         vocab_plan,
                         alpha,
-                        cfg.podcast_template_ai_vocab.value,
+                        show_ai_vocab,
                         title_text,
                     ).convert("RGB")
                 cached_frame_bytes = frame.tobytes()

@@ -581,6 +581,11 @@ class SynthesisConfig:
     soft_subtitle: bool = True
     podcast_learning_template: bool = False
     podcast_template_style: str = "暗色播客"
+    podcast_template_ai_vocab: bool = False
+    podcast_template_title: str = ""
+    podcast_template_background: str = ""
+    podcast_template_cover: str = ""
+    podcast_template_date: str = ""
     subtitle_render_mode: str = "ASS样式"
     subtitle_layout: str = "译文在上"
     rounded_style: dict = field(default_factory=dict)

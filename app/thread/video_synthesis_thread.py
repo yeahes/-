@@ -97,9 +97,15 @@ class VideoSynthesisThread(QThread):
                     video_file,
                     subtitle_file,
                     output_path,
+                    template_style=self.task.synthesis_config.podcast_template_style,
+                    show_ai_vocab=self.task.synthesis_config.podcast_template_ai_vocab,
+                    title_text=self.task.synthesis_config.podcast_template_title,
+                    background_path=self.task.synthesis_config.podcast_template_background,
+                    cover_path=self.task.synthesis_config.podcast_template_cover,
+                    date_text=self.task.synthesis_config.podcast_template_date,
                     progress_callback=self.progress_callback,
                 )
-                self.progress.emit(100, self.tr("鍚堟垚瀹屾垚"))
+                self.progress.emit(100, self.tr("合成完成"))
                 logger.info(f"Podcast learning template video saved: {output_path}")
                 self.finished.emit(self.task)
                 return

@@ -252,6 +252,11 @@ class TaskFactory:
             soft_subtitle=cfg.soft_subtitle.value,
             podcast_learning_template=cfg.podcast_learning_template.value,
             podcast_template_style=cfg.podcast_template_style.value,
+            podcast_template_ai_vocab=cfg.podcast_template_ai_vocab.value,
+            podcast_template_title=cfg.podcast_template_title.value,
+            podcast_template_background=cfg.podcast_template_background.value,
+            podcast_template_cover=cfg.podcast_template_cover.value,
+            podcast_template_date=cfg.podcast_template_date.value,
             subtitle_render_mode=cfg.subtitle_render_mode.value,
             subtitle_layout=cfg.subtitle_layout.value,
             rounded_style={
