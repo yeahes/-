@@ -1199,7 +1199,7 @@ def draw_article_frame(
         if zh_lines:
             zh_fill = with_alpha((65, 81, 104, 255), subtitle_alpha)
             for idx, line in enumerate(zh_lines):
-                draw_stroked_text(d, (acx(280 + zh_width // 2), acy(zh_y) + idx * acy(zh_gap)), line, zh_font, zh_fill, anchor="ma", stroke_width=0)
+                draw_stroked_text(d, (ARTICLE_WIDTH // 2, acy(zh_y) + idx * acy(zh_gap)), line, zh_font, zh_fill, anchor="ma", stroke_width=0)
     return img
 
 

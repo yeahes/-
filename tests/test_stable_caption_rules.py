@@ -2577,14 +2577,22 @@ def test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths():
         "male",
     )
     original_wrap_zh = podcast_learning_video.wrap_zh
+    original_draw_text = podcast_learning_video.draw_stroked_text
     widths = []
+    chinese_centers = []
 
     def capture_wrap_zh(draw, text, fnt, max_width):
         widths.append(max_width)
         return original_wrap_zh(draw, text, fnt, max_width)
 
+    def capture_draw_text(draw, xy, text, *args, **kwargs):
+        if any("\u4e00" <= char <= "\u9fff" for char in text):
+            chinese_centers.append((xy, kwargs.get("anchor")))
+        return original_draw_text(draw, xy, text, *args, **kwargs)
+
     with patch.object(podcast_learning_video, "wrap_zh", side_effect=capture_wrap_zh), \
-         patch.object(podcast_learning_video, "draw_article_vocab_card") as draw_card:
+         patch.object(podcast_learning_video, "draw_article_vocab_card") as draw_card, \
+         patch.object(podcast_learning_video, "draw_stroked_text", side_effect=capture_draw_text):
         frame = podcast_learning_video.draw_article_frame(
             article_image,
             cue,
@@ -2595,6 +2603,7 @@ def test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths():
     assert frame.size == (1920, 1080)
     assert podcast_learning_video.acx(1455) in widths
     assert not draw_card.called
+    assert any(xy[0] == 960 and anchor == "ma" for xy, anchor in chinese_centers)
 
 
 def test_article_template_tip_font_and_wrapper_support_chinese_text():
