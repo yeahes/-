@@ -12,10 +12,12 @@ if str(ROOT) not in sys.path:
 
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
 from app.core.subtitle_processor.stable_ts_alignment import (
+    _make_frozen_word_timed_subtitle_segments,
     _make_whisperx_subtitle_segments,
     _make_whisperx_word_segments,
     _pad_short_subtitle_timing_sequence,
     _repair_subtitle_timing_sequence,
+    _whisperx_mapping_is_complete,
 )
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.entities import SubtitleConfig, SubtitleTask
@@ -89,6 +91,91 @@ def _split_text(text, max_words=14):
     ]
 
 
+def test_final_time_alignment_reapplies_display_padding_to_loaded_short_subtitle():
+    editor = _editor()
+    segments = [
+        ASRDataSeg("Previous line.", 0, 1000, "前一句。"),
+        ASRDataSeg("over 20% of its real value.", 1200, 1320, "超过20%的实际价值。"),
+        ASRDataSeg("Next line.", 2300, 3200, "下一句。"),
+    ]
+    for index, seg in enumerate(segments, 1):
+        seg.subtitle_id = f"S{index:04d}"
+
+    repaired = editor._repair_final_short_subtitle_timings(segments)
+
+    assert repaired[1].end_time - repaired[1].start_time >= 700
+    assert repaired[0].end_time <= repaired[1].start_time - 40
+    assert repaired[1].end_time <= repaired[2].start_time - 40
+    assert repaired[1].text == segments[1].text
+    assert repaired[1].translated_text == segments[1].translated_text
+    assert getattr(repaired[1], "subtitle_id") == "S0002"
+
+
+def test_final_time_alignment_shifts_next_when_loaded_short_has_no_gap():
+    editor = _editor()
+    segments = [
+        ASRDataSeg("deliver the joke,", 302600, 305840, "讲出笑话，"),
+        ASRDataSeg(
+            "and react to the silence if it completely bombs.",
+            305880,
+            306140,
+            "并且在它彻底冷场时应对沉默。",
+        ),
+        ASRDataSeg("Right. You're on the hook for the delivery.", 306180, 307740, "没错，你要负责实际的表达。"),
+    ]
+    for index, seg in enumerate(segments, 1):
+        seg.subtitle_id = f"S{index:04d}"
+
+    repaired = editor._repair_final_short_subtitle_timings(segments)
+
+    assert repaired[1].start_time == 305880
+    assert repaired[1].end_time - repaired[1].start_time >= 700
+    assert repaired[2].start_time >= repaired[1].end_time + 40
+    assert repaired[2].end_time - repaired[2].start_time >= 700
+    assert repaired[1].text == segments[1].text
+    assert repaired[2].text == segments[2].text
+    assert getattr(repaired[1], "subtitle_id") == "S0002"
+    assert getattr(repaired[2], "subtitle_id") == "S0003"
+
+
+def test_final_time_alignment_runs_chinese_speed_repair_without_touching_english():
+    editor = _editor()
+    asr_data = ASRData(
+        [
+            ASRDataSeg(
+                "can't spell to save his life.",
+                0,
+                1560,
+                "拼写烂到不行的人之手的文本所带来的恐怖谷效应说起。",
+            )
+        ]
+    )
+    asr_data.segments[0].subtitle_id = "S0001"
+    editor._last_semantic_groups = [{"id": 1, "items": []}]
+    editor._last_subtitle_items = []
+
+    called = {}
+
+    def fake_compress(segments, semantic_groups=None, subtitle_items=None):
+        called["semantic_groups"] = semantic_groups
+        return [
+            editor._copy_segment(
+                segments[0],
+                translated_text="它来自一个平时拼写很差的人",
+            )
+        ]
+
+    editor._compress_fast_chinese_segments = fake_compress
+    editor._write_coverage_report = lambda *args, **kwargs: None
+
+    repaired = editor.repair_after_final_time_alignment(asr_data)
+
+    assert called["semantic_groups"] == editor._last_semantic_groups
+    assert repaired.segments[0].text == "can't spell to save his life."
+    assert getattr(repaired.segments[0], "subtitle_id") == "S0001"
+    assert repaired.segments[0].translated_text == "它来自一个平时拼写很差的人"
+
+
 def _words(text):
     return ScreenSubtitleEditor._word_tokens(text)
 
@@ -114,6 +201,16 @@ def _id_editor():
     editor._llm_cache_stats = {}
     editor._allocation_runtime_stats = {}
     return editor
+
+
+def test_screen_editor_uses_16_word_stable_hard_floor():
+    with patch.object(ScreenSubtitleEditor, "_init_client", return_value=None):
+        editor = ScreenSubtitleEditor(
+            model="test-model",
+            max_english_words=14,
+        )
+
+    assert editor.max_english_words == 16
 
 
 class _NoCache:
@@ -230,13 +327,13 @@ class _StaticCache:
         raise AssertionError("cache-backed test must not write")
 
 
-def _assert_stable_split(text):
-    parts = _split_text(text)
+def _assert_stable_split(text, max_words=16):
+    parts = _split_text(text, max_words=max_words)
     assert parts
     rebuilt = [word for part in parts for word in _words(part)]
     assert rebuilt == _words(text)
     for part in parts:
-        assert len(_words(part)) <= 14, part
+        assert len(_words(part)) <= max_words, part
         first = _words(part)[0]
         last = _words(part)[-1]
         assert first not in {"of", "for", "with", "by", "to"}, parts
@@ -733,6 +830,9 @@ def test_syntax_boundary_audit_keeps_confirmed_bad_cuts():
         ("Rajan's", "rather provocative idea"),
         ("they took", "this low-lying"),
         ("state assets across", "the 10 most active provinces"),
+        ("A 56 year-old man is weaving a loaded", "motorized scooter"),
+        ("motorized scooter through the dense", "chaotic traffic"),
+        ("we really have to look", "at the mechanics"),
     ]
 
     for left, right in confirmed:
@@ -785,6 +885,28 @@ def test_chinese_semantic_audit_skips_semantic_loss_when_mapping_invalid():
     issues = editor._chinese_semantic_group_audit_issues(segments, "WARNING")
 
     assert not [issue for issue in issues if "semantic_loss" in issue.get("reason", "")]
+
+
+def test_chinese_semantic_audit_ignores_normal_short_responses():
+    editor = _editor()
+    samples = [
+        ("Good question.", "问得好。"),
+        ("Oh, yeah.", "哦，是的。"),
+        ("In a way, yeah.", "在某种程度上，是的。"),
+    ]
+    for index, (english, chinese) in enumerate(samples, 1):
+        subtitle_id = f"S{index:04d}"
+        group_id = f"G{index:04d}"
+        editor._last_semantic_group_audit_contexts = {
+            group_id: _semantic_context(index, [subtitle_id], english, chinese)
+        }
+        editor._last_semantic_group_id_by_subtitle_id = {subtitle_id: group_id}
+        segment = ASRDataSeg(english, index * 1000, index * 1000 + 800, chinese)
+        segment.subtitle_id = subtitle_id
+
+        issues = editor._chinese_semantic_group_audit_issues([segment], "WARNING")
+
+        assert not issues
 
 
 def test_semantic_audit_context_requires_id_signature_and_expected_ids():
@@ -1082,6 +1204,22 @@ def test_asr_suspicious_phrases_are_reported_without_fixing_text():
     assert "asr_ungrammatical_collocation" in codes
     assert "asr_semantic_nonsense" in codes
     assert "asr_hyphenation_suspicious" in codes
+
+
+def test_asr_suspicious_article_context_misses_are_reported():
+    editor = _editor()
+    segments = [
+        ASRDataSeg("And the invisible electric cess was still there?", 0, 1200, "ok"),
+        ASRDataSeg("Only 10% of America respondents said yes.", 1300, 2600, "ok"),
+        ASRDataSeg("Taylor Swift plans to legally adopt Kils surname.", 2700, 4200, "ok"),
+    ]
+
+    issues = editor._asr_suspicious_issues(segments)
+    codes = {issue.get("rule_code") for issue in issues}
+
+    assert "asr_semantic_nonsense" in codes
+    assert "asr_adjective_form_suspicious" in codes
+    assert "asr_name_suspicious" in codes
 
 
 def test_abbreviation_name_boundary_is_syntax_warning():
@@ -2034,13 +2172,13 @@ def test_final_gate_blocks_particle_preposition_complement_split():
     assert not evaluation["legal"]
 
 
-def test_final_gate_blocks_short_verb_object_split():
+def test_final_gate_soft_flags_heuristic_short_verb_object_split():
     editor = _marker_editor(["issued", "this", "stark", "public", "warning"])
 
     evaluation = editor._evaluate_stable_cut_boundary(0, 1)
 
-    assert "short_verb_object_split" in evaluation["hard_issues"]
-    assert not evaluation["legal"]
+    assert "short_verb_object_split" in evaluation["soft_issues"]
+    assert evaluation["legal"]
 
 
 def test_final_gate_blocks_auxiliary_predicate_split():
@@ -2052,13 +2190,13 @@ def test_final_gate_blocks_auxiliary_predicate_split():
     assert not evaluation["legal"]
 
 
-def test_final_gate_blocks_catenative_verb_complement_split():
+def test_final_gate_soft_flags_heuristic_catenative_verb_complement_split():
     editor = _marker_editor(["helped", "expose", "the", "crimes"])
 
     evaluation = editor._evaluate_stable_cut_boundary(0, 1)
 
-    assert "verb_complement_split" in evaluation["hard_issues"]
-    assert not evaluation["legal"]
+    assert "verb_complement_split" in evaluation["soft_issues"]
+    assert evaluation["legal"]
 
 
 def test_final_gate_blocks_numeric_unit_or_noun_split():
@@ -2070,22 +2208,22 @@ def test_final_gate_blocks_numeric_unit_or_noun_split():
     assert not evaluation["legal"]
 
 
-def test_final_gate_blocks_compound_noun_split():
+def test_final_gate_soft_flags_heuristic_compound_noun_split():
     editor = _marker_editor(["large-scale", "job", "displacement"])
 
     evaluation = editor._evaluate_stable_cut_boundary(1, 2)
 
-    assert "compound_noun_split" in evaluation["hard_issues"]
-    assert not evaluation["legal"]
+    assert "compound_noun_split" in evaluation["soft_issues"]
+    assert evaluation["legal"]
 
 
-def test_final_gate_blocks_modifier_noun_head_split():
+def test_final_gate_soft_flags_heuristic_modifier_noun_head_split():
     editor = _marker_editor(["the", "vast", "majority", "of", "people"])
 
     evaluation = editor._evaluate_stable_cut_boundary(1, 2)
 
-    assert "modifier_noun_head_split" in evaluation["hard_issues"]
-    assert not evaluation["legal"]
+    assert "modifier_noun_head_split" in evaluation["soft_issues"]
+    assert evaluation["legal"]
 
 
 def test_final_gate_blocks_negation_emphasis_split():
@@ -2124,13 +2262,87 @@ def test_final_gate_blocks_time_range_to_continuation():
     assert not evaluation["legal"]
 
 
-def test_final_gate_blocks_phrasal_verb_particle_split():
+def test_final_gate_blocks_coordinated_modifier_split():
+    editor = _marker_editor(["a", "massive", "economic", "and", "social", "pressure", "cooker"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(2, 3)
+
+    assert "coordinated_modifier_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_modifier_chain_split():
+    editor = _marker_editor(["a", "massive", "economic", "and", "social", "pressure", "cooker"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "modifier_chain_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_final_gate_blocks_high_confidence_phrasal_verb_particle_split():
     editor = _marker_editor(["we", "really", "have", "to", "look", "at", "the", "mechanics"])
 
     evaluation = editor._evaluate_stable_cut_boundary(4, 5)
 
-    assert "phrasal_verb_particle_split" in evaluation["hard_issues"]
+    assert "protected_phrasal_boundary_split" in evaluation["hard_issues"]
     assert not evaluation["legal"]
+
+
+def test_number_anchor_accepts_billion_to_chinese_yi_conversion():
+    editor = _id_editor()
+    anchors = editor._build_group_allocation_anchors("They raised 57.9 billion yuan.")
+
+    number_anchor = next(anchor for anchor in anchors if anchor["type"] == "number")
+
+    assert number_anchor["value"] == "57900000000"
+    assert editor._allocation_anchor_present(number_anchor["value"], "number", "他们募集了579亿人民币。")
+    assert editor._allocation_anchor_present("8600000000", "number", "大约是86亿美元。")
+
+
+def test_number_anchor_accepts_decade_and_century_chinese_equivalents():
+    editor = _id_editor()
+
+    assert editor._allocation_anchor_present("2000", "number", "他在21世纪初转向健美。")
+    assert editor._allocation_anchor_present("1800", "number", "可以想象成19世纪铺设铁路。")
+
+
+def test_negation_anchor_accepts_natural_chinese_question_tags_and_until_pattern():
+    editor = _id_editor()
+
+    assert editor._allocation_anchor_present("negation", "negation", "对吧？")
+    assert editor._allocation_anchor_present("negation", "negation", "他直到62岁才创办那家公司。")
+
+
+def test_legacy_sample_specific_fragment_rules_are_not_hardcoded():
+    assert not ScreenSubtitleEditor._is_bad_chinese_fragment("而如果联系更宏观层面，")
+    assert not ScreenSubtitleEditor._is_bad_chinese_fragment("经过一栋空置的政府大楼")
+
+
+def test_final_fragment_gate_repairs_trailing_dependent_fragments():
+    editor = _marker_editor(["It's", "a", "mind-bending", "number.", "And", "they", "aren't", "funding"], max_words=8)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 4, 2), _word_item(editor, 5, 7, 3)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    texts = [item.original for item in repaired]
+    assert texts == ["It's a mind-bending number. And they aren't funding"]
+    assert all(not editor._ends_with_dependent_boundary_token(text) for text in texts)
+    assert all(item.subtitle_id is None for item in repaired)
+
+
+def test_final_fragment_gate_repairs_possessive_and_quantifier_tails():
+    editor = _marker_editor(
+        ["all", "the", "capital", "committed", "to", "markets", "company's", "trajectory"],
+        max_words=6,
+    )
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 5, 2), _word_item(editor, 6, 6, 3), _word_item(editor, 7, 7, 4)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    texts = [item.original for item in repaired]
+    assert texts == ["all the capital committed to markets", "company's trajectory"]
+    assert all(item.subtitle_id is None for item in repaired)
 
 
 def test_final_gate_allows_sentence_initial_to_me_after_punctuation():
@@ -2245,6 +2457,29 @@ def test_podcast_template_prefers_stable_manifest_subtitle():
         resolved = resolve_podcast_template_subtitle("C:/tmp/222.m4a", str(ass))
 
         assert Path(resolved) == stable
+
+
+def test_podcast_template_ignores_blocked_stable_manifest_subtitle():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        stable = root / "stable-final-original-top.srt"
+        manifest = root / "stable-final-manifest.json"
+        ass = root / "output.ass"
+        stable.write_text("stable", encoding="utf-8")
+        ass.write_text("", encoding="utf-8")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "render_blocked": True,
+                    "paths": {"original_top_srt": str(stable)},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resolved = resolve_podcast_template_subtitle("C:/tmp/222.m4a", str(ass))
+
+        assert Path(resolved) == ass
 
 
 def test_stable_srt_writer_keeps_bilingual_original_top():
@@ -2835,6 +3070,39 @@ def test_allocation_quality_rejects_adjacent_core_duplication():
     assert "adjacent_chinese_semantic_duplication" in validation["issue_codes"]
 
 
+def test_allocation_quality_rejects_adjacent_long_common_phrase_duplication():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "身边的人究竟是爱真实的我们，还是只是爱上了我们雇来替我们说话的算法？",
+        "subtitle_parts": [
+            {
+                "subtitle_id": "S0001",
+                "english": "if the people in our lives actually love us for who we are, or if they're",
+            },
+            {
+                "subtitle_id": "S0002",
+                "english": "just in love with the algorithm we hired to speak for us?",
+            },
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "身边的人究竟是爱真实的我们，还是只是爱上了那个我们雇来替我们说话的算法呢",
+            "S0002": "只是爱上了我们雇来替我们说话的算法吗？",
+        },
+    )
+
+    assert not validation["valid"]
+    assert "adjacent_chinese_semantic_duplication" in validation["issue_codes"]
+    assert any(
+        issue.get("reason") == "adjacent_long_common_phrase"
+        for issue in validation["issues"]
+    )
+
+
 def test_allocation_quality_detects_negation_misplacement():
     editor = _id_editor()
     entry = {
@@ -2953,6 +3221,50 @@ def test_allocation_quality_accepts_chinese_number_equivalents():
         million_entry,
         {"S0001": "拥有一千万并不会让你更快乐。"},
     )
+    blue_collar_entry = {
+        "id": 5,
+        "full_translation": "中国经济中蓝领工人的数量达到了4亿人。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "China has 400 million blue-collar workers."},
+        ],
+    }
+    blue_collar_validation = editor._validate_group_chinese_allocation(
+        blue_collar_entry,
+        {"S0001": "中国经济中蓝领工人的数量达到了4亿人。"},
+    )
+    raised_entry = {
+        "id": 6,
+        "full_translation": "他们募集了579亿人民币。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "They raised 57.9 billion yuan."},
+        ],
+    }
+    raised_validation = editor._validate_group_chinese_allocation(
+        raised_entry,
+        {"S0001": "他们募集了579亿人民币。"},
+    )
+    usd_entry = {
+        "id": 7,
+        "full_translation": "大约是86亿美元。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "That's about 8.6 billion U S."},
+        ],
+    }
+    usd_validation = editor._validate_group_chinese_allocation(
+        usd_entry,
+        {"S0001": "大约是86亿美元。"},
+    )
+    decade_entry = {
+        "id": 8,
+        "full_translation": "他在21世纪初转向健美。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "He pivoted to bodybuilding in the early 2000 s."},
+        ],
+    }
+    decade_validation = editor._validate_group_chinese_allocation(
+        decade_entry,
+        {"S0001": "他在21世纪初转向健美。"},
+    )
     economists_entry = {
         "id": 4,
         "full_translation": "那两百位经济学家发出了警告。",
@@ -2971,6 +3283,14 @@ def test_allocation_quality_accepts_chinese_number_equivalents():
     assert "number_allocation_mismatch" not in hours_validation["issue_codes"]
     assert million_validation["valid"]
     assert "number_allocation_mismatch" not in million_validation["issue_codes"]
+    assert blue_collar_validation["valid"]
+    assert "number_allocation_mismatch" not in blue_collar_validation["issue_codes"]
+    assert raised_validation["valid"]
+    assert "number_allocation_mismatch" not in raised_validation["issue_codes"]
+    assert usd_validation["valid"]
+    assert "number_allocation_mismatch" not in usd_validation["issue_codes"]
+    assert decade_validation["valid"]
+    assert "number_allocation_mismatch" not in decade_validation["issue_codes"]
     assert economists_validation["valid"]
     assert "number_allocation_mismatch" not in economists_validation["issue_codes"]
 
@@ -3501,6 +3821,76 @@ def test_whisperx_time_only_preserves_text_and_translation_while_retiming():
     assert remapped.segments[0].end_time + 40 <= remapped.segments[1].start_time
 
 
+def test_whisperx_time_only_rejects_incomplete_subtitle_mapping():
+    source = [
+        ASRDataSeg(
+            "2001 to 2011 and then compared that decade to the years 2013 to 2023.",
+            690574,
+            692857,
+            "2001年到2011年，再与2013年到2023年对比。",
+        ),
+        ASRDataSeg(
+            "Okay. And what did they find?",
+            692897,
+            694387,
+            "好的。那他们发现了什么？",
+        ),
+    ]
+    aligned_words = [
+        {"text": "2001", "start": 690.54, "end": 691.20},
+        {"text": "to", "start": 691.20, "end": 691.50},
+        {"text": "2011", "start": 691.60, "end": 692.18},
+        {"text": "and", "start": 692.18, "end": 692.72},
+        {"text": "then", "start": 692.72, "end": 692.86},
+        {"text": "Okay", "start": 696.58, "end": 696.82},
+        {"text": "And", "start": 697.02, "end": 697.04},
+        {"text": "what", "start": 697.04, "end": 697.26},
+        {"text": "did", "start": 697.26, "end": 697.38},
+        {"text": "they", "start": 697.38, "end": 697.50},
+        {"text": "find", "start": 697.50, "end": 697.80},
+    ]
+
+    remapped = _make_whisperx_subtitle_segments(
+        source,
+        aligned_words,
+        lead_in_ms=20,
+        tail_padding_ms=180,
+        min_duration_ms=650,
+    )
+
+    assert not _whisperx_mapping_is_complete(remapped, source)
+    assert getattr(remapped, "whisperx_unmatched_subtitles")[0]["index"] == 1
+    assert remapped.segments[0].end_time == source[0].end_time
+
+
+def test_frozen_word_timing_prevents_whisperx_from_compressing_long_subtitle():
+    segment = ASRDataSeg(
+        "2001 to 2011 and then compared that decade to the years 2013 to 2023.",
+        690595,
+        692917,
+        "2001年到2011年，再与2013年到2023年对比。",
+    )
+    segment.subtitle_id = "S0226"
+    segment.word_start = 2012
+    segment.word_end = 2025
+    segment.stable_word_start_ms = 690540
+    segment.stable_word_end_ms = 695460
+
+    remapped = _make_frozen_word_timed_subtitle_segments(
+        [segment],
+        lead_in_ms=20,
+        tail_padding_ms=180,
+        min_duration_ms=650,
+    )
+
+    assert remapped is not None
+    assert remapped.segments[0].start_time == 690520
+    assert remapped.segments[0].end_time == 695640
+    assert remapped.segments[0].end_time > 692917
+    assert remapped.segments[0].text == segment.text
+    assert getattr(remapped.segments[0], "subtitle_id") == "S0226"
+
+
 def test_whisperx_time_only_pads_ultra_short_subtitle_when_neighbor_room_exists():
     segments = [
         ASRDataSeg("Before.", 0, 2400, "之前。"),
@@ -3734,12 +4124,422 @@ def test_full_merge_repair_chain_keeps_400_plus_ids_without_drift():
     assert [seg.text for seg in repaired] == [seg.text for seg in segments]
 
 
+def test_safe_auto_repair_is_noop_when_disabled():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = False
+    segments = [
+        ASRDataSeg("First different sentence.", 0, 1500, "这是明显重复的中文。"),
+        ASRDataSeg("Second different sentence.", 1500, 3000, "这是明显重复的中文。"),
+    ]
+    for index, seg in enumerate(segments, 1):
+        seg.subtitle_id = f"S{index:04d}"
+
+    repaired = editor._safe_auto_repair_segments(segments, stage="test")
+
+    assert [seg.text for seg in repaired] == [seg.text for seg in segments]
+    assert [seg.translated_text for seg in repaired] == [seg.translated_text for seg in segments]
+
+
+def test_safe_auto_repair_retranslates_exact_duplicate_chinese_by_id():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_log = []
+    segments = [
+        ASRDataSeg("First different sentence.", 0, 1800, "这是明显重复的中文。"),
+        ASRDataSeg("Second different sentence.", 1800, 3600, "这是明显重复的中文。"),
+    ]
+    for index, seg in enumerate(segments, 1):
+        seg.subtitle_id = f"S{index:04d}"
+
+    with patch.object(editor, "_translate_split_parts", return_value=["第二句正确中文。"]):
+        repaired = editor._safe_auto_repair_segments(segments, stage="test")
+
+    assert [seg.subtitle_id for seg in repaired] == ["S0001", "S0002"]
+    assert [seg.text for seg in repaired] == [seg.text for seg in segments]
+    assert [(seg.start_time, seg.end_time) for seg in repaired] == [
+        (seg.start_time, seg.end_time) for seg in segments
+    ]
+    assert repaired[0].translated_text == "这是明显重复的中文。"
+    assert repaired[1].translated_text == "第二句正确中文。"
+    assert editor._safe_auto_repair_log
+    assert editor._safe_auto_repair_log[-1]["subtitle_id"] == "S0002"
+
+
+def test_safe_auto_repair_extends_high_load_short_subtitle_when_neighbor_has_room():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_log = []
+    segments = [
+        ASRDataSeg(
+            "He is trying to prevent the natural price discovery of the market.",
+            1000,
+            1700,
+            "他试图阻止市场自然的价格发现机制。",
+        ),
+        ASRDataSeg("And the next sentence has enough room.", 1740, 5200, "下一句有足够空间。"),
+    ]
+
+    repaired = editor._repair_final_short_subtitle_timings(segments)
+
+    assert repaired[0].end_time - repaired[0].start_time > 700
+    assert repaired[0].end_time <= repaired[1].start_time - 40
+    assert repaired[0].text == segments[0].text
+    assert repaired[0].translated_text == segments[0].translated_text
+    assert any(item["code"] == "high_load_short_timing_repaired" for item in editor._safe_auto_repair_log)
+
+
+def test_safe_auto_repair_does_not_extend_high_load_short_subtitle_when_disabled():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = False
+    segments = [
+        ASRDataSeg(
+            "He is trying to prevent the natural price discovery of the market.",
+            1000,
+            1700,
+            "他试图阻止市场自然的价格发现机制。",
+        ),
+        ASRDataSeg("And the next sentence has enough room.", 1740, 5200, "下一句有足够空间。"),
+    ]
+
+    repaired = editor._repair_final_short_subtitle_timings(segments)
+
+    assert repaired[0].end_time - repaired[0].start_time < editor._target_high_load_duration_ms(segments[0])
+    assert repaired[0].text == segments[0].text
+
+
+def test_duration_audit_reports_high_load_short_subtitle_as_warning():
+    editor = _id_editor()
+    segments = [
+        ASRDataSeg(
+            "He is trying to prevent the natural price discovery of the market.",
+            1000,
+            1700,
+            "他试图阻止市场自然的价格发现机制。",
+        )
+    ]
+
+    issues = editor._subtitle_duration_issues(segments, "WARNING")
+
+    assert issues
+    assert issues[0]["code"] == "subtitle_high_load_too_short"
+
+
+def test_safe_auto_repair_records_review_candidates_without_rewriting_fragments():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_candidates = []
+    segments = [
+        ASRDataSeg("Yes, this is the key part.", 0, 1200, "是的，这是关键部分。因为"),
+        ASRDataSeg("The next idea is separate.", 1240, 2600, "下一点是分开的。"),
+    ]
+    for index, seg in enumerate(segments, 1):
+        seg.subtitle_id = f"S{index:04d}"
+
+    repaired = editor._safe_auto_repair_segments(segments, stage="test")
+
+    assert [seg.translated_text for seg in repaired] == [seg.translated_text for seg in segments]
+    assert any(
+        item["code"] == "candidate_chinese_fragment_review_only"
+        and item["decision"] == "not_auto_repaired_due_to_false_positive_risk"
+        for item in editor._safe_auto_repair_candidates
+    )
+    assert not editor._is_high_confidence_chinese_fragment_candidate("哦，绝对是历史性的。")
+    assert not editor._is_high_confidence_chinese_fragment_candidate("因为这两家公司主导了内存芯片市场。")
+
+
+def test_safe_auto_repair_guard_rejects_repairs_that_create_new_hard_problem():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_log = []
+    segments = [
+        ASRDataSeg("First different sentence.", 0, 1800, "第一句中文。"),
+        ASRDataSeg("Second different sentence.", 1800, 3600, "第二句中文。"),
+    ]
+    for index, seg in enumerate(segments, 1):
+        seg.subtitle_id = f"S{index:04d}"
+    damaged = [editor._copy_segment(seg) for seg in segments]
+    damaged[1] = editor._copy_segment(damaged[1], translated_text="第一句中文。")
+
+    with patch.object(editor, "_repair_exact_duplicate_chinese_segments", return_value=damaged):
+        repaired = editor._safe_auto_repair_segments(segments, stage="test")
+
+    assert [seg.translated_text for seg in repaired] == [seg.translated_text for seg in segments]
+    assert any(item["code"] == "safe_repair_guard_rejected" for item in editor._safe_auto_repair_log)
+
+
+def test_safe_auto_repair_llm_repairs_high_confidence_chinese_candidate_after_final_alignment():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_log = []
+    segments = [ASRDataSeg("Yeah, he is out there.", 0, 1800, "是啊，他正在")]
+    segments[0].subtitle_id = "S0001"
+    item = ScreenSubtitleItem(
+        source_ids=[1],
+        original=segments[0].text,
+        translated=segments[0].translated_text,
+        subtitle_id="S0001",
+    )
+    semantic_groups = [{"id": 1, "start_index": 0, "items": [item]}]
+    editor._last_semantic_full_translations = {1: "是啊，他正在外面积极行动。"}
+
+    with patch.object(
+        editor,
+        "_request_chinese_compression",
+        return_value={
+            "groups": [
+                {
+                    "target_index": 0,
+                    "segments": [{"index": 0, "zh": "是啊，他正在外面积极行动。"}],
+                }
+            ]
+        },
+    ) as request:
+        repaired = editor._safe_auto_repair_segments(
+            segments,
+            semantic_groups=semantic_groups,
+            subtitle_items=[item],
+            stage="after_final_time_alignment",
+        )
+
+    assert request.called
+    assert repaired[0].text == segments[0].text
+    assert repaired[0].subtitle_id == "S0001"
+    assert repaired[0].translated_text == "是啊，他正在外面积极行动。"
+    assert any(item["code"] == "llm_chinese_candidate_repaired" for item in editor._safe_auto_repair_log)
+
+
+def test_safe_auto_repair_llm_does_not_run_candidate_repair_before_final_alignment():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    segments = [ASRDataSeg("Yeah, he is out there.", 0, 1800, "是啊，他正在")]
+    segments[0].subtitle_id = "S0001"
+    item = ScreenSubtitleItem(
+        source_ids=[1],
+        original=segments[0].text,
+        translated=segments[0].translated_text,
+        subtitle_id="S0001",
+    )
+    semantic_groups = [{"id": 1, "start_index": 0, "items": [item]}]
+    editor._last_semantic_full_translations = {1: "是啊，他正在外面积极行动。"}
+
+    with patch.object(editor, "_request_chinese_compression") as request:
+        repaired = editor._safe_auto_repair_segments(
+            segments,
+            semantic_groups=semantic_groups,
+            subtitle_items=[item],
+            stage="before_export",
+        )
+
+    assert not request.called
+    assert repaired[0].translated_text == segments[0].translated_text
+
+
+def test_safe_auto_repair_llm_rejects_invalid_candidate_repair():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_log = []
+    segments = [ASRDataSeg("Yeah, he is out there.", 0, 1800, "是啊，他正在")]
+    segments[0].subtitle_id = "S0001"
+    item = ScreenSubtitleItem(
+        source_ids=[1],
+        original=segments[0].text,
+        translated=segments[0].translated_text,
+        subtitle_id="S0001",
+    )
+    semantic_groups = [{"id": 1, "start_index": 0, "items": [item]}]
+    editor._last_semantic_full_translations = {1: "是啊，他正在外面积极行动。"}
+
+    with patch.object(
+        editor,
+        "_request_chinese_compression",
+        return_value={
+            "groups": [
+                {
+                    "target_index": 0,
+                    "segments": [{"index": 0, "zh": "因为"}],
+                }
+            ]
+        },
+    ):
+        repaired = editor._safe_auto_repair_segments(
+            segments,
+            semantic_groups=semantic_groups,
+            subtitle_items=[item],
+            stage="after_final_time_alignment",
+        )
+
+    assert repaired[0].translated_text == segments[0].translated_text
+    assert any(item["code"] == "llm_chinese_candidate_repair_rejected" for item in editor._safe_auto_repair_log)
+
+
+def test_safe_auto_repair_llm_retries_invalid_candidate_with_same_group_context():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_log = []
+    segments = [
+        ASRDataSeg("when you look at internet native humor and culture.", 0, 2600, "当你在看网络原生幽默和文化时。"),
+        ASRDataSeg("Zachary Dunn is a fascinating example.", 2600, 5200, "Zachary Dunn就是一个很有意思的例子。"),
+    ]
+    for index, segment in enumerate(segments, 1):
+        segment.subtitle_id = f"S{index:04d}"
+    items = [
+        ScreenSubtitleItem(
+            source_ids=[index],
+            original=segment.text,
+            translated=segment.translated_text,
+            subtitle_id=segment.subtitle_id,
+        )
+        for index, segment in enumerate(segments, 1)
+    ]
+    semantic_groups = [{"id": 1, "start_index": 0, "items": items}]
+    editor._last_semantic_full_translations = {
+        1: "从网络原生幽默和文化来看，Zachary Dunn就是一个很有意思的例子。"
+    }
+
+    responses = [
+        {
+            "groups": [
+                {
+                    "target_index": 0,
+                    "segments": [{"index": 0, "zh": "因为"}],
+                }
+            ]
+        },
+        {
+            "groups": [
+                {
+                    "target_index": 0,
+                    "segments": [
+                        {"index": 0, "zh": "从网络原生幽默和文化来看，"},
+                        {"index": 1, "zh": "Zachary Dunn就是一个很有意思的例子。"},
+                    ],
+                }
+            ]
+        },
+    ]
+
+    def fake_request(*args, **kwargs):
+        return responses.pop(0)
+
+    with patch.object(editor, "_request_chinese_compression", side_effect=fake_request) as request:
+        repaired = editor._safe_auto_repair_segments(
+            segments,
+            semantic_groups=semantic_groups,
+            subtitle_items=items,
+            stage="after_final_time_alignment",
+        )
+
+    assert request.call_count == 2
+    assert [seg.text for seg in repaired] == [seg.text for seg in segments]
+    assert [seg.subtitle_id for seg in repaired] == ["S0001", "S0002"]
+    assert repaired[0].translated_text == "从网络原生幽默和文化来看，"
+    assert repaired[1].translated_text == segments[1].translated_text
+    assert any(item["code"] == "llm_chinese_candidate_repaired" for item in editor._safe_auto_repair_log)
+
+
+def test_safe_auto_repair_llm_rejects_new_adjacent_chinese_boundary_break():
+    editor = _id_editor()
+    editor.enable_safe_auto_repair = True
+    editor._safe_auto_repair_log = []
+    segments = [
+        ASRDataSeg(
+            "You validate a radically new disruptive movement by anchoring it",
+            466020,
+            469660,
+            "你将一个全新的颠覆性运动，直接锚定在",
+        ),
+        ASRDataSeg(
+            "directly to an ancient, established, and highly respected text.",
+            469700,
+            473600,
+            "一部古老、权威且备受尊崇的文本上，从而为其提供合法性。",
+        ),
+    ]
+    for index, segment in enumerate(segments, 1):
+        segment.subtitle_id = f"S{index:04d}"
+    items = [
+        ScreenSubtitleItem(
+            source_ids=[index],
+            original=segment.text,
+            translated=segment.translated_text,
+            subtitle_id=segment.subtitle_id,
+        )
+        for index, segment in enumerate(segments, 1)
+    ]
+    semantic_groups = [{"id": 1, "start_index": 0, "items": items}]
+    editor._last_semantic_full_translations = {
+        1: "你将一个全新的颠覆性运动，直接锚定在一部古老、权威且备受尊崇的文本上，从而为其提供合法性。"
+    }
+
+    with patch.object(
+        editor,
+        "_request_chinese_compression",
+        return_value={
+            "groups": [
+                {
+                    "target_index": 0,
+                    "segments": [
+                        {"index": 0, "zh": "你将一个全新的颠覆性运动，直接锚定它"},
+                        {"index": 1, "zh": "到一部古老、权威且备受尊崇的文本上，从而为其提供合法性。"},
+                    ],
+                }
+            ]
+        },
+    ):
+        repaired = editor._safe_auto_repair_segments(
+            segments,
+            semantic_groups=semantic_groups,
+            subtitle_items=items,
+            stage="after_final_time_alignment",
+        )
+
+    assert [seg.translated_text for seg in repaired] == [seg.translated_text for seg in segments]
+    assert any(item["code"] == "llm_chinese_candidate_repair_rejected" for item in editor._safe_auto_repair_log)
+
+
+def test_final_gate_blocks_protected_named_phrase_split():
+    editor = _marker_editor(["Wall", "Street", "is", "watching"], max_words=8)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 3, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == ["Wall Street is watching"]
+    assert "protected_named_phrase_split" in editor._syntax_boundary_reasons("Wall", "Street is watching")
+
+
+def test_final_gate_blocks_protected_phrasal_boundary_split():
+    editor = _marker_editor(["They", "are", "pricing", "in", "the", "belief"], max_words=8)
+    items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 5, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == ["They are pricing in the belief"]
+    assert "protected_phrasal_boundary_split" in editor._syntax_boundary_reasons("They are pricing", "in the belief")
+
+
+def test_final_gate_blocks_look_at_boundary_split():
+    editor = _marker_editor(["We", "need", "to", "look", "at", "why", "this", "changed"], max_words=8)
+    items = [_word_item(editor, 0, 3, 1), _word_item(editor, 4, 7, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == ["We need to look at why this changed"]
+    assert "protected_phrasal_boundary_split" in editor._syntax_boundary_reasons("We need to look", "at why this changed")
+
+
 def test_passed_validation_writes_final_output_and_manifest_metadata():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
+        source_dir = root / "source"
+        output_dir = root / "work" / "subtitle"
+        source_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
+        audio_path = source_dir / "sample.m4a"
+        audio_path.write_bytes(b"audio")
         task = SubtitleTask(
-            subtitle_path=str(root / "source.srt"),
-            output_path=str(root / "output.srt"),
+            subtitle_path=str(output_dir / "source.srt"),
+            video_path=str(audio_path),
+            output_path=str(output_dir / "output.srt"),
         )
         thread = SubtitleThread.__new__(SubtitleThread)
         thread.task = task
@@ -3762,16 +4562,76 @@ def test_passed_validation_writes_final_output_and_manifest_metadata():
             },
         )
 
-        manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        manifest = json.loads((output_dir / "stable-final-manifest.json").read_text(encoding="utf-8"))
         assert manifest["render_blocked"] is False
         assert manifest["translation_model"] == "deepseek-v4-flash"
         assert manifest["code_commit"] == "abc123"
         assert manifest["cache_used"] is False
         assert manifest["prompt_version"] == "global-subtitle-id-v2"
-        assert (root / "output.srt").exists()
+        assert (output_dir / "output.srt").exists()
+        assert not (output_dir / "字幕处理结果摘要.txt").exists()
+        summary_path = source_dir / "字幕处理结果摘要.txt"
+        assert summary_path.exists()
+        summary = summary_path.read_text(encoding="utf-8-sig")
+        assert "结论：通过" in summary
+        assert "字幕数量：1" in summary
 
 
-def test_qa_review_srt_is_mirrored_to_source_audio_folder_only():
+def test_stable_result_summary_records_safe_repair_details():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_dir = root / "source"
+        output_dir = root / "work" / "subtitle"
+        source_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
+        audio_path = source_dir / "sample.m4a"
+        audio_path.write_bytes(b"audio")
+        task = SubtitleTask(
+            subtitle_path=str(output_dir / "source.srt"),
+            video_path=str(audio_path),
+            output_path=str(output_dir / "output.srt"),
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        config = SubtitleConfig(
+            need_screen_subtitle_edit=True,
+            screen_subtitle_stable_mode=True,
+            subtitle_layout="original_top",
+        )
+
+        thread._save_stable_subtitle_outputs(
+            ASRData([ASRDataSeg("English 1.", 0, 1000, "这是译文")]),
+            config,
+            coverage_report_path=str(root / "coverage-report.txt"),
+            validation_status="passed",
+            validation_summary={"status": "WARNING", "errors": [], "warnings": [{"code": "x", "message": "待检查"}], "info": []},
+            manifest_meta={
+                "safe_auto_repair_enabled": True,
+                "safe_auto_repair_log": [
+                    {
+                        "code": "llm_chinese_candidate_repaired",
+                        "subtitle_id": "S0001",
+                        "start": "00:00:00.000",
+                        "end": "00:00:01.000",
+                        "before_chinese": "旧中文",
+                        "after_chinese": "新中文",
+                    }
+                ],
+                "safe_auto_repair_candidates": [{"code": "candidate"}],
+            },
+        )
+
+        manifest = json.loads((output_dir / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        assert "work_summary_txt" not in manifest["result_summary_paths"]
+        summary_path = Path(manifest["result_summary_paths"]["source_summary_txt"])
+        summary = summary_path.read_text(encoding="utf-8-sig")
+        assert "结论：可用" in summary
+        assert "实际修复：1" in summary
+        assert "旧中文" in summary
+        assert "新中文" in summary
+
+
+def test_qa_review_srt_is_not_mirrored_to_source_audio_folder():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         source_dir = root / "source"
@@ -3806,14 +4666,14 @@ def test_qa_review_srt_is_mirrored_to_source_audio_folder_only():
             manifest_meta={"qa_review_points_srt": str(qa_path)},
         )
 
-        assert (source_dir / "qa-review-points.srt").exists()
+        assert qa_path.exists()
+        assert not (source_dir / "qa-review-points.srt").exists()
         assert not (source_dir / "coverage-report.txt").exists()
         assert not (source_dir / "stable-final-manifest.json").exists()
 
         work_manifest = json.loads((output_dir / "stable-final-manifest.json").read_text(encoding="utf-8"))
-        assert work_manifest["source_report_paths"] == {
-            "qa_review_points_srt": str(source_dir / "qa-review-points.srt")
-        }
+        assert work_manifest["qa_review_points_srt"] == str(qa_path)
+        assert "source_report_paths" not in work_manifest
 
 
 def test_user_subtitle_exports_are_saved_to_source_audio_folder():
@@ -3904,7 +4764,7 @@ def test_id_bound_mapping_has_no_drift_over_400_subtitles():
     assert applied[-1].translated == "zh-S0405"
 
 
-def test_non_structural_validation_errors_still_write_stable_artifacts():
+def test_validation_summary_error_marks_stable_manifest_failed():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         task = SubtitleTask(
@@ -3935,11 +4795,11 @@ def test_non_structural_validation_errors_still_write_stable_artifacts():
         )
 
         manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
-        assert manifest["validation_status"] == "passed"
-        assert manifest["render_blocked"] is False
+        assert manifest["validation_status"] == "failed"
+        assert manifest["render_blocked"] is True
         assert manifest["validation_error_codes"] == ["subtitle_duration_invalid"]
         assert Path(manifest["paths"]["original_top_srt"]).exists()
-        assert (root / "output.srt").exists()
+        assert not (root / "output.srt").exists()
 
 
 def test_runtime_module_import_path_is_available():
@@ -3976,6 +4836,10 @@ def test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
 
 
 if __name__ == "__main__":
+    test_final_time_alignment_reapplies_display_padding_to_loaded_short_subtitle()
+    test_final_time_alignment_shifts_next_when_loaded_short_has_no_gap()
+    test_final_time_alignment_runs_chinese_speed_repair_without_touching_english()
+    test_screen_editor_uses_16_word_stable_hard_floor()
     test_preposition_phrase_is_not_stranded()
     test_number_and_policy_sentence_keeps_readable_boundaries()
     test_long_finance_sentence_keeps_full_coverage()
@@ -4000,6 +4864,7 @@ if __name__ == "__main__":
     test_syntax_boundary_audit_keeps_confirmed_bad_cuts()
     test_chinese_semantic_group_audit_warns_on_lost_core_action()
     test_chinese_semantic_audit_skips_semantic_loss_when_mapping_invalid()
+    test_chinese_semantic_audit_ignores_normal_short_responses()
     test_semantic_audit_context_requires_id_signature_and_expected_ids()
     test_semantic_audit_mapping_does_not_shift_when_audit_groups_exceed_generation_count()
     test_semantic_audit_mapping_does_not_shift_when_audit_groups_drop_generation_count()
@@ -4015,6 +4880,7 @@ if __name__ == "__main__":
     test_short_backchannel_duration_is_warning_not_error()
     test_short_regular_sentence_duration_remains_error()
     test_asr_suspicious_phrases_are_reported_without_fixing_text()
+    test_asr_suspicious_article_context_misses_are_reported()
     test_abbreviation_name_boundary_is_syntax_warning()
     test_caption_audit_uses_16_word_hard_limit()
     test_caption_audit_keeps_numeric_percent_chinese_line()
@@ -4070,17 +4936,21 @@ if __name__ == "__main__":
     test_final_pre_id_second_phase_preserves_word_order_and_timestamps()
     test_boundary_snapshots_record_stage_changes_before_subtitle_ids()
     test_final_gate_blocks_particle_preposition_complement_split()
-    test_final_gate_blocks_short_verb_object_split()
+    test_final_gate_soft_flags_heuristic_short_verb_object_split()
     test_final_gate_blocks_auxiliary_predicate_split()
-    test_final_gate_blocks_catenative_verb_complement_split()
+    test_final_gate_soft_flags_heuristic_catenative_verb_complement_split()
     test_final_gate_blocks_numeric_unit_or_noun_split()
-    test_final_gate_blocks_compound_noun_split()
-    test_final_gate_blocks_modifier_noun_head_split()
+    test_final_gate_soft_flags_heuristic_compound_noun_split()
+    test_final_gate_soft_flags_heuristic_modifier_noun_head_split()
     test_final_gate_blocks_negation_emphasis_split()
     test_final_gate_blocks_stranded_leading_of_complement()
     test_final_gate_blocks_stranded_leading_with_complement()
     test_final_gate_blocks_time_range_to_continuation()
-    test_final_gate_blocks_phrasal_verb_particle_split()
+    test_final_gate_blocks_coordinated_modifier_split()
+    test_final_gate_blocks_modifier_chain_split()
+    test_final_gate_blocks_high_confidence_phrasal_verb_particle_split()
+    test_final_fragment_gate_repairs_trailing_dependent_fragments()
+    test_final_fragment_gate_repairs_possessive_and_quantifier_tails()
     test_final_gate_allows_sentence_initial_to_me_after_punctuation()
     test_final_fragment_gate_repairs_incomplete_interrogative_fragment()
     test_final_repair_does_not_create_adjacent_subject_fragment()
@@ -4088,6 +4958,7 @@ if __name__ == "__main__":
     test_final_fragment_gate_repairs_connector_and_reflexive_fragments()
     test_final_fragment_gate_records_unresolved_when_no_legal_solution()
     test_podcast_template_prefers_stable_manifest_subtitle()
+    test_podcast_template_ignores_blocked_stable_manifest_subtitle()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()
     test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()
@@ -4095,12 +4966,17 @@ if __name__ == "__main__":
     test_id_bound_group_allows_different_return_order()
     test_allocation_quality_retries_information_leaked_to_previous_id()
     test_allocation_quality_rejects_adjacent_core_duplication()
+    test_allocation_quality_rejects_adjacent_long_common_phrase_duplication()
     test_allocation_quality_detects_negation_misplacement()
     test_allocation_quality_allows_negation_with_adjacent_predicate_completion()
     test_allocation_quality_accepts_common_chinese_negation_equivalents()
     test_allocation_quality_accepts_entity_spacing_equivalent()
     test_allocation_quality_accepts_chinese_number_equivalents()
     test_allocation_quality_accepts_decimal_wan_number_equivalent()
+    test_number_anchor_accepts_billion_to_chinese_yi_conversion()
+    test_number_anchor_accepts_decade_and_century_chinese_equivalents()
+    test_negation_anchor_accepts_natural_chinese_question_tags_and_until_pattern()
+    test_legacy_sample_specific_fragment_rules_are_not_hardcoded()
     test_allocation_quality_allows_adjacent_number_when_target_line_is_not_degraded()
     test_allocation_quality_rejects_adjacent_number_when_target_line_is_empty()
     test_allocation_quality_accepts_natural_subtitle_half_sentence()
@@ -4127,8 +5003,26 @@ if __name__ == "__main__":
     test_passed_validation_writes_final_output_and_manifest_metadata()
     test_user_subtitle_exports_are_saved_to_source_audio_folder()
     test_id_bound_mapping_has_no_drift_over_400_subtitles()
-    test_non_structural_validation_errors_still_write_stable_artifacts()
+    test_validation_summary_error_marks_stable_manifest_failed()
     test_runtime_module_import_path_is_available()
     test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
     test_whisperx_time_only_preserves_text_and_translation_while_retiming()
+    test_whisperx_time_only_rejects_incomplete_subtitle_mapping()
+    test_frozen_word_timing_prevents_whisperx_from_compressing_long_subtitle()
+    test_safe_auto_repair_is_noop_when_disabled()
+    test_safe_auto_repair_retranslates_exact_duplicate_chinese_by_id()
+    test_safe_auto_repair_extends_high_load_short_subtitle_when_neighbor_has_room()
+    test_safe_auto_repair_does_not_extend_high_load_short_subtitle_when_disabled()
+    test_duration_audit_reports_high_load_short_subtitle_as_warning()
+    test_safe_auto_repair_records_review_candidates_without_rewriting_fragments()
+    test_safe_auto_repair_guard_rejects_repairs_that_create_new_hard_problem()
+    test_safe_auto_repair_llm_repairs_high_confidence_chinese_candidate_after_final_alignment()
+    test_safe_auto_repair_llm_does_not_run_candidate_repair_before_final_alignment()
+    test_safe_auto_repair_llm_rejects_invalid_candidate_repair()
+    test_safe_auto_repair_llm_retries_invalid_candidate_with_same_group_context()
+    test_safe_auto_repair_llm_rejects_new_adjacent_chinese_boundary_break()
+    test_final_gate_blocks_protected_named_phrase_split()
+    test_final_gate_blocks_protected_phrasal_boundary_split()
+    test_final_gate_blocks_look_at_boundary_split()
+    test_stable_result_summary_records_safe_repair_details()
     print("stable caption rule smoke tests passed")

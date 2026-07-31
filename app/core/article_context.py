@@ -1061,17 +1061,24 @@ def _surface_text_key(text: str) -> str:
 def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -> bool:
     if _is_self_replacement_candidate(candidate):
         return False
-    if candidate["final_confidence"] < high_confidence:
+    near_threshold_person_edge = _near_threshold_person_edge_candidate(
+        candidate, high_confidence
+    )
+    if candidate["final_confidence"] < high_confidence and not near_threshold_person_edge:
         return False
     if _article_scope_rejection_reason(candidate):
         return False
+    if near_threshold_person_edge:
+        return True
     return len(candidate.get("matched_conditions") or []) >= 2
 
 
 def _not_applied_reason(candidate: Dict[str, Any], high_confidence: float) -> str:
     if _is_self_replacement_candidate(candidate):
         return "self_replacement_skipped"
-    if candidate["final_confidence"] < high_confidence:
+    if candidate["final_confidence"] < high_confidence and not _near_threshold_person_edge_candidate(
+        candidate, high_confidence
+    ):
         return "below_high_confidence_threshold"
     scope_reason = _article_scope_rejection_reason(candidate)
     if scope_reason:
@@ -1151,6 +1158,33 @@ def _candidate_is_person_name(candidate: Dict[str, Any]) -> bool:
         "poet",
         "writer",
     }
+
+
+def _near_threshold_person_edge_candidate(
+    candidate: Dict[str, Any],
+    high_confidence: float,
+) -> bool:
+    if not _candidate_is_person_name(candidate):
+        return False
+    if not _candidate_has_article_evidence(candidate):
+        return False
+    confidence = float(candidate.get("final_confidence") or 0.0)
+    if confidence < high_confidence - 0.03:
+        return False
+    original_tokens = _word_tokens(str(candidate.get("original_text", "") or ""))
+    corrected_tokens = _word_tokens(str(candidate.get("candidate_text", "") or ""))
+    if len(original_tokens) < 2 or len(original_tokens) != len(corrected_tokens):
+        return False
+    if not all(_token_is_capitalized_name_piece(token) for token in original_tokens):
+        return False
+    original_last = _normalize_entity_gate_token(original_tokens[-1])
+    corrected_last = _normalize_entity_gate_token(corrected_tokens[-1])
+    if not original_last or original_last != corrected_last:
+        return False
+    string_similarity = float(candidate.get("string_similarity") or 0.0)
+    phonetic_similarity = float(candidate.get("phonetic_similarity") or 0.0)
+    same_initials = _entity_initials(original_tokens) == _entity_initials(corrected_tokens)
+    return phonetic_similarity >= 0.8 or (same_initials and string_similarity >= 0.72)
 
 
 def _ambiguous_minor_person_spelling_change(
@@ -1639,7 +1673,7 @@ def _correct_segment_text(
                 continue
             scored = _score_correction_candidate(phrase, match_term)
             confidence = float(scored["final_confidence"])
-            if confidence >= high_confidence and _candidate_stays_in_article_scope(scored):
+            if _should_apply_candidate(scored, high_confidence):
                 pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(phrase)}(?![A-Za-z0-9])")
                 replacement = scored["corrected_text"]
                 result, count = pattern.subn(replacement, result, count=1)

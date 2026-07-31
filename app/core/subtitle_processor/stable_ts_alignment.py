@@ -418,10 +418,10 @@ def align_subtitle_segments_with_whisperx_time_only(
     subtitle_data: ASRData,
     language: str = "en",
     callback=None,
-    lead_in_ms: int = 80,
-    tail_padding_ms: int = 450,
+    lead_in_ms: int = 40,
+    tail_padding_ms: int = 260,
     min_gap_ms: int = 40,
-    min_duration_ms: int = 800,
+    min_duration_ms: int = 700,
 ) -> Optional[ASRData]:
     """Return subtitle_data with WhisperX-derived times while preserving text.
 
@@ -439,6 +439,24 @@ def align_subtitle_segments_with_whisperx_time_only(
     if len(WORD_RE.findall(transcript)) < 3:
         logger.info("WhisperX time-only skipped: transcript is too short")
         return None
+    frozen = _make_frozen_word_timed_subtitle_segments(
+        subtitle_data.segments,
+        lead_in_ms=lead_in_ms,
+        tail_padding_ms=tail_padding_ms,
+        min_duration_ms=min_duration_ms,
+    )
+    if frozen is not None:
+        _repair_subtitle_timing_sequence(frozen.segments, min_gap_ms=min_gap_ms)
+        _pad_short_subtitle_timing_sequence(
+            frozen.segments,
+            min_gap_ms=min_gap_ms,
+            min_duration_ms=min_duration_ms,
+        )
+        logger.info(
+            "WhisperX time-only skipped: using frozen stable word timings for %s subtitles",
+            len(frozen.segments),
+        )
+        return frozen
     aligned_words = _run_whisperx_words(audio_path, subtitle_data, language, callback=callback)
     if not aligned_words:
         return None
@@ -450,6 +468,8 @@ def align_subtitle_segments_with_whisperx_time_only(
         min_duration_ms=min_duration_ms,
     )
     if not remapped.segments:
+        return None
+    if not _whisperx_mapping_is_complete(remapped, subtitle_data.segments):
         return None
     _repair_subtitle_timing_sequence(remapped.segments, min_gap_ms=min_gap_ms)
     _pad_short_subtitle_timing_sequence(
@@ -468,6 +488,51 @@ def align_subtitle_segments_with_whisperx_time_only(
         changed,
     )
     return remapped
+
+
+def _make_frozen_word_timed_subtitle_segments(
+    source_segments: Sequence[ASRDataSeg],
+    lead_in_ms: int,
+    tail_padding_ms: int,
+    min_duration_ms: int,
+) -> Optional[ASRData]:
+    if not source_segments:
+        return None
+    if not all(
+        hasattr(seg, "stable_word_start_ms") and hasattr(seg, "stable_word_end_ms")
+        for seg in source_segments
+    ):
+        return None
+
+    mapped: List[ASRDataSeg] = []
+    for seg in source_segments:
+        raw_start = int(getattr(seg, "stable_word_start_ms"))
+        raw_end = int(getattr(seg, "stable_word_end_ms"))
+        start = max(0, raw_start - int(lead_in_ms))
+        end = max(raw_end + int(tail_padding_ms), start + 1)
+        if end - start < int(min_duration_ms):
+            end = start + int(min_duration_ms)
+        copied = ASRDataSeg(
+            text=seg.text,
+            translated_text=seg.translated_text,
+            start_time=start,
+            end_time=end,
+        )
+        for attr in (
+            "subtitle_id",
+            "word_start",
+            "word_end",
+            "stable_word_start_ms",
+            "stable_word_end_ms",
+        ):
+            if hasattr(seg, attr):
+                setattr(copied, attr, getattr(seg, attr))
+        mapped.append(copied)
+    result = ASRData(mapped)
+    result.whisperx_unmatched_subtitles = []
+    result.whisperx_matched_subtitle_count = len(mapped)
+    result.used_frozen_stable_word_timing = True
+    return result
 
 
 def _run_whisperx_words(
@@ -591,9 +656,10 @@ def _make_whisperx_subtitle_segments(
         for word in aligned_words
     ]
     mapped: List[ASRDataSeg] = []
+    unmatched: List[dict] = []
     cursor = 0
     matched = 0
-    for seg in source_segments:
+    for subtitle_index, seg in enumerate(source_segments, 1):
         tokens = _subtitle_tokens(seg.text or "")
         word_range = _find_token_sequence(aligned_norms, tokens, cursor)
         if word_range:
@@ -605,6 +671,15 @@ def _make_whisperx_subtitle_segments(
             cursor = end_index
             matched += 1
         else:
+            unmatched.append(
+                {
+                    "index": subtitle_index,
+                    "text": seg.text,
+                    "token_count": len(tokens),
+                    "start_time": int(seg.start_time),
+                    "end_time": int(seg.end_time),
+                }
+            )
             start = int(seg.start_time)
             end = int(seg.end_time)
         start = max(0, start)
@@ -626,7 +701,33 @@ def _make_whisperx_subtitle_segments(
         matched,
         len(aligned_words),
     )
-    return ASRData(mapped)
+    result = ASRData(mapped)
+    result.whisperx_unmatched_subtitles = unmatched
+    result.whisperx_matched_subtitle_count = matched
+    return result
+
+
+def _whisperx_mapping_is_complete(
+    mapped: ASRData,
+    source_segments: Sequence[ASRDataSeg],
+) -> bool:
+    unmatched = list(getattr(mapped, "whisperx_unmatched_subtitles", []) or [])
+    if unmatched:
+        logger.warning(
+            "WhisperX time-only rejected: %s subtitles were not fully mapped; first=%s",
+            len(unmatched),
+            unmatched[0],
+        )
+        return False
+    matched = int(getattr(mapped, "whisperx_matched_subtitle_count", 0) or 0)
+    if matched != len(source_segments):
+        logger.warning(
+            "WhisperX time-only rejected: matched subtitle count mismatch %s/%s",
+            matched,
+            len(source_segments),
+        )
+        return False
+    return True
 
 
 def _repair_subtitle_timing_sequence(

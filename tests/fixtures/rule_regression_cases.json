@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "notes": [
+    "This fixture stores representative rule regressions from real subtitle reviews.",
+    "Cases must stay generic: do not add sample-specific text patches to production code."
+  ],
+  "english_syntax_boundaries": [
+    {
+      "id": "bad_preposition_object_sulfur_dioxide_into_air",
+      "source": "444 review",
+      "left": "dumping sulfur dioxide into",
+      "right": "the air.",
+      "expected": "warning",
+      "expected_codes": ["preposition_object_split"]
+    },
+    {
+      "id": "bad_particle_verb_hunkering_down",
+      "source": "444 review",
+      "left": "Everyone is hunkering",
+      "right": "down for the next phase.",
+      "expected": "warning",
+      "expected_codes": ["phrasal_verb_split"]
+    },
+    {
+      "id": "bad_subject_predicate_stardust_solutions_are_trying",
+      "source": "444 review",
+      "left": "Stardust Solutions",
+      "right": "are trying something similar.",
+      "expected": "warning",
+      "expected_codes": ["subject_predicate_split"]
+    },
+    {
+      "id": "safe_sentence_then_but",
+      "source": "33 false positive review",
+      "left": "pump water in.",
+      "right": "But the next part matters.",
+      "expected": "safe",
+      "forbidden_codes": ["preposition_object_split", "phrasal_verb_split"]
+    },
+    {
+      "id": "safe_than_that_pronoun",
+      "source": "44 false positive review",
+      "left": "much further than that.",
+      "right": "What do you mean?",
+      "expected": "safe",
+      "forbidden_codes": ["determiner_noun_split", "preposition_object_split"]
+    }
+  ],
+  "chinese_allocation_quality": [
+    {
+      "id": "reject_adjacent_long_common_phrase_duplication",
+      "source": "social AI review",
+      "entry": {
+        "id": 1,
+        "full_english": "Do they love the real us, or only the algorithm we hired to speak for us?",
+        "full_translation": "他们爱的是真实的我们，还是只是爱上了我们雇来替我们说话的算法？",
+        "subtitle_parts": [
+          {"subtitle_id": "S0001", "english": "Do they love the real us,"},
+          {"subtitle_id": "S0002", "english": "or only the algorithm we hired to speak for us?"}
+        ]
+      },
+      "allocation": {
+        "S0001": "身边的人究竟是爱真实的我们，还是只是爱上了那个我们雇来替我们说话的算法呢",
+        "S0002": "只是爱上了我们雇来替我们说话的算法吗？"
+      },
+      "valid": false,
+      "expected_issue_codes": ["adjacent_chinese_semantic_duplication"]
+    },
+    {
+      "id": "reject_lost_core_action_ponder",
+      "source": "000 review",
+      "validator": "semantic_group_context",
+      "entry": {
+        "id": 2,
+        "full_english": "That is a good question to ponder next time you walk past an empty government building.",
+        "full_translation": "这是一个值得思考的问题，下次你经过一栋空置的政府大楼时可以想一想。",
+        "subtitle_parts": [
+          {"subtitle_id": "S0104", "english": "That is a good question to ponder"},
+          {"subtitle_id": "S0105", "english": "next time you walk past an empty government building."}
+        ]
+      },
+      "allocation": {
+        "S0104": "这是一个很好的问题，下次你",
+        "S0105": "经过一栋空置的政府大楼。"
+      },
+      "valid": false,
+      "expected_issue_codes": ["group_allocation_information_omission"]
+    },
+    {
+      "id": "accept_concise_ponder_repair",
+      "source": "000 review",
+      "entry": {
+        "id": 3,
+        "full_english": "That is a good question to ponder next time you walk past an empty government building.",
+        "full_translation": "这是一个值得思考的问题，下次你经过一栋空置的政府大楼时可以想一想。",
+        "subtitle_parts": [
+          {"subtitle_id": "S0104", "english": "That is a good question to ponder"},
+          {"subtitle_id": "S0105", "english": "next time you walk past an empty government building."}
+        ]
+      },
+      "allocation": {
+        "S0104": "这是个值得思考的问题。",
+        "S0105": "经过空置政府大楼时思考。"
+      },
+      "valid": true,
+      "expected_issue_codes": []
+    },
+    {
+      "id": "reject_missing_translation_id",
+      "source": "20-minute left-shift review",
+      "entry": {
+        "id": 4,
+        "full_english": "For anyone who does not know, that means working from 9 a.m. to 9 p.m. six days a week.",
+        "full_translation": "不了解的人，这意味着早上9点工作到晚上9点，每周工作六天。",
+        "subtitle_parts": [
+          {"subtitle_id": "S0232", "english": "For anyone who does not know, that means working from 9 a.m."},
+          {"subtitle_id": "S0233", "english": "to 9 p.m."},
+          {"subtitle_id": "S0234", "english": "six days a week."}
+        ]
+      },
+      "allocation": {
+        "S0232": "不了解的人，这意味着早9工作到晚9。",
+        "S0234": "每周六天。"
+      },
+      "valid": false,
+      "expected_issue_codes": ["translation_group_cardinality_mismatch"]
+    }
+  ],
+  "timing_repairs": [
+    {
+      "id": "loaded_final_short_subtitle_shifts_next_without_text_change",
+      "source": "social AI review",
+      "segments": [
+        {
+          "subtitle_id": "S0115",
+          "english": "deliver the joke,",
+          "chinese": "讲出笑话，",
+          "start_ms": 302600,
+          "end_ms": 305840
+        },
+        {
+          "subtitle_id": "S0116",
+          "english": "and react to the silence if it completely bombs.",
+          "chinese": "并且在它彻底冷场时应对沉默。",
+          "start_ms": 305880,
+          "end_ms": 306140
+        },
+        {
+          "subtitle_id": "S0117",
+          "english": "Right. You are on the hook for the delivery.",
+          "chinese": "没错，你要负责实际的表达。",
+          "start_ms": 306180,
+          "end_ms": 307740
+        }
+      ],
+      "target_subtitle_id": "S0116",
+      "min_duration_ms": 700,
+      "expect_text_unchanged": true
+    }
+  ],
+  "local_chinese_speed_fallback": [
+    {
+      "id": "short_brand_laser_keeps_english_brand",
+      "source": "space data center review",
+      "english": "SpaceX lasers.",
+      "chinese": "使用的是太空探索技术公司的激光器。",
+      "start_ms": 414720,
+      "end_ms": 415940,
+      "expected_chinese": "SpaceX激光器。"
+    },
+    {
+      "id": "bigger_test_coming_is_concise",
+      "source": "space data center review",
+      "english": "But they have a much bigger test coming.",
+      "chinese": "但他们即将进行一次规模大得多的测试。",
+      "start_ms": 470400,
+      "end_ms": 471920,
+      "expected_chinese": "更大的测试要来了。"
+    }
+  ],
+  "id_writeback": [
+    {
+      "id": "missing_middle_translation_keeps_following_id_slots",
+      "source": "20-minute left-shift review",
+      "items": [
+        {"subtitle_id": "S0001", "english": "First.", "chinese": "第一句。"},
+        {"subtitle_id": "S0002", "english": "Second.", "chinese": "第二句。"},
+        {"subtitle_id": "S0003", "english": "Third.", "chinese": "第三句。"},
+        {"subtitle_id": "S0004", "english": "Fourth.", "chinese": "第四句。"}
+      ],
+      "groups": [
+        {"id": 1, "start_index": 0, "subtitle_ids": ["S0001", "S0002"]},
+        {"id": 2, "start_index": 2, "subtitle_ids": ["S0003", "S0004"]}
+      ],
+      "translations_by_group": {
+        "1": {"S0001": "新第一句。"},
+        "2": {"S0003": "新第三句。", "S0004": "新第四句。"}
+      },
+      "expected_chinese": ["新第一句。", "第二句。", "新第三句。", "新第四句。"]
+    }
+  ]
+}

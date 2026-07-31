@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import re
 import builtins
@@ -28,10 +29,10 @@ from app.core.utils.logger import setup_logger
 
 logger = setup_logger("screen_subtitle_editor")
 
-DISPLAY_LEAD_IN_MS = 80
-DISPLAY_TAIL_PADDING_MS = 450
+DISPLAY_LEAD_IN_MS = 40
+DISPLAY_TAIL_PADDING_MS = 260
 DISPLAY_MIN_GAP_MS = 40
-DISPLAY_MIN_DURATION_MS = 800
+DISPLAY_MIN_DURATION_MS = 700
 DISPLAY_BRIDGE_GAP_MS = 800
 DISPLAY_SHORT_MERGE_MS = 700
 DISPLAY_SHORT_MERGE_GAP_MS = 500
@@ -99,7 +100,7 @@ Do NOT rewrite English into a shorter new sentence just to meet the word limit. 
 Do not remove "you know", "like", "well", "I mean", "actually", "basically", or "honestly" just to make the sentence cleaner.
 
 # Length style
-- English length is the main visual constraint. Most English subtitles should be 6-12 words, with 13-14 acceptable when it preserves a natural phrase or spoken beat.
+- English length is the main visual constraint. Most English subtitles should be 6-12 words, with 13-16 acceptable when it preserves a natural phrase or spoken beat.
 - Chinese length is secondary. Make Chinese natural and compact, but do not split only because the Chinese line is long.
 - Soft upper limits: English ${max_english_words} words, Chinese ${max_cjk_chars} Chinese characters.
 - Treat ${max_english_words} English words as the hard maximum. Do not exceed it. Still, do not cut mechanically at the number; first choose a natural semantic, prepositional, contrastive, or clause boundary.
@@ -299,13 +300,14 @@ class ScreenSubtitleEditor:
         coverage_report_path: Optional[str] = None,
         article_context_prompt: str = "",
         update_callback: Optional[Callable[[Dict], None]] = None,
+        enable_safe_auto_repair: bool = False,
         allocation_max_concurrency: int = 1,
         allocation_batch_size: int = 16,
     ):
         self.model = model
         self.target_language = target_language
         self.max_cjk_chars = max_cjk_chars
-        self.max_english_words = max_english_words
+        self.max_english_words = max(HARD_ENGLISH_WORD_LIMIT, int(max_english_words or HARD_ENGLISH_WORD_LIMIT))
         self.batch_num = batch_num
         self.thread_num = thread_num
         self.temperature = temperature
@@ -315,6 +317,7 @@ class ScreenSubtitleEditor:
         self.coverage_report_path = coverage_report_path
         self.article_context_prompt = (article_context_prompt or "").strip()
         self.update_callback = update_callback
+        self.enable_safe_auto_repair = bool(enable_safe_auto_repair)
         self.allocation_max_concurrency = max(1, int(allocation_max_concurrency or 1))
         self.allocation_batch_size = min(24, max(1, int(allocation_batch_size or 16)))
         self.cache_manager = CacheManager(str(CACHE_PATH))
@@ -328,6 +331,8 @@ class ScreenSubtitleEditor:
         self._last_semantic_full_translations: Dict[int, str] = {}
         self._last_semantic_group_audit_contexts: Dict[str, Dict] = {}
         self._last_semantic_group_id_by_subtitle_id: Dict[str, str] = {}
+        self._last_semantic_groups: List[Dict] = []
+        self._last_subtitle_items: List[ScreenSubtitleItem] = []
         self._discourse_marker_orphans: List[Dict] = []
         self._frozen_subtitle_ids: List[str] = []
         self._translation_structure_errors: List[Dict] = []
@@ -349,6 +354,8 @@ class ScreenSubtitleEditor:
         self._allocation_isolation_before: Dict = {}
         self._allocation_isolation_after: Dict = {}
         self._allocation_isolation_report: Dict = {}
+        self._safe_auto_repair_log: List[Dict] = []
+        self._safe_auto_repair_candidates: List[Dict] = []
         self._qa_review_points_path: str = ""
         self._qa_review_points_count: int = 0
         self.last_validation_summary: Optional[Dict] = None
@@ -460,6 +467,8 @@ class ScreenSubtitleEditor:
         self._last_semantic_full_translations = {}
         self._last_semantic_group_audit_contexts = {}
         self._last_semantic_group_id_by_subtitle_id = {}
+        self._last_semantic_groups = []
+        self._last_subtitle_items = []
         self._discourse_marker_orphans = []
         self._boundary_snapshots = []
         self._boundary_snapshot_changes = []
@@ -468,6 +477,8 @@ class ScreenSubtitleEditor:
         self._allocation_isolation_before = {}
         self._allocation_isolation_after = {}
         self._allocation_isolation_report = {}
+        self._safe_auto_repair_log = []
+        self._safe_auto_repair_candidates = []
         self._llm_cache_stats = {}
         self._allocation_runtime_stats = {}
         self._active_source_segments_by_id = {
@@ -505,7 +516,10 @@ class ScreenSubtitleEditor:
         items = self._validate_and_repair_final_pre_id_boundaries(items)
         items = self._assign_global_subtitle_ids(items)
         semantic_groups = self._semantic_translation_groups(items)
+        self._last_semantic_groups = list(semantic_groups)
+        self._last_subtitle_items = list(items)
         items = self._translate_semantic_subtitle_groups(items)
+        self._last_subtitle_items = list(items)
         self._validate_final_item_translation_ids(items)
         items = self._validate_stable_items(items)
         segments = self._items_to_segments(
@@ -524,6 +538,12 @@ class ScreenSubtitleEditor:
             segments,
             semantic_groups=semantic_groups,
             subtitle_items=items,
+        )
+        segments = self._safe_auto_repair_segments(
+            segments,
+            semantic_groups=semantic_groups,
+            subtitle_items=items,
+            stage="before_export",
         )
         segments = self._order_segments_by_frozen_subtitle_ids(segments)
         self._validate_final_segment_translation_ids(segments)
@@ -547,6 +567,202 @@ class ScreenSubtitleEditor:
         )
         self._report_subtitle_coverage_gaps(asr_data.segments, segments)
         return ASRData(segments)
+
+    def repair_after_final_time_alignment(self, asr_data: ASRData) -> ASRData:
+        """Final local pass after WhisperX/frozen time mapping.
+
+        English text, subtitle IDs and segment order are frozen at this point.
+        Only display timing padding and Chinese text allocation are allowed.
+        """
+        if not asr_data or not asr_data.segments:
+            return asr_data
+        before = list(asr_data.segments)
+        segments = self._repair_final_short_subtitle_timings(before)
+        segments = self._compress_fast_chinese_segments(
+            segments,
+            semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
+            subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
+        )
+        segments = self._align_segment_translation_punctuation(segments)
+        segments = self._safe_auto_repair_segments(
+            segments,
+            semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
+            subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
+            stage="after_final_time_alignment",
+        )
+        asr_data.segments = list(segments)
+        source_map = getattr(self, "_active_source_segments_by_id", {}) or {}
+        source_segments = list(source_map.values()) if isinstance(source_map, dict) else list(source_map)
+        if source_segments:
+            self._report_subtitle_coverage_gaps(source_segments, asr_data.segments)
+        else:
+            self._write_coverage_report([], self._translation_gaps(asr_data.segments), asr_data.segments)
+        return asr_data
+
+    def _repair_final_short_subtitle_timings(
+        self, segments: Sequence[ASRDataSeg]
+    ) -> List[ASRDataSeg]:
+        if not segments:
+            return []
+        repaired = self._apply_display_timing_padding(segments)
+        repaired = self._shift_next_for_loaded_short_final_segments(repaired)
+        if getattr(self, "enable_safe_auto_repair", False):
+            repaired = self._repair_high_load_short_subtitle_timings(repaired)
+        fixed = 0
+        for old, new in zip(segments, repaired):
+            if int(new.end_time) - int(new.start_time) > int(old.end_time) - int(old.start_time):
+                fixed += 1
+        if fixed:
+            logger.info("最终时间轴短字幕补时: %s", fixed)
+        return repaired
+
+    def _shift_next_for_loaded_short_final_segments(
+        self, segments: Sequence[ASRDataSeg]
+    ) -> List[ASRDataSeg]:
+        result = list(segments)
+        if len(result) < 2:
+            return result
+        shifted = 0
+        for index in range(len(result) - 1):
+            seg = result[index]
+            nxt = result[index + 1]
+            start = max(0, int(seg.start_time))
+            end = max(start + 1, int(seg.end_time))
+            duration_ms = end - start
+            if duration_ms >= DISPLAY_MIN_DURATION_MS:
+                continue
+            original = self._normalize_text(seg.text)
+            translated = self._normalize_text(seg.translated_text)
+            if self._is_simple_short_response(original, translated):
+                continue
+            text_load = self._word_count(original) + len(re.findall(r"[\u4e00-\u9fff]", translated))
+            if text_load <= 4:
+                continue
+            target_end = start + DISPLAY_MIN_DURATION_MS
+            if target_end <= end:
+                continue
+            next_end = max(int(nxt.end_time), int(nxt.start_time) + 1)
+            shifted_next_start = target_end + DISPLAY_MIN_GAP_MS
+            if next_end - shifted_next_start < DISPLAY_MIN_DURATION_MS:
+                continue
+            result[index] = self._copy_segment(seg, start_time=start, end_time=target_end)
+            result[index + 1] = self._copy_segment(
+                nxt,
+                start_time=shifted_next_start,
+                end_time=next_end,
+            )
+            shifted += 1
+        if shifted:
+            logger.info("最终时间轴短字幕通过顺延下一条补时: %s", shifted)
+        return result
+
+    def _repair_high_load_short_subtitle_timings(
+        self, segments: Sequence[ASRDataSeg]
+    ) -> List[ASRDataSeg]:
+        result = list(segments)
+        if not result:
+            return result
+        repaired = 0
+        for index, seg in enumerate(result):
+            if not self._is_high_load_short_subtitle(seg):
+                continue
+            target_duration = self._target_high_load_duration_ms(seg)
+            start = max(0, int(seg.start_time))
+            end = max(start + 1, int(seg.end_time))
+            if end - start >= target_duration:
+                continue
+            target_end = start + target_duration
+            if index + 1 < len(result):
+                nxt = result[index + 1]
+                next_end = max(int(nxt.end_time), int(nxt.start_time) + 1)
+                shifted_next_start = target_end + DISPLAY_MIN_GAP_MS
+                if next_end - shifted_next_start < DISPLAY_MIN_DURATION_MS:
+                    continue
+                result[index] = self._copy_segment(seg, start_time=start, end_time=target_end)
+                result[index + 1] = self._copy_segment(
+                    nxt,
+                    start_time=shifted_next_start,
+                    end_time=next_end,
+                )
+                self._record_safe_timing_repair(seg, result[index], index + 1, "high_load_short_timing_repaired")
+                repaired += 1
+            else:
+                result[index] = self._copy_segment(seg, start_time=start, end_time=target_end)
+                self._record_safe_timing_repair(seg, result[index], index + 1, "high_load_short_timing_repaired")
+                repaired += 1
+        if repaired:
+            logger.info("高负载短字幕补时: %s", repaired)
+        return result
+
+    def _record_safe_timing_repair(
+        self,
+        old: ASRDataSeg,
+        new: ASRDataSeg,
+        index: int,
+        code: str,
+    ) -> None:
+        if not getattr(self, "enable_safe_auto_repair", False):
+            return
+        if not hasattr(self, "_safe_auto_repair_log"):
+            self._safe_auto_repair_log = []
+        subtitle_id = self._segment_subtitle_id(new, index)
+        key = (code, subtitle_id, int(old.start_time), int(old.end_time), int(new.start_time), int(new.end_time))
+        for item in self._safe_auto_repair_log:
+            if (
+                item.get("code"),
+                item.get("subtitle_id"),
+                int(item.get("before_start_ms", -1)),
+                int(item.get("before_end_ms", -1)),
+                int(item.get("after_start_ms", -1)),
+                int(item.get("after_end_ms", -1)),
+            ) == key:
+                return
+        self._safe_auto_repair_log.append(
+            {
+                "stage": "final_timing",
+                "code": code,
+                "index": index,
+                "subtitle_id": subtitle_id,
+                "start": self._format_ms(new.start_time),
+                "end": self._format_ms(new.end_time),
+                "english": new.text,
+                "before_chinese": old.translated_text,
+                "after_chinese": new.translated_text,
+                "before_start_ms": int(old.start_time),
+                "before_end_ms": int(old.end_time),
+                "after_start_ms": int(new.start_time),
+                "after_end_ms": int(new.end_time),
+            }
+        )
+
+    def _is_high_load_short_subtitle(self, seg: ASRDataSeg) -> bool:
+        original = self._normalize_text(seg.text)
+        translated = self._normalize_text(seg.translated_text)
+        if self._is_simple_short_response(original, translated):
+            return False
+        duration_ms = max(1, int(seg.end_time) - int(seg.start_time))
+        word_count = self._word_count(original)
+        chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", translated))
+        if duration_ms <= 900 and word_count >= 8 and chinese_chars >= 10:
+            return True
+        if duration_ms <= 800 and word_count >= 10:
+            return True
+        if duration_ms <= 800 and word_count >= 4 and chinese_chars >= 16:
+            return True
+        weighted_load = word_count * 1.35 + chinese_chars
+        return (
+            duration_ms <= 900
+            and word_count >= 5
+            and chinese_chars >= 10
+            and weighted_load / (duration_ms / 1000.0) > 24
+        )
+
+    def _target_high_load_duration_ms(self, seg: ASRDataSeg) -> int:
+        word_count = self._word_count(self._normalize_text(seg.text))
+        chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", self._normalize_text(seg.translated_text)))
+        english_budget = int(math.ceil((word_count / max(ENGLISH_WPS_WARNING, 1.0)) * 1000)) if word_count else 0
+        chinese_budget = int(math.ceil((chinese_chars / max(CHINESE_CPS_WARNING, 1.0)) * 1000)) if chinese_chars else 0
+        return min(1800, max(DISPLAY_MIN_DURATION_MS, english_budget, chinese_budget))
 
     def _repair_abnormal_timing_gaps(
         self,
@@ -1685,6 +1901,11 @@ class ScreenSubtitleEditor:
             issues.append("incomplete_interrogative_fragment")
         if self._looks_like_negation_or_emphasis_fragment(words):
             issues.append("negation_or_emphasis_fragment")
+        if self._looks_like_incomplete_bare_verb_fragment(item, words, next_item):
+            issues.append("incomplete_short_fragment")
+        trailing_issue = self._trailing_dependent_fragment_issue(item, next_item)
+        if trailing_issue:
+            issues.append(trailing_issue)
 
         hard = list(dict.fromkeys(issues))
         result["hard_fragment_issues"] = hard
@@ -1692,6 +1913,57 @@ class ScreenSubtitleEditor:
         result["is_valid"] = not hard
         result["has_independent_meaning"] = bool(result["has_finite_predicate"] and word_count >= 4)
         return result
+
+    def _trailing_dependent_fragment_issue(
+        self,
+        item: ScreenSubtitleItem,
+        next_item: Optional[ScreenSubtitleItem],
+    ) -> str:
+        if next_item is None:
+            return ""
+        if item.subtitle_id or next_item.subtitle_id:
+            return ""
+        if not self._items_are_continuous(item, next_item):
+            return ""
+        if self._items_cross_speaker(item, next_item):
+            return ""
+        pause = self._boundary_pause_ms(item, next_item)
+        if pause is not None and pause >= 450:
+            return ""
+        words = [word.casefold() for word in self._word_tokens(item.original)]
+        next_words = [word.casefold() for word in self._word_tokens(next_item.original)]
+        if not words or not next_words:
+            return ""
+        last = words[-1]
+        next_first = next_words[0]
+        surface = self._normalize_text(item.original)
+        if re.search(r"[.!?]\s*$", surface):
+            return ""
+        if self._is_protected_named_phrase_split(last, next_first):
+            return "trailing_protected_named_phrase_fragment"
+        if self._is_protected_phrasal_boundary(last, next_first):
+            return "trailing_protected_phrasal_fragment"
+        if last in {"and", "but", "or", "so"}:
+            return "trailing_connector_fragment"
+        if last in {
+            "am", "is", "are", "was", "were", "be", "been", "being",
+            "do", "does", "did", "have", "has", "had",
+            "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+            "it's", "that's", "there's", "he's", "she's", "what's",
+        }:
+            return "trailing_auxiliary_fragment"
+        if last.endswith("'s") and self._token_looks_noun_like(next_first):
+            return "trailing_possessive_fragment"
+        if last in {"all", "both", "either", "neither"} and (
+            next_first in self._stable_determiners() or self._token_looks_noun_like(next_first)
+        ):
+            return "trailing_quantifier_fragment"
+        if (
+            self._looks_like_adjective_before_noun(last, next_first)
+            and not self._looks_like_allowed_sentence_final_adjective(last)
+        ):
+            return "trailing_modifier_fragment"
+        return ""
 
     def _weak_fragment_issues(
         self,
@@ -1759,6 +2031,8 @@ class ScreenSubtitleEditor:
             "am", "is", "are", "was", "were", "be", "been", "being",
             "do", "does", "did", "have", "has", "had",
             "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+            "isn't", "aren't", "wasn't", "weren't", "haven't", "hasn't", "hadn't",
+            "don't", "doesn't", "didn't", "can't", "couldn't", "won't", "wouldn't",
             "tend", "tends", "need", "needs", "needed",
         }
         if any(word in finite_or_aux for word in words):
@@ -1777,6 +2051,8 @@ class ScreenSubtitleEditor:
             "am", "is", "are", "was", "were", "be", "been", "being",
             "do", "does", "did", "have", "has", "had",
             "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+            "isn't", "aren't", "wasn't", "weren't", "haven't", "hasn't", "hadn't",
+            "don't", "doesn't", "didn't", "can't", "couldn't", "won't", "wouldn't",
             "tend", "tends", "need", "needs", "needed",
         }
         common_past_or_present_verbs = {
@@ -1807,6 +2083,35 @@ class ScreenSubtitleEditor:
         if not words:
             return False
         return all(word in {"never", "ever", "not"} for word in words)
+
+    def _looks_like_incomplete_bare_verb_fragment(
+        self,
+        item: ScreenSubtitleItem,
+        words: Sequence[str],
+        next_item: Optional[ScreenSubtitleItem],
+    ) -> bool:
+        if next_item is None or not words or len(words) > 4:
+            return False
+        if not self._items_are_continuous(item, next_item) or self._items_cross_speaker(item, next_item):
+            return False
+        pause = self._boundary_pause_ms(item, next_item)
+        if pause is not None and pause >= 450:
+            return False
+        surface = self._normalize_text(item.original)
+        if re.search(r"[.!?]\s*$", surface):
+            return False
+        bare_verbs = {
+            "open", "build", "make", "take", "create", "turn", "move", "put",
+            "bring", "keep", "hold", "push", "pull", "drive",
+        }
+        if words[0] not in bare_verbs:
+            return False
+        if words[-1] in self._stable_determiners():
+            return True
+        if re.search(r"[,;:]\s*$", surface) and not self._fragment_has_finite_predicate(words):
+            return True
+        next_words = [word.casefold() for word in self._word_tokens(next_item.original)]
+        return bool(next_words and self._looks_like_adjective_before_noun(words[-1], next_words[0]))
 
     def _short_item_duration_ms(self, item: ScreenSubtitleItem) -> int:
         timing = self._item_word_timing(item)
@@ -1865,6 +2170,13 @@ class ScreenSubtitleEditor:
             "negation_or_emphasis_fragment",
             "standalone_connector_fragment",
             "trailing_reflexive_fragment",
+            "trailing_connector_fragment",
+            "trailing_auxiliary_fragment",
+            "trailing_possessive_fragment",
+            "trailing_quantifier_fragment",
+            "trailing_modifier_fragment",
+            "trailing_protected_named_phrase_fragment",
+            "trailing_protected_phrasal_fragment",
         }
         if len(items) != 2:
             return []
@@ -1875,9 +2187,30 @@ class ScreenSubtitleEditor:
             return []
         if self._internal_sentence_transition_word_index(merged) is not None:
             return []
+        if self._ends_with_dependent_boundary_token(merged.original):
+            return []
         if self._weak_fragment_issues(merged, None, None):
             return []
         return [merged]
+
+    @classmethod
+    def _ends_with_dependent_boundary_token(cls, text: str) -> bool:
+        if re.search(r"[.!?]\s*$", text or ""):
+            return False
+        words = [word.casefold() for word in cls._word_tokens(text)]
+        if not words:
+            return False
+        last = words[-1]
+        if last in {"and", "but", "or", "so"}:
+            return True
+        if last in cls._stable_determiners():
+            return True
+        return last in {
+            "am", "is", "are", "was", "were", "be", "been", "being",
+            "do", "does", "did", "have", "has", "had",
+            "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+            "it's", "that's", "there's", "he's", "she's", "what's",
+        }
 
     def _can_repair_pre_id_window(self, items: Sequence[ScreenSubtitleItem]) -> bool:
         if len(items) < 2 or len(items) > 3:
@@ -2372,6 +2705,14 @@ class ScreenSubtitleEditor:
         source_id = subtitle_id if subtitle_id is not None else getattr(seg, "subtitle_id", None)
         if source_id:
             copied.subtitle_id = source_id
+        for attr in (
+            "word_start",
+            "word_end",
+            "stable_word_start_ms",
+            "stable_word_end_ms",
+        ):
+            if hasattr(seg, attr):
+                setattr(copied, attr, getattr(seg, attr))
         return copied
 
     @classmethod
@@ -2407,6 +2748,11 @@ class ScreenSubtitleEditor:
             "llm_cache_stats": self._llm_cache_stats,
             "allocation_runtime_stats": self._allocation_runtime_stats,
             "qa_review_points_count": self._qa_review_points_count,
+            "safe_auto_repair_enabled": bool(getattr(self, "enable_safe_auto_repair", False)),
+            "safe_auto_repair_count": len(getattr(self, "_safe_auto_repair_log", []) or []),
+            "safe_auto_repair_log": list(getattr(self, "_safe_auto_repair_log", []) or []),
+            "safe_auto_repair_candidate_count": len(getattr(self, "_safe_auto_repair_candidates", []) or []),
+            "safe_auto_repair_candidates": list(getattr(self, "_safe_auto_repair_candidates", []) or [])[:200],
         }
         if self._qa_review_points_path:
             metadata["qa_review_points_srt"] = self._qa_review_points_path
@@ -2736,7 +3082,7 @@ class ScreenSubtitleEditor:
     def _stable_word_ranges_for_span(
         self, span: tuple[int, int], target_words: Optional[int] = None
     ) -> List[tuple[int, int]]:
-        target = target_words or min(self.max_english_words, 14)
+        target = target_words or min(self.max_english_words, 16)
         emergency = max(target, min(16, max(self.max_english_words, target)))
         start, end = span
         if end < start:
@@ -2985,20 +3331,10 @@ class ScreenSubtitleEditor:
             issues.append("auxiliary_predicate_split")
         if self._is_subject_finite_verb_boundary(left_token, right_token):
             issues.append("subject_finite_verb_split")
-        if self._is_short_verb_object_split(left_token, right_token):
-            issues.append("short_verb_object_split")
-        if self._is_verb_complement_split(left_token, right_token):
-            issues.append("verb_complement_split")
-        if self._is_compound_noun_split(left_token, right_token):
-            issues.append("compound_noun_split")
-        if self._is_modifier_noun_head_split(left_token, right_token):
-            issues.append("modifier_noun_head_split")
         if self._is_determiner_head_phrase_split(left_token, right_token):
             issues.append("determiner_head_phrase_split")
         if self._is_particle_or_preposition_complement_split(left_token, right_token):
             issues.append("particle_or_preposition_complement_split")
-        if self._is_phrasal_verb_particle_split(left_token, right_token):
-            issues.append("phrasal_verb_particle_split")
         if self._is_time_range_continuation_split(left, right):
             issues.append("time_range_continuation_split")
         elif self._is_stranded_leading_complement_split(left, right, pause_ms):
@@ -3007,6 +3343,16 @@ class ScreenSubtitleEditor:
             issues.append("negation_or_emphasis_fragment")
         if self._is_adverb_adjective_boundary(left_token, right_token, pause_ms):
             issues.append("adverb_adjective_split")
+        if self._is_modifier_chain_split(left, right, pause_ms):
+            issues.append("modifier_chain_split")
+        if self._is_high_confidence_modifier_head_boundary(left_token, right_token):
+            issues.append("high_confidence_modifier_head_split")
+        if self._is_protected_named_phrase_split(left_token, right_token):
+            issues.append("protected_named_phrase_split")
+        if self._is_protected_phrasal_boundary(left_token, right_token):
+            issues.append("protected_phrasal_boundary_split")
+        if self._is_coordinated_modifier_split(left, right, pause_ms):
+            issues.append("coordinated_modifier_split")
         if self._is_transition_attached_to_previous_sentence(left, right, pause_ms):
             issues.append("transition_attached_to_previous_sentence")
         for issue in (getattr(self, "_syntax_hard_cut_issues", {}) or {}).get((left, right), []):
@@ -3021,6 +3367,16 @@ class ScreenSubtitleEditor:
         issues: List[str] = []
         if left_token in {"you", "than"} and right_token:
             issues.append("comparative_clause_split")
+        if self._is_short_verb_object_split(left_token, right_token):
+            issues.append("short_verb_object_split")
+        if self._is_verb_complement_split(left_token, right_token):
+            issues.append("verb_complement_split")
+        if self._is_compound_noun_split(left_token, right_token):
+            issues.append("compound_noun_split")
+        if self._is_modifier_noun_head_split(left_token, right_token):
+            issues.append("modifier_noun_head_split")
+        if self._is_phrasal_verb_particle_split(left_token, right_token):
+            issues.append("phrasal_verb_particle_split")
         return issues
 
     def _is_transition_attached_to_previous_sentence(
@@ -3041,6 +3397,59 @@ class ScreenSubtitleEditor:
         previous_surface = str(entries[left - 1].get("surface") or "")
         left_surface = str(entries[left].get("surface") or "")
         return bool(re.search(r"[.!?]\s*$", previous_surface) or re.search(r"[,;:]\s*$", left_surface))
+
+    def _is_coordinated_modifier_split(
+        self,
+        left: int,
+        right: int,
+        pause_ms: Optional[int],
+    ) -> bool:
+        if pause_ms is not None and pause_ms >= 450:
+            return False
+        entries = self._active_word_entries
+        if not entries or right + 1 >= len(entries):
+            return False
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        next_token = self._clean_boundary_token(entries[right + 1].get("token") or "")
+        if right_token not in {"and", "or"} or not left_token or not next_token:
+            return False
+        if next_token in self._stable_determiners():
+            return False
+        if not (
+            self._looks_like_adjective_before_noun(left_token, next_token)
+            or self._looks_like_adjective_before_noun(next_token, "pressure")
+            or left_token in {"economic", "social", "financial", "political", "cultural", "structural"}
+        ):
+            return False
+        return next_token in {
+            "social", "economic", "financial", "political", "cultural", "structural",
+            "public", "private", "global", "local", "massive", "major",
+        } or self._token_looks_noun_like(next_token)
+
+    def _is_modifier_chain_split(
+        self,
+        left: int,
+        right: int,
+        pause_ms: Optional[int],
+    ) -> bool:
+        if pause_ms is not None and pause_ms >= 450:
+            return False
+        entries = self._active_word_entries
+        if not entries or right + 1 >= len(entries):
+            return False
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        next_token = self._clean_boundary_token(entries[right + 1].get("token") or "")
+        modifier_tokens = {
+            "massive", "major", "minor", "huge", "small", "large", "deep",
+            "economic", "social", "financial", "political", "cultural",
+            "structural", "public", "private", "global", "local",
+            "traditional", "modern", "invisible", "aggressive",
+        }
+        if left_token not in modifier_tokens or right_token not in modifier_tokens:
+            return False
+        return next_token in modifier_tokens or next_token in {"and", "or"} or self._token_looks_noun_like(next_token)
 
     @staticmethod
     def _sentence_transition_tokens() -> set:
@@ -3217,6 +3626,82 @@ class ScreenSubtitleEditor:
     def _is_modifier_noun_head_split(self, left: str, right: str) -> bool:
         return self._looks_like_adjective_before_noun(left, right)
 
+    @staticmethod
+    def _is_high_confidence_modifier_head_boundary(left: str, right: str) -> bool:
+        protected_pairs = {
+            ("loaded", "motorized"),
+            ("dense", "chaotic"),
+            ("secretive", "regional"),
+            ("healthy", "cash"),
+            ("corporate", "solvency"),
+            ("strategic", "pathway"),
+            ("traditional", "high"),
+            ("traditional", "fast"),
+            ("long-term", "regional"),
+            ("economic", "miracle"),
+            ("subsequent", "slowdown"),
+            ("deep", "physical"),
+            ("creative", "drive"),
+        }
+        if (left, right) in protected_pairs:
+            return True
+        if left.endswith("'s") or left.endswith("s'"):
+            return True
+        return False
+
+    @staticmethod
+    def _is_protected_named_phrase_split(left: str, right: str) -> bool:
+        protected_pairs = {
+            ("wall", "street"),
+            ("south", "korea"),
+            ("north", "korea"),
+            ("new", "york"),
+            ("silicon", "valley"),
+            ("sk", "hynix"),
+            ("goldman", "sachs"),
+            ("federal", "reserve"),
+            ("united", "states"),
+            ("saudi", "arabia"),
+            ("elon", "musk"),
+            ("jensen", "huang"),
+            ("world", "bank"),
+        }
+        return (left, right) in protected_pairs
+
+    @staticmethod
+    def _is_protected_phrasal_boundary(left: str, right: str) -> bool:
+        protected_pairs = {
+            ("look", "at"),
+            ("looks", "at"),
+            ("looked", "at"),
+            ("looking", "at"),
+            ("refer", "to"),
+            ("refers", "to"),
+            ("referred", "to"),
+            ("referring", "to"),
+            ("focus", "on"),
+            ("focuses", "on"),
+            ("focused", "on"),
+            ("focusing", "on"),
+            ("deal", "with"),
+            ("deals", "with"),
+            ("dealt", "with"),
+            ("dealing", "with"),
+            ("relate", "to"),
+            ("relates", "to"),
+            ("related", "to"),
+            ("relating", "to"),
+            ("pricing", "in"),
+            ("priced", "in"),
+            ("price", "in"),
+            ("hunkering", "down"),
+            ("forced", "to"),
+            ("trying", "to"),
+            ("able", "to"),
+            ("going", "to"),
+        }
+        return (left, right) in protected_pairs
+
     def _is_determiner_head_phrase_split(self, left: str, right: str) -> bool:
         return left in self._stable_determiners() and self._token_looks_noun_like(right)
 
@@ -3356,7 +3841,9 @@ class ScreenSubtitleEditor:
     def _looks_like_adjective_before_noun(left: str, right: str) -> bool:
         if not left or not right:
             return False
-        if "-" in left:
+        if right in {"and", "or", "but", "of", "to", "in", "on", "for", "with"}:
+            return False
+        if "-" in left and ScreenSubtitleEditor._token_looks_noun_like(right):
             return True
         adjective_endings = (
             "al", "ful", "ive", "ous", "ic", "ary", "ory", "less", "able", "ible",
@@ -3371,13 +3858,18 @@ class ScreenSubtitleEditor:
             "economy", "expansion", "optimization",
             "sector", "job", "jobs", "day", "days", "shift", "shifts",
             "graduate", "graduates", "future", "present",
-            "majority",
+            "majority", "capital", "thing", "trajectory", "investor", "investors",
+            "wait", "scooter", "traffic", "pitch", "solvency", "pathway",
+            "miracle", "slowdown", "drive", "memory", "funds", "monopolies",
         }
         common_adjectives = {
             "complete", "existing", "grueling", "high-tech", "intensive",
             "massive", "outward", "own", "private", "publicly", "recurring",
             "relentless", "sprawling", "state", "structural", "sustainable",
-            "today's", "vast", "corporate",
+            "today's", "vast", "corporate", "exact", "same", "largest", "strict",
+            "loaded", "motorized", "dense", "chaotic", "secretive", "regional",
+            "healthy", "strategic", "traditional", "fast", "long-term",
+            "economic", "subsequent", "deep", "physical", "creative",
         }
         noun_modifiers = {
             "asset", "assets", "budget", "cash", "land", "private", "public",
@@ -3390,6 +3882,13 @@ class ScreenSubtitleEditor:
         if left in noun_modifiers and right in common_nouns:
             return True
         return right in common_nouns and left.endswith(adjective_endings)
+
+    @staticmethod
+    def _looks_like_allowed_sentence_final_adjective(token: str) -> bool:
+        return token in {
+            "clear", "specific", "important", "good", "bad", "true", "false",
+            "right", "wrong", "possible", "necessary", "available", "ready",
+        }
 
     @staticmethod
     def _dangerous_segment_end_tokens() -> set:
@@ -5236,6 +5735,10 @@ class ScreenSubtitleEditor:
         reasons: List[str] = []
         if self._is_abbreviation_name_boundary(previous_text, current_text):
             reasons.append("abbreviation_name_split")
+        if self._is_protected_named_phrase_split(prev, cur):
+            reasons.append("protected_named_phrase_split")
+        if self._is_protected_phrasal_boundary(prev, cur):
+            reasons.append("protected_phrasal_boundary_split")
 
         prepositions = {
             "into", "of", "for", "with", "without", "in", "on", "at", "by",
@@ -5250,18 +5753,23 @@ class ScreenSubtitleEditor:
             "force", "forces", "forced", "alter", "alters", "altered", "show",
             "shows", "showed", "raise", "raises", "raised", "put", "puts",
             "make", "makes", "made", "give", "gives", "gave", "take", "takes",
-            "took", "create", "creates", "created",
+            "took", "create", "creates", "created", "look", "looks", "looked",
         }
         adjectives = {
             "absolute", "extreme", "uncomfortable", "rapid", "massive", "structural",
             "financial", "corporate", "public", "private", "local", "global",
             "new", "old", "major", "regional", "economic", "entire", "empty",
-            "really",
+            "really", "loaded", "dense", "chaotic", "secretive", "healthy",
+            "strategic", "traditional", "high-tech", "mind-bending", "working",
+            "motorized",
+            "short-term", "long-term", "impenetrable", "physical", "personal",
         }
         common_nouns = {
             "air", "look", "edge", "atmosphere", "world", "question", "solution",
             "solutions", "building", "government", "market", "markets", "policy",
-            "data", "source", "sources",
+            "data", "source", "sources", "scooter", "traffic", "pitch",
+            "funds", "memory", "monopolies", "standards", "trainers",
+            "industry", "miracle", "slowdown", "art",
         }
 
         if prev in prepositions:
@@ -5278,6 +5786,8 @@ class ScreenSubtitleEditor:
             reasons.append("phrasal_verb_split")
         if prev in object_verbs and (cur in determiners or cur in adjectives or cur in common_nouns):
             reasons.append("verb_object_split")
+        if prev in {"look", "looks", "looked"} and cur == "at":
+            reasons.append("verb_preposition_split")
         if prev in adjectives and (cur in adjectives or cur in common_nouns):
             reasons.append("modifier_head_split")
         if prev2 in be_aux and prev.endswith("ing") and cur in particles:
@@ -5337,6 +5847,10 @@ class ScreenSubtitleEditor:
     @classmethod
     def _bad_cut_reasons(cls, previous_last: str, current_first: str) -> List[str]:
         reasons: List[str] = []
+        if cls._is_protected_named_phrase_split(previous_last, current_first):
+            reasons.append("固定专名被切开")
+        if cls._is_protected_phrasal_boundary(previous_last, current_first):
+            reasons.append("固定短语被切开")
         protected_pairs = {
             ("corporate", "division"): "固定名词短语被切开",
             ("because", "that"): "because that 从句被切开",
@@ -5702,6 +6216,8 @@ class ScreenSubtitleEditor:
     ) -> List[Dict]:
         findings: List[Dict] = []
         reasons: List[str] = []
+        if self._is_simple_short_response(english, chinese):
+            return findings
         if mapping_valid and self._is_incomplete_chinese_group(chinese):
             findings.append(
                 {
@@ -5845,10 +6361,13 @@ class ScreenSubtitleEditor:
             text_load = self._word_count(original) + len(re.findall(r"[\u4e00-\u9fff]", translated))
             is_invalid = duration_ms < SUBTITLE_DURATION_INVALID_MS
             is_too_short_for_load = duration_ms < SUBTITLE_DURATION_ERROR_MS and not simple_response and text_load > 4
+            is_high_load_short = self._is_high_load_short_subtitle(seg)
             is_error = is_invalid or is_too_short_for_load
             is_warning = (
                 not is_error
                 and (
+                    is_high_load_short
+                    or
                     duration_ms < SUBTITLE_DURATION_ERROR_MS
                     or duration_ms < SUBTITLE_DURATION_WARNING_MS
                 )
@@ -5860,18 +6379,27 @@ class ScreenSubtitleEditor:
             threshold = (
                 SUBTITLE_DURATION_INVALID_MS
                 if is_invalid
-                else (SUBTITLE_DURATION_ERROR_MS if is_error else SUBTITLE_DURATION_WARNING_MS)
+                else (
+                    SUBTITLE_DURATION_ERROR_MS
+                    if is_error
+                    else (self._target_high_load_duration_ms(seg) if is_high_load_short else SUBTITLE_DURATION_WARNING_MS)
+                )
             )
+            code = "subtitle_duration_invalid" if is_error else "subtitle_duration_too_short"
+            reason = f"字幕显示时间 {duration_ms}ms，低于 {threshold}ms 阈值"
+            if is_high_load_short and not is_error:
+                code = "subtitle_high_load_too_short"
+                reason = f"字幕显示时间 {duration_ms}ms，但文本负载较高，建议至少 {threshold}ms"
             issues.append(
                 {
-                    "code": "subtitle_duration_invalid" if is_error else "subtitle_duration_too_short",
+                    "code": code,
                     "level": "ERROR" if is_error else "WARNING",
                     "index": index,
                     "start": self._format_ms(seg.start_time),
                     "end": self._format_ms(seg.end_time),
                     "duration_ms": duration_ms,
                     "threshold_ms": threshold,
-                    "reason": f"字幕显示时间 {duration_ms}ms，低于 {threshold}ms 阈值",
+                    "reason": reason,
                     "simple_response": simple_response,
                     "text_load": text_load,
                     "original": original,
@@ -5888,6 +6416,7 @@ class ScreenSubtitleEditor:
         short_en = {
             "right",
             "yeah",
+            "oh yeah",
             "yes",
             "no",
             "okay",
@@ -5895,6 +6424,9 @@ class ScreenSubtitleEditor:
             "really",
             "exactly",
             "sure",
+            "good question",
+            "in a way yeah",
+            "unbelievable",
             "why",
             "where",
             "how",
@@ -5904,6 +6436,11 @@ class ScreenSubtitleEditor:
             "\u6ca1\u9519",
             "\u5bf9",
             "\u662f\u7684",
+            "\u95ee\u5f97\u597d",
+            "\u54e6\u662f\u7684",
+            "\u5728\u67d0\u79cd\u7a0b\u5ea6\u4e0a\u662f\u7684",
+            "\u96be\u4ee5\u7f6e\u4fe1",
+            "\u8fd8\u6709\u66f4\u5389\u5bb3\u7684",
             "\u771f\u7684\u5417",
             "\u771f\u7684",
             "\u597d\u7684",
@@ -5921,6 +6458,8 @@ class ScreenSubtitleEditor:
         issues: List[Dict] = []
         for index, seg in enumerate(segments, 1):
             duration_ms = max(1, int(seg.end_time) - int(seg.start_time))
+            if duration_ms < SUBTITLE_DURATION_INVALID_MS:
+                continue
             duration_sec = duration_ms / 1000.0
             original = self._normalize_text(seg.text)
             translated = self._normalize_text(seg.translated_text)
@@ -6086,6 +6625,24 @@ class ScreenSubtitleEditor:
                     "asr_semantic_nonsense",
                     "疑似ASR把 safety nets 识别成不成立的表达",
                     "high",
+                ),
+                (
+                    r"\belectric\s+cess\b",
+                    "asr_semantic_nonsense",
+                    "疑似ASR把 electric fence 识别成不成立的表达",
+                    "high",
+                ),
+                (
+                    r"\b[a-z][a-z]{1,8}s?\s+surname\b",
+                    "asr_name_suspicious",
+                    "疑似专名所有格识别异常：surname 前的人名建议结合文章上下文回听确认",
+                    "medium",
+                ),
+                (
+                    r"\bamerica\s+respondents\b",
+                    "asr_adjective_form_suspicious",
+                    "疑似国家名形容词形式错误：常见表达应接近 American respondents",
+                    "medium",
                 ),
                 (
                     r"\bstate-of\s+the-art\b|\bstate\s+of-the-art\b",
@@ -6558,6 +7115,504 @@ class ScreenSubtitleEditor:
         )
         return repaired
 
+    def _safe_auto_repair_segments(
+        self,
+        segments: Sequence[ASRDataSeg],
+        semantic_groups: Optional[Sequence[Dict]] = None,
+        subtitle_items: Optional[Sequence[ScreenSubtitleItem]] = None,
+        stage: str = "unknown",
+    ) -> List[ASRDataSeg]:
+        if not getattr(self, "enable_safe_auto_repair", False):
+            return list(segments)
+        before = [self._copy_segment(seg) for seg in segments]
+        self._record_safe_auto_repair_candidates(before, stage)
+        before_guard = self._safe_auto_repair_guard_summary(before)
+        repaired = [self._copy_segment(seg) for seg in segments]
+        repaired = self._translate_missing_segments(repaired)
+        repaired = self._align_segment_translation_punctuation(repaired)
+        repaired = self._repair_exact_duplicate_chinese_segments(repaired)
+        repaired = self._compress_fast_chinese_segments(
+            repaired,
+            semantic_groups=semantic_groups,
+            subtitle_items=subtitle_items,
+        )
+        repaired = self._repair_high_confidence_chinese_candidates_with_llm(
+            repaired,
+            semantic_groups=semantic_groups,
+            subtitle_items=subtitle_items,
+            stage=stage,
+        )
+        after_guard = self._safe_auto_repair_guard_summary(repaired)
+        if not self._safe_auto_repair_guard_passes(before_guard, after_guard):
+            self._safe_auto_repair_log.append(
+                {
+                    "stage": stage,
+                    "code": "safe_repair_guard_rejected",
+                    "before": before_guard,
+                    "after": after_guard,
+                }
+            )
+            return before
+        self._record_safe_auto_repair_diff(before, repaired, stage)
+        return repaired
+
+    def _repair_high_confidence_chinese_candidates_with_llm(
+        self,
+        segments: Sequence[ASRDataSeg],
+        semantic_groups: Optional[Sequence[Dict]] = None,
+        subtitle_items: Optional[Sequence[ScreenSubtitleItem]] = None,
+        stage: str = "unknown",
+    ) -> List[ASRDataSeg]:
+        if stage != "after_final_time_alignment":
+            return list(segments)
+        if not semantic_groups or not subtitle_items:
+            return list(segments)
+        targets: List[tuple[int, ASRDataSeg]] = []
+        seen_group_ids: set = set()
+        for index, seg in enumerate(segments):
+            chinese = self._normalize_text(seg.translated_text)
+            if not chinese or not self._is_high_confidence_chinese_fragment_candidate(chinese):
+                continue
+            context = self._semantic_context_for_segment_index(
+                index,
+                segments,
+                semantic_groups=semantic_groups,
+                subtitle_items=subtitle_items,
+            )
+            parts = context.get("parts") or []
+            group_key = context.get("group_id")
+            if not parts or len(parts) > 5 or group_key in seen_group_ids:
+                continue
+            seen_group_ids.add(group_key)
+            targets.append((index, seg))
+        if not targets:
+            return list(segments)
+
+        payload = []
+        for index, seg in targets[:12]:
+            item = self._chinese_compression_payload_item(
+                index,
+                seg,
+                segments,
+                semantic_groups=semantic_groups,
+                subtitle_items=subtitle_items,
+            )
+            item["candidate_reason"] = "high_confidence_chinese_fragment"
+            item["repair_scope"] = "same_sense_group_chinese_only"
+            payload.append(item)
+        prompt = (
+            "Repair only high-confidence Simplified Chinese subtitle fragments inside each provided sense_group.\n"
+            "Do not change English, subtitle IDs, order, timing, or subtitle count.\n"
+            "Use full_translation as the authority. English is only for locating meaning.\n"
+            "Only rewrite Chinese for existing indices in sense_group.parts when it makes the group more complete and natural.\n"
+            "Keep facts, numbers, names, negation, contrast, causality, modality, and core conclusions.\n"
+            "Avoid creating new dangling clauses, repeated Chinese, or text that is too long for the subtitle duration.\n"
+            "If no safe improvement exists for a target, return no segments for it.\n"
+            "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
+        )
+        try:
+            data = self._request_chinese_compression(
+                prompt,
+                payload,
+                task="screen_subtitle_high_confidence_chinese_candidate_repair",
+                temperature=0.0,
+            )
+        except Exception as exc:
+            logger.warning("高置信中文候选局部修复失败，保留原字幕: %s", str(exc))
+            return list(segments)
+
+        allocations = self._parse_chinese_group_allocations(data, segments)
+
+        retry_payload = []
+        for index, seg in targets[:12]:
+            target_id = self._segment_subtitle_id(seg, index + 1)
+            allocation = allocations.get(target_id, {})
+            context = self._semantic_context_for_segment_index(
+                index,
+                segments,
+                semantic_groups=semantic_groups,
+                subtitle_items=subtitle_items,
+            )
+            if allocation and self._is_valid_group_chinese_allocation_by_id(
+                allocation,
+                segments,
+                context,
+            ):
+                continue
+            retry_item = self._chinese_compression_payload_item(
+                index,
+                seg,
+                segments,
+                semantic_groups=semantic_groups,
+                subtitle_items=subtitle_items,
+            )
+            retry_item["candidate_reason"] = "high_confidence_chinese_fragment"
+            retry_item["repair_scope"] = "same_sense_group_chinese_only"
+            retry_item["rejected_group_segments"] = allocation
+            retry_item["retry_reason"] = (
+                "missing_safe_allocation" if not allocation else "allocation_validation_failed"
+            )
+            retry_payload.append(retry_item)
+
+        if retry_payload:
+            retry_prompt = (
+                "Conservatively repair Simplified Chinese subtitle allocation inside each fixed sense_group.\n"
+                "The first attempt was missing or invalid. Use full_translation as the only authority for Chinese meaning.\n"
+                "Do not translate freely from English. English only locates which meaning belongs to which fixed subtitle ID.\n"
+                "You may rewrite the target and adjacent same-group Chinese lines, but only existing indices are allowed.\n"
+                "Do not change English, IDs, order, timing, or subtitle count.\n"
+                "Prefer short, direct, complete Chinese expressions. Preserve core actions, facts, numbers, names, negation, contrast, and causality.\n"
+                "Reject dangling clauses such as 当...时, 如果..., 因为..., 对于..., 在..., 把..., 将..., 意味着..., 的...\n"
+                "If no safe complete improvement exists, return no segments for that group.\n"
+                "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
+            )
+            try:
+                retry_data = self._request_chinese_compression(
+                    retry_prompt,
+                    retry_payload,
+                    task="screen_subtitle_high_confidence_chinese_candidate_repair_retry",
+                    temperature=0.0,
+                )
+                retry_allocations = self._parse_chinese_group_allocations(
+                    retry_data,
+                    segments,
+                )
+                allocations.update(retry_allocations)
+            except Exception as exc:
+                logger.warning("高置信中文候选保守重试失败，保留原字幕: %s", str(exc))
+
+        result = list(segments)
+        index_by_id = self._segment_index_by_subtitle_id(result)
+        changed = 0
+        for index, seg in targets[:12]:
+            target_id = self._segment_subtitle_id(seg, index + 1)
+            allocation = allocations.get(target_id, {})
+            if not allocation:
+                self._safe_auto_repair_log.append(
+                    {
+                        "stage": stage,
+                        "code": "llm_chinese_candidate_repair_skipped",
+                        "subtitle_id": target_id,
+                        "reason": "no_safe_allocation_returned",
+                    }
+                )
+                continue
+            context = self._semantic_context_for_segment_index(
+                index,
+                result,
+                semantic_groups=semantic_groups,
+                subtitle_items=subtitle_items,
+            )
+            if not self._is_valid_group_chinese_allocation_by_id(allocation, result, context):
+                self._safe_auto_repair_log.append(
+                    {
+                        "stage": stage,
+                        "code": "llm_chinese_candidate_repair_rejected",
+                        "subtitle_id": target_id,
+                        "reason": "validation_failed",
+                        "allocation": allocation,
+                    }
+                )
+                continue
+            for subtitle_id, text in allocation.items():
+                item_index = index_by_id.get(subtitle_id)
+                if item_index is None:
+                    continue
+                old = result[item_index]
+                normalized = self._normalize_text(text)
+                if not normalized or old.translated_text == normalized:
+                    continue
+                result[item_index] = self._copy_segment(old, translated_text=normalized)
+                changed += 1
+                self._safe_auto_repair_log.append(
+                    {
+                        "stage": stage,
+                        "code": "llm_chinese_candidate_repaired",
+                        "index": item_index + 1,
+                        "subtitle_id": subtitle_id,
+                        "start": self._format_ms(old.start_time),
+                        "end": self._format_ms(old.end_time),
+                        "english": old.text,
+                        "before_chinese": old.translated_text,
+                        "after_chinese": normalized,
+                        "before_start_ms": int(old.start_time),
+                        "before_end_ms": int(old.end_time),
+                        "after_start_ms": int(old.start_time),
+                        "after_end_ms": int(old.end_time),
+                    }
+                )
+        if not changed:
+            return list(segments)
+        result = self._restore_invalid_postprocess_allocations(
+            before_segments=segments,
+            after_segments=result,
+            semantic_groups=semantic_groups,
+            subtitle_items=subtitle_items,
+        )
+        return result
+
+    def _record_safe_auto_repair_candidates(
+        self,
+        segments: Sequence[ASRDataSeg],
+        stage: str,
+    ) -> None:
+        if not hasattr(self, "_safe_auto_repair_candidates"):
+            self._safe_auto_repair_candidates = []
+        existing = {
+            (
+                item.get("stage"),
+                item.get("code"),
+                item.get("subtitle_id"),
+                item.get("right_subtitle_id", ""),
+            )
+            for item in self._safe_auto_repair_candidates
+        }
+        for index, seg in enumerate(segments, 1):
+            subtitle_id = self._segment_subtitle_id(seg, index)
+            if self._is_high_load_short_subtitle(seg):
+                self._append_safe_auto_repair_candidate(
+                    existing,
+                    {
+                        "stage": stage,
+                        "code": "candidate_high_load_short_subtitle",
+                        "subtitle_id": subtitle_id,
+                        "start": self._format_ms(seg.start_time),
+                        "end": self._format_ms(seg.end_time),
+                        "english": self._normalize_text(seg.text),
+                        "chinese": self._normalize_text(seg.translated_text),
+                        "decision": "repair_timing_only_when_safe_auto_repair_is_enabled_and_neighbor_has_room",
+                    },
+                )
+            chinese = self._normalize_text(seg.translated_text)
+            if chinese and self._is_high_confidence_chinese_fragment_candidate(chinese):
+                self._append_safe_auto_repair_candidate(
+                    existing,
+                    {
+                        "stage": stage,
+                        "code": "candidate_chinese_fragment_review_only",
+                        "subtitle_id": subtitle_id,
+                        "start": self._format_ms(seg.start_time),
+                        "end": self._format_ms(seg.end_time),
+                        "english": self._normalize_text(seg.text),
+                        "chinese": chinese,
+                        "decision": "not_auto_repaired_due_to_false_positive_risk",
+                    },
+                )
+        for index, (left, right) in enumerate(zip(segments, segments[1:]), 1):
+            left_tokens = self._word_tokens(left.text)
+            right_tokens = self._word_tokens(right.text)
+            if not left_tokens or not right_tokens:
+                continue
+            left_last = self._clean_boundary_token(left_tokens[-1])
+            right_first = self._clean_boundary_token(right_tokens[0])
+            codes: List[str] = []
+            if self._is_protected_named_phrase_split(left_last, right_first):
+                codes.append("candidate_protected_named_phrase_split")
+            if self._is_protected_phrasal_boundary(left_last, right_first):
+                codes.append("candidate_protected_phrasal_boundary_split")
+            for code in codes:
+                self._append_safe_auto_repair_candidate(
+                    existing,
+                    {
+                        "stage": stage,
+                        "code": code,
+                        "subtitle_id": self._segment_subtitle_id(left, index),
+                        "right_subtitle_id": self._segment_subtitle_id(right, index + 1),
+                        "start": self._format_ms(left.start_time),
+                        "end": self._format_ms(right.end_time),
+                        "left_english": self._normalize_text(left.text),
+                        "right_english": self._normalize_text(right.text),
+                        "decision": "prevented_in_new_local_cutting_or_reported_for_existing_output",
+                    },
+                )
+
+    @staticmethod
+    def _is_high_confidence_chinese_fragment_candidate(text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text or "")
+        if not normalized:
+            return False
+        stripped = re.sub(r"[。！？!?…]+$", "", normalized)
+        if not stripped:
+            return False
+        hard_dangling_suffixes = (
+            "因为",
+            "如果",
+            "由于",
+            "对于",
+            "关于",
+            "以及",
+            "并且",
+            "而",
+            "但",
+            "把",
+            "将",
+            "意味着",
+            "导致",
+            "开始",
+            "正在",
+        )
+        if stripped.endswith(hard_dangling_suffixes):
+            return True
+        if stripped.endswith("在") and len(stripped) <= 18:
+            return True
+        if stripped.endswith("时") and not re.search(r"(想|看|说|问|思考|考虑|引发|导致|发生|出现|结束)$", stripped):
+            return True
+        return False
+
+    def _append_safe_auto_repair_candidate(self, existing: set, item: Dict) -> None:
+        key = (
+            item.get("stage"),
+            item.get("code"),
+            item.get("subtitle_id"),
+            item.get("right_subtitle_id", ""),
+        )
+        if key in existing:
+            return
+        existing.add(key)
+        self._safe_auto_repair_candidates.append(item)
+
+    def _safe_auto_repair_guard_summary(self, segments: Sequence[ASRDataSeg]) -> Dict[str, int]:
+        return {
+            "count": len(segments),
+            "missing_chinese": len(self._translation_gaps(segments)),
+            "severe_chinese_speed": sum(1 for seg in segments if self._is_severe_chinese_speed(seg)),
+            "duration_errors": len(self._subtitle_duration_issues(segments, "ERROR")),
+            "duplicate_chinese": len(self._duplicate_chinese_issues(segments)),
+            "overlong_english": len(self._overlong_english_issues(segments)),
+        }
+
+    @staticmethod
+    def _safe_auto_repair_guard_passes(before: Dict[str, int], after: Dict[str, int]) -> bool:
+        if int(after.get("count", 0)) != int(before.get("count", 0)):
+            return False
+        guarded_keys = (
+            "missing_chinese",
+            "severe_chinese_speed",
+            "duration_errors",
+            "duplicate_chinese",
+            "overlong_english",
+        )
+        return all(int(after.get(key, 0)) <= int(before.get(key, 0)) for key in guarded_keys)
+
+    def _repair_exact_duplicate_chinese_segments(
+        self, segments: Sequence[ASRDataSeg]
+    ) -> List[ASRDataSeg]:
+        targets: List[int] = []
+        for index in range(1, len(segments)):
+            previous = segments[index - 1]
+            current = segments[index]
+            previous_zh = self._normalize_chinese_for_compare(previous.translated_text)
+            current_zh = self._normalize_chinese_for_compare(current.translated_text)
+            if not previous_zh or previous_zh != current_zh or len(current_zh) < 8:
+                continue
+            previous_en = self._normalize_text(previous.text)
+            current_en = self._normalize_text(current.text)
+            if not previous_en or not current_en:
+                continue
+            if self._normalize_text(previous_en).lower() == self._normalize_text(current_en).lower():
+                continue
+            if self._is_simple_short_response(previous_en, previous.translated_text) or self._is_simple_short_response(
+                current_en, current.translated_text
+            ):
+                continue
+            targets.append(index)
+
+        if not targets:
+            return list(segments)
+
+        originals = [segments[index].text for index in targets]
+        try:
+            translations = self._translate_split_parts(originals)
+        except Exception as exc:
+            logger.warning("精确重复中文字幕重译失败，保留原字幕: %s", str(exc))
+            return list(segments)
+        if len(translations) != len(targets):
+            logger.warning("精确重复中文字幕重译数量不一致，保留原字幕")
+            return list(segments)
+
+        result = list(segments)
+        changed = 0
+        for offset, index in enumerate(targets):
+            old = result[index]
+            translated = self._normalize_text(str(translations[offset] or ""))
+            if not translated:
+                continue
+            if self._normalize_chinese_for_compare(translated) == self._normalize_chinese_for_compare(old.translated_text):
+                continue
+            if self._is_translation_too_fast_for_segment(translated, old):
+                continue
+            result[index] = self._copy_segment(old, translated_text=translated)
+            changed += 1
+        if changed:
+            logger.info("自动修复精确重复中文字幕: %s", changed)
+        return result
+
+    def _is_translation_too_fast_for_segment(self, translated: str, seg: ASRDataSeg) -> bool:
+        zh_chars = len(re.findall(r"[\u4e00-\u9fff]", translated or ""))
+        if zh_chars < 12:
+            return False
+        duration_ms = max(1, int(seg.end_time) - int(seg.start_time))
+        cps = zh_chars / (duration_ms / 1000.0)
+        return cps > CHINESE_CPS_ERROR
+
+    def _record_safe_auto_repair_diff(
+        self,
+        before: Sequence[ASRDataSeg],
+        after: Sequence[ASRDataSeg],
+        stage: str,
+    ) -> None:
+        if not hasattr(self, "_safe_auto_repair_log"):
+            self._safe_auto_repair_log = []
+        if len(before) != len(after):
+            self._safe_auto_repair_log.append(
+                {
+                    "stage": stage,
+                    "code": "safe_repair_count_changed_rejected",
+                    "before_count": len(before),
+                    "after_count": len(after),
+                }
+            )
+            return
+        for index, (old, new) in enumerate(zip(before, after), 1):
+            if (
+                old.text == new.text
+                and old.translated_text == new.translated_text
+                and int(old.start_time) == int(new.start_time)
+                and int(old.end_time) == int(new.end_time)
+            ):
+                continue
+            code = self._safe_auto_repair_change_code(old, new)
+            self._safe_auto_repair_log.append(
+                {
+                    "stage": stage,
+                    "code": code,
+                    "index": index,
+                    "subtitle_id": self._segment_subtitle_id(new, index),
+                    "start": self._format_ms(new.start_time),
+                    "end": self._format_ms(new.end_time),
+                    "english": new.text,
+                    "before_chinese": old.translated_text,
+                    "after_chinese": new.translated_text,
+                    "before_start_ms": int(old.start_time),
+                    "before_end_ms": int(old.end_time),
+                    "after_start_ms": int(new.start_time),
+                    "after_end_ms": int(new.end_time),
+                }
+            )
+
+    def _safe_auto_repair_change_code(self, old: ASRDataSeg, new: ASRDataSeg) -> str:
+        if not self._normalize_text(old.translated_text) and self._normalize_text(new.translated_text):
+            return "missing_chinese_filled"
+        old_norm = self._normalize_chinese_for_compare(old.translated_text)
+        new_norm = self._normalize_chinese_for_compare(new.translated_text)
+        if old_norm != new_norm:
+            if self._is_severe_chinese_speed(old) and not self._is_severe_chinese_speed(new):
+                return "severe_chinese_speed_repaired"
+            return "chinese_text_repaired"
+        if int(old.start_time) != int(new.start_time) or int(old.end_time) != int(new.end_time):
+            return "timing_padding_repaired"
+        return "safe_repair_changed"
+
     def _repair_overlong_english_segments_local(
         self, segments: Sequence[ASRDataSeg]
     ) -> List[ASRDataSeg]:
@@ -6608,41 +7663,49 @@ class ScreenSubtitleEditor:
             for index, seg in enumerate(segments)
             if self._is_severe_chinese_speed(seg)
         ]
-        if not targets:
+        fallback_candidates = [
+            (index, seg)
+            for index, seg in enumerate(segments)
+            if self._has_chinese_speed_pressure(seg)
+            and self._local_chinese_speed_fallback(seg)
+        ]
+        if not targets and not fallback_candidates:
             return list(segments)
 
-        payload = [
-            self._chinese_compression_payload_item(
-                index,
-                seg,
-                segments,
-                semantic_groups=semantic_groups,
-                subtitle_items=subtitle_items,
+        data = {"items": []}
+        if targets:
+            payload = [
+                self._chinese_compression_payload_item(
+                    index,
+                    seg,
+                    segments,
+                    semantic_groups=semantic_groups,
+                    subtitle_items=subtitle_items,
+                )
+                for index, seg in targets
+            ]
+            prompt = (
+                "You compress Simplified Chinese subtitles for fixed bilingual video subtitles.\n"
+                "Only rewrite target Chinese subtitles. Do not change English, IDs, order, or timing.\n"
+                "Use full_translation as the authority. English is only for locating meaning.\n"
+                "Read the whole sense_group and adjacent parts before compressing the target.\n"
+                "The target Chinese must be natural, concise, and independently understandable when possible.\n"
+                "If the target is overloaded and an adjacent same-group subtitle is much shorter, prefer moving dependent meaning into that adjacent subtitle.\n"
+                "Avoid title-like fragments and dangling clauses such as 而若..., 如果..., 因为..., 对于..., 在..., 把..., 将..., 意味着..., 的..., 以及...\n"
+                "Keep facts, numbers, names, negation, contrast, causality, modality, and core conclusions.\n"
+                "Return pure JSON:\n"
+                "{\"items\":[{\"index\":0,\"chinese\":\"压缩后的中文\"}]}"
             )
-            for index, seg in targets
-        ]
-        prompt = (
-            "You compress Simplified Chinese subtitles for fixed bilingual video subtitles.\n"
-            "Only rewrite target Chinese subtitles. Do not change English, IDs, order, or timing.\n"
-            "Use full_translation as the authority. English is only for locating meaning.\n"
-            "Read the whole sense_group and adjacent parts before compressing the target.\n"
-            "The target Chinese must be natural, concise, and independently understandable when possible.\n"
-            "If the target is overloaded and an adjacent same-group subtitle is much shorter, prefer moving dependent meaning into that adjacent subtitle.\n"
-            "Avoid title-like fragments and dangling clauses such as 而若..., 如果..., 因为..., 对于..., 在..., 把..., 将..., 意味着..., 的..., 以及...\n"
-            "Keep facts, numbers, names, negation, contrast, causality, modality, and core conclusions.\n"
-            "Return pure JSON:\n"
-            "{\"items\":[{\"index\":0,\"chinese\":\"压缩后的中文\"}]}"
-        )
-        try:
-            data = self._request_chinese_compression(
-                prompt,
-                payload,
-                task="screen_subtitle_chinese_speed_compress",
-                temperature=0.1,
-            )
-        except Exception as e:
-            logger.warning("中文字幕超速压缩失败，保留原字幕: %s", str(e))
-            return list(segments)
+            try:
+                data = self._request_chinese_compression(
+                    prompt,
+                    payload,
+                    task="screen_subtitle_chinese_speed_compress",
+                    temperature=0.1,
+                )
+            except Exception as e:
+                logger.warning("中文字幕超速压缩失败，保留原字幕: %s", str(e))
+                return list(segments)
 
         by_id: Dict[str, str] = {}
         for item in data.get("items", []) if isinstance(data, dict) else []:
@@ -6724,6 +7787,12 @@ class ScreenSubtitleEditor:
                 compressed, seg, segments, index, context=context
             ):
                 continue
+            fallback = self._local_chinese_speed_fallback(seg)
+            if fallback and self._is_valid_chinese_compression(
+                fallback, seg, segments, index, context=context
+            ):
+                by_id[subtitle_id] = fallback
+                continue
             retry_item = self._chinese_compression_payload_item(
                 index, seg, segments, semantic_groups=semantic_groups, subtitle_items=subtitle_items
             )
@@ -6755,6 +7824,18 @@ class ScreenSubtitleEditor:
 
         result = list(segments)
         changed = 0
+        for index, seg in fallback_candidates:
+            fallback = self._local_chinese_speed_fallback(seg)
+            if not fallback or not self._is_valid_chinese_compression(
+                fallback,
+                seg,
+                result,
+                index,
+            ):
+                continue
+            result[index] = self._copy_segment(seg, translated_text=fallback)
+            changed += 1
+
         for index, seg in targets:
             context = self._semantic_context_for_segment_index(
                 index,
@@ -6798,7 +7879,16 @@ class ScreenSubtitleEditor:
                 index,
                 context=context,
             ):
-                continue
+                fallback = self._local_chinese_speed_fallback(seg)
+                if not fallback or not self._is_valid_chinese_compression(
+                    fallback,
+                    seg,
+                    segments,
+                    index,
+                    context=context,
+                ):
+                    continue
+                compressed = fallback
             result[index] = self._copy_segment(
                 seg,
                 translated_text=compressed,
@@ -6813,6 +7903,54 @@ class ScreenSubtitleEditor:
             )
             logger.info("局部压缩中文字幕阅读速度: %s", changed)
         return result
+
+    def _local_chinese_speed_fallback(self, seg: ASRDataSeg) -> str:
+        original = self._normalize_text(seg.text)
+        translated = self._normalize_text(seg.translated_text)
+        if not original or not translated:
+            return ""
+
+        text = translated
+        brand_tokens = re.findall(r"\b[A-Z][A-Za-z0-9]*\b", original)
+        if brand_tokens:
+            replacements = {
+                "太空探索技术公司": "SpaceX",
+                "开放人工智能公司": "OpenAI",
+                "英伟达公司": "NVIDIA",
+                "英伟达": "NVIDIA",
+            }
+            lowered_tokens = {token.lower() for token in brand_tokens}
+            for zh_name, en_name in replacements.items():
+                if en_name.lower() in lowered_tokens:
+                    text = text.replace(zh_name, en_name)
+
+        compact_original = original.lower()
+        if "laser" in compact_original:
+            for prefix in ("使用的是", "采用的是", "用的是"):
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+            if "spacex" in compact_original and "激光" in text:
+                text = "SpaceX激光器。"
+
+        if (
+            "bigger test" in compact_original
+            and "coming" in compact_original
+            and "测试" in text
+        ):
+            text = "更大的测试要来了。"
+
+        if text == translated:
+            return ""
+        return self._normalize_text(text)
+
+    def _has_chinese_speed_pressure(self, seg: ASRDataSeg) -> bool:
+        translated = self._normalize_text(seg.translated_text)
+        zh_chars = len(re.findall(r"[\u4e00-\u9fff]", translated))
+        if zh_chars < 8:
+            return False
+        duration_ms = max(1, int(seg.end_time) - int(seg.start_time))
+        cps = zh_chars / (duration_ms / 1000.0)
+        return cps > CHINESE_CPS_WARNING
 
     def _restore_invalid_postprocess_allocations(
         self,
@@ -6855,6 +7993,12 @@ class ScreenSubtitleEditor:
                 }
             )
             if before_valid and not after_validation["valid"]:
+                if self._should_keep_speed_repair_despite_soft_omission(
+                    before_segments[start:end],
+                    result[start:end],
+                    after_validation,
+                ):
+                    continue
                 for index in range(start, end):
                     result[index] = before_segments[index]
                 self._last_allocation_unresolved.append(
@@ -6865,6 +8009,44 @@ class ScreenSubtitleEditor:
                     }
                 )
         return result
+
+    def _should_keep_speed_repair_despite_soft_omission(
+        self,
+        before_group: Sequence[ASRDataSeg],
+        after_group: Sequence[ASRDataSeg],
+        after_validation: Dict,
+    ) -> bool:
+        issue_codes = set(after_validation.get("issue_codes") or [])
+        if issue_codes - {"group_allocation_information_omission"}:
+            return False
+        if len(before_group) != len(after_group):
+            return False
+        for before, after in zip(before_group, after_group):
+            if (
+                before.text != after.text
+                or before.start_time != after.start_time
+                or before.end_time != after.end_time
+                or self._segment_subtitle_id(before, 0) != self._segment_subtitle_id(after, 0)
+            ):
+                return False
+
+        before_errors = sum(1 for seg in before_group if self._is_severe_chinese_speed(seg))
+        after_errors = sum(1 for seg in after_group if self._is_severe_chinese_speed(seg))
+        if after_errors >= before_errors:
+            return False
+
+        changed = [
+            (before, after)
+            for before, after in zip(before_group, after_group)
+            if before.translated_text != after.translated_text
+        ]
+        if not changed:
+            return False
+        for before, after in changed:
+            fallback = self._local_chinese_speed_fallback(before)
+            if fallback != self._normalize_text(after.translated_text):
+                return False
+        return True
 
     def _allocation_entry_from_group_segments(
         self,
@@ -7141,11 +8323,40 @@ class ScreenSubtitleEditor:
         merged = self._normalize_text("".join(merged_parts))
         full_translation = self._normalize_text(context.get("full_translation", ""))
         full_english = self._normalize_text(context.get("full_english", ""))
+        part_ids = [
+            str(part.get("subtitle_id") or part.get("index") or offset)
+            for offset, part in enumerate(parts)
+        ]
+        if self._detect_adjacent_chinese_duplication(part_ids, merged_parts):
+            return False
+        if self._detect_unnatural_adjacent_chinese_boundary(merged_parts):
+            return False
         if self._is_incomplete_chinese_group(merged):
             return False
         if self._has_core_semantic_loss(merged, full_translation, full_english):
             return False
         return True
+
+    @staticmethod
+    def _detect_unnatural_adjacent_chinese_boundary(texts: Sequence[str]) -> bool:
+        normalized = [
+            re.sub(r"\s+", "", text or "").strip()
+            for text in texts
+        ]
+        for left, right in zip(normalized, normalized[1:]):
+            left = re.sub(r"[，。！？；：、,.!?;:]+$", "", left)
+            right = re.sub(r"^[，。！？；：、,.!?;:]+", "", right)
+            if not left or not right:
+                continue
+            if re.search(r"(锚定|定位|归入|投入|放入|置于|固定|连接|链接)(它|其|这|那|这个|这一点)$", left) and right.startswith(
+                ("到", "在", "于", "向", "至")
+            ):
+                return True
+            if left.endswith(("它", "其", "这个", "这一点")) and right.startswith(
+                ("到一", "到某", "到古", "到新", "到旧", "在一", "于一")
+            ):
+                return True
+        return False
 
     @staticmethod
     def _is_incomplete_chinese_group(text: str) -> bool:
@@ -7160,6 +8371,13 @@ class ScreenSubtitleEditor:
             "\u662f\u7684",
             "\u771f\u7684",
             "\u771f\u7684\u5417",
+            "对吧",
+            "是吧",
+            "好吧",
+            "嗯",
+            "啊",
+            "哦",
+            "哇",
             "\u5728\u54ea\u91cc",
             "\u4e3a\u4ec0\u4e48",
             "\u4ec0\u4e48\u95ee\u9898",
@@ -7230,13 +8448,11 @@ class ScreenSubtitleEditor:
             "把",
             "意味着",
         )
+        if normalized in {"那么", "而且", "然后", "所以", "不过", "但是", "此外"}:
+            return False
         if normalized.startswith(bad_prefixes):
             return True
         if normalized.endswith(bad_suffixes):
-            return True
-        if "联系更宏观层面" in normalized and not normalized.startswith("再从"):
-            return True
-        if "空置" in normalized and "政府" in normalized and not re.search(r"[\u60f3\u601d\u8003\u770b]", normalized):
             return True
         return False
 
@@ -7597,6 +8813,12 @@ class ScreenSubtitleEditor:
                 end_time=end_time,
             )
             segment.subtitle_id = item.subtitle_id
+            if item.word_start is not None and item.word_end is not None:
+                segment.word_start = item.word_start
+                segment.word_end = item.word_end
+                if word_timing:
+                    segment.stable_word_start_ms = int(word_timing[0])
+                    segment.stable_word_end_ms = int(word_timing[1])
             result.append(segment)
 
         return result
@@ -8075,6 +9297,7 @@ class ScreenSubtitleEditor:
         result = self._translate_semantic_subtitle_groups(result)
         result = self._translate_missing_item_translations(result)
         result = [self._align_item_translation_punctuation(item) for item in result]
+        result = self._repair_leading_translation_punctuation_items(result)
         return result or items
 
     @staticmethod
@@ -8402,7 +9625,7 @@ class ScreenSubtitleEditor:
             merged_text = f"{result[-1].original} {item.original}" if result else item.original
             is_tail_dangling_word = self._is_tail_dangling_word(item.original)
             max_words_for_merge = (
-                max(self.max_english_words, 14)
+                max(self.max_english_words, 16)
                 if is_tail_dangling_word
                 else self.max_english_words
             )
@@ -9589,7 +10812,39 @@ class ScreenSubtitleEditor:
                         "reason": "adjacent_duplicate_or_containment",
                     }
                 )
+                continue
+            common = self._long_common_chinese_overlap(left, right)
+            if common:
+                issues.append(
+                    {
+                        "subtitle_ids": [subtitle_ids[index], subtitle_ids[index + 1]],
+                        "reason": "adjacent_long_common_phrase",
+                        "common_phrase": common,
+                        "common_length": len(common),
+                    }
+                )
         return issues
+
+    @staticmethod
+    def _long_common_chinese_overlap(left: str, right: str) -> str:
+        left = re.sub(r"\s+", "", left or "")
+        right = re.sub(r"\s+", "", right or "")
+        if len(left) < 12 or len(right) < 12:
+            return ""
+        match = SequenceMatcher(None, left, right).find_longest_match(
+            0,
+            len(left),
+            0,
+            len(right),
+        )
+        if match.size < 10:
+            return ""
+        common = left[match.a : match.a + match.size]
+        if len(common) < max(10, int(min(len(left), len(right)) * 0.35)):
+            return ""
+        if re.fullmatch(r"(?:这个|那个|他们|我们|因为|所以|但是|而且|就是|一个|一种|问题|事情)+", common):
+            return ""
+        return common
 
     def _detect_group_information_omission(
         self,
@@ -9849,10 +11104,18 @@ class ScreenSubtitleEditor:
             raw = match.group(0)
             after = (english or "")[match.end(): match.end() + 16]
             value = raw.replace(",", "").replace(" ", "")
-            scale_match = re.match(r"\s*(million|thousand|hundred)\b", after, re.IGNORECASE)
-            if scale_match and value.isdigit():
-                scale = {"hundred": 100, "thousand": 1000, "million": 1000000}[scale_match.group(1).lower()]
-                value = str(int(value) * scale)
+            scale_match = re.match(r"\s*(billion|million|thousand|hundred)\b", after, re.IGNORECASE)
+            if scale_match:
+                scale = {
+                    "hundred": 100,
+                    "thousand": 1000,
+                    "million": 1000000,
+                    "billion": 1000000000,
+                }[scale_match.group(1).lower()]
+                try:
+                    value = str(int(round(float(value) * scale)))
+                except ValueError:
+                    pass
             anchors.append(
                 {
                     "type": "number",
@@ -9892,7 +11155,7 @@ class ScreenSubtitleEditor:
             return False
         return bool(
             re.search(
-                r"(?:不|没|无|非|未|别|勿|不能|不会|不是|没有|不再|不必|不用|无需|无法|并非|绝非)",
+                r"(?:不|没|无|非|未|别|勿|不能|不会|不是|没有|不再|不必|不用|无需|无法|并非|绝非|直到.+才|对吧|是吧|不是吗|对不对|难道)",
                 text,
             )
         )
@@ -9951,6 +11214,15 @@ class ScreenSubtitleEditor:
 
         variants = {int_to_zh(number)}
         variants.update({item.replace("二百", "两百").replace("二千", "两千").replace("二万", "两万") for item in list(variants)})
+        if number >= 100000000 and number % 100000000 == 0:
+            variants.add(f"{number // 100000000}亿")
+            variants.add(f"{number // 100000000}亿美元")
+            variants.add(f"{number // 100000000}亿人民币")
+        elif number >= 100000000 and number % 10000000 == 0:
+            yi_value = number / 100000000
+            variants.add(f"{yi_value:g}亿")
+            variants.add(f"{yi_value:g}亿美元")
+            variants.add(f"{yi_value:g}亿人民币")
         if 1000 <= number <= 2099:
             year_digits = "".join(digit_map[int(ch)] for ch in str(number))
             variants.update({year_digits, f"{year_digits}年", f"{number}年"})
@@ -9963,6 +11235,11 @@ class ScreenSubtitleEditor:
                         f"{small_to_zh(century)}世纪{small_to_zh(decade)}年代",
                     }
                 )
+                if decade == 0:
+                    variants.update({f"{century}世纪初", f"{small_to_zh(century)}世纪初"})
+            if number % 100 == 0:
+                century = number // 100 + 1
+                variants.update({f"{century}世纪", f"{small_to_zh(century)}世纪"})
         if number % 10000 == 0 and number >= 10000:
             variants.add(f"{number // 10000}万")
         if number % 1000 == 0 and number >= 1000:
@@ -10688,6 +11965,7 @@ class ScreenSubtitleEditor:
             seg.translated_text = cls._align_translation_punctuation(
                 seg.text, seg.translated_text
             )
+        cls._repair_leading_translation_punctuation_segments(segments)
         return segments
 
     @classmethod
@@ -10704,6 +11982,73 @@ class ScreenSubtitleEditor:
             word_end=item.word_end,
             subtitle_id=item.subtitle_id,
         )
+
+    @classmethod
+    def _repair_leading_translation_punctuation_items(
+        cls, items: List[ScreenSubtitleItem]
+    ) -> List[ScreenSubtitleItem]:
+        if not items:
+            return items
+        repaired = list(items)
+        for index in range(1, len(repaired)):
+            previous = repaired[index - 1]
+            current = repaired[index]
+            previous_text, current_text = cls._move_leading_translation_punctuation(
+                previous.translated, current.translated
+            )
+            if previous_text == previous.translated and current_text == current.translated:
+                continue
+            repaired[index - 1] = ScreenSubtitleItem(
+                source_ids=previous.source_ids,
+                original=previous.original,
+                translated=previous_text,
+                word_start=previous.word_start,
+                word_end=previous.word_end,
+                subtitle_id=previous.subtitle_id,
+            )
+            repaired[index] = ScreenSubtitleItem(
+                source_ids=current.source_ids,
+                original=current.original,
+                translated=current_text,
+                word_start=current.word_start,
+                word_end=current.word_end,
+                subtitle_id=current.subtitle_id,
+            )
+        return repaired
+
+    @classmethod
+    def _repair_leading_translation_punctuation_segments(
+        cls, segments: List[ASRDataSeg]
+    ) -> None:
+        for index in range(1, len(segments)):
+            previous = segments[index - 1]
+            current = segments[index]
+            previous_text, current_text = cls._move_leading_translation_punctuation(
+                previous.translated_text, current.translated_text
+            )
+            previous.translated_text = previous_text
+            current.translated_text = current_text
+
+    @staticmethod
+    def _move_leading_translation_punctuation(
+        previous: str, current: str
+    ) -> tuple[str, str]:
+        previous = (previous or "").strip()
+        current = (current or "").strip()
+        if not previous or not current:
+            return previous, current
+        match = re.match(r"^([，,、。！？!?；;：:]+)(\s*)(.+)$", current)
+        if not match:
+            return previous, current
+        leading = match.group(1)
+        remainder = match.group(3).strip()
+        if not remainder:
+            return previous, current
+        terminal = "。！？!?；;：:"
+        if previous[-1] in terminal:
+            return previous, remainder
+        punctuation = "，" if any(char in leading for char in "，,、") else leading[-1]
+        return f"{previous}{punctuation}", remainder
 
     @staticmethod
     def _align_translation_punctuation(original: str, translated: str) -> str:

@@ -2,7 +2,6 @@ import datetime
 import copy
 import json
 import os
-import shutil
 import time
 from pathlib import Path
 from typing import Dict
@@ -97,7 +96,7 @@ class SubtitleThread(QThread):
         audio_path = getattr(self.task, "video_path", None) or ""
         if not audio_path or not Path(audio_path).exists():
             logger.warning("WhisperX time-only skipped: source audio is missing: %s", audio_path)
-            return asr_data
+            raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：找不到源音频。"))
         try:
             stage_started = time.perf_counter()
             self.progress.emit(92, self.tr("WhisperX最终时间轴对齐..."))
@@ -110,16 +109,18 @@ class SubtitleThread(QThread):
             self._record_stage_duration("whisperx_time_only_alignment", stage_started)
             if not aligned or not aligned.has_data() or len(aligned.segments) != len(asr_data.segments):
                 logger.warning("WhisperX time-only did not produce a complete subtitle timeline")
-                return asr_data
+                raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：字幕没有完整匹配到音频。"))
             for old, new in zip(asr_data.segments, aligned.segments):
                 if old.text != new.text or old.translated_text != new.translated_text:
                     logger.warning("WhisperX time-only rejected: subtitle text changed during mapping")
-                    return asr_data
+                    raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：对齐过程改变了字幕文本。"))
             logger.info("WhisperX time-only applied to final subtitle timings")
             return aligned
         except Exception as exc:
-            logger.warning("WhisperX time-only failed, keeping original timings: %s", exc)
-            return asr_data
+            logger.warning("WhisperX time-only failed: %s", exc)
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：") + str(exc)) from exc
 
     @staticmethod
     def _subtitle_layout_names() -> Dict[str, str]:
@@ -291,6 +292,8 @@ class SubtitleThread(QThread):
             asr_data, stable_paths["only_translation_srt"], "only_translation"
         )
 
+        if validation_summary and validation_summary.get("status") == "ERROR":
+            validation_status = "failed"
         render_blocked = validation_status == "failed"
         if not render_blocked:
             if output_path.suffix.lower() == ".ass":
@@ -326,25 +329,182 @@ class SubtitleThread(QThread):
         }
         if manifest_meta:
             manifest.update(manifest_meta)
-        source_report_paths = self._source_audio_report_paths(
-            qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
-        )
         source_subtitle_paths = self._write_source_audio_subtitle_exports(asr_data)
-        if source_report_paths:
-            manifest["source_report_dir"] = str(self._source_audio_report_dir())
-            manifest["source_report_paths"] = source_report_paths
         if source_subtitle_paths:
             manifest["source_subtitle_dir"] = str(self._source_audio_report_dir())
             manifest["source_subtitle_paths"] = source_subtitle_paths
+        summary_paths = self._write_stable_result_summary(manifest)
+        if summary_paths:
+            manifest["result_summary_paths"] = summary_paths
         manifest_path = output_dir / "stable-final-manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        self._mirror_stable_reports_to_source_dir(
-            qa_review_points_path=str(manifest.get("qa_review_points_srt") or ""),
-        )
         logger.info("Stable subtitle manifest saved: %s", manifest_path)
+
+    def _write_stable_result_summary(self, manifest: dict) -> dict:
+        summary = self._build_stable_result_summary(manifest)
+        if not summary:
+            return {}
+        source_dir = self._source_audio_report_dir()
+        if source_dir is None:
+            return {}
+        paths = {"source_summary_txt": str(source_dir / "字幕处理结果摘要.txt")}
+        for path_text in paths.values():
+            try:
+                Path(path_text).write_text(summary, encoding="utf-8-sig")
+            except Exception as exc:
+                logger.warning("Writing stable result summary failed: %s", exc)
+        return paths
+
+    def _build_stable_result_summary(self, manifest: dict) -> str:
+        validation = manifest.get("validation_summary") or {}
+        errors = list(validation.get("errors") or [])
+        warnings = list(validation.get("warnings") or [])
+        info = list(validation.get("info") or [])
+        repair_log = list(manifest.get("safe_auto_repair_log") or [])
+        repair_candidates = list(manifest.get("safe_auto_repair_candidates") or [])
+        changed_repairs = self._unique_summary_repairs([
+            item for item in repair_log
+            if str(item.get("code") or "").endswith("_repaired")
+            or str(item.get("code") or "") in {
+                "safe_repair_changed",
+                "chinese_text_repaired",
+                "severe_chinese_speed_repaired",
+                "missing_chinese_filled",
+                "timing_padding_repaired",
+            }
+        ])
+        rejected_repairs = [
+            item for item in repair_log
+            if "rejected" in str(item.get("code") or "") or "skipped" in str(item.get("code") or "")
+        ]
+
+        status = str(manifest.get("validation_status") or "unknown")
+        blocked = bool(manifest.get("render_blocked"))
+        if blocked:
+            conclusion = "失败：存在硬错误，已阻止后续合成。"
+        elif errors:
+            conclusion = "异常：报告存在 ERROR，需要人工确认。"
+        elif warnings:
+            conclusion = "可用：没有硬错误，但仍有需要抽查的问题。"
+        else:
+            conclusion = "通过：未发现需要阻断的问题。"
+
+        lines = [
+            "字幕处理结果摘要",
+            "",
+            f"结论：{conclusion}",
+            f"生成时间：{manifest.get('created_at', '')}",
+            f"字幕数量：{manifest.get('subtitle_count', 0)}",
+            f"稳定模式：{'开' if manifest.get('stable_mode') else '关'}",
+            f"安全修复：{'开' if manifest.get('safe_auto_repair_enabled') else '关'}",
+            f"状态：{status}",
+            f"是否阻止合成：{'是' if blocked else '否'}",
+            "",
+            "问题统计：",
+            f"- ERROR：{len(errors)}",
+            f"- WARNING：{len(warnings)}",
+            f"- INFO：{len(info)}",
+            f"- 修复候选：{len(repair_candidates)}",
+            f"- 实际修复：{len(changed_repairs)}",
+            f"- 跳过/拒绝：{len(rejected_repairs)}",
+        ]
+
+        if errors:
+            lines.extend(["", "需要优先处理的 ERROR："])
+            lines.extend(self._summary_issue_lines(errors, limit=8))
+
+        if warnings:
+            lines.extend(["", "主要 WARNING："])
+            lines.extend(self._summary_issue_lines(warnings, limit=8))
+
+        if changed_repairs:
+            lines.extend(["", "本次实际修复："])
+            for item in changed_repairs[:12]:
+                subtitle_id = item.get("subtitle_id", "")
+                code = item.get("code", "")
+                before = str(item.get("before_chinese") or "").strip()
+                after = str(item.get("after_chinese") or "").strip()
+                time_range = self._summary_time_range(item)
+                if before or after:
+                    lines.append(f"- {subtitle_id} {time_range} {code}")
+                    lines.append(f"  前：{before}")
+                    lines.append(f"  后：{after}")
+                else:
+                    lines.append(f"- {subtitle_id} {time_range} {code}")
+
+        if rejected_repairs:
+            lines.extend(["", "已跳过或拒绝的修复："])
+            for item in rejected_repairs[:12]:
+                lines.append(
+                    f"- {item.get('subtitle_id', '')} {item.get('code', '')}：{item.get('reason', '')}"
+                )
+
+        paths = manifest.get("paths") or {}
+        source_paths = manifest.get("source_subtitle_paths") or {}
+        lines.extend(["", "输出文件："])
+        if paths.get("original_top_srt"):
+            lines.append(f"- 工作目录双语字幕：{paths.get('original_top_srt')}")
+        if source_paths.get("bilingual_original_top_srt"):
+            lines.append(f"- 音频目录双语字幕：{source_paths.get('bilingual_original_top_srt')}")
+        if source_paths.get("only_translation_srt"):
+            lines.append(f"- 音频目录中文字幕：{source_paths.get('only_translation_srt')}")
+        if source_paths.get("only_original_srt"):
+            lines.append(f"- 音频目录英文字幕：{source_paths.get('only_original_srt')}")
+        if manifest.get("coverage_report"):
+            lines.append(f"- 详细报告：{manifest.get('coverage_report')}")
+
+        if blocked or errors:
+            recommendation = "建议：先处理 ERROR，不建议直接合成。"
+        elif changed_repairs:
+            recommendation = "建议：可以导入视频抽查实际修复点和 WARNING 位置。"
+        elif warnings:
+            recommendation = "建议：可以合成，但优先抽查 WARNING 中的英文切分和阅读速度。"
+        else:
+            recommendation = "建议：可以直接合成或导入剪辑软件。"
+        lines.extend(["", recommendation, ""])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _summary_issue_lines(issues: list, limit: int) -> list:
+        lines = []
+        for issue in issues[:limit]:
+            code = issue.get("code", "")
+            message = str(issue.get("message") or "").strip()
+            item_count = len(issue.get("items") or []) if isinstance(issue.get("items"), list) else 0
+            suffix = f"（{item_count}项）" if item_count else ""
+            lines.append(f"- {code}：{message}{suffix}")
+        return lines
+
+    @staticmethod
+    def _summary_time_range(item: dict) -> str:
+        start = str(item.get("start") or "").strip()
+        end = str(item.get("end") or "").strip()
+        if start and end:
+            return f"{start} --> {end}"
+        return ""
+
+    @staticmethod
+    def _unique_summary_repairs(items: list) -> list:
+        unique = []
+        seen = set()
+        for item in items:
+            key = (
+                item.get("subtitle_id"),
+                item.get("before_chinese"),
+                item.get("after_chinese"),
+                item.get("before_start_ms"),
+                item.get("before_end_ms"),
+                item.get("after_start_ms"),
+                item.get("after_end_ms"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
 
     def _source_audio_subtitle_paths(self) -> dict:
         source_dir = self._source_audio_report_dir()
@@ -390,35 +550,6 @@ class SubtitleThread(QThread):
         if not source_dir.exists():
             return None
         return source_dir
-
-    def _source_audio_report_paths(
-        self,
-        qa_review_points_path: str,
-    ) -> dict:
-        source_dir = self._source_audio_report_dir()
-        if source_dir is None:
-            return {}
-        paths = {}
-        if qa_review_points_path:
-            paths["qa_review_points_srt"] = source_dir / "qa-review-points.srt"
-        return {key: str(path) for key, path in paths.items()}
-
-    def _mirror_stable_reports_to_source_dir(
-        self,
-        qa_review_points_path: str,
-    ) -> None:
-        source_dir = self._source_audio_report_dir()
-        if source_dir is None:
-            return
-        try:
-            report_sources = []
-            if qa_review_points_path:
-                report_sources.append((Path(qa_review_points_path), source_dir / "qa-review-points.srt"))
-            for source, destination in report_sources:
-                if source.exists() and source.resolve() != destination.resolve():
-                    shutil.copy2(source, destination)
-        except Exception as exc:
-            logger.warning("Mirroring subtitle reports to source audio folder failed: %s", exc)
 
     def _setup_api_config(self) -> SubtitleConfig:
         """设置API配置，返回SubtitleConfig"""
@@ -687,6 +818,7 @@ class SubtitleThread(QThread):
                         subtitle_config.need_screen_subtitle_quality_check
                         and not subtitle_config.screen_subtitle_stable_mode
                     ),
+                    enable_safe_auto_repair=subtitle_config.screen_subtitle_safe_auto_repair,
                     allocation_max_concurrency=subtitle_config.screen_subtitle_allocation_max_concurrency,
                     allocation_batch_size=subtitle_config.screen_subtitle_allocation_batch_size,
                     article_context_prompt=article_translation_prompt,
@@ -713,7 +845,30 @@ class SubtitleThread(QThread):
                         + "\n"
                         + message
                     )
-                asr_data = self._apply_whisperx_time_only_if_enabled(asr_data)
+                try:
+                    asr_data = self._apply_whisperx_time_only_if_enabled(asr_data)
+                except RuntimeError as exc:
+                    validation_summary = {
+                        "status": "ERROR",
+                        "errors": [
+                            {
+                                "code": "whisperx_time_mapping_incomplete",
+                                "message": str(exc),
+                            }
+                        ],
+                        "warnings": [],
+                        "info": [],
+                    }
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=validation_summary,
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                    )
+                    raise
+                asr_data = screen_editor.repair_after_final_time_alignment(asr_data)
                 final_duration_errors = screen_editor._subtitle_duration_issues(
                     asr_data.segments,
                     "ERROR",
@@ -740,6 +895,22 @@ class SubtitleThread(QThread):
                     )
                     raise RuntimeError(
                         self.tr("最终时间轴存在严重短字幕，已停止后续合成。")
+                    )
+                if (
+                    screen_editor.last_validation_summary
+                    and screen_editor.last_validation_summary.get("status") == "ERROR"
+                ):
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=screen_editor.last_validation_summary,
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                    )
+                    raise RuntimeError(
+                        self.tr("字幕体检发现 ERROR，已停止后续合成。报告路径：")
+                        + coverage_report_path
                     )
                 self.update_all.emit(asr_data.to_json())
                 self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
@@ -776,6 +947,11 @@ class SubtitleThread(QThread):
                 subtitle_config,
                 coverage_report_path=coverage_report_path,
                 validation_status="passed",
+                validation_summary=(
+                    screen_editor.last_validation_summary
+                    if subtitle_config.need_screen_subtitle_edit
+                    else None
+                ),
                 manifest_meta=self._screen_manifest_metadata(screen_editor),
             )
             logger.info(f"字幕保存到 {self.task.output_path}")

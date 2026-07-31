@@ -33,6 +33,11 @@ def main() -> int:
             False,
         ),
         (
+            "rule regression library",
+            ["tests/test_rule_regression_library.py"],
+            False,
+        ),
+        (
             "syntax check",
             [
                 "-m",
@@ -41,6 +46,7 @@ def main() -> int:
                 "app/thread/video_synthesis_thread.py",
                 "app/core/subtitle_processor/screen_editor.py",
                 "tests/test_stable_caption_rules.py",
+                "tests/test_rule_regression_library.py",
                 "tests/audit_stable_outputs.py",
             ],
             False,

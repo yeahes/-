@@ -27,6 +27,7 @@ def _context():
             {"canonical_name": "Jack Ma", "aliases": [], "category": "person"},
             {"canonical_name": "Yu Hao", "aliases": [], "category": "person"},
             {"canonical_name": "Zhong Shanshan", "aliases": [], "category": "person"},
+            {"canonical_name": "Taylor Swift", "aliases": ["Ms Swift"], "category": "person"},
         ],
         "brands": [
             {"canonical_name": "Pop Mart", "aliases": ["PopMart"], "category": "brand"},
@@ -93,6 +94,22 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
                 "Zhong Shanshan built a water empire.",
                 "DeepSeek startled the market.",
             ],
+        )
+
+    def test_corrects_near_threshold_person_name_when_last_name_matches_article_entity(self):
+        raw = [
+            ASRDataSeg(
+                "Kaler Swift's marriage was a massive cultural event.",
+                100,
+                200,
+            )
+        ]
+
+        corrected = self._correct(raw)
+
+        self.assertEqual(
+            corrected.segments[0].text,
+            "Taylor Swift's marriage was a massive cultural event.",
         )
 
     def test_does_not_rewrite_common_words_or_numbers(self):

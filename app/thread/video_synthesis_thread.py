@@ -24,6 +24,9 @@ def resolve_podcast_template_subtitle(video_file: str, subtitle_file: str) -> st
     if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("render_blocked"):
+                logger.warning("Stable subtitle manifest is blocked by validation: %s", manifest_path)
+                return subtitle_file
             stable_path = Path(
                 manifest.get("paths", {}).get("original_top_srt", "")
             )

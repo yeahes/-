@@ -96,6 +96,14 @@ class SubtitleSettingDialog(MessageBoxBase):
             self,
         )
 
+        self.safe_auto_repair_card = SwitchSettingCard(
+            FIF.ACCEPT,
+            self.tr("自动复查与安全修复"),
+            self.tr("只修缺中文、严重超速、句首标点和明显重复中文；不改英文和时间轴"),
+            cfg.screen_subtitle_safe_auto_repair,
+            self,
+        )
+
         self.screen_cjk_card = SpinBoxSettingCard(
             cfg.screen_subtitle_max_cjk,
             FIF.TILES,
@@ -110,7 +118,7 @@ class SubtitleSettingDialog(MessageBoxBase):
             cfg.screen_subtitle_max_english,
             FIF.TILES,
             self.tr("上屏英文词数软上限"),
-            self.tr("校正时尽量控制单条英文词数，允许必要时略微超出"),
+            self.tr("稳定模式低于16时仍按16作为硬容错，避免把完整意群切碎"),
             minimum=6,
             maximum=40,
             parent=self,
@@ -121,6 +129,7 @@ class SubtitleSettingDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.stable_mode_card)
         self.viewLayout.addWidget(self.stable_mode_status)
         self.viewLayout.addWidget(self.screen_quality_check_card)
+        self.viewLayout.addWidget(self.safe_auto_repair_card)
         self.viewLayout.addWidget(self.screen_cjk_card)
         self.allocation_concurrency_card = SpinBoxSettingCard(
             cfg.screen_subtitle_allocation_max_concurrency,

@@ -11,10 +11,27 @@ runtime\python.exe scripts\run_regression.py
 This runs:
 
 - stable caption rule smoke tests
+- rule regression library cases
 - Python syntax checks for core modified modules
 - generated subtitle audit for known local samples when available
 
 ## Focused Tests
+
+Rule regression library:
+
+```powershell
+runtime\python.exe tests\test_rule_regression_library.py
+```
+
+Add representative cases to:
+
+```text
+tests\fixtures\rule_regression_cases.json
+```
+
+Use this fixture for repeated, generic failure patterns from run reviews. Do not
+add sample-specific text patches here unless the same failure class is expected
+to recur across unrelated audio.
 
 Stable caption rules:
 

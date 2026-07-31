@@ -469,6 +469,24 @@ def _asr_suspicious_issues(cues: Iterable[CaptionCue]) -> tuple[list[dict], list
                 "high",
             ),
             (
+                r"\belectric\s+cess\b",
+                "asr_semantic_nonsense",
+                "疑似ASR把 electric fence 识别成不成立的表达",
+                "high",
+            ),
+            (
+                r"\b[a-z][a-z]{1,8}s?\s+surname\b",
+                "asr_name_suspicious",
+                "疑似专名所有格识别异常：surname 前的人名建议结合文章上下文回听确认",
+                "medium",
+            ),
+            (
+                r"\bamerica\s+respondents\b",
+                "asr_adjective_form_suspicious",
+                "疑似国家名形容词形式错误：常见表达应接近 American respondents",
+                "medium",
+            ),
+            (
                 r"\bstate-of\s+the-art\b|\bstate\s+of-the-art\b",
                 "asr_hyphenation_suspicious",
                 "疑似ASR或切分破坏了固定形容词 state-of-the-art",
@@ -765,9 +783,9 @@ def _syntax_boundary_reasons(previous_text: str, current_text: str) -> list[str]
     particles = {"down", "up", "out", "off", "in", "on", "away", "back", "over"}
     be_aux = {"am", "is", "are", "was", "were", "be", "been", "being", "we're", "they're", "it's", "that's"}
     auxiliaries = be_aux | {"can", "could", "will", "would", "should", "may", "might", "must", "do", "does", "did", "have", "has", "had"}
-    object_verbs = {"force", "forces", "forced", "alter", "alters", "altered", "show", "shows", "showed", "raise", "raises", "raised", "put", "puts", "make", "makes", "made", "give", "gives", "gave", "take", "takes", "took", "create", "creates", "created"}
-    adjectives = {"absolute", "extreme", "uncomfortable", "rapid", "massive", "structural", "financial", "corporate", "public", "private", "local", "global", "new", "old", "major", "regional", "economic", "entire", "empty", "really"}
-    common_nouns = {"air", "look", "edge", "atmosphere", "world", "question", "solution", "solutions", "building", "government", "market", "markets", "policy", "data", "source", "sources"}
+    object_verbs = {"force", "forces", "forced", "alter", "alters", "altered", "show", "shows", "showed", "raise", "raises", "raised", "put", "puts", "make", "makes", "made", "give", "gives", "gave", "take", "takes", "took", "create", "creates", "created", "look", "looks", "looked"}
+    adjectives = {"absolute", "extreme", "uncomfortable", "rapid", "massive", "structural", "financial", "corporate", "public", "private", "local", "global", "new", "old", "major", "regional", "economic", "entire", "empty", "really", "loaded", "dense", "chaotic", "secretive", "healthy", "strategic", "traditional", "high-tech", "mind-bending", "working", "motorized", "short-term", "long-term", "impenetrable", "physical", "personal"}
+    common_nouns = {"air", "look", "edge", "atmosphere", "world", "question", "solution", "solutions", "building", "government", "market", "markets", "policy", "data", "source", "sources", "scooter", "traffic", "pitch", "funds", "memory", "monopolies", "standards", "trainers", "industry", "miracle", "slowdown", "art"}
     if prev in prepositions:
         reasons.append("preposition_object_split")
     if prev in determiners:
@@ -782,6 +800,8 @@ def _syntax_boundary_reasons(previous_text: str, current_text: str) -> list[str]
         reasons.append("phrasal_verb_split")
     if prev in object_verbs and (cur in determiners or cur in adjectives or cur in common_nouns):
         reasons.append("verb_object_split")
+    if prev in {"look", "looks", "looked"} and cur == "at":
+        reasons.append("verb_preposition_split")
     if prev in adjectives and (cur in adjectives or cur in common_nouns):
         reasons.append("modifier_head_split")
     if prev2 in be_aux and prev.endswith("ing") and cur in particles:
