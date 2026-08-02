@@ -485,35 +485,7 @@ class ScreenSubtitleEditor:
             index: seg for index, seg in enumerate(asr_data.segments, 1)
         }
         self._llm_cache_used = False
-        items = self._stable_cut_items(asr_data.segments)
-        self._capture_boundary_snapshot(
-            "_stable_cut_items",
-            items,
-            changed_by="_stable_cut_items",
-            previous_items=None,
-        )
-        items = self._merge_standalone_discourse_markers(items)
-        self._capture_boundary_snapshot(
-            "_merge_standalone_discourse_markers",
-            items,
-            changed_by="_merge_standalone_discourse_markers",
-            previous_items=self._boundary_snapshot_items("_stable_cut_items"),
-        )
-        items = self._merge_short_display_segments(items)
-        self._capture_boundary_snapshot(
-            "_merge_short_display_segments",
-            items,
-            changed_by="_merge_short_display_segments",
-            previous_items=self._boundary_snapshot_items("_merge_standalone_discourse_markers"),
-        )
-        items = self._rebalance_edge_discourse_markers(items)
-        self._capture_boundary_snapshot(
-            "_rebalance_edge_discourse_markers",
-            items,
-            changed_by="_rebalance_edge_discourse_markers",
-            previous_items=self._boundary_snapshot_items("_merge_short_display_segments"),
-        )
-        items = self._validate_and_repair_final_pre_id_boundaries(items)
+        items = self._finalize_stable_english_boundaries(asr_data.segments)
         items = self._assign_global_subtitle_ids(items)
         semantic_groups = self._semantic_translation_groups(items)
         self._last_semantic_groups = list(semantic_groups)
@@ -567,6 +539,53 @@ class ScreenSubtitleEditor:
         )
         self._report_subtitle_coverage_gaps(asr_data.segments, segments)
         return ASRData(segments)
+
+    def _finalize_stable_english_boundaries(
+        self, source_segments: Sequence[ASRDataSeg]
+    ) -> List[ScreenSubtitleItem]:
+        """Build the frozen language-owned English boundary set before IDs.
+
+        Presentation templates receive the resulting cues and may wrap or scale
+        their text, but they must not create or move subtitle boundaries.  This
+        keeps the English, semantic groups, Chinese allocation, and manifest
+        independent from the selected video template.
+        """
+        items = self._stable_cut_items(source_segments)
+        self._capture_boundary_snapshot(
+            "_stable_cut_items",
+            items,
+            changed_by="_stable_cut_items",
+            previous_items=None,
+        )
+        items = self._merge_standalone_discourse_markers(items)
+        self._capture_boundary_snapshot(
+            "_merge_standalone_discourse_markers",
+            items,
+            changed_by="_merge_standalone_discourse_markers",
+            previous_items=self._boundary_snapshot_items("_stable_cut_items"),
+        )
+        items = self._merge_short_display_segments(items)
+        self._capture_boundary_snapshot(
+            "_merge_short_display_segments",
+            items,
+            changed_by="_merge_short_display_segments",
+            previous_items=self._boundary_snapshot_items("_merge_standalone_discourse_markers"),
+        )
+        items = self._rebalance_edge_discourse_markers(items)
+        self._capture_boundary_snapshot(
+            "_rebalance_edge_discourse_markers",
+            items,
+            changed_by="_rebalance_edge_discourse_markers",
+            previous_items=self._boundary_snapshot_items("_merge_short_display_segments"),
+        )
+        items = self._validate_and_repair_final_pre_id_boundaries(items)
+        self._capture_boundary_snapshot(
+            "_validate_and_repair_final_pre_id_boundaries",
+            items,
+            changed_by="_validate_and_repair_final_pre_id_boundaries",
+            previous_items=self._boundary_snapshot_items("_rebalance_edge_discourse_markers"),
+        )
+        return items
 
     def repair_after_final_time_alignment(self, asr_data: ASRData) -> ASRData:
         """Final local pass after WhisperX/frozen time mapping.

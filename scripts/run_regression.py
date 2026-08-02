@@ -33,6 +33,11 @@ def main() -> int:
             False,
         ),
         (
+            "stable boundary finalization",
+            ["tests/test_stable_boundary_finalization.py"],
+            False,
+        ),
+        (
             "rule regression library",
             ["tests/test_rule_regression_library.py"],
             False,
