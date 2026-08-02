@@ -6,8 +6,8 @@
 - Stable mode must not rewrite English for style.
 - Stable mode must not delete filler or backchannel words by default.
 - If a short backchannel is visually too brief, merge or extend display timing instead of deleting it.
-- Target maximum is 14 English words per subtitle.
-- If a rare case cannot satisfy both 14 words and grammatical integrity, preserve grammatical integrity first and report the issue.
+- Preferred visual target is 6-12 English words per subtitle.
+- Normal hard maximum is 16 English words. A rare 17-19 word structural exception is allowed only when every shorter cut would create a parser-confirmed grammar error; report the exception.
 
 ## English Cutting
 

@@ -31,7 +31,7 @@ Rules:
 
 - English text is restored locally from word ranges.
 - LLM must not rewrite, delete, reorder, or invent English.
-- Target upper limit is 14 words.
+- Preferred visual target is 6-12 words; the normal hard maximum is 16. A 17-19 word exception requires an audited parser-confirmed grammar constraint.
 - Preserve source order and token coverage.
 - Prefer clause, punctuation, discourse, and phrase boundaries.
 - Avoid cutting after prepositions, articles, auxiliaries, or connectors.

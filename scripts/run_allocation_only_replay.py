@@ -18,6 +18,8 @@ from app.core.bk_asr.asr_data import ASRDataSeg
 from app.core.storage.cache_manager import CacheManager
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
 
+DEFAULT_MAX_ENGLISH_WORDS = 16
+
 
 def _load_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
@@ -26,6 +28,11 @@ def _load_json(path: Path):
 def _write_json(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _manifest_max_english_words(run_manifest: dict) -> int:
+    """Use the stable-cut contract when an older manifest lacks this field."""
+    return int(run_manifest.get("max_english_words") or DEFAULT_MAX_ENGLISH_WORDS)
 
 
 def _latest_artifact_dir() -> Path:
@@ -183,7 +190,7 @@ def main() -> int:
     editor = ScreenSubtitleEditor(
         model=model,
         max_cjk_chars=int(run_manifest.get("max_cjk_chars") or 24),
-        max_english_words=int(run_manifest.get("max_english_words") or 14),
+        max_english_words=_manifest_max_english_words(run_manifest),
         batch_num=24,
         timeout=90,
         enable_stable_mode=True,

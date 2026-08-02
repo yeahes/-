@@ -38,6 +38,11 @@ def main() -> int:
             False,
         ),
         (
+            "allocation-only replay contract",
+            ["tests/test_allocation_only_replay.py"],
+            False,
+        ),
+        (
             "syntax check",
             [
                 "-m",
@@ -47,6 +52,7 @@ def main() -> int:
                 "app/core/subtitle_processor/screen_editor.py",
                 "tests/test_stable_caption_rules.py",
                 "tests/test_rule_regression_library.py",
+                "tests/test_allocation_only_replay.py",
                 "tests/audit_stable_outputs.py",
             ],
             False,
