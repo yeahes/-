@@ -4,22 +4,21 @@ Status: stable English boundary routing and renderer-owned structural-overflow
 checkpoint verified by focused regression; fresh end-to-end production and
 article-template visual validation are pending.
 
-Last verified: 2026-08-04 03:47:18 Asia/Shanghai
+Last verified: 2026-08-04 03:53:42 Asia/Shanghai
 
 Branch: main
 
-Verified HEAD: b5fe576345fbd82b3accc57b5d61fe40f597bd52
-The current working-tree checkpoint was verified against this HEAD; all
-implementation, test, and documentation changes listed below remain unstaged.
+Verified HEAD: 173c3f705fb6b3cd9339429aff4acb3a740f93ff
+The baseline implementation commit was verified before this state-only
+metadata update.
 
-Working tree: modified in tracked implementation, documentation, and test
-files listed by `git status --short`, plus the active cross-module issue list.
+Working tree: clean at the verified baseline code commit; this state-only
+metadata commit may advance HEAD without changing implementation behavior.
 The auxiliary vocabulary handoff is committed at
 `docs/handoffs/2026-08-04-vocabulary-cards.md`; `docs/CODEX_STATE.md` is a
 compatibility pointer to this canonical root file.
 
-Next action: rerun the focused and unified regression after the baseline fixes,
-then wait for explicit confirmation before committing.
+Next action: create the requested feature worktrees from the clean baseline.
 
 Unknowns: no fresh unseen-audio production render has been completed after the
 latest stable boundary and fixed-ID allocation changes.
