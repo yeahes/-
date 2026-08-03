@@ -243,7 +243,8 @@ Result:
 - It derives final cue times only from the existing subtitle ID word spans. A
   full cue is never mapped by its final cue text.
 - `final-cue-timeline.json` is the shared timing artifact for validation and
-  export. Own-word envelope failures or `S0000` IDs block SRT/ASS export.
+  export. Own-word envelope failures, `S0000` IDs, or a cue order that differs
+  from frozen subtitle-ID order block SRT/ASS export.
 
 ## Latest Alignment Verification
 

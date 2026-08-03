@@ -248,6 +248,14 @@ def validate_final_cue_timeline(
         errors.append({"code": "final_timeline_subtitle_id_missing", "subtitle_ids": missing_ids})
     if unknown_ids:
         errors.append({"code": "final_timeline_subtitle_id_unknown", "subtitle_ids": unknown_ids})
+    if returned_ids != expected_ids:
+        errors.append(
+            {
+                "code": "final_timeline_subtitle_order_mismatch",
+                "expected_subtitle_ids": expected_ids,
+                "returned_subtitle_ids": returned_ids,
+            }
+        )
 
     word_by_id = _word_index(words, errors)
     previous_end = -1

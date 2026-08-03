@@ -172,6 +172,38 @@ def test_artifact_rejects_final_cue_that_ends_before_its_word_envelope():
     assert "final_timeline_word_envelope_uncovered" in codes
 
 
+def test_artifact_rejects_cues_reordered_from_frozen_subtitle_ids():
+    words = _words((1000, 1200), (1210, 1400), (1410, 1600), (1610, 1800))
+    artifact = final_cue_timeline_artifact(
+        [
+            {
+                "subtitle_id": "S0002",
+                "word_start": 0,
+                "word_end": 1,
+                "word_envelope_start_ms": 1000,
+                "word_envelope_end_ms": 1400,
+                "start_ms": 960,
+                "end_ms": 1500,
+            },
+            {
+                "subtitle_id": "S0001",
+                "word_start": 2,
+                "word_end": 3,
+                "word_envelope_start_ms": 1410,
+                "word_envelope_end_ms": 1800,
+                "start_ms": 1410,
+                "end_ms": 2060,
+            },
+        ],
+        words,
+        expected_subtitle_ids=["S0001", "S0002"],
+    )
+
+    codes = {item["code"] for item in artifact["validation"]["errors"]}
+    assert "final_timeline_subtitle_order_mismatch" in codes
+    assert artifact["validation"]["status"] == "ERROR"
+
+
 if __name__ == "__main__":
     test_final_timeline_cue_covers_its_last_frozen_word()
     test_final_timeline_cue_covers_its_first_frozen_word()
@@ -180,4 +212,5 @@ if __name__ == "__main__":
     test_adjacent_word_overlap_is_reconciled_in_the_ledger_before_cue_building()
     test_missing_or_synthetic_subtitle_id_blocks_final_timeline()
     test_artifact_rejects_final_cue_that_ends_before_its_word_envelope()
+    test_artifact_rejects_cues_reordered_from_frozen_subtitle_ids()
     print("final cue timeline tests passed")
