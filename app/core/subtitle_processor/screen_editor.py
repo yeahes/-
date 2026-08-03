@@ -14270,7 +14270,13 @@ class ScreenSubtitleEditor:
         # A sentence-final list item or noun phrase can begin with a connector
         # and still be complete. Punctuation only bypasses validation when the
         # final grammar is not itself a dangling modifier or connective.
-        if terminal_punctuation and not normalized.endswith(terminal_dangling_endings):
+        if terminal_punctuation and (
+            not normalized.endswith(terminal_dangling_endings)
+            or re.search(
+                r"(?:不是|并非|是)[^，。！？；：]{0,20}(?:写|做|创|制|编|说|叫|算|为|用|称|给|由|被|有|在|来自|属于)[^，。！？；：]{0,12}的$",
+                normalized,
+            )
+        ):
             return False
         if total <= 1:
             return self._is_bad_chinese_fragment(text)

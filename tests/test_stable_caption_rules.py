@@ -4380,6 +4380,29 @@ def test_id_bound_allocation_rejects_terminal_modifier_fragment():
     assert "unnatural_chinese_fragment" in validation["issue_codes"]
 
 
+def test_id_bound_allocation_accepts_terminal_shi_de_predicate():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "也就是用来突然打断自己思路的标点符号，那肯定是AI写的。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "Those are the marks people use to interrupt themselves"},
+            {"subtitle_id": "S0002", "english": "so it must have been written by AI."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0001": "也就是用来突然打断自己思路的标点符号，",
+            "S0002": "那肯定是AI写的。",
+        },
+    )
+
+    assert validation["valid"]
+    assert "unnatural_chinese_fragment" not in validation["issue_codes"]
+
+
 def test_terminal_modifier_fragment_uses_specialized_fixed_id_retry():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
@@ -8234,6 +8257,7 @@ if __name__ == "__main__":
     test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()
     test_id_bound_group_rejects_unknown_id()
     test_id_bound_allocation_rejects_terminal_modifier_fragment()
+    test_id_bound_allocation_accepts_terminal_shi_de_predicate()
     test_terminal_modifier_fragment_uses_specialized_fixed_id_retry()
     test_semantic_audit_does_not_flag_a_complete_single_cue_as_a_fragment()
     test_id_bound_group_allows_different_return_order()
