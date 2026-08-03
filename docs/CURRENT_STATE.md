@@ -185,6 +185,9 @@ Last updated: 2026-08-04
   actual cross-cue allocation boundary; one invalid group or failed allocation
   batch records its own unresolved evidence and cannot discard other groups'
   ID-bound Chinese mappings.
+- A missing authoritative full translation now records the affected frozen IDs
+  as a blocking structure error and unresolved allocation while preserving
+  already completed fixed-ID mappings from other groups.
 - Optional Chinese polish now includes a narrowly selected complex
   enumeration/comparison group class. It remains capped, writes only existing
   subtitle IDs, and never changes English, order, or timing.

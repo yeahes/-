@@ -4687,6 +4687,30 @@ def test_invalid_single_cue_group_does_not_discard_other_fixed_id_allocations():
     assert editor._last_allocation_unresolved[0]["semantic_group_id"] == "G0001"
 
 
+def test_missing_full_translation_does_not_discard_prior_fixed_id_allocation():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    groups = [_id_group(1, 0, [items[0]]), _id_group(2, 1, [items[1]])]
+
+    allocated = editor._allocate_semantic_group_translations(
+        groups,
+        {1: "保留第一组翻译。"},
+    )
+
+    assert allocated == {1: {"S0001": "保留第一组翻译。"}}
+    assert editor._translation_structure_errors[-1] == {
+        "code": "translation_group_cardinality_mismatch",
+        "message": "Semantic full translation is missing for the fixed-ID group.",
+        "semantic_group_id": "G0002",
+        "expected_subtitle_ids": ["S0002"],
+        "returned_subtitle_ids": [],
+        "duplicate_subtitle_ids": [],
+        "unknown_subtitle_ids": [],
+        "missing_subtitle_ids": ["S0002"],
+    }
+    assert editor._last_allocation_unresolved[-1]["reason"] == "authoritative_full_translation_missing"
+
+
 def test_full_translation_number_error_is_not_misclassified_as_allocation_error():
     editor = _id_editor()
     entry = {
@@ -8169,6 +8193,7 @@ if __name__ == "__main__":
     test_single_cue_group_uses_authoritative_full_translation_without_allocation_request()
     test_single_cue_authoritative_translation_ending_in_de_is_not_an_allocation_fragment()
     test_invalid_single_cue_group_does_not_discard_other_fixed_id_allocations()
+    test_missing_full_translation_does_not_discard_prior_fixed_id_allocation()
     test_full_translation_number_error_is_not_misclassified_as_allocation_error()
     test_full_translation_requests_are_chunked_and_retry_missing_groups()
     test_full_translation_prompt_restrains_ordinary_chinese_em_dashes()

@@ -12844,8 +12844,6 @@ class ScreenSubtitleEditor:
         direct_allocations: Dict[int, Dict[str, str]] = {}
         for group in groups:
             full_translation = full_translations.get(group["id"], "")
-            if not full_translation:
-                return {}
             subtitle_parts = []
             for offset, item in enumerate(group["items"], 1):
                 timing = self._item_word_timing(item)
@@ -12874,6 +12872,25 @@ class ScreenSubtitleEditor:
                 "subtitle_parts": subtitle_parts,
             }
             allocation_entries.append(entry)
+            if not full_translation:
+                expected_ids = [str(part["subtitle_id"]) for part in subtitle_parts]
+                self._record_translation_structure_error(
+                    "translation_group_cardinality_mismatch",
+                    group_id=int(group["id"]),
+                    expected_ids=expected_ids,
+                    missing_ids=expected_ids,
+                    message="Semantic full translation is missing for the fixed-ID group.",
+                )
+                self._record_allocation_quality_unresolved(
+                    entry,
+                    {},
+                    {"issue_codes": ["translation_group_cardinality_mismatch"]},
+                    "authoritative_full_translation_missing",
+                )
+                # A missing upstream translation blocks its own IDs during final
+                # validation, but must not erase completed allocations for other
+                # frozen groups.
+                continue
             if len(subtitle_parts) != 1:
                 payload.append(entry)
                 continue
