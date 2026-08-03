@@ -1,7 +1,7 @@
 # CODEX State
 
 Status: implementation checkpoint verified by the unified automated regression;
-fresh end-to-end production validation on a newly generated audio run is still pending.
+fresh end-to-end production and article-template visual validation are pending.
 
 Last verified: 2026-08-04 00:17:32 Asia/Shanghai
 
@@ -9,8 +9,10 @@ Branch: main
 
 Verified HEAD: 6713185a9ff3af96a26d44bec15b2391ee2acd46
 
-Working tree: clean immediately after the verified implementation checkpoint.
-This state record contains no executable change and is committed separately.
+Working tree: no uncommitted executable source changes after the verified
+implementation checkpoint. Two concurrent, untracked handoff documents remain:
+`docs/CODEX_STATE.md` and `docs/handoffs/2026-08-04-vocabulary-cards.md`.
+They were read for this consolidation but are not silently included in a commit.
 
 ## Verified Contract
 
@@ -51,6 +53,19 @@ ASR word timestamps
   corrected-ASR artifacts with matching fingerprints and digests may be reused.
   Incomplete in-memory translation/allocation/final-output state is not resumed.
 
+## Optional Article Vocabulary Cards
+
+- The `文章单词` template is presentation-only. Its phrase selection, scheduling,
+  cache handling, frame rendering, and English highlight logic are confined to
+  the video-template path and do not write stable English boundaries, IDs,
+  cue order, word ownership, or final timing.
+- Current code keeps the active full card until a later card replaces it; before
+  the first card it displays the episode-title panel. Cache validity includes
+  source hash, model, and `VOCAB_PROMPT_VERSION`.
+- Focused card behavior is exercised by the unified regression. Legacy review
+  bar, overview, and placeholder drawing helpers remain in the renderer but
+  are not evidence of the active card state.
+
 ## Verification Evidence
 
 - `runtime\python.exe -X utf8 scripts\run_regression.py`: PASS on the current
@@ -73,14 +88,17 @@ ASR word timestamps
   fluency, or timing quality on unseen audio.
 - External LLM/API availability and WhisperX runtime behavior require a real
   run in the active environment to validate cache, fallback, and latency.
+- The article-card renderer has no fresh visual render evidence after its latest
+  UI changes. Typography, perceived density, and first-card transition require
+  review from a newly rendered article-template video.
 
 ## Next Action
 
-Run one previously unseen audio through the normal stable production path with
-the intended API and alignment configuration. Before adding any rule, inspect
-the new manifest, frozen word ledger, final cue timeline, validation summary,
-and user-facing review queue; then compare the produced SRT/ASS and rendered
-video against those artifacts.
+Run one previously unseen audio through the normal stable production path using
+the intended API and alignment configuration, with the article template and
+smart vocabulary cards enabled when that optional feature is under review.
+Before adding any rule, inspect the new manifest, frozen word ledger, final cue
+timeline, validation summary, review queue, SRT/ASS, and rendered video.
 
 ## Source Priority
 
