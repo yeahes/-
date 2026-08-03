@@ -453,6 +453,20 @@ Result:
 - Regression coverage verifies the forced-cut branch, the incomplete
   17-19 candidate branch, and the validation distinction.
 
+## Latest Parser-Confirmed English Boundary Protection
+
+- Stable pre-ID cutting now protects three additional local dependency shapes:
+  compact coordination, an object immediately followed by a content-clause
+  marker, and a verb-attached post-object modifier. The protection applies
+  only to continuous short spans without a meaningful recorded pause.
+- A comma-delimited `but`, `or`, `so`, or `yet` clause boundary remains
+  eligible for the existing visual temporal split; it is not treated as a
+  compact coordination.
+- This changes English boundary eligibility before IDs are assigned. English
+  source order, word-ledger timestamps, Chinese allocation, final cue timing,
+  and export behavior remain unchanged. Fresh production validation is still
+  required for the prior `识别` run because that artifact predates the fix.
+
 ## Stable Manifest Resolution
 
 - When `stable-final-manifest.json` exists beside the selected subtitle path,

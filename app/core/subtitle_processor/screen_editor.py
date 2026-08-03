@@ -5985,6 +5985,9 @@ class ScreenSubtitleEditor:
             self._protect_numeric_range_boundaries(doc, doc_to_word)
             self._protect_subject_verb_boundaries(doc, doc_to_word)
             self._protect_coordinated_subject_boundaries(doc, doc_to_word)
+            self._protect_compact_coordination_boundaries(doc, doc_to_word)
+            self._protect_object_content_clause_boundaries(doc, doc_to_word)
+            self._protect_object_attached_modifier_boundaries(doc, doc_to_word)
             self._protect_comma_bracketed_adverb_boundaries(doc, doc_to_word)
             self._protect_modifier_head_boundaries(doc, doc_to_word)
 
@@ -6516,6 +6519,120 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 range(indices[0], indices[-1] + 1),
                 "coordinated_subject_split",
+            )
+
+    def _protect_compact_coordination_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a short parser-confirmed coordination from being visually fragmented."""
+        for token in doc:
+            if getattr(token, "dep_", "") != "conj" or token.i not in doc_to_word:
+                continue
+            head = token.head
+            if head.i not in doc_to_word:
+                continue
+            start = min(doc_to_word[head.i], doc_to_word[token.i])
+            end = max(doc_to_word[head.i], doc_to_word[token.i])
+            if end <= start or end - start > 12:
+                continue
+            clause_connector = next(
+                (
+                    candidate
+                    for candidate in doc
+                    if candidate.i in doc_to_word
+                    and start <= doc_to_word[candidate.i] <= end
+                    and getattr(candidate, "dep_", "") == "cc"
+                    and self._clean_boundary_token(getattr(candidate, "text", ""))
+                    in {"but", "or", "so", "yet"}
+                    and doc_to_word[candidate.i] > start
+                    and re.search(
+                        r"[,;:]\s*$",
+                        str(
+                            self._active_word_entries[
+                                doc_to_word[candidate.i] - 1
+                            ].get("surface") or ""
+                        ),
+                    )
+                ),
+                None,
+            )
+            if clause_connector is not None:
+                continue
+            pauses = [
+                self._word_pause_ms(index, index + 1)
+                for index in range(start, end)
+            ]
+            if any(pause is not None and pause >= 450 for pause in pauses):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(start, end + 1),
+                "coordinated_constituent_split",
+            )
+
+    def _protect_object_content_clause_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a verb's final object attached to its following content clause."""
+        for marker in doc:
+            if (
+                getattr(marker, "dep_", "") != "mark"
+                or marker.i not in doc_to_word
+                or self._clean_boundary_token(getattr(marker, "text", ""))
+                not in {"if", "whether", "that", "how", "what", "why", "where", "when"}
+            ):
+                continue
+            marker_index = doc_to_word[marker.i]
+            previous = next(
+                (
+                    token
+                    for token in doc
+                    if doc_to_word.get(token.i) == marker_index - 1
+                ),
+                None,
+            )
+            if (
+                previous is None
+                or getattr(previous, "dep_", "") not in {"dobj", "obj", "iobj"}
+                or previous.head.i not in doc_to_word
+                or getattr(previous.head, "pos_", "") not in {"VERB", "AUX"}
+            ):
+                continue
+            previous_index = doc_to_word[previous.i]
+            pause_ms = self._word_pause_ms(previous_index, marker_index)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [previous_index, marker_index],
+                "object_content_clause_split",
+            )
+
+    def _protect_object_attached_modifier_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a verb-attached post-object modifier with its object phrase."""
+        for modifier in doc:
+            if (
+                getattr(modifier, "dep_", "") != "prep"
+                or modifier.i not in doc_to_word
+                or getattr(modifier.head, "pos_", "") not in {"VERB", "AUX"}
+            ):
+                continue
+            modifier_index = doc_to_word[modifier.i]
+            previous = next(
+                (
+                    token
+                    for token in doc
+                    if doc_to_word.get(token.i) == modifier_index - 1
+                ),
+                None,
+            )
+            if (
+                previous is None
+                or getattr(previous, "dep_", "") not in {"dobj", "obj", "attr", "oprd"}
+                or previous.head != modifier.head
+            ):
+                continue
+            previous_index = doc_to_word[previous.i]
+            pause_ms = self._word_pause_ms(previous_index, modifier_index)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [previous_index, modifier_index],
+                "object_attached_modifier_split",
             )
 
     def _protect_comma_bracketed_adverb_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:

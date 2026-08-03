@@ -2097,6 +2097,52 @@ def test_parser_blocks_compact_coordinated_subject_boundary():
     assert not evaluation["legal"]
 
 
+def test_parser_blocks_compact_coordination_boundaries():
+    predicate_editor = _marker_editor(
+        "Yeah. As AI continues to rapidly adapt and, you know, successfully mimic our best writing traits, it changes.".split()
+    )
+    predicate_editor._prepare_syntax_cut_hints()
+
+    predicate = predicate_editor._evaluate_stable_cut_boundary(9, 10)
+
+    assert "coordinated_constituent_split" in predicate["hard_issues"]
+    assert not predicate["legal"]
+
+    list_editor = _marker_editor(
+        "Yeah. Will you have to rely on deliberate eccentricity, messy grammar, and chaotic punctuation, just to prove it?".split()
+    )
+    list_editor._prepare_syntax_cut_hints()
+
+    list_item = list_editor._evaluate_stable_cut_boundary(8, 9)
+
+    assert "coordinated_constituent_split" in list_item["hard_issues"]
+    assert not list_item["legal"]
+
+
+def test_parser_blocks_object_content_clause_boundary():
+    editor = _marker_editor(
+        "Well, if you are relying on Pangram to tell you if an email or an essay is real, you have to understand this.".split()
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(9, 10)
+
+    assert "object_content_clause_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_blocks_object_attached_modifier_boundary():
+    editor = _marker_editor(
+        "They are constantly adjusting their internal weights based on human thumbs-ups and thumbs-downs.".split()
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(6, 7)
+
+    assert "object_attached_modifier_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
 def test_parser_blocks_short_dative_object_start_boundary():
     editor = _marker_editor(
         ["the", "company", "gives", "you", "a", "completely", "different", "lens."]
@@ -8076,6 +8122,9 @@ if __name__ == "__main__":
     test_short_verb_possessive_complement_boundary_is_hard_when_syntax_marks_it()
     test_parser_blocks_direct_verb_particle_boundary()
     test_parser_blocks_compact_coordinated_subject_boundary()
+    test_parser_blocks_compact_coordination_boundaries()
+    test_parser_blocks_object_content_clause_boundary()
+    test_parser_blocks_object_attached_modifier_boundary()
     test_parser_blocks_short_dative_object_start_boundary()
     test_parser_blocks_numeric_range_boundaries()
     test_pre_id_candidate_gate_rejects_new_hard_syntax_boundary()
