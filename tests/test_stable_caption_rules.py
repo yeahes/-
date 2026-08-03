@@ -4508,6 +4508,89 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
     assert editor._translation_structure_errors == []
 
 
+def test_allocation_retry_preserves_initial_fixed_id_protocol_evidence():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    group = _id_group(1, 0, items)
+    frozen_fields = [
+        (item.subtitle_id, item.original, item.word_start, item.word_end)
+        for item in items
+    ]
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "part_translations": [
+                            {"subtitle_id": "S0001", "zh": "这是一条完整内容。"},
+                        ],
+                    }
+                ]
+            }
+        return {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "这是一条完整内容。"},
+                        {"subtitle_id": "S0002", "zh": "这是另一条完整内容。"},
+                    ],
+                }
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations(
+            [group],
+            {1: "这是一条完整内容。这是另一条完整内容。"},
+        )
+
+    assert allocated == {
+        1: {"S0001": "这是一条完整内容。", "S0002": "这是另一条完整内容。"}
+    }
+    assert [
+        (item.subtitle_id, item.original, item.word_start, item.word_end)
+        for item in items
+    ] == frozen_fields
+    assert editor._translation_structure_errors == []
+    attempt_records = [
+        record
+        for record in editor._last_allocation_validation
+        if record.get("record_type") == "allocation_structure_attempt"
+    ]
+    assert attempt_records == [
+        {
+            "record_type": "allocation_structure_attempt",
+            "status": "retry_required",
+            "stage": "initial_batch",
+            "expected_semantic_group_ids": [1],
+            "errors": [
+                {
+                    "code": "translation_id_missing",
+                    "message": "Missing translation subtitle_id(s).",
+                    "semantic_group_id": "G0001",
+                    "expected_subtitle_ids": ["S0001", "S0002"],
+                    "returned_subtitle_ids": ["S0001"],
+                    "duplicate_subtitle_ids": [],
+                    "unknown_subtitle_ids": [],
+                    "missing_subtitle_ids": ["S0002"],
+                },
+                {
+                    "code": "translation_group_cardinality_mismatch",
+                    "message": "Returned subtitle_id set does not match expected subtitle_id set.",
+                    "semantic_group_id": "G0001",
+                    "expected_subtitle_ids": ["S0001", "S0002"],
+                    "returned_subtitle_ids": ["S0001"],
+                    "duplicate_subtitle_ids": [],
+                    "unknown_subtitle_ids": [],
+                    "missing_subtitle_ids": ["S0002"],
+                },
+            ],
+        }
+    ]
+
+
 def test_allocation_final_artifact_keeps_unresolved_group_fixed_id_mapping():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(3))
@@ -8042,6 +8125,7 @@ if __name__ == "__main__":
     test_terminal_modifier_fragment_uses_specialized_fixed_id_retry()
     test_semantic_audit_does_not_flag_a_complete_single_cue_as_a_fragment()
     test_id_bound_group_allows_different_return_order()
+    test_allocation_retry_preserves_initial_fixed_id_protocol_evidence()
     test_allocation_final_artifact_keeps_unresolved_group_fixed_id_mapping()
     test_single_cue_group_uses_authoritative_full_translation_without_allocation_request()
     test_single_cue_authoritative_translation_ending_in_de_is_not_an_allocation_fragment()
