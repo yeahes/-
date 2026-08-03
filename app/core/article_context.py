@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -544,6 +545,10 @@ def _correct_word_timestamp_segments(
                 if _is_self_replacement_candidate(candidate):
                     continue
                 if candidate["final_confidence"] >= review_confidence:
+                    if candidate.get("matched_variant_is_alias"):
+                        alias_collision = _find_ambiguous_alias_canonical_collision(candidate, terms)
+                        if alias_collision:
+                            candidate["alias_canonical_collision"] = alias_collision
                     candidates.append(candidate)
 
     selected, overlap_rejections = _resolve_overlapping_article_correction_candidates(
@@ -1018,12 +1023,22 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
     original_tokens = _word_tokens(original_text)
     canonical_tokens = _word_tokens(canonical)
     entity_gate = _entity_phrase_gate(original_text, canonical)
+    matched_variant_is_alias = bool(best_variant) and (
+        _compact_text(best_variant) != _compact_text(canonical)
+    )
+    matched_alias_evidence = (
+        _matched_alias_evidence(term["source"], best_variant)
+        if matched_variant_is_alias
+        else {}
+    )
     return {
         "original_text": original_text,
         "suspicious_text": original_text,
         "corrected_text": _replacement_text_for_original(original_text, canonical),
         "candidate_text": canonical,
         "matched_variant": best_variant,
+        "matched_variant_is_alias": matched_variant_is_alias,
+        "matched_alias_evidence": matched_alias_evidence,
         "source": "article_glossary.json",
         "string_similarity": round(best_string, 4),
         "phonetic_similarity": round(best_phonetic, 4),
@@ -1046,6 +1061,143 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
             "aliases": term["source"].get("aliases", []),
         },
     }
+
+
+def _matched_alias_evidence(source: Dict[str, Any], matched_variant: str) -> Dict[str, Any]:
+    matched_key = _compact_text(matched_variant)
+    if not matched_key:
+        return {}
+    for detail in source.get("alias_details") or []:
+        if _compact_text(str(detail.get("alias", "") or "")) != matched_key:
+            continue
+        evidence = detail.get("evidence")
+        return dict(evidence) if isinstance(evidence, dict) else {}
+    return {}
+
+
+def _find_ambiguous_alias_canonical_collision(
+    candidate: Dict[str, Any],
+    terms: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Detect a short alias that is embedded in a different entity phrase.
+
+    An article can legitimately contain both a short shared name and several
+    longer institutions.  Similarity alone must not turn the distinct token in
+    the ASR phrase into the target canonical's token.  This only rejects an
+    automatic replacement when the original word window itself supports a
+    competing glossary canonical.
+    """
+    matched_variant = str(candidate.get("matched_variant", "") or "")
+    target_canonical = str(candidate.get("candidate_text", "") or "")
+    original_tokens = _normalized_entity_tokens(_word_tokens(candidate.get("original_text", "")))
+    alias_tokens = _normalized_entity_tokens(_word_tokens(matched_variant))
+    target_tokens = _normalized_entity_tokens(_word_tokens(target_canonical))
+    if (
+        not original_tokens
+        or not alias_tokens
+        or not target_tokens
+        or _compact_text(matched_variant) == _compact_text(target_canonical)
+        or len(alias_tokens) >= len(target_tokens)
+    ):
+        return {}
+
+    original_alias_starts = _token_subsequence_starts(original_tokens, alias_tokens)
+    target_alias_starts = _token_subsequence_starts(target_tokens, alias_tokens)
+    if not original_alias_starts or not target_alias_starts:
+        return {}
+
+    conflicts: List[Dict[str, Any]] = []
+    seen_canonicals = set()
+    target_key = _compact_text(target_canonical)
+    for term in terms:
+        conflicting_canonical = str(term.get("canonical", "") or "")
+        conflicting_tokens = _normalized_entity_tokens(_word_tokens(conflicting_canonical))
+        if (
+            not conflicting_tokens
+            or _compact_text(conflicting_canonical) == target_key
+            or _compact_text(conflicting_canonical) in seen_canonicals
+        ):
+            continue
+        conflicting_alias_starts = _token_subsequence_starts(conflicting_tokens, alias_tokens)
+        if not conflicting_alias_starts:
+            continue
+
+        conflict = _find_alias_discriminator_conflict(
+            original_tokens,
+            target_tokens,
+            conflicting_tokens,
+            original_alias_starts,
+            target_alias_starts,
+            conflicting_alias_starts,
+        )
+        if not conflict:
+            continue
+        source = term.get("source") or {}
+        conflicts.append(
+            {
+                "canonical_name": conflicting_canonical,
+                "category": source.get("category", ""),
+                "source_key": source.get("source_key", ""),
+                "evidence": dict(source.get("evidence") or {}),
+                **conflict,
+            }
+        )
+        seen_canonicals.add(_compact_text(conflicting_canonical))
+
+    if not conflicts:
+        return {}
+    return {
+        "matched_variant": matched_variant,
+        "target_canonical": target_canonical,
+        "matched_alias_evidence": dict(candidate.get("matched_alias_evidence") or {}),
+        "conflicting_canonicals": conflicts,
+    }
+
+
+def _token_subsequence_starts(tokens: Sequence[str], phrase: Sequence[str]) -> List[int]:
+    if not tokens or not phrase or len(phrase) > len(tokens):
+        return []
+    return [
+        start
+        for start in range(len(tokens) - len(phrase) + 1)
+        if list(tokens[start : start + len(phrase)]) == list(phrase)
+    ]
+
+
+def _find_alias_discriminator_conflict(
+    original_tokens: Sequence[str],
+    target_tokens: Sequence[str],
+    conflicting_tokens: Sequence[str],
+    original_alias_starts: Sequence[int],
+    target_alias_starts: Sequence[int],
+    conflicting_alias_starts: Sequence[int],
+) -> Dict[str, Any]:
+    for original_start in original_alias_starts:
+        for target_start in target_alias_starts:
+            for conflicting_start in conflicting_alias_starts:
+                for original_index, original_token in enumerate(original_tokens):
+                    relative_index = original_index - original_start
+                    target_index = target_start + relative_index
+                    conflicting_index = conflicting_start + relative_index
+                    if not (0 <= conflicting_index < len(conflicting_tokens)):
+                        continue
+                    conflicting_token = conflicting_tokens[conflicting_index]
+                    if _entity_token_similarity(original_token, conflicting_token) < 0.9:
+                        continue
+                    target_token = (
+                        target_tokens[target_index]
+                        if 0 <= target_index < len(target_tokens)
+                        else ""
+                    )
+                    if target_token and _entity_token_similarity(original_token, target_token) >= 0.8:
+                        continue
+                    return {
+                        "discriminator_word_offset": original_index,
+                        "original_token": original_token,
+                        "target_token": target_token,
+                        "conflicting_token": conflicting_token,
+                    }
+    return {}
 
 
 def _is_self_replacement_candidate(candidate: Dict[str, Any]) -> bool:
@@ -1098,6 +1250,12 @@ def _article_scope_rejection_reason(candidate: Dict[str, Any]) -> str:
     if not original_tokens or not corrected_tokens:
         return "ordinary_text_not_article_proper_noun_scope"
 
+    if candidate.get("alias_canonical_collision"):
+        return "ambiguous_alias_canonical_collision"
+
+    if _is_place_demonym_candidate(original_tokens, corrected_tokens, candidate):
+        return "place_demonym_not_entity"
+
     if "exact_alias_match" in (candidate.get("matched_conditions") or []):
         return "" if _exact_alias_can_auto_apply(candidate) else "alias_would_degrade_canonical_match"
 
@@ -1106,14 +1264,95 @@ def _article_scope_rejection_reason(candidate: Dict[str, Any]) -> str:
         return conservative_reason
 
     if not candidate.get("entity_gate_passed"):
-        if _high_confidence_article_entity_candidate(candidate):
+        if _candidate_tokens_fully_align_to_canonical(original_tokens, corrected_tokens):
             return ""
-        return "ordinary_text_not_article_proper_noun_scope"
+        return str(candidate.get("entity_gate_reason") or "ordinary_text_not_article_proper_noun_scope")
 
     if len(original_tokens) == 1 and len(corrected_tokens) == 1:
         if not _single_token_candidate_stays_in_scope(original_tokens[0], corrected_tokens[0], candidate):
             return "ordinary_text_not_article_proper_noun_scope"
     return ""
+
+
+def _is_place_demonym_candidate(
+    original_tokens: Sequence[str],
+    corrected_tokens: Sequence[str],
+    candidate: Dict[str, Any],
+) -> bool:
+    """Keep place names separate from nationality and resident words.
+
+    A place in an article is useful terminology, but its adjectival or plural
+    demonym is ordinary sentence text. Similarity alone must not turn
+    ``Americans`` into ``America``.
+    """
+    if len(original_tokens) != 1 or len(corrected_tokens) != 1:
+        return False
+    source = candidate.get("source_glossary") or {}
+    source_key = str(source.get("source_key", candidate.get("source_key", "")) or "").casefold()
+    category = str(source.get("category", candidate.get("category", "")) or "").casefold()
+    if source_key != "places" and category not in {"place", "places", "location", "country", "city"}:
+        return False
+    original = _normalize_entity_gate_token(original_tokens[0])
+    corrected = _normalize_entity_gate_token(corrected_tokens[0])
+    if original == corrected or min(len(original), len(corrected)) < 4:
+        return False
+    prefix_length = len(os.path.commonprefix((original, corrected)))
+    return prefix_length >= 3 and original.endswith(("an", "ans", "ian", "ians", "ese", "ish"))
+
+
+def _candidate_tokens_fully_align_to_canonical(
+    original_tokens: Sequence[str],
+    canonical_tokens: Sequence[str],
+) -> bool:
+    """Accept only replacements whose complete source window maps to the entity.
+
+    This permits structural ASR forms such as ``A Drift`` -> ``Adrift`` while
+    rejecting a canonical entity followed by an ordinary word such as
+    ``American Enterprise Institute details``. The caller has already applied
+    the normal score threshold; this guard is solely about replacement range.
+    """
+    source = [_normalize_entity_gate_token(token) for token in original_tokens]
+    canonical = [_normalize_entity_gate_token(token) for token in canonical_tokens]
+    source = [token for token in source if token]
+    canonical = [token for token in canonical if token]
+    if not source or not canonical:
+        return False
+    if len(source) == 1 and len(canonical) == 1:
+        return False
+
+    source_index = 0
+    canonical_index = 0
+    while source_index < len(source) and canonical_index < len(canonical):
+        if _entity_token_similarity(source[source_index], canonical[canonical_index]) >= 0.8:
+            source_index += 1
+            canonical_index += 1
+            continue
+        if (
+            source_index + 1 < len(source)
+            and _entity_token_similarity(
+                "".join(source[source_index : source_index + 2]),
+                canonical[canonical_index],
+            ) >= 0.8
+        ):
+            source_index += 2
+            canonical_index += 1
+            continue
+        if (
+            canonical_index + 1 < len(canonical)
+            and _entity_token_similarity(
+                source[source_index],
+                "".join(canonical[canonical_index : canonical_index + 2]),
+            ) >= 0.8
+        ):
+            source_index += 1
+            canonical_index += 2
+            continue
+        return False
+    return source_index == len(source) and canonical_index == len(canonical)
+
+
+def _entity_token_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, left, right).ratio()
 
 
 def _conservative_person_name_rejection_reason(candidate: Dict[str, Any]) -> str:
@@ -1257,66 +1496,6 @@ def _edit_distance(left: str, right: str, *, max_distance: int = 2) -> int:
     return previous[-1]
 
 
-def _high_confidence_article_entity_candidate(candidate: Dict[str, Any]) -> bool:
-    source = candidate.get("source_glossary") or {}
-    source_key = str(source.get("source_key", "") or "").casefold()
-    category = str(source.get("category", "") or "").casefold()
-    high_precision_sources = {
-        "people",
-        "companies",
-        "brands",
-        "organisations",
-        "places",
-        "books_and_works",
-        "awards",
-        "media_outlets",
-        "platforms",
-    }
-    high_precision_categories = {
-        "analyst",
-        "author",
-        "book",
-        "literary award",
-        "media outlet",
-        "memoir",
-        "poem",
-        "poet",
-        "poetry collection",
-        "research center",
-        "social media platform",
-        "think tank",
-        "writer",
-    }
-    if source_key not in high_precision_sources and category not in high_precision_categories:
-        return False
-    original = str(candidate.get("original_text", "") or "")
-    corrected = str(candidate.get("candidate_text", "") or "")
-    if not re.search(r"[A-Z]", original):
-        return False
-    original_tokens = _word_tokens(original)
-    corrected_tokens = _word_tokens(corrected)
-    if not original_tokens or not corrected_tokens:
-        return False
-    if (
-        original_tokens[-1].casefold() in {"and", "or", "but", "for", "of", "to", "with", "in", "on", "at", "by"}
-        and original_tokens[-1].casefold() != corrected_tokens[-1].casefold()
-    ):
-        return False
-    if (
-        original_tokens[0].casefold() in {"a", "an", "the", "and", "or", "but", "for", "of", "to", "with", "in", "on", "at", "by"}
-        and original_tokens[0].casefold() != corrected_tokens[0].casefold()
-    ):
-        return False
-    if abs(len(original_tokens) - len(corrected_tokens)) > 1:
-        return False
-    string_similarity = float(candidate.get("string_similarity") or 0)
-    phonetic_similarity = float(candidate.get("phonetic_similarity") or 0)
-    same_initials = _entity_initials(original_tokens) == _entity_initials(corrected_tokens)
-    if same_initials and max(string_similarity, phonetic_similarity) >= 0.82:
-        return True
-    return string_similarity >= 0.86 and phonetic_similarity >= 0.82
-
-
 def _entity_initials(tokens: Sequence[str]) -> str:
     return "".join((token[:1] or "").casefold() for token in tokens if token)
 
@@ -1337,6 +1516,10 @@ def _entity_phrase_gate(original_text: str, canonical: str) -> Dict[str, Any]:
         return _entity_gate_result(False, "candidate_would_expand_short_phrase")
     if len(original_tokens) > len(canonical_tokens) + 1:
         return _entity_gate_result(False, "candidate_would_delete_common_words")
+    if len(original_tokens) > len(canonical_tokens) and not all(
+        _token_is_capitalized_name_piece(token) for token in original_tokens
+    ):
+        return _entity_gate_result(False, "candidate_would_delete_non_entity_token")
 
     normalized = [_normalize_entity_gate_token(token) for token in original_tokens]
     if any(token in _ENTITY_BLOCKING_FUNCTION_WORDS for token in normalized):

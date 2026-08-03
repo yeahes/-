@@ -67,6 +67,14 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
                 output_dir=Path(tmp),
             )
 
+    def _correct_with_context(self, segments, context):
+        with tempfile.TemporaryDirectory() as tmp:
+            return apply_article_asr_corrections(
+                ASRData(segments),
+                context,
+                output_dir=Path(tmp),
+            )
+
     def test_corrects_only_article_glossary_proper_names(self):
         raw = [
             ASRDataSeg("Right, Li Yang Wenfing.", 100, 200),
@@ -122,6 +130,70 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
 
         corrected = self._correct(raw)
         self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+
+    def test_does_not_conflate_places_with_demonyms_or_consume_trailing_words(self):
+        context = {
+            "places": [
+                {"canonical_name": "America", "aliases": [], "category": "place"},
+                {"canonical_name": "China", "aliases": [], "category": "place"},
+            ],
+            "organisations": [
+                {"canonical_name": "Census Bureau", "aliases": [], "category": "organisation"},
+                {
+                    "canonical_name": "American Enterprise Institute",
+                    "aliases": [],
+                    "category": "organisation",
+                },
+            ],
+        }
+        raw = [
+            ASRDataSeg("Americans", 100, 200),
+            ASRDataSeg("have", 200, 300),
+            ASRDataSeg("applied.", 300, 400),
+            ASRDataSeg("Chinese", 500, 600),
+            ASRDataSeg("founders", 600, 700),
+            ASRDataSeg("are", 700, 800),
+            ASRDataSeg("growing.", 800, 900),
+            ASRDataSeg("Census", 1000, 1100),
+            ASRDataSeg("Bureau,", 1100, 1200),
+            ASRDataSeg("there", 1200, 1300),
+            ASRDataSeg("are", 1300, 1400),
+            ASRDataSeg("signs.", 1400, 1500),
+            ASRDataSeg("American", 1600, 1700),
+            ASRDataSeg("Enterprise", 1700, 1800),
+            ASRDataSeg("Institute", 1800, 1900),
+            ASRDataSeg("details", 1900, 2000),
+            ASRDataSeg("findings.", 2000, 2100),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            " ".join(seg.text for seg in corrected.segments),
+            " ".join(seg.text for seg in raw),
+        )
+        american_logs = [item for item in logs if item.get("original_text") == "Americans"]
+        self.assertTrue(american_logs)
+        self.assertTrue(all(item["reason"] == "place_demonym_not_entity" for item in american_logs))
+        self.assertTrue(
+            any(
+                item.get("original_text") == "Census Bureau, there"
+                and item["reason"] == "candidate_would_delete_non_entity_token"
+                for item in logs
+            )
+        )
+        self.assertTrue(
+            any(
+                item.get("original_text") == "American Enterprise Institute details"
+                and item["reason"] == "candidate_would_delete_non_entity_token"
+                for item in logs
+            )
+        )
 
     def test_skips_self_replacements_and_technical_terms_for_asr_correction(self):
         context = {
@@ -181,6 +253,127 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
 
         corrected = self._correct(raw)
         self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+
+    def test_short_alias_collision_with_related_canonical_is_review_only(self):
+        article = (
+            "Northbridge Reserve College opened a research centre. "
+            "Northbridge Reserve Council Directorate published a separate report."
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "organisations": [
+                    {
+                        "canonical_name": "Northbridge Reserve College",
+                        "aliases": [],
+                        "category": "organisation",
+                    },
+                    {
+                        "canonical_name": "Northbridge Reserve Council Directorate",
+                        "aliases": ["Northbridge Reserve"],
+                        "category": "organisation",
+                    },
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Northbridge", 0, 100),
+            ASRDataSeg("Reserve", 100, 200),
+            ASRDataSeg("College", 200, 300),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(" ".join(seg.text for seg in corrected.segments), "Northbridge Reserve College")
+        collision = next(
+            item
+            for item in logs
+            if item.get("reason") == "ambiguous_alias_canonical_collision"
+        )
+        self.assertFalse(collision["applied"])
+        self.assertEqual(collision["result"], "review_only")
+        self.assertEqual(collision["matched_variant"], "Northbridge Reserve")
+        self.assertEqual(collision["canonical_name"], "Northbridge Reserve Council Directorate")
+        self.assertEqual(
+            collision["alias_canonical_collision"]["conflicting_canonicals"][0]["canonical_name"],
+            "Northbridge Reserve College",
+        )
+        self.assertEqual(collision["start_word_index"], 0)
+        self.assertEqual(collision["end_word_index"], 3)
+
+    def test_exact_canonical_correction_survives_related_alias_collision_guard(self):
+        article = (
+            "Northbridge Reserve College opened a research centre. "
+            "Northbridge Reserve Council Directorate published a separate report."
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "organisations": [
+                    {
+                        "canonical_name": "Northbridge Reserve College",
+                        "aliases": [],
+                        "category": "organisation",
+                    },
+                    {
+                        "canonical_name": "Northbridge Reserve Council Directorate",
+                        "aliases": ["Northbridge Reserve"],
+                        "category": "organisation",
+                    },
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Northbridge", 0, 100),
+            ASRDataSeg("Reserve", 100, 200),
+            ASRDataSeg("Collage", 200, 300),
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(" ".join(seg.text for seg in corrected.segments), "Northbridge Reserve College")
+
+    def test_unrelated_high_confidence_entity_correction_remains_automatic(self):
+        article = "Harborview Dynamics released a new report."
+        context = enrich_article_context_with_evidence(
+            {
+                "companies": [
+                    {
+                        "canonical_name": "Harborview Dynamics",
+                        "aliases": [],
+                        "category": "company",
+                    }
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Harbourview", 0, 100),
+            ASRDataSeg("Dynamics", 100, 200),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(" ".join(seg.text for seg in corrected.segments), "Harborview Dynamics")
+        self.assertTrue(
+            any(
+                item.get("applied")
+                and item.get("canonical_name") == "Harborview Dynamics"
+                for item in logs
+            )
+        )
 
     def test_preserves_count_and_timestamps(self):
         raw = [
