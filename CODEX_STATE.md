@@ -1,24 +1,26 @@
 # CODEX State
 
-Status: stable English boundary routing and renderer-owned structural-overflow
-checkpoint verified by focused regression; fresh end-to-end production and
-article-template visual validation are pending.
+Status: main has integrated frozen final-cue order validation; unified
+regression passed, while fresh end-to-end production and article-template
+visual validation remain pending.
 
-Last verified: 2026-08-04 03:53:42 Asia/Shanghai
+Last verified: 2026-08-04 05:36:00 Asia/Shanghai
 
 Branch: main
 
-Verified HEAD: 173c3f705fb6b3cd9339429aff4acb3a740f93ff
-The baseline implementation commit was verified before this state-only
-metadata update.
+Verified HEAD: 0a6bdb84bb560cb62e30c4054b95eeee6dd3d46a
+Merged `be4ee1e` now rejects a final timeline whose returned cue-ID sequence
+differs from frozen subtitle-ID order.
 
-Working tree: clean at the verified baseline code commit; this state-only
+Working tree: clean at the verified integration commit; this state-only
 metadata commit may advance HEAD without changing implementation behavior.
 The auxiliary vocabulary handoff is committed at
 `docs/handoffs/2026-08-04-vocabulary-cards.md`; `docs/CODEX_STATE.md` is a
 compatibility pointer to this canonical root file.
 
-Next action: create the requested feature worktrees from the clean baseline.
+Next action: run one previously unseen audio through the stable production path
+and inspect its frozen word ledger, final cue timeline, validation, SRT/ASS,
+and rendered article-template video.
 
 Unknowns: no fresh unseen-audio production render has been completed after the
 latest stable boundary and fixed-ID allocation changes.
