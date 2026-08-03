@@ -15,8 +15,8 @@ Last updated: 2026-07-26
 
 ## Local Samples
 
-- `tests\audit_stable_outputs.py 222 777 999` depends on local `work-dir` outputs.
-- In this checkout, those sample folders are absent, so the audit reports `MISSING`.
+- `tests\audit_stable_outputs.py` depends on an explicit fresh `work-dir`
+  output. It is intentionally excluded from the unified regression.
 - Historical fixture samples exist under `tests\fixtures\caption_audit_2026_07_22`.
 
 ## Generated Outputs
@@ -28,4 +28,3 @@ Last updated: 2026-07-26
 
 - Word-level timestamps are useful but not authoritative.
 - Very short word timings and gaps can still produce display issues.
-

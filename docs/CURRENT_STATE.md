@@ -92,7 +92,8 @@ Last updated: 2026-08-03
   separated from advanced performance and legacy compatibility controls, and
   the editor keeps compatibility correction, prompt, import, and folder actions
   under `More`. This changes no processing configuration or pipeline behavior.
-- The current local `work-dir` samples `222`, `777`, and `999` are not present in this checkout, so `tests\audit_stable_outputs.py 222 777 999` reports `MISSING`.
+- Generated-output auditing is on-demand and requires an explicit fresh
+  `work-dir` sample; it is not part of the unified regression.
 
 ## In Progress
 

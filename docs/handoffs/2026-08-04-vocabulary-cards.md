@@ -130,9 +130,9 @@ The following tests live in `tests/test_stable_caption_rules.py`:
 
 Verification recorded for this checkpoint: `runtime\python.exe
 scripts\run_regression.py` and `git diff --check` both passed on 2026-08-04.
-The audit's `222`, `777`, and `999` entries reported `MISSING` because those
-local samples are absent, not because a test failed. Run the project-required
-regression command again after any behavior change:
+Generated-output auditing now requires an explicit fresh `work-dir` sample and
+is excluded from the project regression. Run the project-required regression
+command again after any behavior change:
 
 ```powershell
 E:\VideoCaptioner-screen-subtitle\runtime\python.exe scripts\run_regression.py

@@ -77,8 +77,9 @@ ASR word timestamps
   queue, run-state, and syntax checks.
 - `git diff --check`: PASS before the implementation checkpoint. The observed
   LF/CRLF messages are line-ending notices, not whitespace errors.
-- The known-output audit reported `MISSING` for local samples `222`, `777`, and
-  `999`. This is neither a subtitle-quality pass nor a failure of the code.
+- Generated-output auditing is intentionally excluded from the unified
+  regression. It requires an explicit, fresh `work-dir` sample and is not a
+  substitute for the fixture-backed contract checks.
 
 ## Unknowns
 

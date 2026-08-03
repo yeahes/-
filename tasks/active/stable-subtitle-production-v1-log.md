@@ -29,7 +29,6 @@ Result:
 - syntax check: pass
 - known output audit: completed
 - 2026-07-26 recheck: stable caption smoke tests pass; syntax check passes.
-- 2026-07-26 recheck: local samples `222`, `777`, and `999` are currently `MISSING` in `work-dir`, so their current quality is not verified by `tests\audit_stable_outputs.py`.
 - 2026-07-27 WhisperX backend check: FasterWhisper plus WhisperX CUDA alignment completed on `外卖骑手诗人的走红，标志着中国农民工文学的兴起`; subtitle validation passed, video synthesis completed, final SRT had no overlaps and no >1000ms gaps.
 - 2026-08-02 boundary regression: sentence-final `over.` no longer triggers
   the preposition-object guard. A frozen replay of `如何识别人工智能写作`

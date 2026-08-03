@@ -134,11 +134,6 @@ def main() -> int:
             ],
             False,
         ),
-        (
-            "known output audit",
-            ["tests/audit_stable_outputs.py", "222", "777", "999"],
-            True,
-        ),
     ]
 
     for name, args, allow_warning_exit in checks:
@@ -153,7 +148,7 @@ def main() -> int:
         return 1
 
     print("\nRegression command completed.")
-    print("Note: output audit may report ERROR for stale local work-dir samples.")
+    print("Note: generated-output audits require an explicit fresh work-dir sample.")
     return 0
 
 

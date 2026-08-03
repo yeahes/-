@@ -7,7 +7,6 @@ Last updated: 2026-07-26
 ```powershell
 runtime\python.exe scripts\run_regression.py
 runtime\python.exe tests\test_stable_caption_rules.py
-runtime\python.exe tests\audit_stable_outputs.py 222 777 999
 runtime\python.exe -m py_compile app\thread\subtitle_thread.py app\thread\video_synthesis_thread.py app\core\subtitle_processor\screen_editor.py
 ```
 
@@ -16,11 +15,10 @@ runtime\python.exe -m py_compile app\thread\subtitle_thread.py app\thread\video_
 - `scripts\run_regression.py`: pass.
 - `tests\test_stable_caption_rules.py`: pass.
 - `py_compile`: pass.
-- `tests\audit_stable_outputs.py 222 777 999`: pass with all requested samples reported as `MISSING`.
+- Generated-output auditing requires an explicit fresh `work-dir` sample and is
+  intentionally excluded from this baseline.
 
 ## Interpretation
 
-- `MISSING` means the local `work-dir` sample output is unavailable.
-- It does not prove subtitle quality for that sample.
-- Fresh subtitle outputs should be regenerated before judging video quality.
-
+- Run `tests\audit_stable_outputs.py <work-dir sample>` only against a fresh
+  output. It does not replace a visual quality review of the rendered video.

@@ -49,12 +49,12 @@ runtime\python.exe tests\test_stable_run_state.py
 Generated output audit:
 
 ```powershell
-runtime\python.exe tests\audit_stable_outputs.py 222 777 999
+runtime\python.exe tests\audit_stable_outputs.py <work-dir sample>
 ```
 
-This command audits existing `work-dir\<sample>\subtitle` outputs. If those local
-outputs are absent, the sample status is `MISSING`; that is an environment/sample
-availability result, not a code failure.
+This command audits an explicitly named `work-dir\<sample>\subtitle` output.
+Use a newly generated sample when judging current code; it is deliberately not
+run by `scripts\run_regression.py`.
 
 Fixture audit:
 

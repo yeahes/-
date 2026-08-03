@@ -139,9 +139,9 @@ match or list position.
   stable outputs with exact Chinese-ID coverage, zero translation-structure
   errors, and successful render. Generated outputs remain historical evidence,
   not proof that a later code change has been end-to-end validated.
-- The regression audit references local `222`, `777`, and `999` samples that
-  are absent in this checkout; `MISSING` is expected and is not a test pass for
-  subtitle quality.
+- Generated-output auditing is on-demand and requires an explicit fresh
+  `work-dir` sample. It is not part of the unified regression and cannot serve
+  as a substitute for an end-to-end quality review.
 
 ## Unfinished Work and Known Limits
 
