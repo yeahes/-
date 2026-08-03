@@ -6721,6 +6721,45 @@ def test_visual_temporal_budget_splits_complete_sentence_terminal():
     )
 
 
+def test_visual_temporal_budget_splits_complete_imperative_sentence_terminal():
+    words = (
+        "Consider the evidence from every relevant perspective. The next report explains "
+        "the remaining uncertainty."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    _add_visual_pause(editor, 6, 180)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert [item.original for item in repaired] == [
+        "Consider the evidence from every relevant perspective.",
+        "The next report explains the remaining uncertainty.",
+    ]
+    assert [item.word_start for item in repaired] == [0, 7]
+    assert [item.word_end for item in repaired] == [6, 13]
+    assert editor._pre_id_boundary_repairs[0]["visual_temporal_category"] == (
+        "sentence_terminal"
+    )
+
+
+def test_visual_temporal_budget_keeps_to_infinitive_with_its_main_clause():
+    words = (
+        "To consider the evidence from every relevant perspective is useful. "
+        "The next report explains the remaining uncertainty."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    _add_visual_pause(editor, 9, 180)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+
+
 def test_visual_temporal_budget_keeps_subject_with_delayed_predicate_despite_pause():
     words = (
         "You know, this robotic vocabulary actually connects to a very human "
@@ -8131,6 +8170,8 @@ if __name__ == "__main__":
     test_visual_temporal_budget_splits_punctuated_fronted_introduction()
     test_visual_temporal_budget_splits_complete_punctuated_clauses()
     test_visual_temporal_budget_splits_complete_sentence_terminal()
+    test_visual_temporal_budget_splits_complete_imperative_sentence_terminal()
+    test_visual_temporal_budget_keeps_to_infinitive_with_its_main_clause()
     test_visual_temporal_budget_keeps_subject_with_delayed_predicate_despite_pause()
     test_visual_temporal_budget_rejects_punctuated_conditional_intro()
     test_final_timeline_rebuild_preserves_id_text_chinese_and_word_ownership()

@@ -2552,6 +2552,28 @@ class ScreenSubtitleEditor:
             for token in doc
         )
         normalized = self._normalize_text(item.original)
+        # spaCy uses VB for both a bare infinitive and an imperative.  A
+        # terminal imperative such as "Consider the evidence." is a complete
+        # display unit, while "To consider the evidence" is not.  Keep the
+        # distinction local to this visual stage: no source text, timing, or
+        # structural-cut rule is changed.
+        root_is_imperative = bool(
+            root.pos_ == "VERB"
+            and root.tag_ == "VB"
+            and not leading_subordinator
+            and bool(re.search(r"[.!?][\"')\]]*\s*$", normalized))
+            and not any(
+                child.dep_ in {"nsubj", "nsubjpass", "csubj", "expl"}
+                for child in root.children
+            )
+            and not any(
+                token.i < root.i
+                and token.lower_ == "to"
+                and token.head == root
+                and token.dep_ in {"aux", "mark"}
+                for token in doc
+            )
+        )
         comma_terminated = bool(re.search(r"[,;:]\s*$", normalized))
         has_nonfinite_action = any(
             token.pos_ in {"VERB", "AUX"}
@@ -2568,7 +2590,7 @@ class ScreenSubtitleEditor:
         )
         return {
             "complete_main_clause": bool(
-                (root_is_finite or root_has_finite_auxiliary)
+                (root_is_finite or root_has_finite_auxiliary or root_is_imperative)
                 and not leading_subordinator
             ),
             "fronted_nonfinite_introduction": bool(fronted_nonfinite),
