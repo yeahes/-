@@ -299,3 +299,180 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
   delimiter, avoiding false consumption such as `in` inside `stepping`.
 - Added regression coverage for all four parser shapes, candidate rejection,
   and preservation of existing long-object behavior.
+
+## 2026-08-04 Complete Fixed-ID Final Allocation Artifact
+
+- Root cause: `allocation-final.json` was assembled only from allocation
+  attempts accepted by the quality gate. When a retry remained unresolved, the
+  final subtitle writeback retained an ID-bound Chinese value but the final
+  allocation artifact omitted that group's IDs.
+- The artifact now derives every group mapping from the final fixed-ID subtitle
+  items used for export. Existing accepted-attempt provenance is retained when
+  it still matches; otherwise the record explicitly identifies final-item or
+  unresolved-final-item provenance. `allocation-unresolved.json` remains the
+  sole record of why a quality issue was not resolved.
+- English text/order, subtitle IDs, word ranges, timings, allocation decisions,
+  and render gating are unchanged.
+- Added a regression case for an unresolved group whose retained Chinese must
+  still appear in the final allocation artifact.
+
+## 2026-08-04 Chinese Allocation Quality And Near-Threshold Rendering
+
+- Root cause: allocation validation returned success for a terminal Chinese
+  modifier whenever it carried closing punctuation. This bypassed the existing
+  fragment retry and allowed a phrase without its governed noun or predicate
+  to reach final subtitles. The generic allocation retry also reused the
+  ordinary prompt despite knowing that the failure was grammatical.
+- Final modifier fragments now fail fixed-ID validation after permitted
+  non-final continuations are considered. They use the existing one-group
+  retry with a grammar-focused fixed-ID prompt and a distinct cache key; no
+  extra retry or English/timing mutation is introduced.
+- Root cause: the same `12.0` Chinese-CPS threshold classified a 15-character
+  subtitle over 1241ms as a render error at `12.09` CPS. It was a discrete
+  character-count boundary case rather than a sustained reading overload.
+  The explicit error boundary is now `12.25` CPS; `9.0-12.25` CPS remains
+  review evidence. Structural translation/timeline errors are unchanged.
+- The Chinese semantic audit no longer applies fragment rules to a fully
+  punctuated single-cue sentence, eliminating a known class of false positives
+  without weakening multi-cue allocation checks.
+- Added focused regression coverage for terminal modifiers, specialized retry
+  selection, single-cue audit false positives, the 12.09-CPS near-threshold
+  case, and final allocation artifact coverage.
+
+## 2026-08-04 Pre-ID Structural Fragment Merge
+
+- Root cause: direct final-boundary repair correctly identified a trailing
+  English fragment but rejected the only complete 19-word merge under the
+  ordinary 16-word candidate gate. That left a known residual phrase split
+  even when no grammar-safe normal-limit boundary existed.
+- The candidate gate now permits exactly one direct, continuous, pre-ID
+  two-cue-to-one merge when the source boundary has a high-confidence fragment
+  issue and the shared structural-overflow check confirms a complete 17-19
+  word sentence with no legal <=16-word split.
+- The exception is not available to visual temporal splitting, general
+  repartitioning, ID-assigned cues, Chinese allocation, timing, or export.
+- Focused tests cover the allowed 19-word merge, rejection above 19 words,
+  and rejection when a legal normal-limit split exists.
+
+## 2026-08-04 Rejected Direct Merge Fallback
+
+- Root cause: after a direct weak-fragment merge was rejected by the candidate
+  gate, the pre-ID repair loop skipped the normal safe-repartition search for
+  that same local window. This left a legal repair untried, as in the
+  `Yeah, so Todd` subject-fragment regression.
+- A rejected direct merge now falls through to the existing local repartition
+  candidates. The successful candidate must still pass the shared word-order,
+  word-range, speaker, syntax, fragment, and word-limit gate before writeback.
+- The regression now asserts the selected frozen word spans `(0, 8)` and
+  `(9, 14)`. No post-ID English, Chinese, timing, or synthesis behavior is
+  changed.
+- `runtime\python.exe -X utf8 tests\test_stable_caption_rules.py` and
+  `runtime\python.exe -X utf8 scripts\run_regression.py` passed.
+
+## 2026-08-04 Fixed-ID Chinese Postprocess Audit
+
+- Root cause: speed compression and same-group redistribution still accepted
+  legacy positional response fields (`index`, `target_index`, and `id`). A
+  stale cache could therefore target a different frozen subtitle after cue
+  ordering changed. A separate phrase-specific local speed fallback could also
+  shorten Chinese despite a semantic-omission finding.
+- Compression, redistribution, and high-confidence Chinese repair now require
+  explicit existing global `subtitle_id` values for every returned target and
+  segment. Missing or unknown IDs are recorded as translation-structure errors
+  and cannot write back. Prompts no longer describe an index response schema.
+- Removed the phrase-specific local speed rewrite and its dead omission
+  exception. When no ID-valid candidate is returned, the original Chinese is
+  retained; the normal warning/error and fixed-ID candidate comparator remain
+  the only decision path.
+- The frozen invariant remains: Chinese-only candidates may alter only a
+  current group dictionary keyed by existing subtitle IDs. English text/order,
+  word ranges, cue times, IDs, and cache/concurrency ordering are unchanged.
+- Added regression coverage for index-only compression and reallocation
+  responses. Both are rejected without writeback.
+
+## 2026-08-04 Single-Cue Allocation Containment
+
+- Root cause: allocation validation applied a cross-cue terminal-modifier
+  heuristic to a one-cue authoritative full translation. A complete sentence
+  ending in `的` could therefore be marked as a fragment. The caller then
+  returned an empty allocation dictionary, discarding successful mappings from
+  other groups and creating a cascade of missing Chinese IDs.
+- A one-cue group now writes its authoritative full translation directly to
+  its only frozen ID without allocation-fragment validation. Full translation
+  generation remains responsible for that sentence's meaning and fluency.
+- An invalid one-cue group and an unavailable sequential allocation batch now
+  record only their own unresolved groups; they no longer erase already
+  accepted mappings. Final ID validation still blocks export for any missing
+  Chinese cue.
+- Regressions cover a complete `...写作的。` translation and containment of an
+  invalid one-cue group while a following frozen ID remains allocated.
+
+## 2026-08-04 Stable English Boundary Routing Audit
+
+- Root cause: `SubtitleThread` still invoked the legacy LLM
+  `SubtitleOptimizer` when `need_optimize=True`, including stable screen mode.
+  This created a second owner for final English text before deterministic
+  boundary finalization.
+- Fix: `_should_run_legacy_subtitle_optimization()` now permits that optimizer
+  only outside stable screen mode. The stable route stays local and
+  word-ledger-based; no existing valid cue, ID, word range, timing, Chinese
+  field, or renderer behavior changes.
+- Root cause: `ScreenSubtitleEditor.edit()` could silently fall through to the
+  legacy LLM editor when the word ledger was absent or source-to-word mapping
+  was incomplete. Stable mode then had no authoritative complete word ledger.
+- Fix: stable mode now fails before any legacy edit unless the ledger exists
+  and every source segment maps to it. This belongs at the screen-editor
+  ingress because only that module receives both source segments and the
+  authoritative ledger; upstream cannot prove their one-to-one mapping.
+- Added focused regressions for both routes. Full automated validation passed:
+  `tests/test_english_boundary_rules.py`,
+  `tests/test_stable_boundary_finalization.py`,
+  `tests/test_stable_caption_rules.py`, and `scripts/run_regression.py`.
+- Audit note: `split.py` and `split_by_llm.py` remain legacy-mode facilities.
+  Stable production excludes `SubtitleSplitter`, and no stable production
+  caller imports `split_by_llm.py`; removing either requires an explicit
+  legacy-mode migration rather than an audit cleanup.
+
+## 2026-08-04 Stable Manifest Authority
+
+- Root cause: a malformed or unusable `stable-final-manifest.json` was caught
+  and ignored by podcast-template subtitle resolution. The resolver then used
+  filename-based discovery, which could select a stale SRT in the same folder.
+- Fix: an existing manifest is authoritative. Decode, schema, and declared
+  final-SRT failures now stop synthesis; filename discovery remains available
+  only when no manifest exists. Manual-final override and legacy
+  reading-speed revalidation retain their existing manifest-bound behavior.
+- Added regression coverage for malformed manifests and missing manifest SRTs
+  in a folder containing a stale candidate.
+
+## 2026-08-04 Renderer-Owned Unsplittable English Sentence
+
+- Root cause: `_stable_greedy_ranges()` forced a 19-word cue when no legal
+  normal-limit cut existed. It also accepted a grammatically incomplete
+  17-19-word emergency candidate merely because its local boundary was legal.
+  The final validator correctly rejected both incomplete cues as overlong,
+  producing a stable pipeline contradiction before subtitle IDs were assigned.
+- Fix: an emergency 17-19-word cut is eligible only when it is a complete
+  terminal cue or parser-confirmed comma subordinate clause. Otherwise the
+  pre-ID cutter preserves the remaining complete source sentence for renderer
+  wrapping. It is an audited structural-overflow warning, not an export error.
+- Invariant: pre-ID stable cutting must not manufacture a cue which the final
+  English validator is guaranteed to reject. English text/order, the word
+  ledger, IDs, Chinese allocation, and final cue timing remain outside this
+  change.
+- Regression and frozen-ledger replay cover both prior production shapes:
+  a protected `synthetic text` phrase and the terminal `websites on the
+  internet` preposition phrase. The replay uses no ASR or LLM request.
+
+## 2026-08-04 Baseline Contract Reconciliation
+
+- Unified the standalone caption audit's Chinese CPS error boundary with the
+  runtime and synthesis threshold at `12.25`; values from `9.0` through
+  `12.25` remain review warnings.
+- Added a regression for a `12.09` CPS cue to ensure the audit and runtime do
+  not disagree at the discrete near-threshold boundary.
+- Refreshed `CODEX_STATE.md` to the actual verified HEAD and recorded the next
+  action and remaining unknowns. Marked the resolved cross-module allocation
+  issue as a retained root-cause/regression record.
+- Focused stable-caption tests, unified regression, and `git diff --check`
+  passed after the reconciliation.

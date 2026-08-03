@@ -7,7 +7,7 @@
 - Stable mode must not delete filler or backchannel words by default.
 - If a short backchannel is visually too brief, merge or extend display timing instead of deleting it.
 - Preferred visual target is 6-12 English words per subtitle.
-- Normal hard maximum is 16 English words. A rare 17-19 word structural exception is allowed only when every shorter cut would create a parser-confirmed grammar error; report the exception.
+- Normal hard maximum is 16 English words. A rare 17-19 word structural exception is allowed only when every shorter cut would create a parser-confirmed grammar error; report the exception. If an otherwise complete terminal source sentence has no legal normal-limit temporal cut, preserve that complete cue for renderer wrapping and report its structural overflow rather than force a fragment at 19 words.
 - The 12-word / 68-character reading target normally belongs to the renderer.
   A complete 13-16 word English cue remains one temporal subtitle with one ID
   and one Chinese allocation unless a pre-ID visual temporal pass finds a

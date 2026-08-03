@@ -68,38 +68,45 @@ def resolve_podcast_template_subtitle(video_file: str, subtitle_file: str) -> st
     if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("render_blocked"):
-                if _blocked_manifest_reading_speed_is_now_safe(manifest):
-                    stable_path = Path(
-                        manifest.get("paths", {}).get("original_top_srt", "")
-                    )
-                    logger.info(
-                        "Revalidated legacy reading-speed manifest under current threshold: %s",
-                        manifest_path,
-                    )
-                    return str(stable_path)
-                logger.warning("Stable subtitle manifest is blocked by validation: %s", manifest_path)
-                raise RuntimeError(
-                    "字幕体检未通过，已阻止使用该稳定字幕合成视频。"
-                )
-            manual_override = manifest.get("manual_final_override") or {}
-            manual_path_text = str(manual_override.get("subtitle_path") or "")
-            manual_path = Path(manual_path_text) if manual_path_text else None
-            if manual_path is not None and manual_path.exists() and manual_path.stat().st_size > 0:
-                logger.info(
-                    "Resolved podcast subtitle from manual final override: %s", manual_path
-                )
-                return str(manual_path)
-            stable_path = Path(
-                manifest.get("paths", {}).get("original_top_srt", "")
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"稳定字幕清单不可读取，已阻止使用旧字幕合成视频：{manifest_path}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError(
+                f"稳定字幕清单格式无效，已阻止使用旧字幕合成视频：{manifest_path}"
             )
-            if stable_path.exists() and stable_path.stat().st_size > 0:
-                logger.info("Resolved podcast subtitle from stable manifest: %s", stable_path)
+        if manifest.get("render_blocked"):
+            if _blocked_manifest_reading_speed_is_now_safe(manifest):
+                stable_path = Path(
+                    manifest.get("paths", {}).get("original_top_srt", "")
+                )
+                logger.info(
+                    "Revalidated legacy reading-speed manifest under current threshold: %s",
+                    manifest_path,
+                )
                 return str(stable_path)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            logger.warning("Stable subtitle manifest ignored: %s", exc)
+            logger.warning("Stable subtitle manifest is blocked by validation: %s", manifest_path)
+            raise RuntimeError(
+                "字幕体检未通过，已阻止使用该稳定字幕合成视频。"
+            )
+        manual_override = manifest.get("manual_final_override") or {}
+        manual_path_text = str(manual_override.get("subtitle_path") or "")
+        manual_path = Path(manual_path_text) if manual_path_text else None
+        if manual_path is not None and manual_path.exists() and manual_path.stat().st_size > 0:
+            logger.info(
+                "Resolved podcast subtitle from manual final override: %s", manual_path
+            )
+            return str(manual_path)
+        stable_path = Path(
+            (manifest.get("paths") or {}).get("original_top_srt") or ""
+        )
+        if stable_path.exists() and stable_path.stat().st_size > 0:
+            logger.info("Resolved podcast subtitle from stable manifest: %s", stable_path)
+            return str(stable_path)
+        raise RuntimeError(
+            f"稳定字幕清单未指向可用终稿，已阻止使用旧字幕合成视频：{manifest_path}"
+        )
 
     candidates = [
         search_dir / "stable-final-original-top.srt",

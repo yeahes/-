@@ -1,6 +1,6 @@
 # Current State
 
-Last updated: 2026-08-03
+Last updated: 2026-08-04
 
 ## Working
 
@@ -70,6 +70,10 @@ Last updated: 2026-08-03
   IDs, timings, and export are never rehydrated from partial memory state.
 - Allocation now uses global subtitle IDs (`S0001`, `S0002`, ...), not positional lists, for Chinese writeback.
 - Allocation artifacts record inputs, raw returns, validation, retry logs, final mappings, unresolved groups, and structure errors.
+- `allocation-final.json` is reconstructed from the final fixed-ID subtitle
+  writeback at export time. It includes every semantic group's current
+  `subtitle_id -> Chinese` mapping even when a quality retry remains unresolved;
+  `allocation-unresolved.json` retains the failure provenance separately.
 - Completed stable runs now record a `run_comparison` manifest section containing
   the task's actual article-reference state, article/context/glossary hashes,
   correction execution state, and allocation-relevant runtime configuration.
@@ -150,6 +154,10 @@ Last updated: 2026-08-03
   than dynamic programming. The normal target is at most 16 English words;
   17-19 words are allowed only when every shorter candidate would cross a
   parser-confirmed grammar boundary. A forced 19-word cut remains auditable.
+- A direct pre-ID merge may remove a high-confidence English fragment into one
+  complete 17-19 word cue only after the shared structural-overflow check
+  proves that no legal 16-word split exists. This exception is unavailable to
+  visual splitting, general repartitioning, or any ID-assigned stage.
 - The 12-word/68-character reading target normally remains renderer-only. A
   complete 13-16 word cue stays intact and is wrapped over up to two visual
   lines by the selected video template unless the pre-ID visual temporal pass
@@ -161,12 +169,28 @@ Last updated: 2026-08-03
 - Chinese semantic allocation now receives advisory per-cue display budgets
   derived from the fixed cue duration. These budgets guide the LLM but do not
   authorise omission or change the frozen timing.
+- Fixed-ID allocation now treats a terminal Chinese modifier without its head
+  as a quality failure even when it has closing punctuation. Its existing
+  one-group retry uses a fragment-specific prompt; it preserves the same IDs,
+  English, word spans, order, timing, and retry count.
+- Chinese reading speed remains a warning above `9.0` characters per second.
+  The render-error boundary is now `12.25` characters per second, an explicit
+  near-threshold tolerance for discrete CJK character counts; values above it
+  remain validation errors.
+- Chinese semantic auditing skips fragment heuristics for a fully punctuated
+  single-cue group. It still audits semantic loss and all multi-cue allocation
+  boundaries.
+- Single-cue semantic groups write the authoritative full translation to their
+  sole frozen ID. Allocation fragment rules apply only where a group has an
+  actual cross-cue allocation boundary; one invalid group or failed allocation
+  batch records its own unresolved evidence and cannot discard other groups'
+  ID-bound Chinese mappings.
 - Optional Chinese polish now includes a narrowly selected complex
   enumeration/comparison group class. It remains capped, writes only existing
   subtitle IDs, and never changes English, order, or timing.
-- New Chinese compression requests use `subtitle_id` as their writeback
-  protocol. Older index-based cached replies are accepted only for backwards
-  compatibility and are mapped locally before use.
+- Chinese compression, same-group reallocation, and high-confidence repair
+  accept only explicit global `subtitle_id` values. Legacy index-based cached
+  replies are structural failures and cannot write Chinese into a cue.
 - Post-allocation Chinese compression and same-group reallocation compare the
   original and candidate ID dictionaries before writeback. A candidate must
   reduce local reading pressure and remain non-regressive for semantic
@@ -375,3 +399,59 @@ Result:
 - `runtime\python.exe -X utf8 scripts\run_regression.py` passed after the
   rerun. The remaining CRLF messages from `git diff --check` are repository
   line-ending notices, not whitespace failures.
+
+## Latest Allocation And Boundary Regression
+
+- Fixed-ID Chinese allocation rejects terminal modifier fragments and performs
+  one grammar-specific retry without changing English, IDs, word spans, order,
+  or timing. Fully punctuated single-cue Chinese groups no longer receive
+  fragment-only semantic warnings.
+- Chinese reading speed from `9.0` through `12.25` characters per second is
+  recorded for review; only a sustained value above `12.25` remains an error.
+- A rejected direct pre-ID fragment merge now continues to the existing safe
+  repartition search in the same local window. This restores a legal English
+  boundary without changing the frozen post-ID subtitle contract.
+- `runtime\python.exe -X utf8 scripts\run_regression.py` and
+  `runtime\python.exe -X utf8 tests\test_stable_caption_rules.py` passed on
+  2026-08-04 after these changes.
+
+## Latest Stable English Boundary Routing Audit
+
+- Stable screen mode now excludes the legacy `SubtitleOptimizer` even when
+  the legacy `need_optimize` option remains enabled. Its English text, order,
+  and boundaries therefore remain owned by the local word-ledger path.
+- Stable screen editing now fails closed when the required word ledger is
+  absent or any source segment cannot map to it. It cannot silently enter the
+  legacy LLM screen-editor path with incomplete timing ownership.
+- These are routing-only changes: existing frozen cue text, word spans,
+  subtitle IDs, Chinese allocation, final cue timing, and rendering behavior
+  are unchanged for valid stable inputs.
+- Regression coverage verifies both conditions. On 2026-08-04,
+  `tests/test_english_boundary_rules.py`,
+  `tests/test_stable_boundary_finalization.py`,
+  `tests/test_stable_caption_rules.py`, and
+  `scripts/run_regression.py` passed. A fresh ASR/alignment production run on
+  unseen audio remains the outstanding validation risk.
+
+## Latest Renderer-Owned Structural Overflow
+
+- The stable greedy cutter no longer forces a 19-word boundary when every
+  normal-limit boundary would break protected syntax or leave a grammatical
+  fragment. A 17-19 word candidate is accepted only when it is itself a
+  complete terminal cue or a parser-confirmed comma subordinate clause.
+- If no such pre-ID cue boundary exists, the remaining complete source
+  sentence stays frozen as one renderer-owned cue. It is recorded as a
+  `structural_english_overflow` warning, never an `overlong_english` export
+  blocker. A safely splittable or incomplete overlong cue remains blocking.
+- Frozen-ledger replay of `如何识别人工智能写作` converts the former incomplete
+  19-word `synthetic` and `websites` cues into their complete 38-word and
+  22-word source sentences. The replay uses no ASR or LLM request.
+- Regression coverage verifies the forced-cut branch, the incomplete
+  17-19 candidate branch, and the validation distinction.
+
+## Stable Manifest Resolution
+
+- When `stable-final-manifest.json` exists beside the selected subtitle path,
+  podcast-template synthesis treats it as authoritative. A malformed manifest
+  or unavailable declared final SRT blocks synthesis instead of falling back
+  to filename-based discovery, preventing stale subtitle reuse.

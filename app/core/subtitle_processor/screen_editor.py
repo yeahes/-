@@ -65,9 +65,10 @@ ABNORMAL_TIMING_GAP_MS = 1800
 ABNORMAL_TIMING_CLUSTER_GAP_MS = 900
 READ_MS_PER_EN_WORD = 260
 CHINESE_CPS_WARNING = 9.0
-# Keep the production render gate aligned with the standalone audit: above 9
-# chars/s is worth reviewing, while only sustained text above 12 chars/s blocks.
-CHINESE_CPS_ERROR = 12.0
+# Above 9 chars/s is worth reviewing.  The 12.25 chars/s render gate gives
+# fixed-width CJK counts a documented near-threshold tolerance without hiding
+# sustained reading-speed overload.
+CHINESE_CPS_ERROR = 12.25
 ENGLISH_WPS_WARNING = 5.0
 ADJACENT_ZH_DUPLICATE_SIMILARITY = 0.88
 SUBTITLE_DURATION_INVALID_MS = 150
@@ -81,6 +82,9 @@ SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK = (
 )
 SEMANTIC_ALLOCATION_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_v3"
 SEMANTIC_ALLOCATION_RETRY_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_retry_v3"
+SEMANTIC_FRAGMENT_ALLOCATION_RETRY_CACHE_TASK = (
+    "screen_subtitle_semantic_translation_allocation_fragment_retry_v1"
+)
 SEMANTIC_CHINESE_POLISH_PROMPT_VERSION = "semantic-chinese-polish-v3"
 SEMANTIC_CHINESE_POLISH_CACHE_TASK = "screen_subtitle_semantic_chinese_polish_v3"
 MAX_SELECTIVE_CHINESE_POLISH_GROUPS = 8
@@ -320,6 +324,28 @@ Return pure JSON only:
 }
 """
 
+SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT = """
+You are repairing a failed fixed-ID Chinese subtitle allocation.
+
+Return a complete replacement allocation only for the supplied semantic group.
+The English subtitle IDs, order, timing, and word ownership are immutable.
+Use full_translation as the authority; redistribute it only among the existing
+subtitle_ids and do not move later information earlier than its English anchor.
+
+The previous allocation contains a Chinese grammatical fragment. Every final
+subtitle part must be independently readable when its English part is complete.
+Do not end the final part with a bare modifier, possessive marker, place/name
+modifier, or connective that lacks the noun or predicate it governs.
+For a non-final English fragment, a Chinese continuation is allowed only when
+the following existing subtitle_id completes that exact phrase naturally.
+
+Preserve names, numbers, negation, contrast, conditions, modality, and core
+actions. Return exactly the supplied subtitle_id set and no other IDs.
+
+Return pure JSON only:
+{"groups":[{"id":1,"part_translations":[{"subtitle_id":"S0001","zh":"中文字幕1"}]}]}
+"""
+
 SEMANTIC_CHINESE_POLISH_PROMPT = """
 You are polishing fixed Simplified Chinese bilingual video subtitles.
 
@@ -500,13 +526,28 @@ class ScreenSubtitleEditor:
         if not asr_data.segments:
             return asr_data
 
-        if word_time_asr_data and word_time_asr_data.is_word_timestamp():
+        has_word_ledger = bool(
+            word_time_asr_data and word_time_asr_data.is_word_timestamp()
+        )
+        if self.enable_stable_mode:
+            if not has_word_ledger:
+                raise RuntimeError(
+                    "稳定上屏模式需要完整词级账本，不能回退到旧 LLM 上屏编辑路径。"
+                )
             self._active_word_entries = self._word_time_entries(word_time_asr_data.segments)
             self._active_source_word_spans = self._map_source_segments_to_word_entries(
                 asr_data.segments, self._active_word_entries
             )
-            if self.enable_stable_mode and self._active_source_word_spans:
-                return self._edit_stable_word_timed(asr_data)
+            if len(self._active_source_word_spans) != len(asr_data.segments):
+                raise RuntimeError(
+                    "稳定上屏模式需要完整词级账本源映射，不能回退到旧 LLM 上屏编辑路径。"
+                )
+            return self._edit_stable_word_timed(asr_data)
+        if has_word_ledger:
+            self._active_word_entries = self._word_time_entries(word_time_asr_data.segments)
+            self._active_source_word_spans = self._map_source_segments_to_word_entries(
+                asr_data.segments, self._active_word_entries
+            )
         else:
             self._active_word_entries = []
             self._active_source_word_spans = {}
@@ -3278,6 +3319,9 @@ class ScreenSubtitleEditor:
                     previous_item=items[start - 1] if start > 0 else None,
                     next_item=items[end] if end < len(items) else None,
                     allowed_hard_issues=evaluation.get("allowed_hard_issues") or (),
+                    structural_overflow_fragment_issues=(
+                        evaluation.get("hard_issues") or ()
+                    ),
                 )
                 direct_candidate = {
                     "cuts": [],
@@ -3287,11 +3331,14 @@ class ScreenSubtitleEditor:
                     "boundary_scores": [],
                     "candidate_gate": gate,
                 }
-                if not gate["accepted"]:
-                    continue
-                return start, end, direct, [
-                    direct_candidate
-                ]
+                if gate["accepted"]:
+                    return start, end, direct, [
+                        direct_candidate
+                    ]
+                # A rejected direct merge can still leave a legal repartition
+                # inside this same window.  Continue with the existing local
+                # candidate search instead of treating the merge rejection as
+                # a window-level failure.
             repaired, candidates = self._repartition_pre_id_window(window)
             if not repaired and self._requires_forced_overflow_repartition(window, evaluation):
                 repaired, forced_candidates = self._repartition_pre_id_window(
@@ -3358,6 +3405,7 @@ class ScreenSubtitleEditor:
         previous_item: Optional[ScreenSubtitleItem] = None,
         next_item: Optional[ScreenSubtitleItem] = None,
         allowed_hard_issues: Sequence[str] = (),
+        structural_overflow_fragment_issues: Sequence[str] = (),
     ) -> Dict:
         """Validate a pre-ID candidate before it can replace frozen word spans.
 
@@ -3368,6 +3416,11 @@ class ScreenSubtitleEditor:
         final validation.
         """
         allowed = set(allowed_hard_issues or ())
+        allows_structural_overflow = self._is_allowed_pre_id_structural_overflow_merge(
+            old_items,
+            new_items,
+            structural_overflow_fragment_issues,
+        )
         reasons: List[str] = []
         hard_issues: List[str] = []
         fragment_issues: List[str] = []
@@ -3425,7 +3478,10 @@ class ScreenSubtitleEditor:
             fragment_issues.extend(fragment.get("hard_fragment_issues") or [])
             if self._is_ordinary_one_word_fragment(item.original):
                 reasons.append("ordinary_one_word_fragment")
-            if self._word_count(item.original) > self.max_english_words:
+            if (
+                self._word_count(item.original) > self.max_english_words
+                and not allows_structural_overflow
+            ):
                 reasons.append("max_english_words_exceeded")
 
         hard_issues = list(dict.fromkeys(issue for issue in hard_issues if issue not in allowed))
@@ -3439,11 +3495,62 @@ class ScreenSubtitleEditor:
             "hard_issues": hard_issues,
             "hard_fragment_issues": fragment_issues,
             "allowed_hard_issues": sorted(allowed),
+            "structural_english_overflow_exception": allows_structural_overflow,
             "old_word_range": self._items_word_range(old_items),
             "new_word_range": self._items_word_range(new_items),
             "old_word_count": len(self._items_word_tokens(old_items)),
             "new_word_count": len(self._items_word_tokens(new_items)),
         }
+
+    def _is_allowed_pre_id_structural_overflow_merge(
+        self,
+        old_items: Sequence[ScreenSubtitleItem],
+        new_items: Sequence[ScreenSubtitleItem],
+        fragment_issues: Sequence[str],
+    ) -> bool:
+        """Allow one complete 17-19 word cue only while removing a hard fragment.
+
+        This is deliberately narrower than the final validation warning: it is
+        only available to the direct two-cue fragment merge path before IDs
+        exist.  The shared structural-overflow check proves that no legal
+        normal-limit split exists, so the exception cannot grant a visual or
+        general repartitioning path permission to create an overlong cue.
+        """
+        high_confidence_fragment_issues = {
+            "weak_subject_fragment",
+            "incomplete_interrogative_fragment",
+            "trailing_modifier_fragment",
+            "trailing_protected_named_phrase_fragment",
+            "trailing_protected_phrasal_fragment",
+            "trailing_possessive_fragment",
+            "trailing_quantifier_fragment",
+        }
+        if (
+            len(old_items) != 2
+            or len(new_items) != 1
+            or not set(fragment_issues or ()).intersection(high_confidence_fragment_issues)
+        ):
+            return False
+        merged = new_items[0]
+        if (
+            merged.subtitle_id
+            or merged.word_start is None
+            or merged.word_end is None
+        ):
+            return False
+        text = self._normalize_text(merged.original)
+        word_count = self._word_count(text)
+        if word_count <= self.max_english_words or word_count > self.max_english_words + 3:
+            return False
+        segment = ASRDataSeg(text, 0, 0, "")
+        segment.word_start = merged.word_start
+        segment.word_end = merged.word_end
+        return self._is_allowed_structural_english_overflow(
+            segment,
+            text,
+            word_count,
+            self.max_english_words,
+        )
 
     def _requires_forced_overflow_repartition(
         self,
@@ -3535,7 +3642,14 @@ class ScreenSubtitleEditor:
         if not any(issue in weak_codes for issue in (evaluation.get("hard_issues") or [])):
             return []
         merged = self._merge_subtitle_items(items[0], items[1])
-        if self._word_count(merged.original) > self.max_english_words:
+        if (
+            self._word_count(merged.original) > self.max_english_words
+            and not self._is_allowed_pre_id_structural_overflow_merge(
+                items,
+                [merged],
+                evaluation.get("hard_issues") or (),
+            )
+        ):
             return []
         if self._internal_sentence_transition_word_index(merged) is not None:
             return []
@@ -5702,20 +5816,42 @@ class ScreenSubtitleEditor:
                     if not boundary["legal"]:
                         continue
                     length = candidate - cursor + 1
+                    if (
+                        length > target
+                        and not self._is_complete_pre_id_structural_overflow_range(
+                            cursor,
+                            candidate,
+                        )
+                    ):
+                        continue
                     score = float(boundary["boundary_score"]) + (length - target) * 12.0
                     if score < best_score:
                         best_score = score
                         best = candidate
 
             if best is None:
-                # No grammar-safe boundary exists in the exception window. Do
-                # not silently create an unlimited cue; the final audit will
-                # retain the forced boundary as a visible warning.
-                best = min(cursor + emergency - 1, end - 1)
+                # This method receives one terminal source-sentence span. A
+                # forced 19-word cut here can only create an incomplete cue
+                # that the final validator must later reject. Keep the
+                # remaining complete sentence frozen and let the renderer own
+                # its line wrapping; it remains an audited structural warning.
+                ranges.append((cursor, end))
+                break
             right = best
             ranges.append((cursor, right))
             cursor = right + 1
         return self._merge_tiny_stable_ranges(ranges, target, emergency)
+
+    def _is_complete_pre_id_structural_overflow_range(
+        self,
+        word_start: int,
+        word_end: int,
+    ) -> bool:
+        """Permit a 17-19 word exception only for a complete local cue."""
+        text = self._text_from_word_span(word_start, word_end)
+        if re.search(r"[.!?][\"')\]]*\s*$", text or ""):
+            return True
+        return self._is_parser_confirmed_comma_subordinate_clause(text)
 
     def _merge_tiny_stable_ranges(
         self, ranges: List[tuple[int, int]], target: int, emergency: int
@@ -7524,7 +7660,10 @@ class ScreenSubtitleEditor:
                     ("allocation-raw-returns.json", self._last_allocation_raw_returns),
                     ("allocation-validation.json", self._last_allocation_validation),
                     ("allocation-retry-log.json", self._last_allocation_retry_log),
-                    ("allocation-final.json", self._last_allocation_final),
+                    (
+                        "allocation-final.json",
+                        self._final_allocation_payload(semantic_groups, subtitle_items),
+                    ),
                     ("allocation-unresolved.json", self._last_allocation_unresolved),
                     ("allocation-isolation-report.json", self._allocation_isolation_report),
                     ("semantic-group-debug.json", self._last_semantic_group_debug),
@@ -7869,6 +8008,53 @@ class ScreenSubtitleEditor:
                         self._item_to_span_dict(index, item)
                         for index, item in enumerate(items, 1)
                     ],
+                }
+            )
+        return payload
+
+    def _final_allocation_payload(
+        self,
+        groups: Sequence[Dict],
+        subtitle_items: Sequence[ScreenSubtitleItem],
+    ) -> List[Dict]:
+        """Serialize the final Chinese mapping from the actual ID-bound writeback.
+
+        Allocation attempts are useful provenance, but an unresolved retry must
+        not make the final artifact omit IDs that were retained in the final
+        subtitle items.  This artifact therefore follows the same fixed-ID
+        Chinese values that export receives.
+        """
+        chinese_by_id = {
+            self._item_subtitle_id(item, index): item.translated
+            for index, item in enumerate(subtitle_items, 1)
+        }
+        attempted_by_group = {
+            str(record.get("semantic_group_id") or ""): record
+            for record in self._last_allocation_final
+            if isinstance(record, dict)
+        }
+        payload: List[Dict] = []
+        for group in groups:
+            group_id = int(group.get("id") or 0)
+            semantic_group_id = f"G{group_id:04d}"
+            subtitle_ids = self._group_expected_subtitle_ids(group)
+            allocation = {
+                subtitle_id: str(chinese_by_id.get(subtitle_id, "") or "")
+                for subtitle_id in subtitle_ids
+            }
+            attempted = attempted_by_group.get(semantic_group_id)
+            if attempted and attempted.get("allocation") == allocation:
+                source = str(attempted.get("source") or "initial")
+            elif attempted:
+                source = "final_subtitle_items"
+            else:
+                source = "unresolved_final_subtitle_items"
+            payload.append(
+                {
+                    "semantic_group_id": semantic_group_id,
+                    "subtitle_ids": subtitle_ids,
+                    "allocation": allocation,
+                    "source": source,
                 }
             )
         return payload
@@ -8522,7 +8708,10 @@ class ScreenSubtitleEditor:
         reasons: List[str] = []
         if self._is_simple_short_response(english, chinese):
             return findings
-        if mapping_valid and self._is_incomplete_chinese_group(chinese):
+        single_complete_cue = len(parts) == 1 and bool(
+            re.search(r"[。！？.!?]$", str(parts[0] or "").strip())
+        )
+        if mapping_valid and not single_complete_cue and self._is_incomplete_chinese_group(chinese):
             findings.append(
                 {
                     "code": "missing_predicate",
@@ -8540,7 +8729,7 @@ class ScreenSubtitleEditor:
                     "confidence_score": 0.9,
                 }
             )
-        if mapping_valid:
+        if mapping_valid and not single_complete_cue:
             bad_fragments = [
                 index + 1 for index, part in enumerate(parts) if self._is_bad_chinese_fragment(part)
             ]
@@ -9504,11 +9693,11 @@ class ScreenSubtitleEditor:
             "Repair only high-confidence Simplified Chinese subtitle fragments inside each provided sense_group.\n"
             "Do not change English, subtitle IDs, order, timing, or subtitle count.\n"
             "Use full_translation as the authority. English is only for locating meaning.\n"
-            "Only rewrite Chinese for existing indices in sense_group.parts when it makes the group more complete and natural.\n"
+            "Only rewrite Chinese for existing subtitle_id values in sense_group.parts when it makes the group more complete and natural.\n"
             "Keep facts, numbers, names, negation, contrast, causality, modality, and core conclusions.\n"
             "Avoid creating new dangling clauses, repeated Chinese, or text that is too long for the subtitle duration.\n"
             "If no safe improvement exists for a target, return no segments for it.\n"
-            "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
+            "Return pure JSON: {\"groups\":[{\"target_subtitle_id\":\"S0001\",\"segments\":[{\"subtitle_id\":\"S0001\",\"zh\":\"中文\"}]}]}"
         )
         try:
             data = self._request_chinese_compression(
@@ -9559,12 +9748,12 @@ class ScreenSubtitleEditor:
                 "Conservatively repair Simplified Chinese subtitle allocation inside each fixed sense_group.\n"
                 "The first attempt was missing or invalid. Use full_translation as the only authority for Chinese meaning.\n"
                 "Do not translate freely from English. English only locates which meaning belongs to which fixed subtitle ID.\n"
-                "You may rewrite the target and adjacent same-group Chinese lines, but only existing indices are allowed.\n"
+                "You may rewrite the target and adjacent same-group Chinese lines, but only existing subtitle_id values are allowed.\n"
                 "Do not change English, IDs, order, timing, or subtitle count.\n"
                 "Prefer short, direct, complete Chinese expressions. Preserve core actions, facts, numbers, names, negation, contrast, and causality.\n"
                 "Reject dangling clauses such as 当...时, 如果..., 因为..., 对于..., 在..., 把..., 将..., 意味着..., 的...\n"
                 "If no safe complete improvement exists, return no segments for that group.\n"
-                "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
+                "Return pure JSON: {\"groups\":[{\"target_subtitle_id\":\"S0001\",\"segments\":[{\"subtitle_id\":\"S0001\",\"zh\":\"中文\"}]}]}"
             )
             try:
                 retry_data = self._request_chinese_compression(
@@ -9963,13 +10152,7 @@ class ScreenSubtitleEditor:
             for index, seg in enumerate(segments)
             if self._is_severe_chinese_speed(seg)
         ]
-        fallback_candidates = [
-            (index, seg)
-            for index, seg in enumerate(segments)
-            if self._has_chinese_speed_pressure(seg)
-            and self._local_chinese_speed_fallback(seg)
-        ]
-        if not targets and not fallback_candidates:
+        if not targets:
             return list(segments)
 
         data = {"items": []}
@@ -10012,31 +10195,24 @@ class ScreenSubtitleEditor:
         for item in data.get("items", []) if isinstance(data, dict) else []:
             if not isinstance(item, dict):
                 continue
-            subtitle_id = str(item.get("subtitle_id") or item.get("id") or "").strip()
-            if subtitle_id:
-                index = id_to_index.get(subtitle_id)
-                if index is None:
-                    self._record_translation_structure_error(
-                        "translation_id_unknown",
-                        returned_ids=[subtitle_id],
-                        message=f"Compression returned unknown subtitle_id: {subtitle_id}",
-                    )
-                    continue
-            elif str(item.get("index", "")).isdigit():
-                # Read old cached responses safely, but all new requests use IDs.
-                index = int(item["index"])
-                subtitle_id = self._segment_subtitle_id(segments[index], index + 1) if 0 <= index < len(segments) else ""
-            else:
+            subtitle_id = str(item.get("subtitle_id") or "").strip()
+            if not subtitle_id:
+                self._record_translation_structure_error(
+                    "translation_id_missing",
+                    message="Compression returned an item without subtitle_id.",
+                )
                 continue
-            if index < 0 or index >= len(segments):
+            index = id_to_index.get(subtitle_id)
+            if index is None:
                 self._record_translation_structure_error(
                     "translation_id_unknown",
-                    message=f"Compression returned unknown segment index: {index}",
+                    returned_ids=[subtitle_id],
+                    message=f"Compression returned unknown subtitle_id: {subtitle_id}",
                 )
                 continue
             text = str(item.get("chinese", "")).strip()
             if text:
-                by_id[subtitle_id or self._segment_subtitle_id(segments[index], index + 1)] = text
+                by_id[subtitle_id] = text
 
         group_reallocation_payload = []
         for index, seg in targets:
@@ -10065,7 +10241,7 @@ class ScreenSubtitleEditor:
                 "Use full_translation as the authority. English is only for locating meaning.\n"
                 "You may rewrite the target and adjacent same-group Chinese subtitles only when single-line compression fails.\n"
                 "Do not change English, IDs, order, timing, or subtitle count.\n"
-                "Return only existing indices from sense_group.parts. Keep every returned line natural and readable.\n"
+                "Return only existing subtitle_id values from sense_group.parts. Keep every returned line natural and readable.\n"
                 "The concatenated group Chinese must preserve the core meaning and form a complete Chinese sentence.\n"
                 "Balance Chinese reading load across the same-group subtitles according to each part duration.\n"
                 "Return pure JSON using existing subtitle_id values only: "
@@ -10104,12 +10280,6 @@ class ScreenSubtitleEditor:
                 compressed, seg, segments, index, context=context
             ):
                 continue
-            fallback = self._local_chinese_speed_fallback(seg)
-            if fallback and self._is_valid_chinese_compression(
-                fallback, seg, segments, index, context=context
-            ):
-                by_id[subtitle_id] = fallback
-                continue
             retry_item = self._chinese_compression_payload_item(
                 index, seg, segments, semantic_groups=semantic_groups, subtitle_items=subtitle_items
             )
@@ -10142,18 +10312,6 @@ class ScreenSubtitleEditor:
 
         result = list(segments)
         changed = 0
-        for index, seg in fallback_candidates:
-            fallback = self._local_chinese_speed_fallback(seg)
-            if not fallback or not self._is_valid_chinese_compression(
-                fallback,
-                seg,
-                result,
-                index,
-            ):
-                continue
-            result[index] = self._copy_segment(seg, translated_text=fallback)
-            changed += 1
-
         for index, seg in targets:
             context = self._semantic_context_for_segment_index(
                 index,
@@ -10197,16 +10355,7 @@ class ScreenSubtitleEditor:
                 index,
                 context=context,
             ):
-                fallback = self._local_chinese_speed_fallback(seg)
-                if not fallback or not self._is_valid_chinese_compression(
-                    fallback,
-                    seg,
-                    segments,
-                    index,
-                    context=context,
-                ):
-                    continue
-                compressed = fallback
+                continue
             result[index] = self._copy_segment(
                 seg,
                 translated_text=compressed,
@@ -10221,54 +10370,6 @@ class ScreenSubtitleEditor:
             )
             logger.info("局部压缩中文字幕阅读速度: %s", changed)
         return result
-
-    def _local_chinese_speed_fallback(self, seg: ASRDataSeg) -> str:
-        original = self._normalize_text(seg.text)
-        translated = self._normalize_text(seg.translated_text)
-        if not original or not translated:
-            return ""
-
-        text = translated
-        brand_tokens = re.findall(r"\b[A-Z][A-Za-z0-9]*\b", original)
-        if brand_tokens:
-            replacements = {
-                "太空探索技术公司": "SpaceX",
-                "开放人工智能公司": "OpenAI",
-                "英伟达公司": "NVIDIA",
-                "英伟达": "NVIDIA",
-            }
-            lowered_tokens = {token.lower() for token in brand_tokens}
-            for zh_name, en_name in replacements.items():
-                if en_name.lower() in lowered_tokens:
-                    text = text.replace(zh_name, en_name)
-
-        compact_original = original.lower()
-        if "laser" in compact_original:
-            for prefix in ("使用的是", "采用的是", "用的是"):
-                if text.startswith(prefix):
-                    text = text[len(prefix):]
-            if "spacex" in compact_original and "激光" in text:
-                text = "SpaceX激光器。"
-
-        if (
-            "bigger test" in compact_original
-            and "coming" in compact_original
-            and "测试" in text
-        ):
-            text = "更大的测试要来了。"
-
-        if text == translated:
-            return ""
-        return self._normalize_text(text)
-
-    def _has_chinese_speed_pressure(self, seg: ASRDataSeg) -> bool:
-        translated = self._normalize_text(seg.translated_text)
-        zh_chars = len(re.findall(r"[\u4e00-\u9fff]", translated))
-        if zh_chars < 8:
-            return False
-        duration_ms = max(1, int(seg.end_time) - int(seg.start_time))
-        cps = zh_chars / (duration_ms / 1000.0)
-        return cps > CHINESE_CPS_WARNING
 
     def _restore_invalid_postprocess_allocations(
         self,
@@ -10384,44 +10485,6 @@ class ScreenSubtitleEditor:
             pressure += max(0.0, chinese_chars / duration_seconds - CHINESE_CPS_WARNING)
         return pressure
 
-    def _should_keep_speed_repair_despite_soft_omission(
-        self,
-        before_group: Sequence[ASRDataSeg],
-        after_group: Sequence[ASRDataSeg],
-        after_validation: Dict,
-    ) -> bool:
-        issue_codes = set(after_validation.get("issue_codes") or [])
-        if issue_codes - {"group_allocation_information_omission"}:
-            return False
-        if len(before_group) != len(after_group):
-            return False
-        for before, after in zip(before_group, after_group):
-            if (
-                before.text != after.text
-                or before.start_time != after.start_time
-                or before.end_time != after.end_time
-                or self._segment_subtitle_id(before, 0) != self._segment_subtitle_id(after, 0)
-            ):
-                return False
-
-        before_errors = sum(1 for seg in before_group if self._is_severe_chinese_speed(seg))
-        after_errors = sum(1 for seg in after_group if self._is_severe_chinese_speed(seg))
-        if after_errors >= before_errors:
-            return False
-
-        changed = [
-            (before, after)
-            for before, after in zip(before_group, after_group)
-            if before.translated_text != after.translated_text
-        ]
-        if not changed:
-            return False
-        for before, after in changed:
-            fallback = self._local_chinese_speed_fallback(before)
-            if fallback != self._normalize_text(after.translated_text):
-                return False
-        return True
-
     def _allocation_entry_from_group_segments(
         self,
         group: Dict,
@@ -10503,24 +10566,32 @@ class ScreenSubtitleEditor:
                 continue
             target_id = str(group.get("target_subtitle_id") or "").strip()
             if target_id not in id_to_index:
-                if not str(group.get("target_index", "")).isdigit():
-                    continue
-                target_index = int(group["target_index"])
-                if target_index < 0 or target_index >= len(segments):
-                    continue
-                target_id = self._segment_subtitle_id(segments[target_index], target_index + 1)
+                self._record_translation_structure_error(
+                    "translation_id_missing" if not target_id else "translation_id_unknown",
+                    returned_ids=[target_id] if target_id else [],
+                    message=(
+                        "Group reallocation returned no target_subtitle_id."
+                        if not target_id
+                        else f"Group reallocation returned unknown target_subtitle_id: {target_id}"
+                    ),
+                )
+                continue
             allocation: Dict[str, str] = {}
             for item in group.get("segments", []):
                 if not isinstance(item, dict):
                     continue
-                subtitle_id = str(item.get("subtitle_id") or item.get("id") or "").strip()
+                subtitle_id = str(item.get("subtitle_id") or "").strip()
                 if subtitle_id not in id_to_index:
-                    if not str(item.get("index", "")).isdigit():
-                        continue
-                    index = int(item["index"])
-                    if index < 0 or index >= len(segments):
-                        continue
-                    subtitle_id = self._segment_subtitle_id(segments[index], index + 1)
+                    self._record_translation_structure_error(
+                        "translation_id_missing" if not subtitle_id else "translation_id_unknown",
+                        returned_ids=[subtitle_id] if subtitle_id else [],
+                        message=(
+                            "Group reallocation returned a segment without subtitle_id."
+                            if not subtitle_id
+                            else f"Group reallocation returned unknown subtitle_id: {subtitle_id}"
+                        ),
+                    )
+                    continue
                 text = str(item.get("zh", item.get("chinese", ""))).strip()
                 if text:
                     allocation[subtitle_id] = text
@@ -10561,7 +10632,6 @@ class ScreenSubtitleEditor:
         )
         return {
             "subtitle_id": self._segment_subtitle_id(seg, index + 1),
-            "index": index,
             "target": {
                 "subtitle_id": self._segment_subtitle_id(seg, index + 1),
                 "english": self._normalize_text(seg.text),
@@ -10609,7 +10679,6 @@ class ScreenSubtitleEditor:
             group_id = int(group.get("id") or 0)
             return {
                 "group_id": group_id,
-                "target_index": index,
                 "full_english": " ".join(part["english"] for part in parts).strip(),
                 "full_translation": self._last_semantic_full_translations.get(group_id)
                 or "".join(part["current_chinese"] for part in parts),
@@ -10631,7 +10700,6 @@ class ScreenSubtitleEditor:
         ]
         return {
             "group_id": None,
-            "target_index": index,
             "full_english": " ".join(part["english"] for part in parts).strip(),
             "full_translation": "".join(part["current_chinese"] for part in parts),
             "parts": parts,
@@ -12774,7 +12842,11 @@ class ScreenSubtitleEditor:
                     validation,
                     "authoritative_single_cue_allocation_invalid",
                 )
-                return {}
+                # This group has no allocation boundary, but its failure must
+                # never discard already valid fixed-ID allocations from other
+                # groups. Final ID validation owns the render block for this
+                # one unresolved cue.
+                continue
             direct_allocations[int(group["id"])] = direct_allocation
             self._last_allocation_final.append(
                 {
@@ -12849,7 +12921,12 @@ class ScreenSubtitleEditor:
             latest = self._last_allocation_raw_returns[-1] if self._last_allocation_raw_returns else {}
             cache_hits += int(bool(latest.get("cache_hit")))
             if data is None:
-                return {}
+                self._record_omitted_allocation_groups(
+                    payload_chunk,
+                    expected_groups_by_id,
+                    {},
+                )
+                continue
             if not complete:
                 retries += 1
                 chunk_result, complete = self._retry_incomplete_allocation_chunk(
@@ -13350,6 +13427,11 @@ class ScreenSubtitleEditor:
                 "attempted": True,
                 "success": False,
             }
+            retry_prompt = prompt
+            retry_cache_task = SEMANTIC_ALLOCATION_RETRY_CACHE_TASK
+            if "unnatural_chinese_fragment" in set(validation.get("issue_codes") or []):
+                retry_prompt = self._compose_prompt(SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT)
+                retry_cache_task = SEMANTIC_FRAGMENT_ALLOCATION_RETRY_CACHE_TASK
             self._emit_progress_event(
                 "allocation_retry",
                 completed=len(self._last_allocation_retry_log),
@@ -13359,9 +13441,9 @@ class ScreenSubtitleEditor:
                 semantic_group_id=f"G{group_id:04d}",
             )
             data = self._request_semantic_translation_allocation(
-                prompt,
+                retry_prompt,
                 [entry],
-                cache_task=SEMANTIC_ALLOCATION_RETRY_CACHE_TASK,
+                cache_task=retry_cache_task,
             )
             if data is None:
                 self._last_allocation_retry_log.append(retry_record)
@@ -13369,7 +13451,7 @@ class ScreenSubtitleEditor:
                 continue
             self._last_allocation_raw_returns.append(
                 {
-                    "task": SEMANTIC_ALLOCATION_RETRY_CACHE_TASK,
+                    "task": retry_cache_task,
                     "data": data,
                     "expected_group_ids": [group_id],
                     "quality_retry": True,
@@ -13659,7 +13741,11 @@ class ScreenSubtitleEditor:
                 issue_codes.append("group_allocation_information_omission")
                 issues.append({"subtitle_id": expected_ids[offset], "reason": "empty_chinese"})
                 continue
-            if self._is_bad_allocation_chinese_fragment(text, offset, len(ordered_texts)):
+            # A one-cue group is already the authoritative full translation;
+            # it has no allocation boundary for this validator to repair.
+            if len(expected_ids) > 1 and self._is_bad_allocation_chinese_fragment(
+                text, offset, len(ordered_texts)
+            ):
                 issue_codes.append("unnatural_chinese_fragment")
                 issues.append(
                     {
@@ -13808,8 +13894,8 @@ class ScreenSubtitleEditor:
         word_count: int,
         hard_limit: int,
     ) -> bool:
-        """Allow only a complete 17-19 word cue with no legal <=16 split."""
-        if word_count <= hard_limit or word_count > hard_limit + 3:
+        """Allow an audited complete cue only when no legal <=16 split exists."""
+        if word_count <= hard_limit:
             return False
         terminal_sentence = bool(re.search(r"[.!?][\"')\]]*\s*$", text or ""))
         protected_comma_clause = self._is_parser_confirmed_comma_subordinate_clause(text)
@@ -13973,7 +14059,22 @@ class ScreenSubtitleEditor:
         normalized = re.sub(r"[，。！？；：、,.!?;:]+$", "", normalized)
         if not normalized:
             return True
-        if re.search(r"[。！？.!?]$", raw) and len(normalized) >= 4:
+        terminal_punctuation = bool(re.search(r"[。！？.!?]$", raw))
+        terminal_dangling_endings = (
+            "的",
+            "以及",
+            "因为",
+            "如果",
+            "对于",
+            "在",
+            "将",
+            "把",
+            "意味着",
+        )
+        # A sentence-final list item or noun phrase can begin with a connector
+        # and still be complete. Punctuation only bypasses validation when the
+        # final grammar is not itself a dangling modifier or connective.
+        if terminal_punctuation and not normalized.endswith(terminal_dangling_endings):
             return False
         if total <= 1:
             return self._is_bad_chinese_fragment(text)
@@ -13989,10 +14090,8 @@ class ScreenSubtitleEditor:
             ("因为", "如果", "对于", "在", "将", "把", "以及", "而", "但", "并")
         ):
             return False
-        if offset > 0 and normalized.startswith(
-            ("因为", "如果", "对于", "在", "将", "把", "以及", "而", "但", "并")
-        ):
-            return False
+        # Terminal punctuation does not make a bare modifier complete.  Check
+        # the grammar after preserving permitted non-final continuations.
         return self._is_bad_chinese_fragment(text)
 
     def _detect_cross_id_anchor_misplacement(

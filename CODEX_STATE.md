@@ -1,21 +1,28 @@
 # CODEX State
 
-Status: implementation checkpoint verified by the unified automated regression;
-fresh end-to-end production and article-template visual validation are pending.
+Status: stable English boundary routing and renderer-owned structural-overflow
+checkpoint verified by focused regression; fresh end-to-end production and
+article-template visual validation are pending.
 
-Last verified: 2026-08-04 00:30:12 Asia/Shanghai
+Last verified: 2026-08-04 03:47:18 Asia/Shanghai
 
 Branch: main
 
-Verified HEAD: f2b4d56ca5fdf648c2573f6cf2be1cefa0b06ea1
-The executable implementation and audit cleanup were verified before this
-state-only update. Earlier `5580cfc` and `e660957` commits add handoff/state
-documentation.
+Verified HEAD: b5fe576345fbd82b3accc57b5d61fe40f597bd52
+The current working-tree checkpoint was verified against this HEAD; all
+implementation, test, and documentation changes listed below remain unstaged.
 
-Working tree: clean at the verified HEAD before this documentation-only state
-update. The auxiliary vocabulary handoff is committed at
+Working tree: modified in tracked implementation, documentation, and test
+files listed by `git status --short`, plus the active cross-module issue list.
+The auxiliary vocabulary handoff is committed at
 `docs/handoffs/2026-08-04-vocabulary-cards.md`; `docs/CODEX_STATE.md` is a
 compatibility pointer to this canonical root file.
+
+Next action: rerun the focused and unified regression after the baseline fixes,
+then wait for explicit confirmation before committing.
+
+Unknowns: no fresh unseen-audio production render has been completed after the
+latest stable boundary and fixed-ID allocation changes.
 
 ## Verified Contract
 
@@ -31,12 +38,19 @@ ASR word timestamps
 
 - Stable-mode LLM work is restricted to Chinese. It must not alter English,
   subtitle IDs, order, cue count, word ownership, or cue timing.
+- Stable screen mode rejects an absent or incomplete source-to-word mapping;
+  it cannot fall back to the legacy LLM screen-editor path. Likewise, its
+  legacy `need_optimize` setting cannot activate `SubtitleOptimizer`.
 - Final cue timing is ID-addressable and derived from frozen cue word ranges in
   the authoritative word ledger. Final-timeline validation blocks synthesis on
   structural errors.
 - English boundary finalization is local and deterministic. Its production
   stages are ordered by `stable_english_boundaries.py`; no dynamic programming
   or audio-specific text rules are permitted.
+- If a complete terminal source sentence has no legal normal-limit pre-ID
+  boundary, it remains renderer-owned and is audited as a structural overflow;
+  the cutter never creates an incomplete 17-19 word cue merely to satisfy the
+  normal word limit.
 - Allocation retry/compression/polish candidates are accepted only by the
   fixed-ID local quality comparator. A candidate with no high-confidence repair
   or with a detected regression keeps the original allocation.
@@ -75,8 +89,12 @@ ASR word timestamps
   implementation checkpoint. It ran final timeline, stable-cut, boundary,
   allocation, artifact, frozen-run, golden-evaluation, manual-editor, review
   queue, run-state, and syntax checks.
-- `git diff --check`: PASS before the implementation checkpoint. The observed
+- `runtime\python.exe -X utf8 scripts\run_regression.py`: PASS after the
+  renderer-owned structural-overflow change.
+- `git diff --check`: PASS after the implementation checkpoint. The observed
   LF/CRLF messages are line-ending notices, not whitespace errors.
+- `tests/test_stable_caption_rules.py`: PASS after the renderer-owned
+  structural-overflow regression and frozen-ledger replay.
 - Generated-output auditing is intentionally excluded from the unified
   regression. It requires an explicit, fresh `work-dir` sample and is not a
   substitute for the fixture-backed contract checks.

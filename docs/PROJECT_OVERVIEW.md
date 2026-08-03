@@ -30,7 +30,7 @@ The desired output is:
 ## User Quality Priorities
 
 1. No missing English while audio is speaking.
-2. English subtitles should normally contain 6-12 words and must stay within 16 words, except for audited 17-19 word grammar-preserving cases.
+2. English subtitles should normally contain 6-12 words and stay within 16 words; 17-19 word grammar-preserving cases, and a complete source sentence with no safe temporal split, are audited renderer-wrapping exceptions.
 3. English text must match the audio and must not be rewritten.
 4. Chinese should read like concise magazine/documentary narration.
 5. Subtitle timing should not disappear before the audio finishes.

@@ -90,6 +90,15 @@ class SubtitleThread(QThread):
     def set_custom_prompt_text(self, text: str):
         self.custom_prompt_text = text
 
+    @staticmethod
+    def _should_run_legacy_subtitle_optimization(
+        *,
+        need_optimize: bool,
+        stable_screen_mode: bool,
+    ) -> bool:
+        """Keep LLM English rewriting out of the stable word-ledger path."""
+        return bool(need_optimize and not stable_screen_mode)
+
     def _record_stage_duration(self, stage: str, started_at: float) -> None:
         self._stage_timings_seconds[stage] = round(max(0.0, time.perf_counter() - started_at), 3)
 
@@ -1190,7 +1199,10 @@ class SubtitleThread(QThread):
             )
             self.subtitle_length = len(asr_data.segments)
 
-            if subtitle_config.need_optimize:
+            if self._should_run_legacy_subtitle_optimization(
+                need_optimize=subtitle_config.need_optimize,
+                stable_screen_mode=stable_screen_mode,
+            ):
                 stage_started = self._begin_stage("optimize_subtitle", "优化字幕")
                 logger.info("正在优化字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
@@ -1204,6 +1216,8 @@ class SubtitleThread(QThread):
                 asr_data = optimizer.optimize_subtitle(asr_data)
                 self.update_all.emit(asr_data.to_json())
                 self._complete_stage("optimize_subtitle", "优化字幕", stage_started)
+            elif subtitle_config.need_optimize:
+                logger.info("稳定上屏模式跳过旧 LLM 英文优化；最终边界由本地词级规则决定")
 
             # 4. 翻译字幕
             translator_map = {

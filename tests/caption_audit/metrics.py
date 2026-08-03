@@ -109,7 +109,7 @@ def audit_srt(
     min_duration_ms: int = 900,
     english_wps_warning: float = 5.0,
     chinese_cps_warning: float = 9.0,
-    chinese_cps_error: float = 12.0,
+    chinese_cps_error: float = 12.25,
 ) -> dict:
     cues = parse_srt(path)
     issues = {

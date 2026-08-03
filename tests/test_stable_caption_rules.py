@@ -231,6 +231,37 @@ def test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split():
     )
 
 
+def test_stable_screen_mode_skips_legacy_llm_optimization():
+    assert not SubtitleThread._should_run_legacy_subtitle_optimization(
+        need_optimize=True,
+        stable_screen_mode=True,
+    )
+    assert SubtitleThread._should_run_legacy_subtitle_optimization(
+        need_optimize=True,
+        stable_screen_mode=False,
+    )
+
+
+def test_stable_screen_mode_rejects_missing_or_unmappable_word_ledger():
+    source = ASRData([ASRDataSeg("alpha beta.", 0, 400)])
+    unmappable_ledger = ASRData(
+        [
+            ASRDataSeg("gamma", 0, 180),
+            ASRDataSeg("delta", 200, 400),
+        ]
+    )
+
+    for ledger in (None, unmappable_ledger):
+        editor = _editor()
+        editor.enable_stable_mode = True
+        try:
+            editor.edit(source, word_time_asr_data=ledger)
+        except RuntimeError as exc:
+            assert "完整词级账本" in str(exc)
+        else:
+            raise AssertionError("stable mode must not fall back to legacy screen editing")
+
+
 class _NoCache:
     def get_llm_result(self, *args, **kwargs):
         return None
@@ -583,6 +614,24 @@ def test_chinese_reading_speed_error_is_reported_but_not_blocking():
         issue["code"] == "reading_speed_error"
         for issue in editor.last_validation_summary["errors"]
     )
+
+
+def test_near_threshold_chinese_speed_is_a_warning_not_a_render_error():
+    editor = _editor()
+    segment = ASRDataSeg(
+        "They call them job creators.",
+        0,
+        1241,
+        "他们把这些小企业称为就业创造者。",
+    )
+
+    health = editor._subtitle_health_issues([segment])
+
+    assert health["reading_speed_errors"] == []
+    assert health["reading_speed_warnings"][0]["cps"] == 12.09
+    editor._report_subtitle_coverage_gaps([segment], [segment])
+    assert editor.last_validation_summary["status"] == "WARNING"
+    assert editor.last_validation_summary["errors"] == []
 
 
 def test_validation_report_adds_actionable_review_tiers_without_changing_status():
@@ -1426,6 +1475,27 @@ def test_caption_audit_treats_borderline_chinese_speed_as_warning_not_blocker():
     speed_warnings = [issue for issue in report["warnings"] if issue["code"] == "chinese_speed_warning"]
     assert [issue["index"] for issue in speed_errors] == [2]
     assert [issue["index"] for issue in speed_warnings] == [1]
+
+
+def test_caption_audit_uses_the_runtime_chinese_speed_error_boundary():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        srt = Path(temp_dir) / "near-threshold-chinese-speed.srt"
+        srt.write_text(
+            "\n".join(
+                [
+                    "1",
+                    "00:00:00,000 --> 00:00:01,241",
+                    "A near-threshold cue.",
+                    "一二三四五六七八九十一二三四五",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        report = audit_srt(srt)
+
+    assert not [issue for issue in report["errors"] if issue["code"] == "chinese_speed_error"]
+    assert [issue["index"] for issue in report["warnings"] if issue["code"] == "chinese_speed_warning"] == [1]
 
 
 def test_caption_audit_keeps_numeric_percent_chinese_line():
@@ -2421,6 +2491,7 @@ def test_final_pre_id_repairs_yeah_so_todd_subject_fragment():
     repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
 
     assert repaired[0].original.startswith("Yeah, so Todd is the founder")
+    assert [(item.word_start, item.word_end) for item in repaired] == [(0, 8), (9, 14)]
     assert all(editor._evaluate_item_pair_for_final_boundary(left, right)["legal"] for left, right in zip(repaired, repaired[1:]))
     assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in repaired)
 
@@ -2433,6 +2504,63 @@ def test_final_pre_id_repairs_pronoun_only_fragment():
 
     assert repaired[0].original.startswith("We tend")
     assert all(item.original != "We" for item in repaired)
+
+
+def test_final_pre_id_merges_high_confidence_fragment_into_unsplittable_19_word_sentence():
+    words = [
+        "Wow.", "Yeah.", "And", "the", "Small", "Business", "and",
+        "Entrepreneurship", "Council", "points", "out", "that", "is",
+        "the", "highest", "level", "this", "entire", "century.",
+    ]
+    editor = _marker_editor(words, max_words=16)
+    items = [_word_item(editor, 0, 15, 1), _word_item(editor, 16, 18, 2)]
+    word_times_before = [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ]
+
+    with patch.object(editor, "_safe_overlong_item_split", return_value=([], [])):
+        repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [" ".join(words)]
+    assert [(item.word_start, item.word_end) for item in repaired] == [(0, 18)]
+    assert all(item.subtitle_id is None for item in repaired)
+    assert [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ] == word_times_before
+
+
+def test_final_pre_id_does_not_allow_fragment_merge_over_19_words():
+    words = [
+        "Wow.", "Yeah.", "And", "the", "Small", "Business", "and",
+        "Entrepreneurship", "Council", "points", "out", "that", "is",
+        "the", "highest", "level", "ever", "this", "entire", "century.",
+    ]
+    editor = _marker_editor(words, max_words=16)
+    items = [_word_item(editor, 0, 16, 1), _word_item(editor, 17, 19, 2)]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 16 for item in repaired)
+    assert [item.original for item in repaired] != [" ".join(words)]
+
+
+def test_final_pre_id_does_not_allow_structural_merge_when_safe_cut_exists():
+    words = [
+        "Wow.", "Yeah.", "And", "the", "Small", "Business", "and",
+        "Entrepreneurship", "Council", "points", "out", "that", "is",
+        "the", "highest", "level", "this", "entire", "century.",
+    ]
+    editor = _marker_editor(words, max_words=16)
+    items = [_word_item(editor, 0, 15, 1), _word_item(editor, 16, 18, 2)]
+    safe_split = [_word_item(editor, 0, 9), _word_item(editor, 10, 18)]
+
+    with patch.object(editor, "_safe_overlong_item_split", return_value=(safe_split, [])):
+        repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 16 for item in repaired)
+    assert [item.original for item in repaired] != [" ".join(words)]
 
 
 def test_final_pre_id_attaches_standalone_so_to_next_sentence():
@@ -3032,6 +3160,28 @@ def test_podcast_template_blocks_failed_stable_manifest_subtitle():
             assert False, "blocked manifest must stop podcast-template synthesis"
         except RuntimeError as exc:
             assert "阻止" in str(exc)
+
+
+def test_podcast_template_does_not_fall_back_when_manifest_is_invalid_or_unusable():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        stale = root / "222-original-top.srt"
+        manifest = root / "stable-final-manifest.json"
+        ass = root / "output.ass"
+        stale.write_text("stale", encoding="utf-8")
+        ass.write_text("", encoding="utf-8")
+
+        for manifest_text in (
+            "{not valid json",
+            json.dumps({"paths": {"original_top_srt": str(root / "missing.srt")}}),
+        ):
+            manifest.write_text(manifest_text, encoding="utf-8")
+            try:
+                resolve_podcast_template_subtitle("C:/tmp/222.m4a", str(ass))
+            except RuntimeError as exc:
+                assert "阻止" in str(exc)
+            else:
+                raise AssertionError("an existing manifest must not fall back to a stale subtitle")
 
 
 def test_podcast_template_reuses_legacy_reading_speed_manifest_when_revalidated():
@@ -4164,6 +4314,90 @@ def test_id_bound_group_rejects_unknown_id():
     } <= _codes(editor)
 
 
+def test_id_bound_allocation_rejects_terminal_modifier_fragment():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "他认为，人工智能创造的巨大价值不会只被硅谷的少数科技巨头吞掉。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0001", "english": "He argues the value will not be swallowed up"},
+            {"subtitle_id": "S0002", "english": "by tech giants in Silicon Valley."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {"S0001": "他认为，巨大的价值不会只被科技巨头吞掉", "S0002": "尤其是硅谷的。"},
+    )
+
+    assert not validation["valid"]
+    assert "unnatural_chinese_fragment" in validation["issue_codes"]
+
+
+def test_terminal_modifier_fragment_uses_specialized_fixed_id_retry():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "The value will not be swallowed up"
+    items[1].original = "by Silicon Valley tech giants."
+    group = _id_group(1, 0, items)
+    full_translations = {
+        1: "这些价值不会只被硅谷的少数科技巨头吞掉。",
+    }
+    calls = []
+
+    def request(prompt, payload, cache_task):
+        calls.append((prompt, cache_task))
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
+            return {
+                "groups": [{
+                    "id": 1,
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "这些价值不会只被科技巨头吞掉"},
+                        {"subtitle_id": "S0002", "zh": "尤其是硅谷的。"},
+                    ],
+                }]
+            }
+        assert cache_task == "screen_subtitle_semantic_translation_allocation_fragment_retry_v1"
+        assert "bare modifier" in prompt
+        return {
+            "groups": [{
+                "id": 1,
+                "part_translations": [
+                    {"subtitle_id": "S0001", "zh": "这些价值不会只被吞掉，"},
+                    {"subtitle_id": "S0002", "zh": "也不会只落入硅谷科技巨头之手。"},
+                ],
+            }]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations([group], full_translations)
+
+    assert allocated[1] == {
+        "S0001": "这些价值不会只被吞掉，",
+        "S0002": "也不会只落入硅谷科技巨头之手。",
+    }
+    assert [task for _, task in calls] == [
+        "screen_subtitle_semantic_translation_allocation_v3",
+        "screen_subtitle_semantic_translation_allocation_fragment_retry_v1",
+    ]
+
+
+def test_semantic_audit_does_not_flag_a_complete_single_cue_as_a_fragment():
+    editor = _id_editor()
+
+    findings = editor._chinese_group_quality_findings(
+        "The boom is entirely broad-based.",
+        "这轮增长完全是全面开花的。",
+        ["这轮增长完全是全面开花的。"],
+        full_translation="这轮增长完全是全面开花的。",
+        mapping_valid=True,
+    )
+
+    assert not {
+        finding["code"] for finding in findings
+    } & {"missing_predicate", "dangling_preposition"}
+
+
 def test_id_bound_group_allows_different_return_order():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(4))
@@ -4274,6 +4508,40 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
     assert editor._translation_structure_errors == []
 
 
+def test_allocation_final_artifact_keeps_unresolved_group_fixed_id_mapping():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(3))
+    groups = [_id_group(1, 0, items[:2]), _id_group(2, 2, items[2:])]
+    editor._last_allocation_final = [
+        {
+            "semantic_group_id": "G0001",
+            "subtitle_ids": ["S0001", "S0002"],
+            "allocation": {"S0001": "中文一", "S0002": "中文二"},
+            "source": "initial",
+        }
+    ]
+    items[0].translated = "中文一"
+    items[1].translated = "中文二"
+    items[2].translated = "保留的中文三"
+
+    payload = editor._final_allocation_payload(groups, items)
+
+    assert payload == [
+        {
+            "semantic_group_id": "G0001",
+            "subtitle_ids": ["S0001", "S0002"],
+            "allocation": {"S0001": "中文一", "S0002": "中文二"},
+            "source": "initial",
+        },
+        {
+            "semantic_group_id": "G0002",
+            "subtitle_ids": ["S0003"],
+            "allocation": {"S0003": "保留的中文三"},
+            "source": "unresolved_final_subtitle_items",
+        },
+    ]
+
+
 def test_single_cue_group_uses_authoritative_full_translation_without_allocation_request():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
@@ -4298,6 +4566,42 @@ def test_single_cue_group_uses_authoritative_full_translation_without_allocation
     ]
     assert editor._last_allocation_retry_log == []
     assert [entry["id"] for entry in editor._last_allocation_inputs] == [1, 2]
+
+
+def test_single_cue_authoritative_translation_ending_in_de_is_not_an_allocation_fragment():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(1))
+    items[0].original = "But the evidence suggests machines do not write that way today."
+    group = _id_group(1, 0, items)
+    chinese = "但数据表明，眼下机器根本不是那样写作的。"
+
+    allocated = editor._allocate_semantic_group_translations([group], {1: chinese})
+
+    assert allocated == {1: {"S0001": chinese}}
+    assert not editor._last_allocation_unresolved
+
+
+def test_invalid_single_cue_group_does_not_discard_other_fixed_id_allocations():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    groups = [_id_group(1, 0, [items[0]]), _id_group(2, 1, [items[1]])]
+
+    def validate(entry, allocation, **_kwargs):
+        return {
+            "semantic_group_id": f"G{entry['id']:04d}",
+            "valid": entry["id"] != 1,
+            "issue_codes": ["full_translation_quality_issue"] if entry["id"] == 1 else [],
+            "issues": [],
+        }
+
+    with patch.object(editor, "_validate_group_chinese_allocation", side_effect=validate):
+        allocated = editor._allocate_semantic_group_translations(
+            groups,
+            {1: "无效完整翻译", 2: "保留第二组翻译。"},
+        )
+
+    assert allocated == {2: {"S0002": "保留第二组翻译。"}}
+    assert editor._last_allocation_unresolved[0]["semantic_group_id"] == "G0001"
 
 
 def test_full_translation_number_error_is_not_misclassified_as_allocation_error():
@@ -6089,6 +6393,48 @@ def test_complete_unsplittable_overflow_is_warning_not_overlong_error():
     assert [issue["code"] for issue in summary["warnings"]] == ["structural_english_overflow"]
 
 
+def test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned():
+    text = (
+        "Well we started by noting that artificial intelligence is already drafting "
+        "more than a third of all new websites on the internet."
+    )
+    words = text.split()
+    editor = _marker_editor(words, max_words=16)
+
+    def only_incomplete_overflow_cut(left, *args, **kwargs):
+        return {
+            "legal": left == 18,
+            "hard_issues": [] if left == 18 else ["protected_syntax_cut"],
+            "boundary_score": 0.0,
+        }
+
+    editor._evaluate_stable_cut_boundary = only_incomplete_overflow_cut
+
+    assert editor._stable_word_ranges_for_span((0, len(words) - 1)) == [
+        (0, len(words) - 1)
+    ]
+
+    segment = ASRDataSeg(text, 0, 4400, "完整中文。")
+    segment.subtitle_id = "S0001"
+    segment.word_start = 0
+    segment.word_end = len(words) - 1
+    editor._safe_overlong_item_split = lambda item: ([], [])
+
+    assert editor._word_count(text) == 22
+    assert editor._is_allowed_structural_english_overflow(segment, text, 22, 16)
+    assert editor._overlong_english_issues([segment]) == []
+    assert len(editor._structural_english_overflow_issues([segment])) == 1
+
+    editor._safe_overlong_item_split = lambda item: ([item], [])
+    assert len(editor._overlong_english_issues([segment])) == 1
+
+    incomplete = ASRDataSeg(text.rstrip("."), 0, 4400, "完整中文。")
+    incomplete.word_start = 0
+    incomplete.word_end = len(words) - 1
+    editor._safe_overlong_item_split = lambda item: ([], [])
+    assert len(editor._overlong_english_issues([incomplete])) == 1
+
+
 def test_comma_terminated_parser_confirmed_subordinate_overflow_is_warning_not_error():
     text = "Yeah. And now that mobile coffee cart is bringing in between 10 000 and 15 000 every single month,"
     editor = _marker_editor(text.split(), max_words=16)
@@ -6588,7 +6934,7 @@ def test_repair_only_modifies_the_target_subtitle_id():
         return seg.translated_text == "LONG_TARGET"
 
     def request(prompt, payload, task, temperature):
-        return {"items": [{"index": 1, "chinese": "这是修复文本"}]}
+        return {"items": [{"subtitle_id": "S0002", "chinese": "这是修复文本"}]}
 
     with patch.object(editor, "_is_severe_chinese_speed", side_effect=severe), patch.object(
         editor, "_request_chinese_compression", side_effect=request
@@ -6621,7 +6967,56 @@ def test_compression_accepts_new_subtitle_id_protocol_without_position_shift():
     assert [seg.subtitle_id for seg in repaired] == ["S0001", "S0002", "S0003"]
     assert repaired[0].translated_text == "这是原文"
     assert repaired[1].translated_text == "这是修复文本"
-    assert repaired[2].translated_text == "这是原文"
+
+
+def test_compression_rejects_legacy_index_only_response_without_writeback():
+    editor = _id_editor()
+    segments = [
+        ASRDataSeg("First line.", 0, 1000, "第一条原文"),
+        ASRDataSeg("Second line.", 1000, 2000, "第二条原文很长"),
+    ]
+    for index, segment in enumerate(segments, 1):
+        segment.subtitle_id = f"S{index:04d}"
+
+    with patch.object(editor, "_is_severe_chinese_speed", side_effect=lambda seg: seg.subtitle_id == "S0002"), patch.object(
+        editor,
+        "_request_chinese_compression",
+        return_value={"items": [{"index": 1, "chinese": "错误位置写回"}]},
+    ):
+        repaired = editor._compress_fast_chinese_segments(segments)
+
+    assert [segment.translated_text for segment in repaired] == [
+        "第一条原文",
+        "第二条原文很长",
+    ]
+    assert any(
+        issue["code"] == "translation_id_missing"
+        for issue in editor._translation_structure_errors
+    )
+
+
+def test_group_reallocation_rejects_legacy_index_only_response():
+    editor = _id_editor()
+    segments = [ASRDataSeg("First line.", 0, 1000, "第一条原文")]
+    segments[0].subtitle_id = "S0001"
+
+    parsed = editor._parse_chinese_group_allocations(
+        {
+            "groups": [
+                {
+                    "target_index": 0,
+                    "segments": [{"index": 0, "zh": "错误位置写回"}],
+                }
+            ]
+        },
+        segments,
+    )
+
+    assert parsed == {}
+    assert any(
+        issue["code"] == "translation_id_missing"
+        for issue in editor._translation_structure_errors
+    )
 
 
 def test_redistribution_parses_out_of_order_returns_by_subtitle_id():
@@ -6630,10 +7025,10 @@ def test_redistribution_parses_out_of_order_returns_by_subtitle_id():
     data = {
         "groups": [
             {
-                "target_index": 2,
+                "target_subtitle_id": "S0003",
                 "segments": [
-                    {"index": 3, "zh": "这是第四条"},
-                    {"index": 1, "zh": "这是第二条"},
+                    {"subtitle_id": "S0004", "zh": "这是第四条"},
+                    {"subtitle_id": "S0002", "zh": "这是第二条"},
                 ],
             }
         ]
@@ -6673,7 +7068,7 @@ def test_compression_keeps_subtitle_ids_and_count():
         return seg.translated_text == "LONG_TARGET"
 
     def request(prompt, payload, task, temperature):
-        return {"items": [{"index": 1, "chinese": "这是压缩文本"}]}
+        return {"items": [{"subtitle_id": "S0002", "chinese": "这是压缩文本"}]}
 
     with patch.object(editor, "_is_severe_chinese_speed", side_effect=severe), patch.object(
         editor, "_request_chinese_compression", side_effect=request
@@ -6896,8 +7291,8 @@ def test_safe_auto_repair_llm_repairs_high_confidence_chinese_candidate_after_fi
         return_value={
             "groups": [
                 {
-                    "target_index": 0,
-                    "segments": [{"index": 0, "zh": "是啊，他正在外面积极行动。"}],
+                "target_subtitle_id": "S0001",
+                "segments": [{"subtitle_id": "S0001", "zh": "是啊，他正在外面积极行动。"}],
                 }
             ]
         },
@@ -6963,8 +7358,8 @@ def test_safe_auto_repair_llm_rejects_invalid_candidate_repair():
         return_value={
             "groups": [
                 {
-                    "target_index": 0,
-                    "segments": [{"index": 0, "zh": "因为"}],
+                "target_subtitle_id": "S0001",
+                "segments": [{"subtitle_id": "S0001", "zh": "因为"}],
                 }
             ]
         },
@@ -7008,18 +7403,18 @@ def test_safe_auto_repair_llm_retries_invalid_candidate_with_same_group_context(
         {
             "groups": [
                 {
-                    "target_index": 0,
-                    "segments": [{"index": 0, "zh": "因为"}],
+                "target_subtitle_id": "S0001",
+                "segments": [{"subtitle_id": "S0001", "zh": "因为"}],
                 }
             ]
         },
         {
             "groups": [
                 {
-                    "target_index": 0,
-                    "segments": [
-                        {"index": 0, "zh": "从网络原生幽默和文化来看，"},
-                        {"index": 1, "zh": "Zachary Dunn就是一个很有意思的例子。"},
+                "target_subtitle_id": "S0001",
+                "segments": [
+                    {"subtitle_id": "S0001", "zh": "从网络原生幽默和文化来看，"},
+                    {"subtitle_id": "S0002", "zh": "Zachary Dunn就是一个很有意思的例子。"},
                     ],
                 }
             ]
@@ -7085,10 +7480,10 @@ def test_safe_auto_repair_llm_rejects_new_adjacent_chinese_boundary_break():
         return_value={
             "groups": [
                 {
-                    "target_index": 0,
-                    "segments": [
-                        {"index": 0, "zh": "你将一个全新的颠覆性运动，直接锚定它"},
-                        {"index": 1, "zh": "到一部古老、权威且备受尊崇的文本上，从而为其提供合法性。"},
+                "target_subtitle_id": "S0001",
+                "segments": [
+                    {"subtitle_id": "S0001", "zh": "你将一个全新的颠覆性运动，直接锚定它"},
+                    {"subtitle_id": "S0002", "zh": "到一部古老、权威且备受尊崇的文本上，从而为其提供合法性。"},
                     ],
                 }
             ]
@@ -7449,6 +7844,8 @@ if __name__ == "__main__":
     test_final_time_alignment_runs_chinese_speed_repair_without_touching_english()
     test_screen_editor_uses_16_word_stable_hard_floor()
     test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split()
+    test_stable_screen_mode_skips_legacy_llm_optimization()
+    test_stable_screen_mode_rejects_missing_or_unmappable_word_ledger()
     test_preposition_phrase_is_not_stranded()
     test_number_and_policy_sentence_keeps_readable_boundaries()
     test_long_finance_sentence_keeps_full_coverage()
@@ -7462,6 +7859,7 @@ if __name__ == "__main__":
     test_final_display_coverage_preserves_real_word_pause()
     test_final_time_alignment_coverage_bridge_runs_with_preserved_alignment_timing()
     test_chinese_reading_speed_error_is_reported_but_not_blocking()
+    test_near_threshold_chinese_speed_is_a_warning_not_a_render_error()
     test_validation_report_adds_actionable_review_tiers_without_changing_status()
     test_validation_review_includes_allocation_unresolved_without_old_error_mutation()
     test_allocation_isolation_report_passes_when_only_chinese_changes()
@@ -7499,6 +7897,7 @@ if __name__ == "__main__":
     test_caption_audit_uses_16_word_hard_limit()
     test_caption_audit_accepts_allowed_plus_discourse_overflow()
     test_caption_audit_treats_borderline_chinese_speed_as_warning_not_blocker()
+    test_caption_audit_uses_the_runtime_chinese_speed_error_boundary()
     test_caption_audit_keeps_numeric_percent_chinese_line()
     test_large_number_anchor_variants_do_not_crash()
     test_concise_group_allocation_is_not_rejected_by_coverage_only()
@@ -7554,6 +7953,9 @@ if __name__ == "__main__":
     test_relative_clause_subject_verb_you_can_is_hard_boundary()
     test_final_pre_id_repairs_yeah_so_todd_subject_fragment()
     test_final_pre_id_repairs_pronoun_only_fragment()
+    test_final_pre_id_merges_high_confidence_fragment_into_unsplittable_19_word_sentence()
+    test_final_pre_id_does_not_allow_fragment_merge_over_19_words()
+    test_final_pre_id_does_not_allow_structural_merge_when_safe_cut_exists()
     test_final_pre_id_attaches_standalone_so_to_next_sentence()
     test_final_pre_id_keeps_independent_short_answers()
     test_weak_fragment_repair_does_not_cross_speaker_change()
@@ -7597,6 +7999,7 @@ if __name__ == "__main__":
     test_final_fragment_gate_records_unresolved_when_no_legal_solution()
     test_podcast_template_prefers_stable_manifest_subtitle()
     test_podcast_template_blocks_failed_stable_manifest_subtitle()
+    test_podcast_template_does_not_fall_back_when_manifest_is_invalid_or_unusable()
     test_podcast_template_reuses_legacy_reading_speed_manifest_when_revalidated()
     test_podcast_template_preserves_full_media_duration_when_subtitles_end_early()
     test_podcast_template_uses_frozen_task_configuration()
@@ -7635,8 +8038,14 @@ if __name__ == "__main__":
     test_atomic_no_response_cannot_be_written_as_affirmative()
     test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()
     test_id_bound_group_rejects_unknown_id()
+    test_id_bound_allocation_rejects_terminal_modifier_fragment()
+    test_terminal_modifier_fragment_uses_specialized_fixed_id_retry()
+    test_semantic_audit_does_not_flag_a_complete_single_cue_as_a_fragment()
     test_id_bound_group_allows_different_return_order()
+    test_allocation_final_artifact_keeps_unresolved_group_fixed_id_mapping()
     test_single_cue_group_uses_authoritative_full_translation_without_allocation_request()
+    test_single_cue_authoritative_translation_ending_in_de_is_not_an_allocation_fragment()
+    test_invalid_single_cue_group_does_not_discard_other_fixed_id_allocations()
     test_full_translation_number_error_is_not_misclassified_as_allocation_error()
     test_full_translation_requests_are_chunked_and_retry_missing_groups()
     test_full_translation_prompt_restrains_ordinary_chinese_em_dashes()
@@ -7684,6 +8093,8 @@ if __name__ == "__main__":
     test_merge_preserves_ids_when_order_changes_before_final_write()
     test_repair_only_modifies_the_target_subtitle_id()
     test_compression_accepts_new_subtitle_id_protocol_without_position_shift()
+    test_compression_rejects_legacy_index_only_response_without_writeback()
+    test_group_reallocation_rejects_legacy_index_only_response()
     test_redistribution_parses_out_of_order_returns_by_subtitle_id()
     test_redistribution_parses_new_id_only_protocol_without_position_shift()
     test_compression_keeps_subtitle_ids_and_count()

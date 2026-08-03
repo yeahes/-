@@ -31,7 +31,7 @@ Rules:
 
 - English text is restored locally from word ranges.
 - LLM must not rewrite, delete, reorder, or invent English.
-- Preferred visual target is 6-12 words; the normal hard maximum is 16. A 17-19 word exception requires an audited parser-confirmed grammar constraint.
+- Preferred visual target is 6-12 words; the normal hard maximum is 16. A 17-19 word exception requires an audited parser-confirmed grammar constraint. When an otherwise complete terminal source sentence has no legal normal-limit temporal cut, it remains one renderer-owned cue and is reported as a structural reading warning rather than being cut into a fragment.
 - Preserve source order and token coverage.
 - Prefer clause, punctuation, discourse, and phrase boundaries.
 - Avoid cutting after prepositions, articles, auxiliaries, or connectors.
