@@ -3,16 +3,19 @@
 Status: implementation checkpoint verified by the unified automated regression;
 fresh end-to-end production and article-template visual validation are pending.
 
-Last verified: 2026-08-04 00:17:32 Asia/Shanghai
+Last verified: 2026-08-04 00:25:34 Asia/Shanghai
 
 Branch: main
 
-Verified HEAD: 6713185a9ff3af96a26d44bec15b2391ee2acd46
+Verified HEAD: e6609578f68f9efcb1a990cab274ef59995915dd
+The executable implementation was verified at
+`6713185a9ff3af96a26d44bec15b2391ee2acd46`; `5580cfc` and `e660957` add
+handoff/state documentation only.
 
-Working tree: no uncommitted executable source changes after the verified
-implementation checkpoint. Two concurrent, untracked handoff documents remain:
-`docs/CODEX_STATE.md` and `docs/handoffs/2026-08-04-vocabulary-cards.md`.
-They were read for this consolidation but are not silently included in a commit.
+Working tree: clean at the verified HEAD before this documentation-only state
+canonicalization. The auxiliary vocabulary handoff is committed at
+`docs/handoffs/2026-08-04-vocabulary-cards.md`; `docs/CODEX_STATE.md` is a
+compatibility pointer to this canonical root file.
 
 ## Verified Contract
 
