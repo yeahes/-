@@ -456,3 +456,21 @@ Result:
   podcast-template synthesis treats it as authoritative. A malformed manifest
   or unavailable declared final SRT blocks synthesis instead of falling back
   to filename-based discovery, preventing stale subtitle reuse.
+
+## 2026-08-04 Fixed-ID Retry Audit And Imperative Visual Boundary
+
+- A retryable initial allocation response that omits, duplicates, or invents a
+  fixed subtitle ID is now retained in `allocation-validation.json` as an
+  `allocation_structure_attempt`. A later successful per-group retry clears
+  the final blocking structure error but does not erase the protocol evidence.
+  English text/order, IDs, word spans, final cue timing, and final Chinese
+  writeback remain unchanged.
+- The pre-ID visual temporal pass now recognizes a terminal imperative with a
+  bare `VB` root as a complete display unit only when it has no explicit
+  subject, attached `to`, or leading subordinator. It still requires the
+  existing terminal pause, duration, word-range continuity, syntax, and
+  candidate-write gates; `To consider ...` remains ineligible.
+- `runtime\python.exe -X utf8 scripts\run_regression.py` and
+  `git diff --check` passed after integrating both changes. A fresh unseen
+  audio production run remains required to assess real ASR parsing and Chinese
+  allocation behavior.

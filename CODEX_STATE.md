@@ -1,16 +1,17 @@
 # CODEX State
 
-Status: main has integrated frozen final-cue order validation; unified
-regression passed, while fresh end-to-end production and article-template
-visual validation remain pending.
+Status: main has integrated fixed-ID allocation retry auditing and terminal
+imperative visual-boundary recognition; unified regression passed, while fresh
+end-to-end production and article-template visual validation remain pending.
 
-Last verified: 2026-08-04 05:36:00 Asia/Shanghai
+Last verified: 2026-08-04 06:02:38 Asia/Shanghai
 
 Branch: main
 
-Verified HEAD: 0a6bdb84bb560cb62e30c4054b95eeee6dd3d46a
-Merged `be4ee1e` now rejects a final timeline whose returned cue-ID sequence
-differs from frozen subtitle-ID order.
+Verified HEAD: f243ff284a66365e990a1054ca748f14530c20bb
+Recoverable fixed-ID allocation protocol failures now remain in allocation
+audit records, and terminal imperative display units may use the existing
+strict pre-ID visual split gate.
 
 Working tree: clean at the verified integration commit; this state-only
 metadata commit may advance HEAD without changing implementation behavior.
