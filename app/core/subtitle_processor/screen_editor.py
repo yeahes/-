@@ -4581,6 +4581,34 @@ class ScreenSubtitleEditor:
     def _record_allocation_runtime_stat(self, key: str, value: Any) -> None:
         self._allocation_runtime_stats[str(key)] = value
 
+    def _record_allocation_structure_attempt(
+        self,
+        errors: Sequence[Dict],
+        *,
+        stage: str,
+        expected_group_ids: Sequence[int],
+        batch_id: Optional[int] = None,
+    ) -> None:
+        """Preserve retryable fixed-ID response failures without blocking export.
+
+        A successful retry replaces only the candidate allocation, never the
+        evidence that the preceding model response violated the fixed-ID
+        protocol.  Final ``translation_structure_errors`` remains reserved for
+        failures that still affect the final subtitle timeline.
+        """
+        if not errors:
+            return
+        record = {
+            "record_type": "allocation_structure_attempt",
+            "status": "retry_required",
+            "stage": str(stage),
+            "expected_semantic_group_ids": [int(group_id) for group_id in expected_group_ids],
+            "errors": [dict(error) for error in errors],
+        }
+        if batch_id is not None:
+            record["batch_id"] = int(batch_id)
+        self._last_allocation_validation.append(record)
+
     def _group_expected_subtitle_ids(self, group: Dict) -> List[str]:
         return [
             self._item_subtitle_id(item, int(group.get("start_index") or 0) + offset)
@@ -13136,6 +13164,12 @@ class ScreenSubtitleEditor:
             chunk_result = batch_result.translations
             complete = batch_result.complete
             if not complete:
+                self._record_allocation_structure_attempt(
+                    batch_result.errors,
+                    stage="initial_batch",
+                    expected_group_ids=batch_result.expected_ids,
+                    batch_id=batch_id,
+                )
                 retry_result, retry_complete = self._retry_incomplete_allocation_chunk(
                     prompt,
                     payload_chunk,
@@ -13322,6 +13356,12 @@ class ScreenSubtitleEditor:
         )
         if complete:
             self._last_semantic_group_debug.extend(debug)
+        else:
+            self._record_allocation_structure_attempt(
+                errors,
+                stage="initial_batch",
+                expected_group_ids=[int(entry.get("id") or 0) for entry in payload_chunk],
+            )
         return result, complete
 
     def _parse_allocation_chunk_data_isolated(
