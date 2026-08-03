@@ -23,6 +23,23 @@ class TaskFactory:
     """任务工厂类，用于创建各种类型的任务"""
 
     @staticmethod
+    def _needs_word_timestamps_for_subtitle_pipeline(
+        *,
+        need_split: bool,
+        need_screen_subtitle_edit: bool,
+        screen_subtitle_stable_mode: bool,
+    ) -> bool:
+        """Request native ASR word times for every pipeline that owns word spans.
+
+        Stable screen subtitles freeze their English cue ranges against a word
+        ledger. That contract is independent of the legacy coarse-splitting
+        switch, which only controls the compatibility pipeline.
+        """
+        return bool(need_split) or bool(
+            need_screen_subtitle_edit and screen_subtitle_stable_mode
+        )
+
+    @staticmethod
     def get_subtitle_style(style_name: str) -> str:
         """获取字幕样式内容
 
@@ -43,14 +60,16 @@ class TaskFactory:
     ) -> TranscribeTask:
         """创建转录任务"""
 
-        # 根据是否需要分段来决定是否需要词级时间戳
-
         # 获取文件名
         file_name = Path(file_path).stem
 
         # 构建输出路径
         if need_next_task:
-            need_word_time_stamp = cfg.need_split.value
+            need_word_time_stamp = TaskFactory._needs_word_timestamps_for_subtitle_pipeline(
+                need_split=cfg.need_split.value,
+                need_screen_subtitle_edit=cfg.need_screen_subtitle_edit.value,
+                screen_subtitle_stable_mode=cfg.screen_subtitle_stable_mode.value,
+            )
             output_path = str(
                 Path(cfg.work_dir.value)
                 / file_name
@@ -204,8 +223,7 @@ class TaskFactory:
             need_remove_punctuation=cfg.needs_remove_punctuation.value,
             need_screen_subtitle_edit=cfg.need_screen_subtitle_edit.value,
             screen_subtitle_stable_mode=cfg.screen_subtitle_stable_mode.value,
-            need_screen_subtitle_quality_check=cfg.need_screen_subtitle_quality_check.value,
-            screen_subtitle_safe_auto_repair=cfg.screen_subtitle_safe_auto_repair.value,
+            screen_subtitle_chinese_polish=cfg.screen_subtitle_chinese_polish.value,
             screen_subtitle_max_cjk=cfg.screen_subtitle_max_cjk.value,
             screen_subtitle_max_english=cfg.screen_subtitle_max_english.value,
             screen_subtitle_allocation_max_concurrency=cfg.screen_subtitle_allocation_max_concurrency.value,

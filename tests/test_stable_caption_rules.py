@@ -14,15 +14,12 @@ if str(ROOT) not in sys.path:
 
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
 from app.core.subtitle_processor.stable_ts_alignment import (
-    _make_frozen_word_timed_subtitle_segments,
-    _make_whisperx_subtitle_segments,
+    align_frozen_word_ledger_with_whisperx,
     _make_whisperx_word_segments,
-    _pad_short_subtitle_timing_sequence,
-    _repair_subtitle_timing_sequence,
-    _whisperx_mapping_is_complete,
 )
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.entities import SynthesisConfig, SynthesisTask, SubtitleConfig, SubtitleTask
+from app.core.task_factory import TaskFactory
 from app.thread.subtitle_thread import SubtitleThread
 from app.thread.video_synthesis_thread import VideoSynthesisThread, resolve_podcast_template_subtitle
 from app.core.utils import podcast_learning_video
@@ -214,6 +211,24 @@ def test_screen_editor_uses_16_word_stable_hard_floor():
         )
 
     assert editor.max_english_words == 16
+
+
+def test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split():
+    assert TaskFactory._needs_word_timestamps_for_subtitle_pipeline(
+        need_split=False,
+        need_screen_subtitle_edit=True,
+        screen_subtitle_stable_mode=True,
+    )
+    assert TaskFactory._needs_word_timestamps_for_subtitle_pipeline(
+        need_split=True,
+        need_screen_subtitle_edit=False,
+        screen_subtitle_stable_mode=False,
+    )
+    assert not TaskFactory._needs_word_timestamps_for_subtitle_pipeline(
+        need_split=False,
+        need_screen_subtitle_edit=True,
+        screen_subtitle_stable_mode=False,
+    )
 
 
 class _NoCache:
@@ -460,6 +475,93 @@ def test_coverage_gap_blocks_single_long_uncovered_span():
         issue["code"] == "coverage_gap_unverified"
         for issue in editor.last_validation_summary["warnings"]
     )
+
+
+def _coverage_segment(text, start, end, subtitle_id, word_start, word_end):
+    segment = ASRDataSeg(text, start, end, "中文")
+    segment.subtitle_id = subtitle_id
+    segment.word_start = word_start
+    segment.word_end = word_end
+    segment.stable_word_start_ms = word_start
+    segment.stable_word_end_ms = word_end
+    return segment
+
+
+def test_final_display_coverage_bridges_short_continuous_source_gap():
+    editor = _editor()
+    source = [
+        ASRDataSeg("Continuous", 0, 1000),
+        ASRDataSeg("source speech.", 1100, 3000),
+    ]
+    segments = [
+        _coverage_segment("First subtitle.", 0, 1000, "S0001", 0, 1000),
+        _coverage_segment("Second subtitle.", 1600, 3000, "S0002", 1100, 3000),
+    ]
+
+    repaired = editor._reconcile_final_display_coverage(segments, source)
+
+    assert repaired[0].end_time == 1300
+    assert repaired[1].start_time == 1300
+    assert repaired[0].text == segments[0].text
+    assert repaired[1].translated_text == segments[1].translated_text
+    assert repaired[0].subtitle_id == "S0001"
+    assert repaired[1].subtitle_id == "S0002"
+    assert repaired[0].stable_word_end_ms == 1000
+    assert repaired[1].stable_word_start_ms == 1100
+    assert editor._display_coverage_repairs[0]["code"] == "continuous_source_coverage_bridge"
+
+
+def test_final_display_coverage_does_not_bridge_long_gap():
+    editor = _editor()
+    source = [ASRDataSeg("Continuous source speech.", 0, 4000)]
+    segments = [
+        _coverage_segment("First subtitle.", 0, 1000, "S0001", 0, 1000),
+        _coverage_segment("Second subtitle.", 2200, 4000, "S0002", 1050, 4000),
+    ]
+
+    repaired = editor._reconcile_final_display_coverage(segments, source)
+
+    assert [(item.start_time, item.end_time) for item in repaired] == [(0, 1000), (2200, 4000)]
+    assert editor._display_coverage_repairs == []
+    assert editor._display_coverage_unresolved[0]["reason"] == "gap_exceeds_auto_repair_limit"
+
+
+def test_final_display_coverage_preserves_real_word_pause():
+    editor = _editor()
+    source = [ASRDataSeg("Source segment with a pause.", 0, 3000)]
+    segments = [
+        _coverage_segment("First subtitle.", 0, 1000, "S0001", 0, 1000),
+        _coverage_segment("Second subtitle.", 1500, 3000, "S0002", 1600, 3000),
+    ]
+
+    repaired = editor._reconcile_final_display_coverage(segments, source)
+
+    assert [(item.start_time, item.end_time) for item in repaired] == [(0, 1000), (1500, 3000)]
+    assert editor._display_coverage_repairs == []
+    assert editor._display_coverage_unresolved[0]["reason"] == "frozen_word_pause_exceeds_limit"
+
+
+def test_final_time_alignment_coverage_bridge_runs_with_preserved_alignment_timing():
+    editor = _editor()
+    source = ASRDataSeg("Continuous source speech.", 0, 3000)
+    editor._active_source_segments_by_id = {1: source}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._compress_fast_chinese_segments = lambda segments, **kwargs: list(segments)
+    editor._align_segment_translation_punctuation = lambda segments: list(segments)
+    editor._report_subtitle_coverage_gaps = lambda *args, **kwargs: None
+    editor._write_stable_pipeline_artifacts = lambda **kwargs: None
+    asr_data = ASRData(
+        [
+            _coverage_segment("First subtitle.", 0, 1000, "S0001", 0, 1000),
+            _coverage_segment("Second subtitle.", 1600, 3000, "S0002", 1100, 3000),
+        ]
+    )
+
+    repaired = editor.repair_after_final_time_alignment(asr_data, preserve_aligned_timing=True)
+
+    assert [(item.start_time, item.end_time) for item in repaired.segments] == [(0, 1300), (1300, 3000)]
+    assert [item.subtitle_id for item in repaired.segments] == ["S0001", "S0002"]
 
 
 def test_chinese_reading_speed_error_is_reported_but_not_blocking():
@@ -1232,6 +1334,19 @@ def test_abbreviation_name_boundary_is_syntax_warning():
     assert "abbreviation_name_split" in _syntax_boundary_reasons("Dr.", "Smith explains it.")
 
 
+def test_terminal_punctuation_wins_over_token_only_determiner_heuristic():
+    words = "The team built a laboratory for this. They gathered 55 940 sentences.".split()
+    editor = _marker_editor(words, max_words=16)
+    this_index = words.index("this.")
+
+    evaluation = editor._evaluate_stable_cut_boundary(this_index, this_index + 1)
+
+    assert evaluation["legal"] is True
+    assert evaluation["hard_issues"] == []
+    assert evaluation["soft_issues"] == []
+    assert not editor._is_unambiguous_sentence_terminal("Dr.", "Smith explains it.")
+
+
 def test_caption_audit_uses_16_word_hard_limit():
     with tempfile.TemporaryDirectory() as temp_dir:
         srt = Path(temp_dir) / "soft-limit.srt"
@@ -1262,6 +1377,55 @@ def test_caption_audit_uses_16_word_hard_limit():
     assert overlong[0]["index"] == 2
     assert overlong[0]["word_count"] == 17
     assert overlong[0]["hard_limit"] == 16
+
+
+def test_caption_audit_accepts_allowed_plus_discourse_overflow():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        srt = Path(temp_dir) / "plus-overflow.srt"
+        srt.write_text(
+            "\n".join(
+                [
+                    "1",
+                    "00:00:00,000 --> 00:00:04,000",
+                    "Plus, breaking away from corporate hubs kind of broke the social pressure to climb that traditional ladder.",
+                    "此外，脱离企业中心也在一定程度上摆脱了传统晋升的社会压力。",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        report = audit_srt(srt)
+
+    assert not [issue for issue in report["errors"] if issue["code"] == "overlong_english"]
+
+
+def test_caption_audit_treats_borderline_chinese_speed_as_warning_not_blocker():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        srt = Path(temp_dir) / "chinese-speed.srt"
+        srt.write_text(
+            "\n".join(
+                [
+                    "1",
+                    "00:00:00,000 --> 00:00:01,340",
+                    "I can see why you'd think that. I mean,",
+                    "我理解你为什么这么想。我的意思是，",
+                    "",
+                    "2",
+                    "00:00:02,000 --> 00:00:03,340",
+                    "This is deliberately too dense.",
+                    "这是一个故意设置得过于密集的中文字幕测试文本。",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        report = audit_srt(srt)
+
+    speed_errors = [issue for issue in report["errors"] if issue["code"] == "chinese_speed_error"]
+    speed_warnings = [issue for issue in report["warnings"] if issue["code"] == "chinese_speed_warning"]
+    assert [issue["index"] for issue in speed_errors] == [2]
+    assert [issue["index"] for issue in speed_warnings] == [1]
 
 
 def test_caption_audit_keeps_numeric_percent_chinese_line():
@@ -1320,6 +1484,19 @@ def test_short_but_severe_chinese_speed_triggers_repair():
     )
 
     assert editor._is_severe_chinese_speed(seg)
+
+
+def test_borderline_chinese_speed_does_not_trigger_render_blocker():
+    editor = _id_editor()
+    seg = ASRDataSeg(
+        "I can see why you'd think that. I mean,",
+        0,
+        1340,
+        "我理解你为什么这么想。我的意思是，",
+    )
+
+    # 15 Chinese characters / 1.34s = about 11.19 chars/s: review, not block.
+    assert not editor._is_severe_chinese_speed(seg)
 
 
 def test_short_subtitle_gets_minimum_display_duration_when_room_allows():
@@ -1395,6 +1572,19 @@ def test_standalone_discourse_marker_attaches_to_immediate_next_sentence():
     assert len(merged) == 1
     assert merged[0].original == "I mean, this market changed."
     assert editor._discourse_marker_orphans == []
+
+
+def test_plus_marker_keeps_a_complete_one_word_overflow_unit():
+    words = "Plus, breaking away from corporate hubs kind of broke the social pressure to climb that traditional ladder.".split()
+    editor = _marker_editor(words, max_words=16)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, len(words) - 1, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 1
+    assert merged[0].original == " ".join(words)
+    assert ScreenSubtitleEditor._word_count(merged[0].original) == 17
+    assert editor._is_allowed_plus_discourse_overflow(merged[0].original, 17, 16)
 
 
 def test_trailing_standalone_discourse_marker_attaches_to_previous_sentence():
@@ -1813,6 +2003,67 @@ def test_short_verb_possessive_complement_boundary_is_hard_when_syntax_marks_it(
     assert not second["legal"]
 
 
+def test_parser_blocks_direct_verb_particle_boundary():
+    editor = _marker_editor(
+        ["AI", "is", "stepping", "in", "and", "permanently", "filling", "the", "gap."]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(2, 3)
+
+    assert "verb_particle_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_blocks_compact_coordinated_subject_boundary():
+    editor = _marker_editor(
+        ["why", "you", "and", "so", "many", "others", "support", "this", "change."]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "coordinated_subject_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_blocks_short_dative_object_start_boundary():
+    editor = _marker_editor(
+        ["the", "company", "gives", "you", "a", "completely", "different", "lens."]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(3, 4)
+
+    assert "short_verb_complement_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_blocks_numeric_range_boundaries():
+    editor = _marker_editor(
+        ["the", "stock", "plummeted", "from", "36%", "to", "under", "10%", "in", "June."]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    for cut_after in (2, 3, 4, 5, 6):
+        evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+        assert "numeric_range_split" in evaluation["hard_issues"], evaluation
+        assert not evaluation["legal"]
+
+
+def test_pre_id_candidate_gate_rejects_new_hard_syntax_boundary():
+    editor = _marker_editor(["they", "made", "it", "to", "the", "top."], max_words=6)
+    editor._prepare_syntax_cut_hints()
+    old_items = [_word_item(editor, 0, 5)]
+    candidate = [_word_item(editor, 0, 1), _word_item(editor, 2, 5)]
+
+    decision = editor._can_apply_pre_id_repair_candidate(old_items, candidate)
+
+    assert decision["accepted"] is False
+    assert "short_verb_complement_split" in decision["hard_issues"]
+    assert decision["old_word_range"] == decision["new_word_range"] == [0, 5]
+
+
 def test_long_object_still_allows_legal_boundary():
     editor = _marker_editor(
         [
@@ -1872,6 +2123,114 @@ def test_final_pre_id_repair_removes_known_hard_boundary():
     assert editor._pre_id_boundary_repairs
 
 
+def test_final_pre_id_keeps_discourse_marker_with_following_sentence_after_terminal_over():
+    words = [
+        "But", "the", "thing", "I", "keep", "coming", "back", "to", "is", "how",
+        "fast", "this", "is", "evolving.", "I", "mean,", "the", "Delve", "era", "is",
+        "over.", "Why", "does", "its", "style", "change", "so", "rapidly?",
+    ]
+    editor = _marker_editor(words, max_words=16)
+    items = [
+        _word_item(editor, 0, 13, 1),
+        _word_item(editor, 14, 20, 2),
+        _word_item(editor, 21, 27, 3),
+    ]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [item.original for item in items]
+    assert repaired[1].original == "I mean, the Delve era is over."
+    assert not any(item.original.endswith("I mean,") for item in repaired)
+    assert "preposition_object_split" not in editor._evaluate_item_boundary(
+        repaired[1], repaired[2]
+    )["hard_issues"]
+
+
+def test_final_pre_id_rebalances_leading_nonfinite_dependent_prefix():
+    words = (
+        "Exactly. Plus, it doesn't naturally quote human experts unless forced to, "
+        "so it doesn't need all those attributive commas and quotation marks either."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    items = [_word_item(editor, 0, 7, 1), _word_item(editor, 8, len(words) - 1, 2)]
+    word_times_before = [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [
+        "Exactly. Plus, it doesn't naturally quote human experts unless forced to,",
+        "so it doesn't need all those attributive commas and quotation marks either.",
+    ]
+    assert [item.word_start for item in repaired] == [0, 11]
+    assert [item.word_end for item in repaired] == [10, len(words) - 1]
+    assert editor._pre_id_boundary_repairs[0]["repair_reason"] == (
+        "leading_nonfinite_dependent_prefix_rebalanced"
+    )
+    assert editor._pre_id_boundary_repairs[0]["word_order_preserved"] is True
+    assert editor._pre_id_boundary_repairs[0]["word_coverage_preserved"] is True
+    segments = []
+    for item in repaired:
+        segment = ASRDataSeg(item.original, 0, 1000, "中文")
+        segment.word_start = item.word_start
+        segment.word_end = item.word_end
+        segments.append(segment)
+    assert editor._bad_cut_issues(segments) == []
+    assert editor._syntax_boundary_audit_issues(segments) == []
+    assert [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ] == word_times_before
+
+
+def test_final_pre_id_keeps_finite_conditional_introduction_in_its_own_cue():
+    words = (
+        "The speaker sets up an example if I normally say, uh, "
+        "I'm going to eat a sandwich for lunch."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    left = _word_item(editor, 0, 5, 1)
+    right = _word_item(editor, 6, len(words) - 1, 2)
+
+    assert editor._leading_nonfinite_dependent_prefix_end(right) is None
+    assert editor._rebalance_leading_nonfinite_dependent_prefixes([left, right]) == [left, right]
+
+
+def test_leading_nonfinite_dependent_prefix_rebalance_respects_long_pause():
+    words = (
+        "Exactly. Plus, it doesn't naturally quote human experts unless forced to, "
+        "so it doesn't need all those attributive commas and quotation marks either."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    for entry in editor._active_word_entries[8:]:
+        entry["start_time"] += 600
+        entry["end_time"] += 600
+    items = [_word_item(editor, 0, 7, 1), _word_item(editor, 8, len(words) - 1, 2)]
+
+    assert editor._rebalance_leading_nonfinite_dependent_prefixes(items) == items
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_leading_nonfinite_dependent_prefix_rebalance_respects_speaker_change():
+    words = (
+        "Exactly. Plus, it doesn't naturally quote human experts unless forced to, "
+        "so it doesn't need all those attributive commas and quotation marks either."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    editor._active_source_segments_by_id[1].speaker = "A"
+    editor._active_source_segments_by_id[2].speaker = "B"
+    items = [_word_item(editor, 0, 7, 1), _word_item(editor, 8, len(words) - 1, 2)]
+
+    assert editor._rebalance_leading_nonfinite_dependent_prefixes(items) == items
+    assert editor._pre_id_boundary_repairs == []
+
+
 def test_final_pre_id_repair_does_not_cross_speaker_change():
     words = ["founder", "of", "a", "non-profit", "built", "trust."]
     editor = _marker_editor(words, max_words=14)
@@ -1883,6 +2242,52 @@ def test_final_pre_id_repair_does_not_cross_speaker_change():
 
     assert [item.original for item in repaired] == [item.original for item in items]
     assert editor._pre_id_boundary_repairs[-1]["unresolved_hard_issue"] is True
+
+
+def test_final_pre_id_rejects_noop_repartition_without_iteration_loop():
+    editor = _marker_editor(["founder", "of", "a", "non-profit"], max_words=14)
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, 3, 2)]
+    evaluation = editor._evaluate_item_pair_for_final_boundary(items[0], items[1])
+    assert not evaluation["legal"]
+
+    with patch.object(
+        editor,
+        "_repartition_pre_id_window",
+        return_value=(list(items), [{"cuts": [[1, 2]]}]),
+    ):
+        repaired = editor._repair_pre_id_boundary_window(items, 0, evaluation)
+
+    assert repaired is None
+
+
+def test_verb_directional_adverb_preposition_boundary_is_hard_when_syntax_marks_it():
+    editor = _marker_editor(
+        [
+            "But",
+            "the",
+            "thing",
+            "I",
+            "keep",
+            "coming",
+            "back",
+            "to",
+            "is",
+            "how",
+            "fast",
+            "this",
+            "is",
+            "evolving.",
+        ]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    verb_adverb = editor._evaluate_stable_cut_boundary(5, 6)
+    adverb_preposition = editor._evaluate_stable_cut_boundary(6, 7)
+
+    assert "verb_adverb_preposition_split" in verb_adverb["hard_issues"]
+    assert "verb_adverb_preposition_split" in adverb_preposition["hard_issues"]
+    assert not verb_adverb["legal"]
+    assert not adverb_preposition["legal"]
 
 
 def test_short_display_merge_keeps_original_when_no_safe_boundary_exists():
@@ -2166,6 +2571,27 @@ def test_boundary_snapshots_record_stage_changes_before_subtitle_ids():
     assert "boundary_score" in payload["stages"][0]["boundaries"][0]
 
 
+def test_final_stable_english_boundaries_do_not_change_for_video_layout():
+    editor = _marker_editor(
+        ["This", "is", "a", "long", "but", "grammatical", "English", "subtitle", "sentence."]
+    )
+
+    items = editor._finalize_stable_english_boundaries([])
+
+    assert " ".join(item.original for item in items) == (
+        "This is a long but grammatical English subtitle sentence."
+    )
+    assert all(item.subtitle_id is None for item in items)
+    assert [stage["stage"] for stage in editor._boundary_snapshots] == [
+        "_stable_cut_items",
+        "_merge_standalone_discourse_markers",
+        "_merge_short_display_segments",
+        "_rebalance_edge_discourse_markers",
+        "_validate_and_repair_final_pre_id_boundaries",
+        "_apply_visual_reading_budget",
+    ]
+
+
 def test_final_gate_blocks_particle_preposition_complement_split():
     editor = _marker_editor(["straight", "into", "the", "absolute", "tundra"])
 
@@ -2173,6 +2599,118 @@ def test_final_gate_blocks_particle_preposition_complement_split():
 
     assert "particle_or_preposition_complement_split" in evaluation["hard_issues"]
     assert not evaluation["legal"]
+
+
+def test_final_gate_keeps_preposition_object_boundary_illegal_after_long_pause():
+    editor = _marker_editor(["optimism", "about", "finding", "a", "good", "job."])
+    editor._active_word_entries[2]["start_time"] = editor._active_word_entries[1]["end_time"] + 500
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert evaluation["pause_ms"] == 500
+    assert "preposition_object_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_stable_cut_keeps_preposition_object_phrase_together_in_long_sentence():
+    text = (
+        "I mean Gallup data shows optimism among 15 to 34 year-olds "
+        "about finding a good job plummeted from 75% to just 43% recently."
+    )
+
+    parts = _split_text(text, max_words=16)
+
+    assert all(not part.rstrip().lower().endswith("about") for part in parts)
+    assert all(not part.lstrip().lower().startswith("finding") for part in parts)
+    assert "about finding a good job" in " ".join(parts).lower()
+
+
+def test_parser_confirmed_verb_object_boundary_stays_illegal_after_long_pause():
+    editor = _marker_editor(
+        ["they", "are", "setting", "up", "large", "new", "facilities."]
+    )
+    editor._prepare_syntax_cut_hints()
+    editor._active_word_entries[4]["start_time"] = editor._active_word_entries[3]["end_time"] + 650
+
+    evaluation = editor._evaluate_stable_cut_boundary(3, 4)
+
+    assert evaluation["pause_ms"] == 650
+    assert "short_verb_object_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_blocks_clause_introducer_from_ending_a_cue():
+    editor = _marker_editor(
+        [
+            "the", "question", "has", "to", "do", "with", "how", "these",
+            "systems", "are", "funded.",
+        ]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(6, 7)
+
+    assert "clause_introducer_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_blocks_verb_from_its_preposition_complement():
+    editor = _marker_editor(
+        ["investors", "got", "liquidated", "in", "that", "doom", "loop."]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(2, 3)
+
+    assert "verb_preposition_complement_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_blocks_verb_from_numeric_result_expression():
+    editor = _marker_editor(
+        [
+            "the", "stock", "kept", "crashing", "52%", "from", "its",
+            "June", "peak.",
+        ]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    verb_to_result = editor._evaluate_stable_cut_boundary(3, 4)
+    result_to_qualifier = editor._evaluate_stable_cut_boundary(4, 5)
+
+    assert "verb_numeric_result_split" in verb_to_result["hard_issues"]
+    assert "numeric_result_qualifier_split" in editor._syntax_hard_cut_issues[(4, 5)]
+    assert not verb_to_result["legal"]
+    assert not result_to_qualifier["legal"]
+
+
+def test_parser_mapping_keeps_numeric_result_after_hyphenated_ledger_word():
+    editor = _marker_editor(
+        [
+            "even", "a", "six-fold", "profit", "jump", "wasn't", "enough",
+            "to", "stop", "the", "stock", "from", "crashing", "52%",
+            "from", "its", "June", "peak.",
+        ]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(12, 13)
+
+    assert "verb_numeric_result_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_stable_cut_prefers_normal_limit_when_a_legal_boundary_exists():
+    words = [
+        "One", "two", "three", "four", "five", "six", "seven", "eight",
+        "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+        "sixteen", "seventeen", "eighteen", "nineteen", "twenty.",
+    ]
+    editor = _marker_editor(words, max_words=16)
+
+    ranges = editor._stable_word_ranges_for_span((0, len(words) - 1))
+
+    assert [end - start + 1 for start, end in ranges] == [16, 4]
 
 
 def test_final_gate_soft_flags_heuristic_short_verb_object_split():
@@ -2209,6 +2747,15 @@ def test_final_gate_blocks_numeric_unit_or_noun_split():
 
     assert "numeric_unit_or_noun_split" in evaluation["hard_issues"]
     assert not evaluation["legal"]
+
+
+def test_numeric_sentence_boundary_is_not_repaired_as_a_numeric_phrase():
+    editor = _marker_editor(["2019.", "Right."])
+
+    evaluation = editor._evaluate_stable_cut_boundary(0, 1)
+
+    assert evaluation["legal"]
+    assert "numeric_unit_or_noun_split" not in evaluation["hard_issues"]
 
 
 def test_final_gate_soft_flags_heuristic_compound_noun_split():
@@ -2462,7 +3009,7 @@ def test_podcast_template_prefers_stable_manifest_subtitle():
         assert Path(resolved) == stable
 
 
-def test_podcast_template_ignores_blocked_stable_manifest_subtitle():
+def test_podcast_template_blocks_failed_stable_manifest_subtitle():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         stable = root / "stable-final-original-top.srt"
@@ -2480,9 +3027,42 @@ def test_podcast_template_ignores_blocked_stable_manifest_subtitle():
             encoding="utf-8",
         )
 
+        try:
+            resolve_podcast_template_subtitle("C:/tmp/222.m4a", str(ass))
+            assert False, "blocked manifest must stop podcast-template synthesis"
+        except RuntimeError as exc:
+            assert "阻止" in str(exc)
+
+
+def test_podcast_template_reuses_legacy_reading_speed_manifest_when_revalidated():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        stable = root / "stable-final-original-top.srt"
+        manifest = root / "stable-final-manifest.json"
+        ass = root / "output.ass"
+        stable.write_text(
+            "1\n00:00:00,000 --> 00:00:01,340\n"
+            "I can see why you'd think that. I mean,\n"
+            "我理解你为什么这么想。我的意思是，\n",
+            encoding="utf-8-sig",
+        )
+        ass.write_text("", encoding="utf-8")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "render_blocked": True,
+                    "validation_summary": {
+                        "errors": [{"code": "reading_speed_error"}]
+                    },
+                    "paths": {"original_top_srt": str(stable)},
+                }
+            ),
+            encoding="utf-8",
+        )
+
         resolved = resolve_podcast_template_subtitle("C:/tmp/222.m4a", str(ass))
 
-        assert Path(resolved) == ass
+        assert Path(resolved) == stable
 
 
 def test_podcast_template_preserves_full_media_duration_when_subtitles_end_early():
@@ -2560,6 +3140,56 @@ def test_podcast_template_uses_frozen_task_configuration():
     assert kwargs["date_text"] == "Jul 31st 2026"
 
 
+def test_article_cover_ignores_legacy_date_text():
+    article_image = Image.new(
+        "RGBA",
+        (
+            podcast_learning_video.acx(854),
+            podcast_learning_video.acy(480),
+        ),
+        (18, 54, 86, 255),
+    )
+    date_area = podcast_learning_video.article_rect(673, 0, 854, 44)
+
+    with_legacy_date = podcast_learning_video.decorate_article_cover(
+        article_image,
+        "Jul 31st 2026",
+    )
+    with_different_legacy_date = podcast_learning_video.decorate_article_cover(
+        article_image,
+        "December 1st 2030",
+    )
+
+    assert with_legacy_date.tobytes() == with_different_legacy_date.tobytes()
+    assert with_legacy_date.crop(date_area).tobytes() == article_image.crop(date_area).tobytes()
+
+
+def test_article_opening_title_shrinks_to_keep_a_normal_long_title_in_three_lines():
+    title = "如何识别人工智能写作，以及它会怎样改变我们的学习方式"
+    image = Image.new("RGBA", (1920, 1080))
+    draw = ImageDraw.Draw(image)
+
+    title_font, lines = podcast_learning_video.fit_article_wrapped_font(
+        draw,
+        title,
+        500,
+        3,
+        52,
+        24,
+        lambda size: podcast_learning_video.article_cjk_font(size, 700),
+        podcast_learning_video.wrap_article_mixed_text,
+    )
+
+    assert title_font.size >= podcast_learning_video.acx(24)
+    assert "".join(lines) == title
+    assert len(lines) <= 3
+    assert all(
+        podcast_learning_video.text_w(draw, line, title_font)
+        <= podcast_learning_video.acx(500)
+        for line in lines
+    )
+
+
 def test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths():
     article_image = Image.new(
         "RGB",
@@ -2606,6 +3236,112 @@ def test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths():
     assert any(xy[0] == 960 and anchor == "ma" for xy, anchor in chinese_centers)
 
 
+def test_caption_wrapper_never_orphans_a_leading_connector_to_balance_two_lines():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    text = "And the data certainly points to an isolationist trend."
+
+    font = podcast_learning_video.fit_article_en_font(draw, text, 1455)
+    lines = podcast_learning_video.wrap_en(draw, text, font, podcast_learning_video.acx(1455))
+
+    assert lines[0] != "And"
+    assert lines[0].startswith("And the ")
+    assert all(len(line.split()) >= 3 for line in lines)
+
+
+def test_caption_wrapper_preserves_preposition_and_infinitive_phrase_edges():
+    chance_words = "It increases the chance of losing the thread of the sentence.".split()
+    lead_words = "Okay, but how does token prediction lead to fewer commas?".split()
+
+    assert podcast_learning_video._caption_line_break_penalty(chance_words, 4) > 0
+    assert podcast_learning_video._caption_line_break_penalty(chance_words, 5) > 0
+    assert podcast_learning_video._caption_line_break_penalty(chance_words, 6) < 1_000
+
+    infinitive_start = lead_words.index("to")
+    assert podcast_learning_video._caption_line_break_penalty(lead_words, infinitive_start) > 0
+    assert podcast_learning_video._caption_line_break_penalty(lead_words, infinitive_start + 1) > 0
+
+
+def test_caption_wrapper_scales_before_breaking_a_hyphenated_compound():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    text = "Think of the AI as a stand-up comedian with no internal sense of humor."
+
+    font = podcast_learning_video.fit_article_en_font(draw, text, 1455)
+    lines = podcast_learning_video.wrap_article_en_subtitle(
+        draw, text, font, podcast_learning_video.acx(1455)
+    )
+
+    assert all(not line.rstrip().endswith("stand-up") for line in lines)
+    assert not podcast_learning_video._has_discouraged_caption_break(text, lines)
+
+
+def test_article_template_does_not_truncate_a_long_english_subtitle():
+    article_image = Image.new(
+        "RGB",
+        (
+            podcast_learning_video.acx(854),
+            podcast_learning_video.acy(480),
+        ),
+    )
+    text = (
+        "Yeah. Our report from the American Enterprise Institute details how massive "
+        "corporations essentially bought out the American entrepreneurial spirit."
+    )
+    cue = podcast_learning_video.Cue(1, 0.0, 2.0, text, "中文译文。", "male")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    en_font = podcast_learning_video.fit_article_en_font(draw, text, 1455)
+    en_lines = podcast_learning_video.wrap_article_en_subtitle(
+        draw, text, en_font, podcast_learning_video.acx(1455)
+    )
+    rendered_lines = []
+    expected_lines = set(en_lines)
+    original_draw_text = podcast_learning_video.draw_stroked_text
+
+    def capture_draw_text(draw, xy, line, *args, **kwargs):
+        if line in expected_lines:
+            rendered_lines.append(line)
+        return original_draw_text(draw, xy, line, *args, **kwargs)
+
+    with patch.object(
+        podcast_learning_video, "draw_stroked_text", side_effect=capture_draw_text
+    ):
+        podcast_learning_video.draw_article_frame(article_image, cue, vocab_plan={})
+
+    assert en_font.size == podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_SUBTITLE_EN_MIN_SIZE
+    )
+    assert len(en_lines) == 3
+    assert en_lines[0].endswith("Institute")
+    assert en_lines[1].endswith("out")
+    assert en_lines[2].startswith("the ")
+    assert len(en_lines[-1].split()) >= 3
+    assert " ".join(en_lines) == text
+    assert " ".join(rendered_lines) == text
+
+
+def test_standard_chinese_subtitle_font_uses_48_then_46_before_two_lines():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    width = podcast_learning_video.scx(1459)
+
+    short_font = podcast_learning_video.fit_standard_zh_font(draw, "这是一句简短的中文字幕。", width)
+    reduced_font = podcast_learning_video.fit_standard_zh_font(draw, "甲" * 32, width)
+    wrapped_font = podcast_learning_video.fit_standard_zh_font(draw, "甲" * 33, width)
+
+    assert short_font.size == 48
+    assert reduced_font.size == 46
+    assert len(podcast_learning_video.wrap_zh(draw, "甲" * 32, reduced_font, width)) == 1
+    assert wrapped_font.size == 46
+    assert len(podcast_learning_video.wrap_zh(draw, "甲" * 33, wrapped_font, width)) == 2
+
+
+def test_article_template_scaled_geometry_stays_on_integer_pixels():
+    values = [16, 31, 68, 854, 900, 916, 1455, 1584]
+
+    assert all(isinstance(podcast_learning_video.acx(value), int) for value in values)
+    assert all(isinstance(podcast_learning_video.acy(value), int) for value in values)
+    assert isinstance(podcast_learning_video.acx(16), int)
+    assert isinstance(podcast_learning_video.acy(16), int)
+
+
 def test_article_template_tip_font_and_wrapper_support_chinese_text():
     font = podcast_learning_video.article_mixed_font(24)
     assert Path(font.path).name.lower() == "msyh.ttc"
@@ -2621,6 +3357,723 @@ def test_article_template_tip_font_and_wrapper_support_chinese_text():
     assert "".join(lines).replace(" ", "") == "playbook不再是体育术语，常比喻一套现成的宣传策略。"
     assert len(lines) >= 2
     assert not any(line in "，。！？；：、" for line in lines)
+
+
+def test_article_opening_title_accent_matches_the_visible_title_height():
+    image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+    rect = podcast_learning_video.article_rect(916, 16, 1584, 530)
+    title = "创业者的天堂"
+    podcast_learning_video.draw_article_opening_topic_panel(image, rect, title)
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    title_font, title_lines = podcast_learning_video.fit_article_wrapped_font(
+        draw,
+        title,
+        500,
+        3,
+        52,
+        24,
+        lambda size: podcast_learning_video.article_cjk_font(size, 700),
+        podcast_learning_video.wrap_article_mixed_text,
+    )
+    line_gap = int(title_font.size * 1.25)
+    block_height = max(line_gap, len(title_lines) * line_gap)
+    title_x = rect[0] + podcast_learning_video.acx(92)
+    first_y = (rect[1] + rect[3] - block_height) // 2
+    bounds = [
+        draw.textbbox((title_x, first_y + index * line_gap), line, font=title_font)
+        for index, line in enumerate(title_lines)
+    ]
+    expected_y0 = min(box[1] for box in bounds)
+    expected_y1 = max(box[3] for box in bounds)
+    accent_x = rect[0] + podcast_learning_video.acx(52)
+    accent_pixels = [
+        y
+        for y in range(rect[1], rect[3] + 1)
+        if image.getpixel((accent_x, y)) == podcast_learning_video.ARTICLE_BLUE
+    ]
+
+    assert (min(accent_pixels), max(accent_pixels)) == (expected_y0, expected_y1)
+
+
+def test_article_mixed_wrapper_rebalances_a_short_chinese_tail_line():
+    detail = "文中指年轻人通过自主创业来摆脱僵化职场困境的途径。"
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+    font, lines = podcast_learning_video.fit_article_wrapped_font(
+        draw,
+        detail,
+        500,
+        2,
+        26,
+        20,
+        lambda size: podcast_learning_video.article_cjk_font(size, 400),
+        podcast_learning_video.wrap_article_mixed_text,
+    )
+
+    assert lines == [
+        "文中指年轻人通过自主创业来",
+        "摆脱僵化职场困境的途径。",
+    ]
+    assert all(
+        podcast_learning_video.text_w(draw, line, font) <= podcast_learning_video.acx(500)
+        for line in lines
+    )
+
+
+def test_article_vocab_typography_uses_hanchan_tip_and_regular_definition():
+    assert Path(podcast_learning_video.article_tip_font(24).path).name == "ChillYunmoGothicMedium.otf"
+    assert Path(podcast_learning_video.article_en_font(24, 400).path).name == "ReadexPro-Regular.ttf"
+    assert Path(podcast_learning_video.article_cjk_font(24, 400).path).name == "ChillYunmoGothicRegular.otf"
+
+
+def test_vocab_highlight_keeps_attached_punctuation_but_not_whitespace():
+    line = 'seriously entertain the accusation, "then reconsider it"'
+    key = "seriously entertain the accusation"
+    end = podcast_learning_video.extend_highlight_to_trailing_punctuation(
+        line,
+        line.lower().index(key) + len(key),
+    )
+
+    assert line[:end] == "seriously entertain the accusation,"
+    assert line[end] == " "
+
+
+def test_standard_subtitle_highlight_colors_attached_punctuation():
+    line = "seriously entertain the accusation, before dismissing it"
+    key = "seriously entertain the accusation"
+    image = Image.new("RGBA", (1920, 1080))
+    draw = ImageDraw.Draw(image)
+    blue = podcast_learning_video.with_alpha(podcast_learning_video.BLUE, 255)
+
+    with patch.object(podcast_learning_video, "draw_subtitle_shadowed_text") as draw_text:
+        podcast_learning_video.draw_highlighted_line(
+            image,
+            draw,
+            960,
+            620,
+            line,
+            key,
+            podcast_learning_video.font(podcast_learning_video.FONT_GANTARI, 32, 600),
+        )
+
+    highlighted_text = [
+        call.args[3]
+        for call in draw_text.call_args_list
+        if call.args[5] == blue
+    ]
+    assert highlighted_text == ["seriously entertain the accusation,"]
+
+
+def test_article_subtitle_highlight_colors_attached_punctuation():
+    line = "seriously entertain the accusation,) before dismissing it"
+    key = "seriously entertain the accusation"
+    fill = (42, 63, 93, 255)
+    highlight_fill = (47, 111, 237, 255)
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+
+    with patch.object(podcast_learning_video, "draw_stroked_text") as draw_text:
+        podcast_learning_video.draw_highlighted_article_line(
+            draw,
+            960,
+            620,
+            line,
+            key,
+            podcast_learning_video.article_en_font(40, 600),
+            fill,
+            highlight_fill,
+        )
+
+    highlighted_text = [
+        call.args[2]
+        for call in draw_text.call_args_list
+        if call.args[4] == highlight_fill
+    ]
+    assert highlighted_text == ["seriously entertain the accusation,)"]
+
+
+def test_article_subtitle_highlight_does_not_add_an_underline_for_the_matched_phrase():
+    line = "Well, the government wound down those subsidies years ago."
+    key = "wound down"
+    fill = (42, 63, 93, 255)
+    highlight_fill = (47, 111, 237, 255)
+    image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image, "RGBA")
+    font = podcast_learning_video.article_en_font(48, 600)
+    center_x, text_y = 960, 620
+
+    podcast_learning_video.draw_highlighted_article_line(
+        draw,
+        center_x,
+        text_y,
+        line,
+        key,
+        font,
+        fill,
+        highlight_fill,
+    )
+
+    prefix = line[:line.lower().index(key)]
+    total_width = podcast_learning_video.text_w(draw, line, font)
+    highlighted_x = center_x - total_width // 2 + podcast_learning_video.text_w(draw, prefix, font)
+    box = draw.textbbox((highlighted_x, text_y), key, font=font)
+    underline_y = box[3] + podcast_learning_video.acy(6) + podcast_learning_video.acy(2)
+    underline_x = (box[0] + box[2]) // 2
+
+    assert image.getpixel((underline_x, underline_y)) == (0, 0, 0, 0)
+
+
+def test_vocab_highlight_ranges_cover_a_phrase_split_between_subtitle_lines():
+    lines = [
+        "Well, the government wound",
+        "down those subsidies years ago.",
+    ]
+
+    assert podcast_learning_video.highlight_ranges_for_lines(lines, "wound down") == [
+        (21, 26),
+        (0, 4),
+    ]
+
+
+def test_article_subtitle_keeps_the_active_phrase_on_one_line_when_possible():
+    text = "Well, the government wound down those subsidies years ago."
+    key = "wound down"
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+    font = podcast_learning_video.fit_article_en_font(draw, text, 1455)
+
+    lines = podcast_learning_video.wrap_en_preserving_highlight(
+        draw,
+        text,
+        font,
+        podcast_learning_video.acx(1455),
+        key,
+    )
+
+    assert " ".join(lines) == text
+    assert any(key in line for line in lines)
+    assert all(len(line.split()) >= 3 for line in lines)
+
+
+def test_vocab_card_plan_keeps_the_latest_full_card_until_replacement():
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 1.0, "A regulatory change.", "", "male"),
+        podcast_learning_video.Cue(2, 1.5, 2.5, "A crackdown begins.", "", "male"),
+        podcast_learning_video.Cue(3, 5.0, 6.0, "New compliance rules.", "", "male"),
+        podcast_learning_video.Cue(4, 10.0, 16.0, "A quiet transition.", "", "male"),
+        podcast_learning_video.Cue(5, 20.0, 21.0, "Algorithmic oversight.", "", "male"),
+        podcast_learning_video.Cue(6, 25.0, 26.0, "More regulatory rules.", "", "male"),
+    ]
+    candidates = {
+        1: {"key": "regulatory", "word": "Regulatory"},
+        2: {"key": "crackdown", "word": "Crackdown"},
+        3: {"key": "compliance", "word": "Compliance"},
+        5: {"key": "algorithmic", "word": "Algorithmic"},
+        6: {"key": "regulatory", "word": "Regulatory"},
+    }
+
+    plan = podcast_learning_video.schedule_vocab_card_plan(candidates, cues)
+
+    assert list(plan) == [1, 5]
+    assert podcast_learning_video.active_vocab_card(plan, cues[0], 0.5)["key"] == "regulatory"
+    assert podcast_learning_video.vocab_card_display_state(plan, cues[2], 5.0)[1] == "full"
+    assert podcast_learning_video.vocab_card_display_state(plan, cues[3], 13.0) == (plan[1], "full")
+    assert podcast_learning_video.vocab_card_display_state(plan, cues[4], 20.0) == (plan[5], "full")
+    assert podcast_learning_video.vocab_card_display_state(plan, None, 50.0) == (plan[5], "full")
+
+
+def test_article_vocab_card_uses_only_expression_gloss_and_concept_note():
+    image = Image.new(
+        "RGBA",
+        (podcast_learning_video.ARTICLE_WIDTH, podcast_learning_video.ARTICLE_HEIGHT),
+        (255, 255, 255, 255),
+    )
+    item = {
+        "word": "black-box algorithm",
+        "phonetic": "/ˈreɡ.jə.lə.tɔːr.i/",
+        "level": "TOEFL",
+        "pos": "adj.",
+        "meaning": "黑箱算法",
+        "definition": "Related to official rules or controls.",
+        "tip_en": "Often used before policy or approval.",
+        "tip_zh": "常放在 policy 等名词前。",
+        "card_type": "concept",
+        "detail": "能给出结论，却无法说明判断过程。",
+    }
+    with patch.object(podcast_learning_video, "draw_stroked_text") as draw_text:
+        podcast_learning_video.draw_article_vocab_card(
+            image,
+            item,
+            podcast_learning_video.article_rect(916, 16, 1584, 530),
+        )
+
+    labels = [call.args[2] for call in draw_text.call_args_list]
+    rendered_text = "".join(labels)
+    assert "black-box algorithm" in labels
+    assert "黑箱算法" in rendered_text
+    assert "能给出结论，却无法说明判断过程。" in rendered_text
+    assert "adj." not in rendered_text
+    assert "TOEFL" not in rendered_text
+    assert "IN CONTEXT" not in rendered_text
+    assert "Related to official rules or controls." not in rendered_text
+
+
+def test_vocab_prompt_requests_expression_card_fields_without_dictionary_metadata():
+    group = podcast_learning_video.VocabSemanticGroup(
+        "VG0001",
+        (1,),
+        0.0,
+        2.0,
+        "A hallmark of quality is consistency.",
+    )
+
+    prompt = podcast_learning_video.build_vocab_selection_prompt([group], 1)
+
+    assert "phrase" in prompt
+    assert "card_type" in prompt
+    assert "detail" in prompt
+    assert "音标" in prompt
+    assert "词性" in prompt
+    assert "tip_zh" not in prompt
+    assert "语义组" in prompt
+
+
+def test_vocab_plan_preserves_the_exact_phrase_from_its_subtitle():
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 2.0, "Long hours can take a toll on health.", "长时间工作会损害健康。", "male"),
+    ]
+    groups = podcast_learning_video.build_vocab_semantic_groups(cues)
+
+    plan = podcast_learning_video.normalize_vocab_plan(
+        [{
+            "group_id": "VG0001",
+            "cue_index": 1,
+            "phrase": "take a toll on",
+            "meaning": "对……造成损害",
+            "card_type": "standard",
+        }],
+        cues,
+        groups,
+    )
+
+    assert plan[1]["word"] == "take a toll on"
+    assert plan[1]["key"] == "take a toll on"
+
+
+def test_vocab_source_phrase_does_not_match_inside_a_larger_word():
+    cue = "She continues to out-earn her husband."
+
+    assert podcast_learning_video.find_vocab_source_phrase(cue, "earn") == ""
+    assert podcast_learning_video.find_vocab_source_phrase(cue, "out-earn") == "out-earn"
+
+
+def test_vocab_plan_limits_concept_cards_to_three_per_episode():
+    cues = [
+        podcast_learning_video.Cue(index, (index - 1) * 20.0, (index - 1) * 20.0 + 2.0, f"Concept {index} appears.", "", "male")
+        for index in range(1, 5)
+    ]
+    candidates = {
+        index: {
+            "key": f"concept {index}",
+            "word": f"Concept {index}",
+            "meaning": f"概念{index}",
+            "detail": "需要额外解释。",
+            "card_type": "concept",
+            "priority": 5,
+        }
+        for index in range(1, 5)
+    }
+
+    plan = podcast_learning_video.schedule_vocab_card_plan(candidates, cues)
+
+    assert sum(item["card_type"] == "concept" for item in plan.values()) == 3
+    assert plan[4]["card_type"] == "standard"
+    assert plan[4]["detail"] == ""
+
+
+def test_vocab_plan_keeps_each_llm_card_inside_its_frozen_group():
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 1.0, "The policy is designed", "", "male"),
+        podcast_learning_video.Cue(2, 1.0, 2.0, "to reduce regulatory risk.", "", "male"),
+        podcast_learning_video.Cue(3, 2.2, 3.2, "That is important.", "", "male"),
+    ]
+    groups = podcast_learning_video.build_vocab_semantic_groups(cues)
+    assert [group.cue_indices for group in groups] == [(1, 2), (3,)]
+    candidates = podcast_learning_video.normalize_vocab_plan(
+        [
+            {
+                "group_id": "VG0001",
+                "cue_index": 2,
+                "word": "regulatory",
+                "meaning": "监管的",
+            }
+        ],
+        cues,
+        groups,
+    )
+    plan = podcast_learning_video.schedule_vocab_card_plan(candidates, cues)
+    assert plan[2]["display_start"] == 1.0
+    assert podcast_learning_video.active_vocab_card(plan, cues[0], 0.5) is None
+    assert podcast_learning_video.active_vocab_card(plan, cues[1], 1.0)["key"] == "regulatory"
+    assert podcast_learning_video.active_vocab_card(plan, cues[2], 2.2)["key"] == "regulatory"
+    assert podcast_learning_video.active_vocab_card(plan, None, 2.2)["key"] == "regulatory"
+
+
+def test_vocab_card_meaning_keeps_only_compact_primary_gloss():
+    assert podcast_learning_video.compact_vocab_meaning(
+        "n. 破绽；暴露真相的线索（此处指暴露 AI 的明显特征）"
+    ) == "破绽；暴露真相的线索"
+    assert podcast_learning_video.compact_vocab_meaning(
+        "名词化（把动词或形容词变成名词的过程/结果）"
+    ) == "名词化"
+
+
+def test_vocab_plan_normalizes_verbose_model_meaning_before_rendering():
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 2.0, "A giveaway reveals the truth.", "", "male"),
+    ]
+    groups = podcast_learning_video.build_vocab_semantic_groups(cues)
+
+    plan = podcast_learning_video.normalize_vocab_plan(
+        [{
+            "group_id": "VG0001",
+            "cue_index": 1,
+            "word": "giveaway",
+            "meaning": "n. 破绽；暴露真相的线索（此处指暴露 AI 的明显特征）",
+        }],
+        cues,
+        groups,
+    )
+
+    assert plan[1]["meaning"] == "破绽；暴露真相的线索"
+
+
+def test_vocab_card_plan_skips_low_priority_model_candidates():
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 2.0, "A marginal word.", "", "male"),
+        podcast_learning_video.Cue(2, 12.0, 14.0, "A central concept.", "", "male"),
+    ]
+    plan = podcast_learning_video.schedule_vocab_card_plan(
+        {
+            1: {"key": "marginal", "word": "Marginal", "priority": 2},
+            2: {"key": "central", "word": "Central", "priority": 5},
+        },
+        cues,
+    )
+
+    assert list(plan) == [2]
+    assert plan[2]["priority"] == 5
+
+
+def test_vocabulary_card_target_is_20_for_a_sixteen_minute_episode():
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 2.0, "Opening.", "", "male"),
+        podcast_learning_video.Cue(2, 958.0, 960.0, "Closing.", "", "female"),
+    ]
+    assert podcast_learning_video.vocabulary_card_target(cues) == 20
+
+
+def test_article_template_does_not_fallback_to_per_subtitle_vocab_lookup():
+    article_image = Image.new(
+        "RGB",
+        (podcast_learning_video.acx(854), podcast_learning_video.acy(480)),
+    )
+    cue = podcast_learning_video.Cue(
+        1,
+        0.0,
+        2.0,
+        "A regulatory change.",
+        "一次监管变化。",
+        "male",
+    )
+    with patch.object(podcast_learning_video, "find_vocab", return_value={"key": "regulatory"}) as fallback, \
+         patch.object(podcast_learning_video, "draw_article_vocab_card") as draw_card:
+        podcast_learning_video.draw_article_frame(
+            article_image,
+            cue,
+            vocab_plan={},
+            show_vocab=True,
+            display_time=0.5,
+        )
+
+    assert not fallback.called
+    assert not draw_card.called
+
+
+def test_vocab_generation_keeps_successful_batches_when_one_batch_fails():
+    from types import SimpleNamespace
+
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 2.0, "An obscure signal appeared.", "出现了一个晦涩信号。", ""),
+        podcast_learning_video.Cue(2, 2.1, 4.0, "The pattern is persistent.", "这种模式持续存在。", ""),
+    ]
+    groups = [
+        podcast_learning_video.VocabSemanticGroup("VG0001", (1,), 0.0, 2.0, cues[0].en),
+        podcast_learning_video.VocabSemanticGroup("VG0002", (2,), 2.1, 4.0, cues[1].en),
+    ]
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls <= 2:
+                raise RuntimeError("temporary provider failure")
+            payload = [{
+                "group_id": "VG0002",
+                "cue_index": 2,
+                "word": "persistent",
+                "phonetic": "/pəˈsɪstənt/",
+                "level": "IELTS",
+                "pos": "adj.",
+                "meaning": "持续的",
+                "definition": "Continuing for a long time.",
+                "tip_en": "A persistent pattern continues over time.",
+                "tip_zh": "表示持续存在。",
+            }]
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    messages = []
+    with tempfile.TemporaryDirectory() as raw:
+        subtitle_path = Path(raw) / "sample.srt"
+        subtitle_path.write_text("", encoding="utf-8")
+        with patch.object(podcast_learning_video, "build_vocab_semantic_groups", return_value=groups), patch.object(
+            podcast_learning_video, "split_vocab_groups_for_requests", return_value=[[groups[0]], [groups[1]]]
+        ), patch.object(podcast_learning_video, "vocabulary_card_target", return_value=2), patch.object(
+            podcast_learning_video, "current_llm_config", return_value=("https://example.test/v1", "key", "test-model")
+        ), patch.object(podcast_learning_video, "OpenAI", return_value=client), patch.object(
+            podcast_learning_video, "CACHE_PATH", Path(raw) / "cache"
+        ):
+            plan = podcast_learning_video.load_or_generate_vocab_plan(
+                subtitle_path,
+                cues,
+                True,
+                progress_callback=lambda _, message: messages.append(message),
+            )
+
+    assert 2 in plan
+    assert 1 not in plan
+    assert any("部分生成完成" in message for message in messages)
+
+
+def test_empty_vocab_cache_is_regenerated_instead_of_reused():
+    from types import SimpleNamespace
+
+    cue = podcast_learning_video.Cue(
+        1, 0.0, 2.0, "An obscure signal appeared.", "出现了一个晦涩信号。", ""
+    )
+    group = podcast_learning_video.VocabSemanticGroup(
+        "VG0001", (1,), 0.0, 2.0, cue.en
+    )
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            payload = [{
+                "group_id": "VG0001",
+                "cue_index": 1,
+                "word": "obscure",
+                "phonetic": "/əbˈskjʊr/",
+                "level": "IELTS",
+                "pos": "adj.",
+                "meaning": "晦涩的",
+                "definition": "Not well known or difficult to understand.",
+                "tip_en": "Obscure can describe an idea that is hard to grasp.",
+                "tip_zh": "可形容概念晦涩难懂。",
+            }]
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+            )
+
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    with tempfile.TemporaryDirectory() as raw:
+        subtitle_path = Path(raw) / "sample.srt"
+        subtitle_path.write_text("", encoding="utf-8")
+        cache_root = Path(raw) / "cache"
+        source_hash = podcast_learning_video.vocab_source_hash([cue])
+        stale_cache = cache_root / "podcast_vocab_cards" / f"{source_hash}.json"
+        stale_cache.parent.mkdir(parents=True)
+        stale_cache.write_text(
+            json.dumps({
+                "source_hash": source_hash,
+                "prompt_version": podcast_learning_video.VOCAB_PROMPT_VERSION,
+                "model": "test-model",
+                "cards": [],
+            }),
+            encoding="utf-8",
+        )
+        with patch.object(podcast_learning_video, "build_vocab_semantic_groups", return_value=[group]), patch.object(
+            podcast_learning_video, "split_vocab_groups_for_requests", return_value=[[group]]
+        ), patch.object(podcast_learning_video, "vocabulary_card_target", return_value=1), patch.object(
+            podcast_learning_video, "current_llm_config", return_value=("https://example.test/v1", "key", "test-model")
+        ), patch.object(podcast_learning_video, "OpenAI", return_value=client), patch.object(
+            podcast_learning_video, "CACHE_PATH", cache_root
+        ):
+            plan = podcast_learning_video.load_or_generate_vocab_plan(subtitle_path, [cue], True)
+
+    assert completions.calls == 1
+    assert plan[1]["key"] == "obscure"
+
+
+def test_article_template_shows_topic_panel_before_first_card():
+    article_image = Image.new(
+        "RGB",
+        (podcast_learning_video.acx(854), podcast_learning_video.acy(480)),
+    )
+    cue = podcast_learning_video.Cue(1, 0.0, 8.0, "Welcome to the lesson.", "欢迎收看本期内容。", "male")
+    plan = {
+        2: {
+            "key": "regulatory",
+            "word": "Regulatory",
+            "meaning": "监管的",
+            "display_start": 4.0,
+            "display_end": 7.0,
+        }
+    }
+    with patch.object(podcast_learning_video, "draw_article_opening_topic_panel") as topic_panel, \
+         patch.object(podcast_learning_video, "draw_article_vocab_card") as card:
+        podcast_learning_video.draw_article_frame(
+            article_image,
+            cue,
+            plan,
+            show_vocab=True,
+            title_text="如何识别人工智能写作",
+            display_time=0.0,
+        )
+        assert topic_panel.called
+        assert topic_panel.call_args.args[2] == "如何识别人工智能写作"
+        assert not card.called
+
+        topic_panel.reset_mock()
+        podcast_learning_video.draw_article_frame(article_image, cue, plan, show_vocab=True, display_time=5.0)
+        assert card.called
+        assert not topic_panel.called
+
+        card.reset_mock()
+        podcast_learning_video.draw_article_frame(article_image, cue, plan, show_vocab=True, display_time=8.0)
+        assert card.called
+        assert not topic_panel.called
+
+
+def test_article_template_crossfades_only_from_topic_to_first_card():
+    article_image = Image.new(
+        "RGB",
+        (podcast_learning_video.acx(854), podcast_learning_video.acy(480)),
+    )
+    cue = podcast_learning_video.Cue(1, 4.0, 6.0, "A key expression appears.", "出现一个重点表达。", "male")
+    plan = {
+        1: {"key": "key expression", "word": "key expression", "meaning": "重点表达", "display_start": 4.0, "display_end": 12.0},
+        2: {"key": "next expression", "word": "next expression", "meaning": "下一个表达", "display_start": 24.0, "display_end": 32.0},
+    }
+    with patch.object(podcast_learning_video, "draw_article_opening_topic_panel") as topic_panel, \
+         patch.object(podcast_learning_video, "draw_article_vocab_card") as card:
+        podcast_learning_video.draw_article_frame(
+            article_image,
+            cue,
+            plan,
+            show_vocab=True,
+            display_time=4.1,
+        )
+        assert topic_panel.called
+        assert card.called
+
+        topic_panel.reset_mock()
+        card.reset_mock()
+        podcast_learning_video.draw_article_frame(
+            article_image,
+            cue,
+            plan,
+            show_vocab=True,
+            display_time=24.1,
+        )
+        assert not topic_panel.called
+        assert card.called
+
+    assert podcast_learning_video.opening_card_transition_progress(plan, plan[1], "full", 4.0) == 0.0
+    assert podcast_learning_video.opening_card_transition_progress(plan, plan[1], "full", 4.125) == 0.5
+    assert podcast_learning_video.opening_card_transition_progress(plan, plan[1], "full", 4.25) is None
+    assert podcast_learning_video.opening_card_transition_progress(plan, plan[2], "full", 24.1) is None
+
+
+def test_episode_vocab_overview_uses_editor_rank_instead_of_earliest_words():
+    plan = {
+        3: {"word": "Early", "display_start": 2.0},
+        21: {"word": "Core", "display_start": 40.0, "episode_rank": 1},
+        48: {"word": "Theme", "display_start": 90.0, "episode_rank": 2},
+        77: {"word": "Mechanism", "display_start": 140.0, "episode_rank": 3},
+    }
+
+    assert [item["word"] for item in podcast_learning_video.episode_vocab_overview_items(plan)] == [
+        "Core",
+        "Theme",
+        "Mechanism",
+    ]
+
+
+def test_template_frame_cache_keeps_the_full_vocab_card_stable():
+    class _FakeStdin:
+        def write(self, payload):
+            pass
+
+        def close(self):
+            pass
+
+    class _FakeProcess:
+        def __init__(self):
+            self.stdin = _FakeStdin()
+
+        def wait(self):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            raise AssertionError("successful template process must not be killed")
+
+    plan = {
+        1: {
+            "key": "regulatory",
+            "word": "Regulatory",
+            "display_id": "1:regulatory",
+            "display_start": 0.0,
+        }
+    }
+    rendered_at = []
+
+    def draw_frame(*args):
+        rendered_at.append(args[-1])
+        return Image.new("RGB", (2, 2))
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        srt = root / "long.srt"
+        srt.write_text(
+            "1\n00:00:00,000 --> 00:00:10,000\nA regulatory change.\n一次监管变化。\n",
+            encoding="utf-8",
+        )
+        with patch.object(podcast_learning_video, "load_or_generate_vocab_plan", return_value=plan), \
+             patch.object(podcast_learning_video, "get_duration", return_value=10.0), \
+             patch.object(podcast_learning_video, "FPS", 1), \
+             patch.object(podcast_learning_video, "make_base", return_value=Image.new("RGBA", (2, 2))), \
+             patch.object(podcast_learning_video, "make_avatars", return_value=(None, None)), \
+             patch.object(podcast_learning_video, "draw_frame", side_effect=draw_frame), \
+             patch.object(podcast_learning_video.subprocess, "Popen", return_value=_FakeProcess()):
+            podcast_learning_video.render_podcast_learning_video(
+                "source.m4a",
+                str(srt),
+                str(root / "output.mp4"),
+                show_ai_vocab=True,
+            )
+
+    assert rendered_at
+    assert all(timestamp < 8.0 for timestamp in rendered_at)
 
 
 def test_stable_srt_writer_keeps_bilingual_original_top():
@@ -2656,6 +4109,14 @@ def test_id_bound_group_missing_one_id_does_not_shift_later_subtitles():
     assert applied[2].translated == "fallback-S0003"
     assert applied[3].translated == "zh-S0004"
     assert {"translation_id_missing", "translation_group_cardinality_mismatch"} <= _codes(editor)
+
+
+def test_atomic_no_response_cannot_be_written_as_affirmative():
+    editor = _editor()
+
+    assert editor._repair_atomic_response_polarity("No.", "对。") == "不是。"
+    assert editor._repair_atomic_response_polarity("No.", "不。") == "不。"
+    assert editor._repair_atomic_response_polarity("No, not at all.", "完全不是。") == "完全不是。"
 
 
 def test_id_bound_group_rejects_duplicate_id_without_compressing_chinese():
@@ -2775,8 +4236,11 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
     editor = _id_editor()
     editor.batch_num = 50
     editor.allocation_batch_size = 24
-    items = editor._assign_global_subtitle_ids(_id_items(25))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 26)]
+    items = editor._assign_global_subtitle_ids(_id_items(50))
+    groups = [
+        _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
+        for index in range(1, 26)
+    ]
     full_translations = {index: f"full-{index}" for index in range(1, 26)}
     requested_group_ids = []
 
@@ -2788,9 +4252,10 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
                     "id": entry["id"],
                     "part_translations": [
                         {
-                            "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
-                            "zh": f"zh-{entry['subtitle_parts'][0]['subtitle_id']}",
+                            "subtitle_id": part["subtitle_id"],
+                            "zh": f"zh-{part['subtitle_id']}",
                         }
+                        for part in entry["subtitle_parts"]
                     ],
                 }
                 for entry in reversed(payload)
@@ -2804,9 +4269,53 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
         list(range(1, 25)),
         [25],
     ]
-    assert allocated[1] == {"S0001": "zh-S0001"}
-    assert allocated[25] == {"S0025": "zh-S0025"}
+    assert allocated[1] == {"S0001": "zh-S0001", "S0002": "zh-S0002"}
+    assert allocated[25] == {"S0049": "zh-S0049", "S0050": "zh-S0050"}
     assert editor._translation_structure_errors == []
+
+
+def test_single_cue_group_uses_authoritative_full_translation_without_allocation_request():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "Hello."
+    items[1].original = "Thanks."
+    groups = [_id_group(1, 0, [items[0]]), _id_group(2, 1, [items[1]])]
+
+    with patch.object(
+        editor,
+        "_request_semantic_translation_allocation",
+        side_effect=AssertionError("single-cue group must not make an allocation request"),
+    ):
+        allocated = editor._allocate_semantic_group_translations(
+            groups,
+            {1: "你好。", 2: "谢谢。"},
+        )
+
+    assert allocated == {1: {"S0001": "你好。"}, 2: {"S0002": "谢谢。"}}
+    assert [entry["source"] for entry in editor._last_allocation_final] == [
+        "authoritative_full_translation",
+        "authoritative_full_translation",
+    ]
+    assert editor._last_allocation_retry_log == []
+    assert [entry["id"] for entry in editor._last_allocation_inputs] == [1, 2]
+
+
+def test_full_translation_number_error_is_not_misclassified_as_allocation_error():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "下降了8个百分点。",
+        "subtitle_parts": [{"subtitle_id": "S0001", "english": "An 8% drop."}],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {"S0001": "下降了8个百分点。"},
+    )
+
+    assert validation["valid"]
+    assert "full_translation_quality_issue" in validation["issue_codes"]
+    assert "number_allocation_mismatch" not in validation["issue_codes"]
 
 
 def test_full_translation_requests_are_chunked_and_retry_missing_groups():
@@ -2833,12 +4342,101 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
         full_translations = editor._translate_semantic_group_full_translations(groups)
 
     assert calls == [
-        ("screen_subtitle_semantic_full_translation_v2", [1, 2]),
-        ("screen_subtitle_semantic_full_translation_v2", [3]),
-        ("screen_subtitle_semantic_full_translation_v2_retry", [2]),
+        ("screen_subtitle_semantic_full_translation_v4", [1, 2]),
+        ("screen_subtitle_semantic_full_translation_v4", [3]),
+        ("screen_subtitle_semantic_full_translation_v4_retry", [2]),
     ]
     assert full_translations == {1: "full-1", 2: "full-2", 3: "full-3"}
     assert editor._translation_structure_errors == []
+
+
+def test_full_translation_prompt_restrains_ordinary_chinese_em_dashes():
+    from app.core.subtitle_processor.screen_editor import SEMANTIC_FULL_TRANSLATION_PROMPT
+
+    assert "Do not use em dashes for ordinary explanations" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "Never leave an em dash at the beginning or end" in SEMANTIC_FULL_TRANSLATION_PROMPT
+
+
+def test_full_translation_em_dash_style_detector_ignores_lexical_hyphen():
+    assert ScreenSubtitleEditor._full_translation_em_dash_findings("盎格鲁-撒克逊传统") == []
+    assert ScreenSubtitleEditor._full_translation_em_dash_findings("——研究结论")
+    assert ScreenSubtitleEditor._full_translation_em_dash_findings("研究结论——")
+    assert ScreenSubtitleEditor._full_translation_em_dash_findings("甲——乙——丙")
+
+
+def test_full_translation_style_retry_only_retries_flagged_group_and_accepts_improvement():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "An ordinary statement."
+    items[1].original = "The study found a clear result."
+    groups = [_id_group(1, 0, [items[0]]), _id_group(2, 1, [items[1]])]
+    calls = []
+
+    def request(prompt, payload, cache_task):
+        calls.append((cache_task, [entry["id"] for entry in payload]))
+        if cache_task == "screen_subtitle_semantic_full_translation_v4":
+            return {
+                "groups": [
+                    {"id": 1, "full_translation": "这是一句普通陈述。"},
+                    {"id": 2, "full_translation": "这项研究得出了明确结论——"},
+                ]
+            }
+        assert cache_task == "screen_subtitle_semantic_full_translation_style_retry_v1"
+        assert payload[0]["current_translation"] == "这项研究得出了明确结论——"
+        return {"groups": [{"id": 2, "full_translation": "这项研究得出了明确结论。"}]}
+
+    with patch.object(editor, "_request_semantic_full_translation_chunk", side_effect=request):
+        full_translations = editor._translate_semantic_group_full_translations(groups)
+
+    assert calls == [
+        ("screen_subtitle_semantic_full_translation_v4", [1, 2]),
+        ("screen_subtitle_semantic_full_translation_style_retry_v1", [2]),
+    ]
+    assert full_translations == {1: "这是一句普通陈述。", 2: "这项研究得出了明确结论。"}
+    assert editor._last_full_translation_style_retry_log == [
+        {
+            "semantic_group_id": "G0002",
+            "cache_task": "screen_subtitle_semantic_full_translation_style_retry_v1",
+            "original_translation": "这项研究得出了明确结论——",
+            "candidate_translation": "这项研究得出了明确结论。",
+            "original_style_findings": [{"code": "em_dash_at_translation_boundary", "em_dash_runs": 1}],
+            "candidate_style_findings": [],
+            "original_style_score": 3,
+            "candidate_style_score": 0,
+            "accepted": True,
+            "decision": "accept_style_retry",
+            "rejection_reasons": [],
+        }
+    ]
+    assert [item.original for item in items] == ["An ordinary statement.", "The study found a clear result."]
+    assert [item.subtitle_id for item in items] == ["S0001", "S0002"]
+
+
+def test_full_translation_style_retry_keeps_original_when_candidate_loses_number_or_negation():
+    editor = _id_editor()
+    original = "该公司没有批准42份提案——"
+    with patch.object(
+        editor,
+        "_request_semantic_full_translation_chunk",
+        return_value={"groups": [{"id": 1, "full_translation": "该公司批准了这些提案。"}]},
+    ):
+        result = editor._retry_full_translations_for_em_dash_style(
+            payload_by_id={
+                1: {
+                    "id": 1,
+                    "full_english": "The company did not approve 42 proposals.",
+                    "current_translation": original,
+                }
+            },
+            full_translations={1: original},
+        )
+
+    assert result == {1: original}
+    assert editor._last_full_translation_style_retry_log[-1]["decision"] == "keep_original"
+    assert set(editor._last_full_translation_style_retry_log[-1]["rejection_reasons"]) == {
+        "lost_number_anchor:42",
+        "lost_negation_anchor:negation",
+    }
 
 
 def test_two_stage_translation_failure_does_not_fallback_to_single_stage():
@@ -2867,7 +4465,7 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
 
     def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
         calls.append((cache_task, [entry["id"] for entry in payload]))
-        if cache_task == "screen_subtitle_semantic_translation_allocation_v2":
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
             return {
                 "groups": [
                     {
@@ -2897,10 +4495,10 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
         allocated = editor._allocate_semantic_group_translations(groups, full_translations)
 
     assert calls == [
-        ("screen_subtitle_semantic_translation_allocation_v2", [1, 2, 3]),
-        ("screen_subtitle_semantic_translation_allocation_retry_v2", [1]),
-        ("screen_subtitle_semantic_translation_allocation_retry_v2", [2]),
-        ("screen_subtitle_semantic_translation_allocation_retry_v2", [3]),
+        ("screen_subtitle_semantic_translation_allocation_v3", [1, 2, 3]),
+        ("screen_subtitle_semantic_translation_allocation_retry_v3", [1]),
+        ("screen_subtitle_semantic_translation_allocation_retry_v3", [2]),
+        ("screen_subtitle_semantic_translation_allocation_retry_v3", [3]),
     ]
     assert allocated == {
         1: {"S0001": "zh-S0001"},
@@ -3094,13 +4692,212 @@ def test_allocation_concurrency_uses_mixed_cache_hits_without_worker_cache_write
     }
     assert editor._llm_cache_used is True
     assert len(editor.cache_manager.set_calls) == 1
-    assert editor._llm_cache_stats["screen_subtitle_semantic_translation_allocation_v2"] == {"hit": 1, "miss": 1}
+    assert editor._llm_cache_stats["screen_subtitle_semantic_translation_allocation_v3"] == {"hit": 1, "miss": 1}
     assert editor._allocation_runtime_stats["batch_size"] == 2
     assert editor._allocation_runtime_stats["batch_count"] == 2
     assert editor._allocation_runtime_stats["cached_batch_count"] == 1
     assert editor._allocation_runtime_stats["pending_batch_count"] == 1
     assert editor._allocation_runtime_stats["actual_max_workers"] == 1
     assert editor._translation_structure_errors == []
+
+
+def test_chinese_polish_rewrites_only_fixed_group_chinese_by_id():
+    editor = _id_editor()
+    editor.enable_chinese_polish = True
+    item = editor._assign_global_subtitle_ids(_id_items(1))[0]
+    item.original = "The system adapts to feedback."
+    groups = [_id_group(1, 0, [item])]
+    full_translations = {1: "系统会根据人类反馈不断调整。"}
+    allocations = {1: {"S0001": "系统将"}}
+
+    def request(prompt, payload, cache_task):
+        assert cache_task == "screen_subtitle_semantic_chinese_polish_v3"
+        return {
+            "groups": [
+                {
+                    "id": entry["id"],
+                    "part_translations": [
+                        {
+                            "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
+                            "zh": "系统会根据人类反馈不断调整。",
+                        }
+                    ],
+                }
+                for entry in payload
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        polished = editor._polish_semantic_group_translations(
+            groups, full_translations, allocations
+        )
+
+    assert polished == {1: {"S0001": "系统会根据人类反馈不断调整。"}}
+    assert item.original == "The system adapts to feedback."
+    assert editor._chinese_polish_log[-1]["decision"] == "applied"
+
+
+def test_chinese_polish_skips_natural_groups_without_a_model_request():
+    editor = _id_editor()
+    editor.enable_chinese_polish = True
+    item = editor._assign_global_subtitle_ids(_id_items(1))[0]
+    item.original = "The system adapts to feedback."
+    groups = [_id_group(1, 0, [item])]
+    full_translations = {1: "系统会根据人类反馈不断调整。"}
+    allocations = {1: {"S0001": "系统会根据人类反馈不断调整。"}}
+
+    with patch.object(editor, "_request_semantic_translation_allocation") as request:
+        polished = editor._polish_semantic_group_translations(
+            groups, full_translations, allocations
+        )
+
+    assert polished == allocations
+    assert not request.called
+
+
+def test_chinese_polish_selects_complex_comparison_group_by_fixed_ids():
+    editor = _id_editor()
+    editor.enable_chinese_polish = True
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    items[0].original = "They compared leading models"
+    items[1].original = "against writing from The Economist,"
+    items[2].original = "CNN, The New York Times,"
+    items[3].original = "and novels published from 1950 to 2022."
+    groups = [_id_group(1, 0, items)]
+    full_translations = {
+        1: "他们将顶尖模型的输出，与《经济学人》、CNN、《纽约时报》以及1950年至2022年的畅销小说进行比较。"
+    }
+    allocations = {
+        1: {
+            "S0001": "他们比较了顶尖模型——",
+            "S0002": "与《经济学人》的写作，",
+            "S0003": "CNN和《纽约时报》，",
+            "S0004": "以及1950至2022年的畅销小说。",
+        }
+    }
+
+    def request(prompt, payload, cache_task):
+        assert cache_task == "screen_subtitle_semantic_chinese_polish_v3"
+        assert payload[0]["subtitle_parts"][0]["target_zh_chars"] >= 4
+        return {
+            "groups": [{
+                "id": 1,
+                "part_translations": [
+                    {"subtitle_id": "S0001", "zh": "他们将顶尖模型的输出，"},
+                    {"subtitle_id": "S0002", "zh": "与《经济学人》的写作进行比较，"},
+                    {"subtitle_id": "S0003", "zh": "对象还包括CNN和《纽约时报》，"},
+                    {"subtitle_id": "S0004", "zh": "以及1950至2022年的畅销小说。"},
+                ],
+            }]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request) as call:
+        polished = editor._polish_semantic_group_translations(
+            groups, full_translations, allocations
+        )
+
+    assert call.called
+    assert polished[1]["S0002"] == "与《经济学人》的写作进行比较，"
+    assert any(
+        "complex_enumeration_or_comparison_allocation" in item.get("issue_codes", [])
+        for item in editor._chinese_polish_log
+        if item.get("decision") == "selected"
+    )
+    applied = [item for item in editor._chinese_polish_log if item.get("decision") == "applied"]
+    assert applied[-1]["quality_comparison"]["require_high_confidence_fix"] is False
+
+
+def test_cross_subtitle_predicate_break_triggers_group_polish_by_fixed_ids():
+    editor = _id_editor()
+    editor.enable_chinese_polish = True
+    items = [
+        ScreenSubtitleItem([1], "A recent study found that the AI models", "", 0, 1),
+        ScreenSubtitleItem([2], "currently drafting over a third of new websites", "", 2, 3),
+        ScreenSubtitleItem([3], "have stopped using those words.", "", 4, 5),
+    ]
+    items = editor._assign_global_subtitle_ids(items)
+    groups = [_id_group(1, 0, items)]
+    full_translations = {
+        1: "一项分析了120万个词的最新研究发现，如今超过三分之一的新网站由AI模型撰写，而这些模型已不再使用那些词。"
+    }
+    allocations = {
+        1: {
+            "S0001": "最近一项分析120万单词的研究发现",
+            "S0002": "目前正在撰写超过三分之一新网站的AI模型",
+            "S0003": "突然不再使用那些词了。",
+        }
+    }
+    frozen_before = [
+        (item.original, item.subtitle_id, item.word_start, item.word_end)
+        for item in items
+    ]
+
+    entry = {
+        "id": 1,
+        "full_english": " ".join(item.original for item in items),
+        "full_translation": full_translations[1],
+        "subtitle_parts": [
+            {"subtitle_id": item.subtitle_id, "english": item.original}
+            for item in items
+        ],
+    }
+    validation = editor._validate_group_chinese_allocation(entry, allocations[1])
+    assert "cross_subtitle_predicate_break" in validation["issue_codes"]
+
+    def request(prompt, payload, cache_task):
+        assert cache_task == "screen_subtitle_semantic_chinese_polish_v3"
+        return {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "一项分析了120万个词的最新研究发现，"},
+                        {"subtitle_id": "S0002", "zh": "如今超过三分之一的新网站由AI模型撰写，"},
+                        {"subtitle_id": "S0003", "zh": "而这些模型已不再使用那些词。"},
+                    ],
+                }
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request) as call:
+        polished = editor._polish_semantic_group_translations(
+            groups, full_translations, allocations
+        )
+
+    assert call.called
+    assert polished[1]["S0002"] == "如今超过三分之一的新网站由AI模型撰写，"
+    assert [
+        (item.original, item.subtitle_id, item.word_start, item.word_end)
+        for item in items
+    ] == frozen_before
+    assert editor._chinese_polish_log[-1]["decision"] == "applied"
+
+
+def test_cross_subtitle_predicate_break_does_not_flag_normal_chinese_continuation():
+    issues = ScreenSubtitleEditor._detect_cross_subtitle_predicate_breaks(
+        ["S0001", "S0002", "S0003"],
+        [
+            "一项最新研究发现，",
+            "如今超过三分之一的新网站由AI模型撰写，",
+            "而这些模型已不再使用那些词。",
+        ],
+    )
+
+    assert issues == []
+
+
+def test_semantic_loss_recognizes_bingfei_as_negation():
+    assert not ScreenSubtitleEditor._has_core_semantic_loss(
+        "再看最新的人口普查数据和美联储研究，他并非个例。",
+        "再看最新的人口普查数据和美联储研究，他并非个例。",
+        "And looking at the latest census data and Federal Reserve research, he is not an outlier.",
+    )
+
+
+def test_sentence_final_shide_is_not_a_dangling_chinese_fragment():
+    assert not ScreenSubtitleEditor._is_bad_chinese_fragment(
+        "但到2025年，全职自雇人数创下百年新高。是的。"
+    )
 
 
 def test_allocation_concurrency_preserves_400_plus_subtitle_ids_without_drift():
@@ -3149,9 +4946,9 @@ def test_allocation_quality_retries_information_leaked_to_previous_id():
     full_translations = {1: "爱丽丝到了。鲍勃签了42份合同。"}
     calls = []
 
-    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v3"):
         calls.append(cache_task)
-        if cache_task == "screen_subtitle_semantic_translation_allocation_v2":
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
             return {
                 "groups": [
                     {
@@ -3180,8 +4977,8 @@ def test_allocation_quality_retries_information_leaked_to_previous_id():
 
     assert allocated[1] == {"S0001": "爱丽丝到了。", "S0002": "鲍勃签了42份合同。"}
     assert calls == [
-        "screen_subtitle_semantic_translation_allocation_v2",
-        "screen_subtitle_semantic_translation_allocation_retry_v2",
+        "screen_subtitle_semantic_translation_allocation_v3",
+        "screen_subtitle_semantic_translation_allocation_retry_v3",
     ]
     assert any("number_allocation_mismatch" in item["issue_codes"] for item in editor._last_allocation_validation)
     assert editor._last_allocation_retry_log[-1]["success"] is True
@@ -3535,8 +5332,8 @@ def test_allocation_retry_rejects_quality_regression_before_writeback():
         1: "爱丽丝到了。鲍勃签了42份合同。卡罗尔批准了这份长期预算计划。",
     }
 
-    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
-        if cache_task == "screen_subtitle_semantic_translation_allocation_v2":
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v3"):
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
             return {
                 "groups": [
                     {
@@ -3685,7 +5482,7 @@ def test_allocation_quality_keeps_out_of_order_return_by_subtitle_id():
     groups = [_id_group(1, 0, items)]
     full_translations = {1: "方案可行。它可以扩展。"}
 
-    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v3"):
         return {
             "groups": [
                 {
@@ -3710,25 +5507,24 @@ def test_allocation_quality_failed_group_does_not_shift_following_100_ids():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(101))
     items[0].original = "It does not work."
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 102)]
-    full_translations = {1: "它不能工作。", **{index: f"中文{index}" for index in range(2, 102)}}
+    items[1].original = "It is still broken."
+    groups = [
+        _id_group(1, 0, items[:2]),
+        *[_id_group(index, index, [items[index]]) for index in range(2, 101)],
+    ]
+    full_translations = {1: "它不能工作，问题仍未解决。", **{index: f"中文{index}" for index in range(2, 101)}}
 
-    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v2"):
-        if payload[0]["id"] == 1:
-            return {
-                "groups": [
-                    {
-                        "id": 1,
-                        "part_translations": [{"subtitle_id": "S0001", "zh": ""}],
-                    }
-                ]
-            }
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v3"):
         return {
             "groups": [
                 {
                     "id": entry["id"],
                     "part_translations": [
-                        {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"中文{entry['id']}"}
+                        {
+                            "subtitle_id": part["subtitle_id"],
+                            "zh": "" if entry["id"] == 1 else f"中文{entry['id']}",
+                        }
+                        for part in entry["subtitle_parts"]
                     ],
                 }
                 for entry in payload
@@ -3740,7 +5536,7 @@ def test_allocation_quality_failed_group_does_not_shift_following_100_ids():
 
     applied = editor._apply_semantic_group_translations(items, groups, allocated)
     assert [item.subtitle_id for item in applied] == [f"S{index:04d}" for index in range(1, 102)]
-    assert applied[100].translated == "中文101"
+    assert applied[100].translated == "中文100"
     assert editor._last_allocation_unresolved
 
 
@@ -3771,6 +5567,61 @@ def test_compression_quality_regression_restores_previous_group_allocation():
 
     assert [seg.translated_text for seg in restored] == ["爱丽丝到了。", "鲍勃离开了。"]
     assert editor._last_allocation_unresolved[-1]["reason"] == "postprocess_allocation_quality_regression_restored"
+
+
+def test_speed_compression_cannot_accept_number_omission_for_shorter_chinese():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(1))
+    items[0].original = "Alice successfully reached the annual sales target in 2024."
+    group = _id_group(1, 0, items)
+    full_translation = "爱丽丝在2024年成功达成了年度销售目标。"
+    editor._last_semantic_full_translations = {1: full_translation}
+    before = [
+        ASRDataSeg(items[0].original, 0, 1000, full_translation),
+    ]
+    after = [
+        ASRDataSeg(items[0].original, 0, 1000, "爱丽丝达成销售目标。"),
+    ]
+    before[0].subtitle_id = "S0001"
+    after[0].subtitle_id = "S0001"
+
+    restored = editor._restore_invalid_postprocess_allocations(
+        before_segments=before,
+        after_segments=after,
+        semantic_groups=[group],
+        subtitle_items=items,
+    )
+
+    assert restored[0].translated_text == full_translation
+    comparison = editor._last_allocation_unresolved[-1]["candidate_comparison"]
+    assert comparison["speed_improved"] is True
+    assert "new_high_confidence_issue" in comparison["reasons"]
+
+
+def test_id_bound_candidate_decision_never_accepts_invalid_candidate():
+    editor = _id_editor()
+    entry = {
+        "id": 1,
+        "full_translation": "爱丽丝到了。",
+        "subtitle_parts": [{"subtitle_id": "S0001", "english": "Alice arrived."}],
+    }
+    allocation = {"S0001": "爱丽丝到了。"}
+    decision = editor._decide_id_bound_allocation_candidate(
+        original_allocation=allocation,
+        candidate_allocation=allocation,
+        group_context=entry,
+        original_validation={"valid": True, "issue_codes": []},
+        candidate_validation={
+            "valid": False,
+            "issue_codes": ["translation_group_cardinality_mismatch"],
+        },
+        candidate_source="test",
+        require_high_confidence_fix=False,
+    )
+
+    assert not decision["accepted"]
+    assert decision["decision"] == "keep_original"
+    assert decision["candidate_source"] == "test"
 
 
 def test_editor_review_points_only_include_long_split_allocation_mismatch():
@@ -3924,10 +5775,21 @@ def test_failed_group_does_not_shift_following_100_subtitles():
 
 
 def test_whisperx_time_only_preserves_text_and_translation_while_retiming():
-    source = [
-        ASRDataSeg("Welcome to today's Deep Dive.", 1000, 2500, "欢迎收看今天的深度解读。"),
-        ASRDataSeg("We are unpacking the story.", 2600, 4300, "我们正在解读这个故事。"),
-    ]
+    source = ASRData([
+        ASRDataSeg("Welcome to today's Deep Dive. We are unpacking the story.", 1000, 4300),
+    ])
+    ledger = ASRData([
+        ASRDataSeg("Welcome", 1000, 1100),
+        ASRDataSeg("to", 1100, 1200),
+        ASRDataSeg("today's", 1200, 1400),
+        ASRDataSeg("Deep", 1400, 1600),
+        ASRDataSeg("Dive.", 1600, 1800),
+        ASRDataSeg("We", 2600, 2700),
+        ASRDataSeg("are", 2700, 2800),
+        ASRDataSeg("unpacking", 2800, 3200),
+        ASRDataSeg("the", 3200, 3300),
+        ASRDataSeg("story.", 3300, 3600),
+    ])
     aligned_words = [
         {"text": "Welcome", "start": 1.22, "end": 1.45},
         {"text": "to", "start": 1.46, "end": 1.56},
@@ -3941,140 +5803,702 @@ def test_whisperx_time_only_preserves_text_and_translation_while_retiming():
         {"text": "story", "start": 3.67, "end": 3.96},
     ]
 
-    remapped = _make_whisperx_subtitle_segments(
-        source,
-        aligned_words,
-        lead_in_ms=80,
-        tail_padding_ms=450,
-        min_duration_ms=800,
-    )
-    _repair_subtitle_timing_sequence(remapped.segments, min_gap_ms=40)
-
-    assert len(remapped.segments) == len(source)
-    assert [seg.text for seg in remapped.segments] == [seg.text for seg in source]
-    assert [seg.translated_text for seg in remapped.segments] == [
-        seg.translated_text for seg in source
-    ]
-    assert remapped.segments[0].start_time == 1140
-    assert remapped.segments[0].end_time == 2700
-    assert remapped.segments[1].start_time == 2840
-    assert remapped.segments[1].end_time == 4410
-    assert remapped.segments[0].end_time + 40 <= remapped.segments[1].start_time
-
-
-def test_whisperx_time_only_rejects_incomplete_subtitle_mapping():
-    source = [
-        ASRDataSeg(
-            "2001 to 2011 and then compared that decade to the years 2013 to 2023.",
-            690574,
-            692857,
-            "2001年到2011年，再与2013年到2023年对比。",
-        ),
-        ASRDataSeg(
-            "Okay. And what did they find?",
-            692897,
-            694387,
-            "好的。那他们发现了什么？",
-        ),
-    ]
-    aligned_words = [
-        {"text": "2001", "start": 690.54, "end": 691.20},
-        {"text": "to", "start": 691.20, "end": 691.50},
-        {"text": "2011", "start": 691.60, "end": 692.18},
-        {"text": "and", "start": 692.18, "end": 692.72},
-        {"text": "then", "start": 692.72, "end": 692.86},
-        {"text": "Okay", "start": 696.58, "end": 696.82},
-        {"text": "And", "start": 697.02, "end": 697.04},
-        {"text": "what", "start": 697.04, "end": 697.26},
-        {"text": "did", "start": 697.26, "end": 697.38},
-        {"text": "they", "start": 697.38, "end": 697.50},
-        {"text": "find", "start": 697.50, "end": 697.80},
-    ]
-
-    remapped = _make_whisperx_subtitle_segments(
-        source,
-        aligned_words,
-        lead_in_ms=20,
-        tail_padding_ms=180,
-        min_duration_ms=650,
-    )
-
-    assert not _whisperx_mapping_is_complete(remapped, source)
-    assert getattr(remapped, "whisperx_unmatched_subtitles")[0]["index"] == 1
-    assert remapped.segments[0].end_time == source[0].end_time
-
-
-def test_frozen_word_timing_prevents_whisperx_from_compressing_long_subtitle():
-    segment = ASRDataSeg(
-        "2001 to 2011 and then compared that decade to the years 2013 to 2023.",
-        690595,
-        692917,
-        "2001年到2011年，再与2013年到2023年对比。",
-    )
-    segment.subtitle_id = "S0226"
-    segment.word_start = 2012
-    segment.word_end = 2025
-    segment.stable_word_start_ms = 690540
-    segment.stable_word_end_ms = 695460
-
-    remapped = _make_frozen_word_timed_subtitle_segments(
-        [segment],
-        lead_in_ms=20,
-        tail_padding_ms=180,
-        min_duration_ms=650,
-    )
+    with patch(
+        "app.core.subtitle_processor.stable_ts_alignment._run_whisperx_words",
+        return_value=aligned_words,
+    ):
+        remapped = align_frozen_word_ledger_with_whisperx("unused.m4a", source, ledger)
 
     assert remapped is not None
-    assert remapped.segments[0].start_time == 690520
-    assert remapped.segments[0].end_time == 695640
-    assert remapped.segments[0].end_time > 692917
-    assert remapped.segments[0].text == segment.text
-    assert getattr(remapped.segments[0], "subtitle_id") == "S0226"
+    by_word_id = {segment.word_id: segment for segment in remapped.segments}
+    assert [by_word_id[index].text for index in range(10)] == [
+        segment.text for segment in ledger.segments
+    ]
+    assert by_word_id[0].start_time == 1220
+    assert by_word_id[9].end_time == 3960
+    assert all(by_word_id[index].alignment_source == "whisperx" for index in range(10))
 
 
-def test_whisperx_time_only_pads_ultra_short_subtitle_when_neighbor_room_exists():
-    segments = [
-        ASRDataSeg("Before.", 0, 2400, "之前。"),
-        ASRDataSeg("Oh, I see.", 2600, 3060, "哦，我明白了。"),
-        ASRDataSeg("After this point.", 3980, 5200, "之后。"),
+def test_whisperx_frozen_ledger_keeps_only_unmatched_word_on_stable_ts_time():
+    source = ASRData([ASRDataSeg("One two three.", 1000, 1600)])
+    ledger = ASRData(
+        [
+            ASRDataSeg("One", 1000, 1100),
+            ASRDataSeg("two", 1110, 1220),
+            ASRDataSeg("three", 1230, 1400),
+        ]
+    )
+    aligned_words = [
+        {"text": "One", "start": 1.01, "end": 1.09},
+        {"text": "three", "start": 1.30, "end": 1.52},
     ]
 
-    _repair_subtitle_timing_sequence(segments, min_gap_ms=40)
-    _pad_short_subtitle_timing_sequence(
-        segments,
-        min_gap_ms=40,
-        min_duration_ms=800,
+    with patch(
+        "app.core.subtitle_processor.stable_ts_alignment._run_whisperx_words",
+        return_value=aligned_words,
+    ):
+        remapped = align_frozen_word_ledger_with_whisperx("unused.m4a", source, ledger)
+
+    assert remapped is not None
+    by_word_id = {segment.word_id: segment for segment in remapped.segments}
+    assert (by_word_id[0].start_time, by_word_id[0].end_time) == (1010, 1090)
+    assert (by_word_id[1].start_time, by_word_id[1].end_time) == (1110, 1220)
+    assert (by_word_id[2].start_time, by_word_id[2].end_time) == (1300, 1520)
+    assert by_word_id[1].alignment_source == "stable-ts-fallback"
+    assert remapped.whisperx_matched_word_count == 2
+    assert remapped.whisperx_fallback_word_count == 1
+
+
+def test_whisperx_frozen_ledger_reverts_a_candidate_that_inverts_fallback_word_order():
+    source = ASRData([ASRDataSeg("and 15 000", 592140, 593020)])
+    ledger = ASRData(
+        [
+            ASRDataSeg("and", 592140, 592260),
+            ASRDataSeg("15", 592260, 592640),
+            ASRDataSeg("000", 592640, 593020),
+        ]
+    )
+    aligned_words = [{"text": "and", "start": 592.917, "end": 593.017}]
+
+    with patch(
+        "app.core.subtitle_processor.stable_ts_alignment._run_whisperx_words",
+        return_value=aligned_words,
+    ):
+        remapped = align_frozen_word_ledger_with_whisperx("unused.m4a", source, ledger)
+
+    assert remapped is not None
+    by_word_id = {segment.word_id: segment for segment in remapped.segments}
+    assert (by_word_id[0].start_time, by_word_id[0].end_time) == (592140, 592260)
+    assert by_word_id[0].alignment_source == "stable-ts-fallback"
+    assert [(segment.word_id, segment.text) for segment in remapped.segments] == [
+        (0, "and"),
+        (1, "15"),
+        (2, "000"),
+    ]
+    assert remapped.whisperx_monotonicity_fallbacks == [
+        {
+            "code": "whisperx_monotonicity_fallback",
+            "word_id": 0,
+            "word": "and",
+            "baseline_range_ms": [592140, 592260],
+            "rejected_whisperx_range_ms": [592917, 593017],
+            "conflicting_word_ids": [0, 1],
+        }
+    ]
+
+
+def test_whisperx_frozen_ledger_keeps_monotonic_candidate_updates():
+    source = ASRData([ASRDataSeg("One two", 1000, 1300)])
+    ledger = ASRData([ASRDataSeg("One", 1000, 1100), ASRDataSeg("two", 1120, 1300)])
+    aligned_words = [
+        {"text": "One", "start": 1.20, "end": 1.30},
+        {"text": "two", "start": 1.31, "end": 1.46},
+    ]
+
+    with patch(
+        "app.core.subtitle_processor.stable_ts_alignment._run_whisperx_words",
+        return_value=aligned_words,
+    ):
+        remapped = align_frozen_word_ledger_with_whisperx("unused.m4a", source, ledger)
+
+    assert remapped is not None
+    by_word_id = {segment.word_id: segment for segment in remapped.segments}
+    assert (by_word_id[0].start_time, by_word_id[1].end_time) == (1200, 1460)
+    assert all(by_word_id[index].alignment_source == "whisperx" for index in range(2))
+    assert remapped.whisperx_monotonicity_fallbacks == []
+
+
+def test_whisperx_time_only_falls_back_to_stable_ledger_without_changing_cues():
+    class _Progress:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, *args):
+            self.events.append(args)
+
+    class _FallbackEditor:
+        def __init__(self):
+            self.alignment = None
+            self.rebuild_backend = None
+
+        def record_final_timeline_alignment(self, **kwargs):
+            self.alignment = kwargs
+
+        def rebuild_final_cue_timeline(self, asr_data, word_ledger, *, alignment_backend):
+            self.rebuild_backend = alignment_backend
+            return asr_data
+
+    thread = SubtitleThread.__new__(SubtitleThread)
+    thread.task = type("Task", (), {"video_path": __file__})()
+    thread.progress = _Progress()
+    thread.tr = lambda value: value
+    thread._record_stage_duration = lambda *args: None
+    source = ASRData([ASRDataSeg("A stable cue.", 1000, 1600, "稳定字幕。")])
+    source.segments[0].subtitle_id = "S0001"
+    ledger = ASRData([ASRDataSeg("A", 1000, 1100), ASRDataSeg("stable", 1110, 1350)])
+    editor = _FallbackEditor()
+
+    with patch.object(SubtitleThread, "_timeline_alignment_backend", return_value="whisperx-time-only"), patch(
+        "app.thread.subtitle_thread.align_frozen_word_ledger_with_whisperx",
+        return_value=None,
+    ):
+        rebuilt = thread._apply_whisperx_time_only_if_enabled(
+            source,
+            alignment_source=source,
+            word_ledger=ledger,
+            screen_editor=editor,
+        )
+
+    assert rebuilt is source
+    assert editor.rebuild_backend == "stable-ts-fallback"
+    assert editor.alignment == {
+        "requested_backend": "whisperx-time-only",
+        "applied_backend": "stable-ts-fallback",
+        "fallback_reason": "incomplete_frozen_word_ledger",
+    }
+    assert any("稳定词级时间轴" in event[1] for event in thread.progress.events)
+
+
+def test_whisperx_time_only_uses_expanded_frozen_ledger_not_source_segment_count():
+    """Final alignment must consume display words, not the coarser ASR spans.
+
+    Stable cutting can expand a single ASR word span such as ``twenty-one``
+    into several frozen display words.  The final alignment contract is the
+    frozen ledger, even when it has more entries than the original ASR input.
+    """
+    class _Progress:
+        def emit(self, *args):
+            pass
+
+    class _LedgerEditor:
+        def __init__(self):
+            self.alignment = None
+            self.rebuilt_word_ids = []
+
+        def record_final_timeline_alignment(self, **kwargs):
+            self.alignment = kwargs
+
+        def rebuild_final_cue_timeline(self, asr_data, word_ledger, *, alignment_backend):
+            self.rebuilt_word_ids = [segment.word_id for segment in word_ledger.segments]
+            assert alignment_backend == "whisperx-time-only"
+            return asr_data
+
+    thread = SubtitleThread.__new__(SubtitleThread)
+    thread.task = type("Task", (), {"video_path": __file__})()
+    thread.progress = _Progress()
+    thread.tr = lambda value: value
+    thread._record_stage_duration = lambda *args: None
+
+    # Three original ASR spans expand into five frozen display words.
+    alignment_source = ASRData(
+        [
+            ASRDataSeg("twenty-one", 0, 320),
+            ASRDataSeg("founders", 330, 640),
+            ASRDataSeg("arrived.", 650, 900),
+        ]
+    )
+    final_cues = ASRData([ASRDataSeg("Twenty one founders arrived.", 0, 900, "二十一位创始人到了。")])
+    final_cues.segments[0].subtitle_id = "S0001"
+    ledger = ASRData(
+        [
+            ASRDataSeg("Twenty", 0, 120),
+            ASRDataSeg("one", 120, 320),
+            ASRDataSeg("founders", 330, 640),
+            ASRDataSeg("arrived", 650, 820),
+            ASRDataSeg(".", 820, 900),
+        ]
+    )
+    for word_id, segment in enumerate(ledger.segments):
+        segment.word_id = word_id
+        segment.alignment_source = "whisperx"
+    editor = _LedgerEditor()
+
+    with patch.object(SubtitleThread, "_timeline_alignment_backend", return_value="whisperx-time-only"), patch(
+        "app.thread.subtitle_thread.align_frozen_word_ledger_with_whisperx",
+        return_value=ledger,
+    ) as align:
+        rebuilt = thread._apply_whisperx_time_only_if_enabled(
+            final_cues,
+            alignment_source=alignment_source,
+            word_ledger=ledger,
+            screen_editor=editor,
+        )
+
+    assert rebuilt is final_cues
+    assert len(alignment_source.segments) == 3
+    assert len(ledger.segments) == 5
+    assert align.call_args.args[2] is ledger
+    assert editor.rebuilt_word_ids == [0, 1, 2, 3, 4]
+    assert editor.alignment["applied_backend"] == "whisperx-time-only"
+
+
+def test_short_nonindependent_backchannel_attaches_to_previous_display_item():
+    previous_words = "This explanation has fourteen ordinary words and ends as a complete thought clearly today".split()
+    words = previous_words + ["Yeah.", "The", "next", "sentence", "continues."]
+    editor = _marker_editor(words, max_words=16)
+    items = [
+        _word_item(editor, 0, len(previous_words) - 1, 1),
+        _word_item(editor, len(previous_words), len(previous_words), 2),
+        _word_item(editor, len(previous_words) + 1, len(words) - 1, 3),
+    ]
+
+    merged = editor._merge_short_display_items(items)
+
+    assert len(merged) == 2
+    assert merged[0].original.endswith("Yeah.")
+    assert ScreenSubtitleEditor._word_count(merged[0].original) == 15
+    assert merged[1].original == "The next sentence continues."
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in merged)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
     )
 
-    assert segments[1].text == "Oh, I see."
-    assert segments[1].translated_text == "哦，我明白了。"
-    assert segments[1].end_time - segments[1].start_time >= 800
-    assert segments[0].end_time + 40 <= segments[1].start_time
-    assert segments[1].end_time + 40 <= segments[2].start_time
+
+def test_complete_unsplittable_overflow_is_warning_not_overlong_error():
+    text = "A precise compact sentence keeps every protected grammatical relation intact through this final complete clause cleanly today."
+    editor = _marker_editor(text.split(), max_words=16)
+    segment = ASRDataSeg(text, 0, 3200, "完整中文。")
+    segment.subtitle_id = "S0001"
+    segment.word_start = 0
+    segment.word_end = len(editor._active_word_entries) - 1
+    editor._safe_overlong_item_split = lambda item: ([], [])
+
+    structural = editor._structural_english_overflow_issues([segment])
+    overlong = editor._overlong_english_issues([segment])
+
+    assert len(structural) == 1
+    assert overlong == []
+    health = {
+        "overlong_english": overlong,
+        "structural_english_overflow": structural,
+        "bad_cuts": [],
+        "translationese": [],
+        "reading_speed_errors": [],
+        "reading_speed_warnings": [],
+        "duration_errors": [],
+        "duration_warnings": [],
+        "duplicate_chinese": [],
+        "asr_suspicious": [],
+        "discourse_marker_orphans": [],
+        "syntax_boundary_audit": [],
+        "chinese_semantic_group_warnings": [],
+        "chinese_semantic_group_info": [],
+    }
+    summary = editor._validation_summary([], [], health, [segment])
+
+    assert summary["errors"] == []
+    assert [issue["code"] for issue in summary["warnings"]] == ["structural_english_overflow"]
 
 
-def test_whisperx_time_only_pads_ultra_short_subtitle_by_shifting_roomy_next_start():
-    segments = [
-        ASRDataSeg("A tribute to the working people.", 30000, 32282, "对劳动人民的致敬。"),
-        ASRDataSeg("And", 32322, 32442, "另一位"),
-        ASRDataSeg("another Douban user made a sharp observation.", 32482, 37005, "豆瓣用户提出了观察。"),
+def test_comma_terminated_parser_confirmed_subordinate_overflow_is_warning_not_error():
+    text = "Yeah. And now that mobile coffee cart is bringing in between 10 000 and 15 000 every single month,"
+    editor = _marker_editor(text.split(), max_words=16)
+    segment = ASRDataSeg(text, 0, 6000, "完整中文。")
+    segment.subtitle_id = "S0001"
+    segment.word_start = 0
+    segment.word_end = len(editor._active_word_entries) - 1
+    editor._safe_overlong_item_split = lambda item: ([], [])
+
+    assert editor._word_count(text) == 19
+    assert editor._is_allowed_structural_english_overflow(segment, text, 19, 16)
+    assert editor._overlong_english_issues([segment]) == []
+    assert len(editor._structural_english_overflow_issues([segment])) == 1
+
+
+def test_comma_overflow_requires_parser_proof_and_no_safe_split():
+    text = "Yeah. And now that mobile coffee cart is bringing in between 10 000 and 15 000 every single month,"
+    editor = _marker_editor(text.split(), max_words=16)
+    segment = ASRDataSeg(text, 0, 6000, "完整中文。")
+    segment.word_start = 0
+    segment.word_end = len(editor._active_word_entries) - 1
+    editor._safe_overlong_item_split = lambda item: ([], [])
+
+    with patch.object(editor, "_load_syntax_nlp", return_value=None):
+        assert not editor._is_allowed_structural_english_overflow(segment, text, 19, 16)
+
+    editor._safe_overlong_item_split = lambda item: ([item], [])
+    assert not editor._is_allowed_structural_english_overflow(segment, text, 19, 16)
+
+
+def test_visual_reading_budget_keeps_complete_13_word_cue_for_renderer_wrapping():
+    words = "The market changed quickly after years of steady growth, and investors are responding.".split()
+    editor = _marker_editor(words, max_words=16)
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    word_times_before = [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
     ]
 
-    _pad_short_subtitle_timing_sequence(
-        segments,
-        min_gap_ms=40,
-        min_duration_ms=800,
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ] == word_times_before
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_visual_reading_budget_keeps_character_heavy_cue_for_renderer_wrapping():
+    words = "Internationalization creates a comprehensive institutional transformation across decentralized communities today.".split()
+    editor = _marker_editor(words, max_words=16)
+    original = _word_item(editor, 0, len(words) - 1, 1)
+
+    assert ScreenSubtitleEditor._word_count(original.original) <= 12
+    assert editor._visible_english_character_count(original.original) > 68
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_visual_reading_budget_never_selects_preposition_object_cut():
+    words = "She is the founder of a non-profit organization that helps young people find careers.".split()
+    editor = _marker_editor(words, max_words=16)
+    original = _word_item(editor, 0, len(words) - 1, 1)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_visual_reading_budget_does_not_create_a_review_for_renderer_wrapping():
+    words = "The market changed quickly after years of steady growth, and investors took notice.".split()
+    editor = _marker_editor(words, max_words=16)
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_visual_reading_budget_keeps_short_open_phrase_with_its_sentence():
+    words = (
+        "It turns out that the most famous giveaway of AI-generated text, "
+        "the word delve, signals a formulaic style."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    original = _word_item(editor, 0, len(words) - 1, 1)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert all(item.original != "the word delve," for item in repaired)
+    phrase = _word_item(editor, 11, 13, 1)
+    issues = editor._visual_split_display_unit_issues(phrase, None, None)
+    assert "visual_open_phrase_fragment" in issues
+
+
+def test_visual_reading_budget_keeps_a_single_clause_for_renderer_wrapping():
+    words = (
+        "But the thing I keep coming back to is how fast this is evolving."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    original = _word_item(editor, 0, len(words) - 1, 1)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_visual_reading_budget_rejects_short_preposition_led_display_tail():
+    words = "Our editors write clear explanations with punchy statements.".split()
+    editor = _marker_editor(words, max_words=16)
+    tail = _word_item(editor, 5, len(words) - 1, 1)
+
+    issues = editor._visual_split_display_unit_issues(tail, _word_item(editor, 0, 4, 1), None)
+
+    assert "visual_preposition_led_fragment" in issues
+
+
+def test_visual_reading_budget_never_creates_parser_confirmed_example_preposition_cut():
+    words = (
+        "Researchers still look for outdated clues like excessive em dashes "
+        "in generated prose today."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+
+    evaluation = editor._evaluate_stable_cut_boundary(6, 7)
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert "preposition_object_split" in evaluation["hard_issues"]
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_stable_cut_keeps_comma_bracketed_adverb_with_preceding_list_item():
+    words = (
+        "I mean, the stakes here are massive for you, for me, really, "
+        "for anyone reading anything on the screen right now."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(10, 11)
+    ranges = editor._stable_word_ranges_for_span((0, len(words) - 1))
+
+    assert "comma_bracketed_adverb_split" in evaluation["hard_issues"]
+    assert ranges == [(0, 11), (12, len(words) - 1)]
+    assert [
+        " ".join(words[start:end + 1])
+        for start, end in ranges
+    ] == [
+        "I mean, the stakes here are massive for you, for me, really,",
+        "for anyone reading anything on the screen right now.",
+    ]
+
+
+def test_visual_budget_keeps_subject_with_delayed_finite_predicate():
+    words = "Yeah. Well, the judges specifically praised its, quote, quiet authority.".split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+
+    evaluation = editor._evaluate_stable_cut_boundary(3, 4)
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert "subject_finite_verb_split" in evaluation["hard_issues"]
+    assert repaired == [original]
+
+
+def test_visual_budget_keeps_short_gerundial_manner_phrase_with_main_question():
+    words = "How can you actually spot the ghost in the machine using your own eyes?".split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    word_times_before = [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ]
+
+    evaluation = editor._evaluate_stable_cut_boundary(9, 10)
+    repaired = editor._apply_visual_reading_budget([original])
+    preposition_tail = _word_item(editor, 7, len(words) - 1, 1)
+
+    assert "short_gerundial_modifier_split" in evaluation["hard_issues"]
+    assert repaired == [original]
+    assert "visual_preposition_led_fragment" in editor._visual_split_display_unit_issues(
+        preposition_tail,
+        _word_item(editor, 0, 6, 1),
+        None,
+    )
+    assert [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ] == word_times_before
+
+
+def _add_visual_pause(editor, cut_after, pause_ms):
+    original_pause = (
+        editor._active_word_entries[cut_after + 1]["start_time"]
+        - editor._active_word_entries[cut_after]["end_time"]
+    )
+    delta = pause_ms - original_pause
+    for entry in editor._active_word_entries[cut_after + 1:]:
+        entry["start_time"] += delta
+        entry["end_time"] += delta
+
+
+def test_visual_temporal_budget_splits_punctuated_fronted_introduction():
+    words = (
+        "Reading about these polysyllables and nominalizations, "
+        "it immediately brings George Orwell to mind."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    _add_visual_pause(editor, 5, 420)
+    word_times_before = [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ]
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert [item.original for item in repaired] == [
+        "Reading about these polysyllables and nominalizations,",
+        "it immediately brings George Orwell to mind.",
+    ]
+    assert [item.word_start for item in repaired] == [0, 6]
+    assert [item.word_end for item in repaired] == [5, 12]
+    assert editor._pre_id_boundary_repairs[0]["visual_temporal_category"] == (
+        "fronted_introduction_boundary"
+    )
+    assert [
+        (entry["start_time"], entry["end_time"])
+        for entry in editor._active_word_entries
+    ] == word_times_before
+
+
+def test_visual_temporal_budget_splits_complete_punctuated_clauses():
+    words = (
+        "Humans might say things are connected, but the AI talks about "
+        "their interdependence."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    _add_visual_pause(editor, 5, 420)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert [item.original for item in repaired] == [
+        "Humans might say things are connected,",
+        "but the AI talks about their interdependence.",
+    ]
+    assert editor._pre_id_boundary_repairs[0]["visual_temporal_category"] == (
+        "complete_clause_boundary"
     )
 
-    assert segments[1].end_time - segments[1].start_time >= 800
-    assert segments[0].end_time + 40 <= segments[1].start_time
-    assert segments[1].end_time + 40 <= segments[2].start_time
-    assert segments[2].end_time - segments[2].start_time >= 800
-    assert [seg.text for seg in segments] == [
-        "A tribute to the working people.",
-        "And",
-        "another Douban user made a sharp observation.",
+
+def test_visual_temporal_budget_splits_complete_sentence_terminal():
+    words = (
+        "The first report confirms a meaningful trend. The next report explains "
+        "the remaining uncertainty."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    _add_visual_pause(editor, 6, 180)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert [item.original for item in repaired] == [
+        "The first report confirms a meaningful trend.",
+        "The next report explains the remaining uncertainty.",
     ]
+    assert editor._pre_id_boundary_repairs[0]["visual_temporal_category"] == (
+        "sentence_terminal"
+    )
+
+
+def test_visual_temporal_budget_keeps_subject_with_delayed_predicate_despite_pause():
+    words = (
+        "You know, this robotic vocabulary actually connects to a very human "
+        "critique from way back."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    _add_visual_pause(editor, 4, 280)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+    evaluation = editor._evaluate_stable_cut_boundary(4, 5)
+    assert "subject_finite_verb_split" in evaluation["hard_issues"]
+
+
+def test_visual_temporal_budget_rejects_punctuated_conditional_intro():
+    words = "If I normally say, uh, I'm going to eat a sandwich for lunch.".split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    original = _word_item(editor, 0, len(words) - 1, 1)
+    _add_visual_pause(editor, 4, 320)
+
+    repaired = editor._apply_visual_reading_budget([original])
+
+    assert repaired == [original]
+    assert editor._pre_id_boundary_repairs == []
+
+
+def test_final_timeline_rebuild_preserves_id_text_chinese_and_word_ownership():
+    editor = _editor()
+    editor._active_word_entries = [
+        {"token": "i", "surface": "I", "start_time": 553220, "end_time": 553340},
+        {"token": "mean", "surface": "mean", "start_time": 553350, "end_time": 553500},
+        {"token": "the", "surface": "the", "start_time": 553510, "end_time": 553620},
+        {"token": "delve", "surface": "Delve", "start_time": 553630, "end_time": 553900},
+        {"token": "era", "surface": "era", "start_time": 553910, "end_time": 554100},
+        {"token": "is", "surface": "is", "start_time": 554110, "end_time": 554220},
+        {"token": "over", "surface": "over.", "start_time": 554230, "end_time": 555720},
+        {"token": "why", "surface": "Why", "start_time": 555730, "end_time": 555960},
+    ]
+    editor._frozen_subtitle_ids = ["S0187", "S0188"]
+    final_data = ASRData(
+        [
+            ASRDataSeg("I mean, the Delve era is over.", 553180, 555284, "我的意思是，Delve时代结束了。"),
+            ASRDataSeg("Why does its style change so rapidly?", 555324, 557100, "为什么它的风格变化这么快？"),
+        ]
+    )
+    for index, segment in enumerate(final_data.segments):
+        segment.subtitle_id = editor._frozen_subtitle_ids[index]
+        segment.word_start = 0 if index == 0 else 7
+        segment.word_end = 6 if index == 0 else 7
+    final_data.segments.reverse()
+
+    ledger = ASRData([])
+    for word_id, entry in enumerate(editor._active_word_entries):
+        word = ASRDataSeg(entry["surface"], entry["start_time"], entry["end_time"])
+        word.word_id = word_id
+        word.alignment_source = "whisperx"
+        ledger.segments.append(word)
+
+    before = {
+        segment.subtitle_id: (
+            segment.text,
+            segment.translated_text,
+            segment.word_start,
+            segment.word_end,
+        )
+        for segment in final_data.segments
+    }
+    rebuilt = editor.rebuild_final_cue_timeline(
+        final_data,
+        ledger,
+        alignment_backend="whisperx-time-only",
+    )
+    after = {
+        segment.subtitle_id: (
+            segment.text,
+            segment.translated_text,
+            segment.word_start,
+            segment.word_end,
+        )
+        for segment in rebuilt.segments
+    }
+
+    assert after == before
+    assert [segment.subtitle_id for segment in rebuilt.segments] == ["S0187", "S0188"]
+    assert rebuilt.segments[0].end_time >= 555720
+    assert editor._final_cue_timeline["validation"]["status"] == "PASS"
+    assert editor._final_cue_timeline["expected_subtitle_ids"] == ["S0187", "S0188"]
+    assert [record["subtitle_id"] for record in editor._final_cue_timeline["records"]] == [
+        "S0187",
+        "S0188",
+    ]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output = Path(temp_dir) / "final.srt"
+        rebuilt.to_srt(save_path=str(output), layout="原文在上")
+        rendered = output.read_text(encoding="utf-8-sig")
+    assert "I mean, the Delve era is over." in rendered
+    assert "我的意思是，Delve时代结束了。" in rendered
+
+
+def test_forced_alignment_finalization_never_moves_timing():
+    editor = _editor()
+    asr_data = ASRData([
+        ASRDataSeg("A short line.", 1000, 1220, "一条很短的字幕。"),
+        ASRDataSeg("The next line.", 1260, 2200, "下一条字幕。"),
+    ])
+    for index, seg in enumerate(asr_data.segments, 1):
+        seg.subtitle_id = f"S{index:04d}"
+    before = [(seg.start_time, seg.end_time) for seg in asr_data.segments]
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._write_coverage_report = lambda *args, **kwargs: None
+
+    repaired = editor.repair_after_final_time_alignment(
+        asr_data,
+        preserve_aligned_timing=True,
+    )
+
+    assert [(seg.start_time, seg.end_time) for seg in repaired.segments] == before
 
 
 def test_failed_validation_does_not_write_final_output_file():
@@ -4177,6 +6601,29 @@ def test_repair_only_modifies_the_target_subtitle_id():
     assert repaired[2].translated_text == "这是原文"
 
 
+def test_compression_accepts_new_subtitle_id_protocol_without_position_shift():
+    editor = _id_editor()
+    segments = _id_segments(3)
+    segments[1].translated_text = "LONG_TARGET"
+
+    def severe(seg):
+        return seg.translated_text == "LONG_TARGET"
+
+    def request(prompt, payload, task, temperature):
+        assert payload[0]["subtitle_id"] == "S0002"
+        return {"items": [{"subtitle_id": "S0002", "chinese": "这是修复文本"}]}
+
+    with patch.object(editor, "_is_severe_chinese_speed", side_effect=severe), patch.object(
+        editor, "_request_chinese_compression", side_effect=request
+    ):
+        repaired = editor._compress_fast_chinese_segments(segments)
+
+    assert [seg.subtitle_id for seg in repaired] == ["S0001", "S0002", "S0003"]
+    assert repaired[0].translated_text == "这是原文"
+    assert repaired[1].translated_text == "这是修复文本"
+    assert repaired[2].translated_text == "这是原文"
+
+
 def test_redistribution_parses_out_of_order_returns_by_subtitle_id():
     editor = _id_editor()
     segments = _id_segments(4)
@@ -4187,6 +6634,26 @@ def test_redistribution_parses_out_of_order_returns_by_subtitle_id():
                 "segments": [
                     {"index": 3, "zh": "这是第四条"},
                     {"index": 1, "zh": "这是第二条"},
+                ],
+            }
+        ]
+    }
+
+    parsed = editor._parse_chinese_group_allocations(data, segments)
+
+    assert parsed == {"S0003": {"S0004": "这是第四条", "S0002": "这是第二条"}}
+
+
+def test_redistribution_parses_new_id_only_protocol_without_position_shift():
+    editor = _id_editor()
+    segments = _id_segments(4)
+    data = {
+        "groups": [
+            {
+                "target_subtitle_id": "S0003",
+                "segments": [
+                    {"subtitle_id": "S0004", "zh": "这是第四条"},
+                    {"subtitle_id": "S0002", "zh": "这是第二条"},
                 ],
             }
         ]
@@ -4981,6 +7448,7 @@ if __name__ == "__main__":
     test_final_time_alignment_shifts_next_when_loaded_short_has_no_gap()
     test_final_time_alignment_runs_chinese_speed_repair_without_touching_english()
     test_screen_editor_uses_16_word_stable_hard_floor()
+    test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split()
     test_preposition_phrase_is_not_stranded()
     test_number_and_policy_sentence_keeps_readable_boundaries()
     test_long_finance_sentence_keeps_full_coverage()
@@ -4989,6 +7457,10 @@ if __name__ == "__main__":
     test_abnormal_timing_gap_is_repaired_for_compressed_cluster()
     test_coverage_gap_does_not_sum_natural_pauses()
     test_coverage_gap_blocks_single_long_uncovered_span()
+    test_final_display_coverage_bridges_short_continuous_source_gap()
+    test_final_display_coverage_does_not_bridge_long_gap()
+    test_final_display_coverage_preserves_real_word_pause()
+    test_final_time_alignment_coverage_bridge_runs_with_preserved_alignment_timing()
     test_chinese_reading_speed_error_is_reported_but_not_blocking()
     test_validation_report_adds_actionable_review_tiers_without_changing_status()
     test_validation_review_includes_allocation_unresolved_without_old_error_mutation()
@@ -5023,17 +7495,20 @@ if __name__ == "__main__":
     test_asr_suspicious_phrases_are_reported_without_fixing_text()
     test_asr_suspicious_article_context_misses_are_reported()
     test_abbreviation_name_boundary_is_syntax_warning()
+    test_terminal_punctuation_wins_over_token_only_determiner_heuristic()
     test_caption_audit_uses_16_word_hard_limit()
+    test_caption_audit_accepts_allowed_plus_discourse_overflow()
+    test_caption_audit_treats_borderline_chinese_speed_as_warning_not_blocker()
     test_caption_audit_keeps_numeric_percent_chinese_line()
     test_large_number_anchor_variants_do_not_crash()
     test_concise_group_allocation_is_not_rejected_by_coverage_only()
     test_short_but_severe_chinese_speed_triggers_repair()
+    test_borderline_chinese_speed_does_not_trigger_render_blocker()
     test_short_subtitle_gets_minimum_display_duration_when_room_allows()
     test_short_backchannel_merges_with_following_segment()
     test_short_sentence_bridges_small_gap_before_next_subtitle()
-    test_whisperx_time_only_pads_ultra_short_subtitle_when_neighbor_room_exists()
-    test_whisperx_time_only_pads_ultra_short_subtitle_by_shifting_roomy_next_start()
     test_standalone_discourse_marker_attaches_to_immediate_next_sentence()
+    test_plus_marker_keeps_a_complete_one_word_overflow_unit()
     test_trailing_standalone_discourse_marker_attaches_to_previous_sentence()
     test_standalone_discourse_marker_does_not_cross_long_pause()
     test_standalone_discourse_marker_does_not_cross_speaker_change()
@@ -5054,9 +7529,21 @@ if __name__ == "__main__":
     test_adverb_adjective_boundary_is_hard_illegal_without_pause()
     test_short_verb_complement_boundary_is_hard_when_syntax_marks_it()
     test_short_verb_possessive_complement_boundary_is_hard_when_syntax_marks_it()
+    test_parser_blocks_direct_verb_particle_boundary()
+    test_parser_blocks_compact_coordinated_subject_boundary()
+    test_parser_blocks_short_dative_object_start_boundary()
+    test_parser_blocks_numeric_range_boundaries()
+    test_pre_id_candidate_gate_rejects_new_hard_syntax_boundary()
     test_long_object_still_allows_legal_boundary()
     test_final_pre_id_repair_removes_known_hard_boundary()
+    test_final_pre_id_keeps_discourse_marker_with_following_sentence_after_terminal_over()
+    test_final_pre_id_rebalances_leading_nonfinite_dependent_prefix()
+    test_final_pre_id_keeps_finite_conditional_introduction_in_its_own_cue()
+    test_leading_nonfinite_dependent_prefix_rebalance_respects_long_pause()
+    test_leading_nonfinite_dependent_prefix_rebalance_respects_speaker_change()
     test_final_pre_id_repair_does_not_cross_speaker_change()
+    test_final_pre_id_rejects_noop_repartition_without_iteration_loop()
+    test_verb_directional_adverb_preposition_boundary_is_hard_when_syntax_marks_it()
     test_short_display_merge_keeps_original_when_no_safe_boundary_exists()
     test_final_pre_id_preserves_word_order_coverage_and_timestamps()
     test_boundary_snapshot_payload_records_pre_id_repairs()
@@ -5076,11 +7563,21 @@ if __name__ == "__main__":
     test_unresolved_weak_fragment_is_recorded_when_no_safe_repair()
     test_final_pre_id_second_phase_preserves_word_order_and_timestamps()
     test_boundary_snapshots_record_stage_changes_before_subtitle_ids()
+    test_final_stable_english_boundaries_do_not_change_for_video_layout()
     test_final_gate_blocks_particle_preposition_complement_split()
+    test_final_gate_keeps_preposition_object_boundary_illegal_after_long_pause()
+    test_stable_cut_keeps_preposition_object_phrase_together_in_long_sentence()
+    test_parser_confirmed_verb_object_boundary_stays_illegal_after_long_pause()
+    test_parser_blocks_clause_introducer_from_ending_a_cue()
+    test_parser_blocks_verb_from_its_preposition_complement()
+    test_parser_blocks_verb_from_numeric_result_expression()
+    test_parser_mapping_keeps_numeric_result_after_hyphenated_ledger_word()
+    test_stable_cut_prefers_normal_limit_when_a_legal_boundary_exists()
     test_final_gate_soft_flags_heuristic_short_verb_object_split()
     test_final_gate_blocks_auxiliary_predicate_split()
     test_final_gate_soft_flags_heuristic_catenative_verb_complement_split()
     test_final_gate_blocks_numeric_unit_or_noun_split()
+    test_numeric_sentence_boundary_is_not_repaired_as_a_numeric_phrase()
     test_final_gate_soft_flags_heuristic_compound_noun_split()
     test_final_gate_soft_flags_heuristic_modifier_noun_head_split()
     test_final_gate_blocks_negation_emphasis_split()
@@ -5099,16 +7596,53 @@ if __name__ == "__main__":
     test_final_fragment_gate_repairs_connector_and_reflexive_fragments()
     test_final_fragment_gate_records_unresolved_when_no_legal_solution()
     test_podcast_template_prefers_stable_manifest_subtitle()
-    test_podcast_template_ignores_blocked_stable_manifest_subtitle()
+    test_podcast_template_blocks_failed_stable_manifest_subtitle()
+    test_podcast_template_reuses_legacy_reading_speed_manifest_when_revalidated()
     test_podcast_template_preserves_full_media_duration_when_subtitles_end_early()
     test_podcast_template_uses_frozen_task_configuration()
     test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths()
+    test_caption_wrapper_never_orphans_a_leading_connector_to_balance_two_lines()
+    test_caption_wrapper_preserves_preposition_and_infinitive_phrase_edges()
+    test_caption_wrapper_scales_before_breaking_a_hyphenated_compound()
+    test_article_template_does_not_truncate_a_long_english_subtitle()
+    test_standard_chinese_subtitle_font_uses_48_then_46_before_two_lines()
+    test_article_template_scaled_geometry_stays_on_integer_pixels()
     test_article_template_tip_font_and_wrapper_support_chinese_text()
+    test_article_vocab_typography_uses_hanchan_tip_and_regular_definition()
+    test_vocab_highlight_keeps_attached_punctuation_but_not_whitespace()
+    test_standard_subtitle_highlight_colors_attached_punctuation()
+    test_article_subtitle_highlight_colors_attached_punctuation()
+    test_vocab_generation_keeps_successful_batches_when_one_batch_fails()
+    test_empty_vocab_cache_is_regenerated_instead_of_reused()
+    test_vocab_card_plan_keeps_the_latest_full_card_until_replacement()
+    test_article_vocab_card_uses_only_expression_gloss_and_concept_note()
+    test_vocab_prompt_requests_expression_card_fields_without_dictionary_metadata()
+    test_vocab_plan_preserves_the_exact_phrase_from_its_subtitle()
+    test_vocab_source_phrase_does_not_match_inside_a_larger_word()
+    test_vocab_plan_limits_concept_cards_to_three_per_episode()
+    test_vocab_plan_keeps_each_llm_card_inside_its_frozen_group()
+    test_vocab_card_meaning_keeps_only_compact_primary_gloss()
+    test_vocab_plan_normalizes_verbose_model_meaning_before_rendering()
+    test_vocab_card_plan_skips_low_priority_model_candidates()
+    test_vocabulary_card_target_is_20_for_a_sixteen_minute_episode()
+    test_article_template_does_not_fallback_to_per_subtitle_vocab_lookup()
+    test_article_template_shows_topic_panel_before_first_card()
+    test_article_template_crossfades_only_from_topic_to_first_card()
+    test_episode_vocab_overview_uses_editor_rank_instead_of_earliest_words()
+    test_template_frame_cache_keeps_the_full_vocab_card_stable()
     test_stable_srt_writer_keeps_bilingual_original_top()
     test_id_bound_group_missing_one_id_does_not_shift_later_subtitles()
+    test_atomic_no_response_cannot_be_written_as_affirmative()
     test_id_bound_group_rejects_duplicate_id_without_compressing_chinese()
     test_id_bound_group_rejects_unknown_id()
     test_id_bound_group_allows_different_return_order()
+    test_single_cue_group_uses_authoritative_full_translation_without_allocation_request()
+    test_full_translation_number_error_is_not_misclassified_as_allocation_error()
+    test_full_translation_requests_are_chunked_and_retry_missing_groups()
+    test_full_translation_prompt_restrains_ordinary_chinese_em_dashes()
+    test_full_translation_em_dash_style_detector_ignores_lexical_hyphen()
+    test_full_translation_style_retry_only_retries_flagged_group_and_accepts_improvement()
+    test_full_translation_style_retry_keeps_original_when_candidate_loses_number_or_negation()
     test_allocation_quality_retries_information_leaked_to_previous_id()
     test_allocation_quality_rejects_adjacent_core_duplication()
     test_allocation_quality_rejects_adjacent_long_common_phrase_duplication()
@@ -5125,14 +7659,23 @@ if __name__ == "__main__":
     test_allocation_quality_allows_adjacent_number_when_target_line_is_not_degraded()
     test_allocation_quality_rejects_adjacent_number_when_target_line_is_empty()
     test_allocation_quality_accepts_natural_subtitle_half_sentence()
+    test_chinese_polish_rewrites_only_fixed_group_chinese_by_id()
+    test_chinese_polish_skips_natural_groups_without_a_model_request()
+    test_chinese_polish_selects_complex_comparison_group_by_fixed_ids()
+    test_cross_subtitle_predicate_break_triggers_group_polish_by_fixed_ids()
+    test_cross_subtitle_predicate_break_does_not_flag_normal_chinese_continuation()
+    test_semantic_loss_recognizes_bingfei_as_negation()
+    test_sentence_final_shide_is_not_a_dangling_chinese_fragment()
     test_allocation_retry_rejects_quality_regression_before_writeback()
     test_compare_allocation_candidates_accepts_strict_improvement_only()
     test_compare_allocation_candidates_rejects_new_high_confidence_issue()
+    test_id_bound_candidate_decision_never_accepts_invalid_candidate()
     test_cross_id_leakage_requires_target_id_to_be_degraded()
     test_cross_id_leakage_flags_when_target_id_is_consumed_and_empty()
     test_allocation_quality_keeps_out_of_order_return_by_subtitle_id()
     test_allocation_quality_failed_group_does_not_shift_following_100_ids()
     test_compression_quality_regression_restores_previous_group_allocation()
+    test_speed_compression_cannot_accept_number_omission_for_shorter_chinese()
     test_empty_middle_translation_keeps_its_own_id_slot()
     test_failed_group_does_not_shift_following_100_subtitles()
     test_failed_validation_does_not_write_final_output_file()
@@ -5140,7 +7683,9 @@ if __name__ == "__main__":
     test_final_segment_count_mismatch_is_structural_error()
     test_merge_preserves_ids_when_order_changes_before_final_write()
     test_repair_only_modifies_the_target_subtitle_id()
+    test_compression_accepts_new_subtitle_id_protocol_without_position_shift()
     test_redistribution_parses_out_of_order_returns_by_subtitle_id()
+    test_redistribution_parses_new_id_only_protocol_without_position_shift()
     test_compression_keeps_subtitle_ids_and_count()
     test_fallback_translation_fills_only_one_missing_subtitle_id()
     test_multiple_semantic_groups_apply_by_id_without_drift()
@@ -5152,22 +7697,35 @@ if __name__ == "__main__":
     test_runtime_module_import_path_is_available()
     test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
     test_whisperx_time_only_preserves_text_and_translation_while_retiming()
-    test_whisperx_time_only_rejects_incomplete_subtitle_mapping()
-    test_frozen_word_timing_prevents_whisperx_from_compressing_long_subtitle()
-    test_safe_auto_repair_is_noop_when_disabled()
-    test_safe_auto_repair_retranslates_exact_duplicate_chinese_by_id()
-    test_safe_auto_repair_extends_high_load_short_subtitle_when_neighbor_has_room()
-    test_safe_auto_repair_does_not_extend_high_load_short_subtitle_when_disabled()
+    test_whisperx_frozen_ledger_keeps_only_unmatched_word_on_stable_ts_time()
+    test_whisperx_frozen_ledger_reverts_a_candidate_that_inverts_fallback_word_order()
+    test_whisperx_frozen_ledger_keeps_monotonic_candidate_updates()
+    test_whisperx_time_only_falls_back_to_stable_ledger_without_changing_cues()
+    test_whisperx_time_only_uses_expanded_frozen_ledger_not_source_segment_count()
+    test_short_nonindependent_backchannel_attaches_to_previous_display_item()
+    test_complete_unsplittable_overflow_is_warning_not_overlong_error()
+    test_comma_terminated_parser_confirmed_subordinate_overflow_is_warning_not_error()
+    test_comma_overflow_requires_parser_proof_and_no_safe_split()
+    test_visual_reading_budget_keeps_complete_13_word_cue_for_renderer_wrapping()
+    test_visual_reading_budget_keeps_character_heavy_cue_for_renderer_wrapping()
+    test_visual_reading_budget_never_selects_preposition_object_cut()
+    test_visual_reading_budget_does_not_create_a_review_for_renderer_wrapping()
+    test_visual_reading_budget_keeps_short_open_phrase_with_its_sentence()
+    test_visual_reading_budget_keeps_a_single_clause_for_renderer_wrapping()
+    test_visual_reading_budget_rejects_short_preposition_led_display_tail()
+    test_visual_reading_budget_never_creates_parser_confirmed_example_preposition_cut()
+    test_stable_cut_keeps_comma_bracketed_adverb_with_preceding_list_item()
+    test_visual_budget_keeps_subject_with_delayed_finite_predicate()
+    test_visual_budget_keeps_short_gerundial_manner_phrase_with_main_question()
+    test_visual_temporal_budget_splits_punctuated_fronted_introduction()
+    test_visual_temporal_budget_splits_complete_punctuated_clauses()
+    test_visual_temporal_budget_splits_complete_sentence_terminal()
+    test_visual_temporal_budget_keeps_subject_with_delayed_predicate_despite_pause()
+    test_visual_temporal_budget_rejects_punctuated_conditional_intro()
+    test_final_timeline_rebuild_preserves_id_text_chinese_and_word_ownership()
+    test_forced_alignment_finalization_never_moves_timing()
     test_duration_audit_reports_high_load_short_subtitle_as_warning()
-    test_safe_auto_repair_records_review_candidates_without_rewriting_fragments()
-    test_safe_auto_repair_guard_rejects_repairs_that_create_new_hard_problem()
-    test_safe_auto_repair_llm_repairs_high_confidence_chinese_candidate_after_final_alignment()
-    test_safe_auto_repair_llm_does_not_run_candidate_repair_before_final_alignment()
-    test_safe_auto_repair_llm_rejects_invalid_candidate_repair()
-    test_safe_auto_repair_llm_retries_invalid_candidate_with_same_group_context()
-    test_safe_auto_repair_llm_rejects_new_adjacent_chinese_boundary_break()
     test_final_gate_blocks_protected_named_phrase_split()
     test_final_gate_blocks_protected_phrasal_boundary_split()
     test_final_gate_blocks_look_at_boundary_split()
-    test_stable_result_summary_records_safe_repair_details()
     print("stable caption rule smoke tests passed")

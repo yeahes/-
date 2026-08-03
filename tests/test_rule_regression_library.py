@@ -196,7 +196,7 @@ def test_rule_regression_speed_fallback_is_not_restored_as_soft_omission():
     editor = _editor()
     before = ASRDataSeg(
         text="But they have a much bigger test coming.",
-        translated_text="但他们即将进行一次规模大得多的测试。",
+        translated_text="但他们即将进行一次规模远大得多且影响深远的测试。",
         start_time=470400,
         end_time=471920,
     )

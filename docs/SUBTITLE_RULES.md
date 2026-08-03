@@ -8,6 +8,22 @@
 - If a short backchannel is visually too brief, merge or extend display timing instead of deleting it.
 - Preferred visual target is 6-12 English words per subtitle.
 - Normal hard maximum is 16 English words. A rare 17-19 word structural exception is allowed only when every shorter cut would create a parser-confirmed grammar error; report the exception.
+- The 12-word / 68-character reading target normally belongs to the renderer.
+  A complete 13-16 word English cue remains one temporal subtitle with one ID
+  and one Chinese allocation unless a pre-ID visual temporal pass finds a
+  high-confidence display-unit boundary: punctuation, an actual local pause,
+  and independently readable grammar on both sides. Video templates still wrap
+  all remaining long cues across two visual lines.
+- Visual temporal splitting never crosses a parser-confirmed protected syntax
+  boundary, speaker change, or discontinuous word range. Both resulting cues
+  need at least four words and enough recorded display time; a subject and its
+  finite verb must remain together even when there is a pause.
+- A short comma-terminated non-finite condition at the start of a cue may move
+  back to the immediately preceding clause only when local parsing confirms it
+  has a clause marker but no subject or finite predicate, the following text is
+  a complete main clause, the pause is under 450ms, and both repaired cues stay
+  within the English word limit. A finite conditional introduction remains in
+  its own cue. The audit records any narrowly accepted syntax exception.
 
 ## English Cutting
 

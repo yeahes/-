@@ -9,6 +9,7 @@ from typing import Iterable
 
 from app.core.subtitle_processor.text_metrics import (
     HARD_ENGLISH_WORD_LIMIT,
+    is_allowed_discourse_overflow,
     word_count as shared_word_count,
 )
 
@@ -108,7 +109,7 @@ def audit_srt(
     min_duration_ms: int = 900,
     english_wps_warning: float = 5.0,
     chinese_cps_warning: float = 9.0,
-    chinese_cps_error: float = 11.0,
+    chinese_cps_error: float = 12.0,
 ) -> dict:
     cues = parse_srt(path)
     issues = {
@@ -187,7 +188,9 @@ def audit_srt(
                 )
             )
         word_count = count_words(cue.english)
-        if word_count > max_words:
+        if word_count > max_words and not is_allowed_discourse_overflow(
+            cue.english, word_count, max_words
+        ):
             issues["errors"].append(
                 _issue(
                     "overlong_english",

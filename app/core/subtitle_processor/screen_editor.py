@@ -12,15 +12,36 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from string import Template
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from openai import OpenAI
 
-from app.config import CACHE_PATH
+from app.config import CACHE_PATH, RESOURCE_PATH
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.storage.cache_manager import CacheManager
+from app.core.subtitle_processor.stable_pipeline_contracts import (
+    FROZEN_PIPELINE_HASH_KEYS,
+    FrozenPipelineSnapshot,
+)
+from app.core.subtitle_processor.final_cue_timeline import (
+    derive_final_cue_timeline,
+    final_cue_timeline_artifact,
+    reconcile_frozen_word_ledger,
+)
+from app.core.subtitle_processor.allocation_quality import (
+    compare_fixed_id_allocation_candidates,
+)
+from app.core.subtitle_processor.stable_artifacts import (
+    stable_artifact_dir,
+    write_json_artifact,
+    write_json_artifact_set,
+)
+from app.core.subtitle_processor.stable_english_boundaries import (
+    finalize_stable_english_boundaries,
+)
 from app.core.subtitle_processor.text_metrics import (
     HARD_ENGLISH_WORD_LIMIT,
+    is_allowed_discourse_overflow,
     word_count,
     word_tokens,
 )
@@ -37,22 +58,45 @@ DISPLAY_BRIDGE_GAP_MS = 800
 DISPLAY_SHORT_MERGE_MS = 700
 DISPLAY_SHORT_MERGE_GAP_MS = 500
 DISPLAY_SHORT_BRIDGE_GAP_MS = 2200
+DISPLAY_COVERAGE_BRIDGE_MAX_MS = 800
+DISPLAY_COVERAGE_WORD_PAUSE_MAX_MS = 450
 COVERAGE_GAP_REPORT_MS = 1500
 ABNORMAL_TIMING_GAP_MS = 1800
 ABNORMAL_TIMING_CLUSTER_GAP_MS = 900
 READ_MS_PER_EN_WORD = 260
 CHINESE_CPS_WARNING = 9.0
-CHINESE_CPS_ERROR = 11.0
+# Keep the production render gate aligned with the standalone audit: above 9
+# chars/s is worth reviewing, while only sustained text above 12 chars/s blocks.
+CHINESE_CPS_ERROR = 12.0
 ENGLISH_WPS_WARNING = 5.0
 ADJACENT_ZH_DUPLICATE_SIMILARITY = 0.88
 SUBTITLE_DURATION_INVALID_MS = 150
 SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
-SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v2"
-SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v2"
-SEMANTIC_ALLOCATION_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_v2"
-SEMANTIC_ALLOCATION_RETRY_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_retry_v2"
+SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v3"
+SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v4"
+SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK = (
+    "screen_subtitle_semantic_full_translation_style_retry_v1"
+)
+SEMANTIC_ALLOCATION_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_v3"
+SEMANTIC_ALLOCATION_RETRY_CACHE_TASK = "screen_subtitle_semantic_translation_allocation_retry_v3"
+SEMANTIC_CHINESE_POLISH_PROMPT_VERSION = "semantic-chinese-polish-v3"
+SEMANTIC_CHINESE_POLISH_CACHE_TASK = "screen_subtitle_semantic_chinese_polish_v3"
+MAX_SELECTIVE_CHINESE_POLISH_GROUPS = 8
+# These are visual review budgets for the 1080p bilingual templates, not
+# translation or structural limits.  The existing 16-word hard contract stays
+# authoritative when no grammatical visual split exists.
+VISUAL_ENGLISH_WORD_SOFT_LIMIT = 12
+VISUAL_ENGLISH_CHARACTER_SOFT_LIMIT = 68
+# Temporal display pages are deliberately stricter than structural English
+# cuts. They exist only for long cues whose spoken delivery supports two
+# independently readable screens.
+VISUAL_TEMPORAL_MIN_PAUSE_MS = 250
+VISUAL_TEMPORAL_TERMINAL_MIN_PAUSE_MS = 120
+VISUAL_TEMPORAL_MIN_DISPLAY_MS = 1100
+VISUAL_TEMPORAL_MIN_MS_PER_WORD = 180
+VISUAL_TEMPORAL_MIN_WORDS = 4
 
 
 SCREEN_EDITOR_PROMPT = """
@@ -187,8 +231,15 @@ Translate each full English sense group into one complete, accurate, natural Sim
 Rules:
 - Translate the complete meaning, not the English word order.
 - Use polished magazine/documentary/finance explainer narration.
+- First identify the Chinese main subject, predicate, object, and logical relation; then write Chinese in that order.
+- Rebuild English post-modifiers, relative clauses, and delayed predicates into normal Chinese assertions.
+- A sentence led by a reporting verb such as "发现、表明、显示、指出" must complete what was found or shown. Do not leave a chained noun phrase in place of the main assertion.
 - Keep facts, numbers, names, negation, contrast, conditions, modality, and speaker stance.
 - Avoid stiff translationese and overly literal English sentence shape.
+- Default to Chinese commas, full stops, colons, semicolons, or parentheses to organize a sentence.
+- Do not use em dashes for ordinary explanations, examples, appositives, causes, or results.
+- Use an em dash only for a clear spoken interruption, abrupt turn, or emphasis that cannot read naturally another way.
+- Never leave an em dash at the beginning or end of a translation.
 - Do not compress aggressively in this stage.
 - Do not split into subtitle lines in this stage.
 
@@ -206,7 +257,7 @@ Return pure JSON only:
 SEMANTIC_TRANSLATION_ALLOCATION_PROMPT = """
 You are assigning a completed Chinese translation back to fixed English subtitle parts.
 
-Version: semantic-allocation-v2
+Version: semantic-allocation-v3
 
 Task:
 Given a full English sense group, its completed Chinese translation, and fixed subtitle parts, write one concise Chinese subtitle for each part.
@@ -226,13 +277,16 @@ Rules:
 - Prefer natural Chinese video subtitle phrasing over word-for-word alignment.
 - Preserve facts, numbers, names, negation, contrast, conditions, modality, and speaker stance.
 - If a part is an incomplete English fragment, make the Chinese fragment natural in context.
+- When an English subject receives its predicate in a later part, keep the Chinese subject-predicate relation readable across those parts. Add a minimal pronoun or connective when needed; do not copy English modifier order.
+- Every subtitle_parts item includes target_zh_chars and absolute_max_zh_chars derived from its display duration. Treat target_zh_chars as a preferred reading budget, not a reason to omit meaning. If one part is too short, distribute the same completed Chinese meaning naturally across adjacent IDs in the same group.
+- For comparisons, lists, and source attributions, rebuild the Chinese sentence first. Do not leave the final subtitle part as a bare list of publications, dates, or nouns without the comparison/action that governs it.
 
 Return pure JSON only:
 {
   "groups": [
     {
       "id": 1,
-      "allocation_prompt_version": "semantic-allocation-v2",
+      "allocation_prompt_version": "semantic-allocation-v3",
       "part_translations": [
         {"subtitle_id": "S0001", "zh": "中文字幕1"},
         {"subtitle_id": "S0002", "zh": "中文字幕2"}
@@ -240,6 +294,50 @@ Return pure JSON only:
     }
   ]
 }
+"""
+
+SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT = """
+You are revising one completed Simplified Chinese translation for a bilingual video subtitle sense group.
+
+Return a complete, accurate, natural replacement translation for each supplied group.
+
+Hard rules:
+- Preserve every fact, number, name, negation, contrast, condition, modality, and speaker stance from current_translation.
+- Do not add facts or remove information.
+- Keep concise magazine/documentary/finance explainer narration.
+- Do not use em dashes for ordinary explanations, examples, appositives, causes, or results.
+- Never begin or end the translation with an em dash.
+- Prefer commas, full stops, colons, semicolons, or parentheses when they read naturally.
+
+Return pure JSON only:
+{
+  "groups": [
+    {
+      "id": 1,
+      "full_translation": "完整自然中文"
+    }
+  ]
+}
+"""
+
+SEMANTIC_CHINESE_POLISH_PROMPT = """
+You are polishing fixed Simplified Chinese bilingual video subtitles.
+
+For each supplied high-risk sense group, improve only the existing Chinese part_translations so they read as natural, concise magazine or documentary narration.
+
+Hard rules:
+- English, subtitle IDs, order, timing and subtitle count are immutable.
+- Use full_translation as the authority for meaning. English only locates where meaning is spoken.
+- Return exactly the same subtitle_id set for every group.
+- Keep names, numbers, negation, contrast, causality, modality and core actions.
+- Keep information near its English anchor. Do not move later information earlier.
+- Redistribute Chinese only inside the same sense group.
+- Keep current wording unchanged if it is already natural.
+- Do not make text more literary at the cost of accuracy or clarity.
+- Do not leave dangling clauses or split Chinese grammar unnaturally.
+
+Return pure JSON only:
+{"groups":[{"id":1,"part_translations":[{"subtitle_id":"S0001","zh":"中文字幕1"}]}]}
 """
 
 
@@ -300,7 +398,10 @@ class ScreenSubtitleEditor:
         coverage_report_path: Optional[str] = None,
         article_context_prompt: str = "",
         update_callback: Optional[Callable[[Dict], None]] = None,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
         enable_safe_auto_repair: bool = False,
+        enable_chinese_polish: bool = False,
+        preserve_aligned_timing: bool = False,
         allocation_max_concurrency: int = 1,
         allocation_batch_size: int = 16,
     ):
@@ -317,7 +418,10 @@ class ScreenSubtitleEditor:
         self.coverage_report_path = coverage_report_path
         self.article_context_prompt = (article_context_prompt or "").strip()
         self.update_callback = update_callback
+        self.progress_callback = progress_callback
         self.enable_safe_auto_repair = bool(enable_safe_auto_repair)
+        self.enable_chinese_polish = bool(enable_chinese_polish)
+        self.preserve_aligned_timing = bool(preserve_aligned_timing)
         self.allocation_max_concurrency = max(1, int(allocation_max_concurrency or 1))
         self.allocation_batch_size = min(24, max(1, int(allocation_batch_size or 16)))
         self.cache_manager = CacheManager(str(CACHE_PATH))
@@ -344,6 +448,7 @@ class ScreenSubtitleEditor:
         self._last_allocation_retry_log: List[Dict] = []
         self._last_allocation_final: List[Dict] = []
         self._last_allocation_unresolved: List[Dict] = []
+        self._last_full_translation_style_retry_log: List[Dict] = []
         self._llm_cache_stats: Dict[str, Dict[str, int]] = {}
         self._allocation_runtime_stats: Dict[str, Any] = {}
         self._llm_cache_used: bool = False
@@ -356,14 +461,32 @@ class ScreenSubtitleEditor:
         self._allocation_isolation_report: Dict = {}
         self._safe_auto_repair_log: List[Dict] = []
         self._safe_auto_repair_candidates: List[Dict] = []
+        self._display_coverage_repairs: List[Dict] = []
+        self._display_coverage_unresolved: List[Dict] = []
+        self._chinese_polish_log: List[Dict] = []
         self._qa_review_points_path: str = ""
         self._qa_review_points_count: int = 0
+        self._final_cue_timeline: Dict[str, Any] = {}
+        self._final_cue_timeline_seed_errors: List[Dict[str, Any]] = []
+        self._final_cue_timeline_path: str = ""
+        self._final_word_timing_reconciliations: List[Dict[str, Any]] = []
+        self._final_timeline_alignment: Dict[str, Any] = {}
         self.last_validation_summary: Optional[Dict] = None
 
     def _compose_prompt(self, base_prompt: str) -> str:
         if not self.article_context_prompt:
             return base_prompt
         return f"{base_prompt}\n\n{self.article_context_prompt}"
+
+    def _emit_progress_event(self, phase: str, **details: Any) -> None:
+        """Report main-thread pipeline progress without mutating subtitle data."""
+        callback = getattr(self, "progress_callback", None)
+        if callback is None:
+            return
+        try:
+            callback({"phase": phase, **details})
+        except Exception as exc:
+            logger.debug("Screen subtitle progress callback failed: %s", exc)
 
     @staticmethod
     def _init_client() -> OpenAI:
@@ -436,8 +559,6 @@ class ScreenSubtitleEditor:
             edited_segments.extend(edited_by_index[chunk_index])
 
         edited_segments = self._repair_global_segments(edited_segments)
-        if self.enable_quality_check:
-            edited_segments = self._quality_check_candidate_segments(edited_segments)
         edited_segments = self._translate_missing_segments(edited_segments)
         edited_segments = self._align_segment_translation_punctuation(edited_segments)
         if word_time_asr_data and word_time_asr_data.is_word_timestamp():
@@ -464,6 +585,7 @@ class ScreenSubtitleEditor:
         self._last_allocation_retry_log = []
         self._last_allocation_final = []
         self._last_allocation_unresolved = []
+        self._last_full_translation_style_retry_log = []
         self._last_semantic_full_translations = {}
         self._last_semantic_group_audit_contexts = {}
         self._last_semantic_group_id_by_subtitle_id = {}
@@ -479,15 +601,31 @@ class ScreenSubtitleEditor:
         self._allocation_isolation_report = {}
         self._safe_auto_repair_log = []
         self._safe_auto_repair_candidates = []
+        self._display_coverage_repairs = []
+        self._display_coverage_unresolved = []
+        self._chinese_polish_log = []
         self._llm_cache_stats = {}
         self._allocation_runtime_stats = {}
+        self._final_cue_timeline = {}
+        self._final_cue_timeline_seed_errors = []
+        self._final_cue_timeline_path = ""
+        self._final_word_timing_reconciliations = []
+        self._final_timeline_alignment = {}
         self._active_source_segments_by_id = {
             index: seg for index, seg in enumerate(asr_data.segments, 1)
         }
         self._llm_cache_used = False
+        self._emit_progress_event("english_boundaries", completed=0, total=1)
         items = self._finalize_stable_english_boundaries(asr_data.segments)
         items = self._assign_global_subtitle_ids(items)
         semantic_groups = self._semantic_translation_groups(items)
+        self._emit_progress_event(
+            "english_boundaries",
+            completed=1,
+            total=1,
+            subtitle_count=len(items),
+            semantic_group_count=len(semantic_groups),
+        )
         self._last_semantic_groups = list(semantic_groups)
         self._last_subtitle_items = list(items)
         items = self._translate_semantic_subtitle_groups(items)
@@ -497,26 +635,17 @@ class ScreenSubtitleEditor:
         segments = self._items_to_segments(
             items, list(enumerate(asr_data.segments, 1))
         )
-        segments = self._translate_missing_segments(segments)
+        # Stable mode must not silently replace a missing ID-bound allocation
+        # with a free single-line translation.  The ID validator below turns
+        # that condition into a structural failure instead.
         segments = self._align_segment_translation_punctuation(segments)
         segments = self._repair_blocking_subtitle_issues(
             segments,
             semantic_groups=semantic_groups,
             subtitle_items=items,
         )
-        segments = self._repair_abnormal_timing_gaps(segments)
-        segments = self._apply_display_timing_padding(segments)
-        segments = self._compress_fast_chinese_segments(
-            segments,
-            semantic_groups=semantic_groups,
-            subtitle_items=items,
-        )
-        segments = self._safe_auto_repair_segments(
-            segments,
-            semantic_groups=semantic_groups,
-            subtitle_items=items,
-            stage="before_export",
-        )
+        if not self.preserve_aligned_timing:
+            segments = self._repair_abnormal_timing_gaps(segments)
         segments = self._order_segments_by_frozen_subtitle_ids(segments)
         self._validate_final_segment_translation_ids(segments)
         self._allocation_isolation_after = self._allocation_isolation_snapshot(
@@ -538,6 +667,7 @@ class ScreenSubtitleEditor:
             final_segments=segments,
         )
         self._report_subtitle_coverage_gaps(asr_data.segments, segments)
+        self._emit_progress_event("finalization", completed=1, total=1)
         return ASRData(segments)
 
     def _finalize_stable_english_boundaries(
@@ -550,72 +680,63 @@ class ScreenSubtitleEditor:
         keeps the English, semantic groups, Chinese allocation, and manifest
         independent from the selected video template.
         """
-        items = self._stable_cut_items(source_segments)
-        self._capture_boundary_snapshot(
-            "_stable_cut_items",
-            items,
-            changed_by="_stable_cut_items",
-            previous_items=None,
+        return finalize_stable_english_boundaries(
+            source_segments,
+            run_stage=lambda stage, items: getattr(self, stage)(items),
+            capture_snapshot=lambda stage, items, changed_by, previous_items: self._capture_boundary_snapshot(
+                stage,
+                items,
+                changed_by=changed_by,
+                previous_items=previous_items,
+            ),
+            previous_snapshot_items=self._boundary_snapshot_items,
         )
-        items = self._merge_standalone_discourse_markers(items)
-        self._capture_boundary_snapshot(
-            "_merge_standalone_discourse_markers",
-            items,
-            changed_by="_merge_standalone_discourse_markers",
-            previous_items=self._boundary_snapshot_items("_stable_cut_items"),
-        )
-        items = self._merge_short_display_segments(items)
-        self._capture_boundary_snapshot(
-            "_merge_short_display_segments",
-            items,
-            changed_by="_merge_short_display_segments",
-            previous_items=self._boundary_snapshot_items("_merge_standalone_discourse_markers"),
-        )
-        items = self._rebalance_edge_discourse_markers(items)
-        self._capture_boundary_snapshot(
-            "_rebalance_edge_discourse_markers",
-            items,
-            changed_by="_rebalance_edge_discourse_markers",
-            previous_items=self._boundary_snapshot_items("_merge_short_display_segments"),
-        )
-        items = self._validate_and_repair_final_pre_id_boundaries(items)
-        self._capture_boundary_snapshot(
-            "_validate_and_repair_final_pre_id_boundaries",
-            items,
-            changed_by="_validate_and_repair_final_pre_id_boundaries",
-            previous_items=self._boundary_snapshot_items("_rebalance_edge_discourse_markers"),
-        )
-        return items
 
-    def repair_after_final_time_alignment(self, asr_data: ASRData) -> ASRData:
+    def repair_after_final_time_alignment(
+        self,
+        asr_data: ASRData,
+        *,
+        preserve_aligned_timing: Optional[bool] = None,
+    ) -> ASRData:
         """Final local pass after WhisperX/frozen time mapping.
 
         English text, subtitle IDs and segment order are frozen at this point.
-        Only display timing padding and Chinese text allocation are allowed.
+        Chinese post-processing is allowed, while a forced-alignment backend
+        keeps ownership of cue timing.
         """
         if not asr_data or not asr_data.segments:
             return asr_data
+        preserve_timing = (
+            getattr(self, "preserve_aligned_timing", False)
+            if preserve_aligned_timing is None
+            else bool(preserve_aligned_timing)
+        )
         before = list(asr_data.segments)
-        segments = self._repair_final_short_subtitle_timings(before)
+        # A forced-alignment backend owns the final cue boundaries.  Chinese
+        # post-processing remains allowed, but it must never move cue times.
+        segments = list(before) if preserve_timing else self._repair_final_short_subtitle_timings(before)
         segments = self._compress_fast_chinese_segments(
             segments,
             semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
             subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
         )
         segments = self._align_segment_translation_punctuation(segments)
-        segments = self._safe_auto_repair_segments(
-            segments,
-            semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
-            subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
-            stage="after_final_time_alignment",
-        )
         asr_data.segments = list(segments)
         source_map = getattr(self, "_active_source_segments_by_id", {}) or {}
         source_segments = list(source_map.values()) if isinstance(source_map, dict) else list(source_map)
+        segments = self._reconcile_final_display_coverage(segments, source_segments)
+        asr_data.segments = list(segments)
+        self.refresh_final_cue_timeline_artifact(asr_data.segments)
         if source_segments:
             self._report_subtitle_coverage_gaps(source_segments, asr_data.segments)
         else:
             self._write_coverage_report([], self._translation_gaps(asr_data.segments), asr_data.segments)
+        self._write_stable_pipeline_artifacts(
+            source_segments=source_segments,
+            semantic_groups=getattr(self, "_last_semantic_groups", []) or [],
+            subtitle_items=getattr(self, "_last_subtitle_items", []) or [],
+            final_segments=asr_data.segments,
+        )
         return asr_data
 
     def _repair_final_short_subtitle_timings(
@@ -625,6 +746,7 @@ class ScreenSubtitleEditor:
             return []
         repaired = self._apply_display_timing_padding(segments)
         repaired = self._shift_next_for_loaded_short_final_segments(repaired)
+        # Retained for direct legacy callers only; the current pipeline no longer enables it.
         if getattr(self, "enable_safe_auto_repair", False):
             repaired = self._repair_high_load_short_subtitle_timings(repaired)
         fixed = 0
@@ -634,6 +756,162 @@ class ScreenSubtitleEditor:
         if fixed:
             logger.info("最终时间轴短字幕补时: %s", fixed)
         return repaired
+
+    def _reconcile_final_display_coverage(
+        self,
+        segments: Sequence[ASRDataSeg],
+        source_segments: Sequence[ASRDataSeg],
+    ) -> List[ASRDataSeg]:
+        """Bridge only short, continuous speech gaps after final timing is frozen.
+
+        The stable source spans are the available speech envelope at this
+        stage.  A gap is eligible only when it stays inside one source span
+        and the adjacent frozen word ranges have no meaningful pause.  The
+        cue texts, IDs, word ranges, and ordering remain untouched.
+        """
+        result = [self._copy_segment(segment) for segment in segments]
+        if len(result) < 2 or not source_segments:
+            return result
+
+        raw_source_intervals = sorted(
+            (max(0, int(source.start_time)), max(int(source.end_time), int(source.start_time)))
+            for source in source_segments
+            if (source.text or "").strip() and int(source.end_time) > int(source.start_time)
+        )
+        source_intervals: List[tuple[int, int]] = []
+        for start_ms, end_ms in raw_source_intervals:
+            if (
+                source_intervals
+                and start_ms - source_intervals[-1][1] <= DISPLAY_COVERAGE_WORD_PAUSE_MAX_MS
+            ):
+                source_intervals[-1] = (source_intervals[-1][0], max(source_intervals[-1][1], end_ms))
+            else:
+                source_intervals.append((start_ms, end_ms))
+        if not source_intervals:
+            return result
+
+        repairs = getattr(self, "_display_coverage_repairs", [])
+        unresolved = getattr(self, "_display_coverage_unresolved", [])
+        for index in range(len(result) - 1):
+            previous = result[index]
+            current = result[index + 1]
+            gap_start = max(0, int(previous.end_time))
+            gap_end = max(gap_start, int(current.start_time))
+            gap_ms = gap_end - gap_start
+            if gap_ms <= 0 or not self._source_interval_contains(source_intervals, gap_start, gap_end):
+                continue
+
+            evidence = self._display_coverage_bridge_evidence(previous, current)
+            if gap_ms > DISPLAY_COVERAGE_BRIDGE_MAX_MS:
+                unresolved.append(
+                    self._display_coverage_gap_record(
+                        previous,
+                        current,
+                        gap_start,
+                        gap_end,
+                        evidence,
+                        "gap_exceeds_auto_repair_limit",
+                    )
+                )
+                continue
+            if not evidence["continuous"]:
+                unresolved.append(
+                    self._display_coverage_gap_record(
+                        previous,
+                        current,
+                        gap_start,
+                        gap_end,
+                        evidence,
+                        str(evidence["reason"]),
+                    )
+                )
+                continue
+
+            boundary = gap_start + gap_ms // 2
+            before_previous_end = int(previous.end_time)
+            before_current_start = int(current.start_time)
+            result[index] = self._copy_segment(previous, end_time=boundary)
+            result[index + 1] = self._copy_segment(current, start_time=boundary)
+            repairs.append(
+                {
+                    "code": "continuous_source_coverage_bridge",
+                    "left_subtitle_id": self._segment_subtitle_id(previous, index + 1),
+                    "right_subtitle_id": self._segment_subtitle_id(current, index + 2),
+                    "gap_start_ms": gap_start,
+                    "gap_end_ms": gap_end,
+                    "gap_ms": gap_ms,
+                    "old_left_end_ms": before_previous_end,
+                    "old_right_start_ms": before_current_start,
+                    "new_boundary_ms": boundary,
+                    "word_pause_ms": evidence["word_pause_ms"],
+                    "left_english": previous.text,
+                    "right_english": current.text,
+                }
+            )
+
+        self._display_coverage_repairs = repairs
+        self._display_coverage_unresolved = unresolved
+        if repairs:
+            logger.info("Final subtitle display coverage bridges applied: %s", len(repairs))
+        if unresolved:
+            logger.warning("Final subtitle display coverage gaps left unresolved: %s", len(unresolved))
+        return result
+
+    @staticmethod
+    def _source_interval_contains(
+        intervals: Sequence[tuple[int, int]],
+        start_ms: int,
+        end_ms: int,
+    ) -> bool:
+        return any(start <= start_ms and end >= end_ms for start, end in intervals)
+
+    @staticmethod
+    def _display_coverage_bridge_evidence(
+        previous: ASRDataSeg,
+        current: ASRDataSeg,
+    ) -> Dict[str, Any]:
+        previous_word_end = getattr(previous, "stable_word_end_ms", None)
+        current_word_start = getattr(current, "stable_word_start_ms", None)
+        if previous_word_end is None or current_word_start is None:
+            return {
+                "continuous": False,
+                "reason": "missing_frozen_word_anchor",
+                "word_pause_ms": None,
+            }
+        word_pause_ms = int(current_word_start) - int(previous_word_end)
+        if word_pause_ms > DISPLAY_COVERAGE_WORD_PAUSE_MAX_MS:
+            return {
+                "continuous": False,
+                "reason": "frozen_word_pause_exceeds_limit",
+                "word_pause_ms": word_pause_ms,
+            }
+        return {
+            "continuous": True,
+            "reason": "continuous_frozen_word_ranges",
+            "word_pause_ms": word_pause_ms,
+        }
+
+    def _display_coverage_gap_record(
+        self,
+        previous: ASRDataSeg,
+        current: ASRDataSeg,
+        gap_start: int,
+        gap_end: int,
+        evidence: Dict[str, Any],
+        reason: str,
+    ) -> Dict[str, Any]:
+        return {
+            "code": "display_coverage_gap_unresolved",
+            "reason": reason,
+            "left_subtitle_id": self._segment_subtitle_id(previous, 0),
+            "right_subtitle_id": self._segment_subtitle_id(current, 0),
+            "gap_start_ms": gap_start,
+            "gap_end_ms": gap_end,
+            "gap_ms": gap_end - gap_start,
+            "word_pause_ms": evidence.get("word_pause_ms"),
+            "left_english": previous.text,
+            "right_english": current.text,
+        }
 
     def _shift_next_for_loaded_short_final_segments(
         self, segments: Sequence[ASRDataSeg]
@@ -983,6 +1261,22 @@ class ScreenSubtitleEditor:
         merge_count = 0
         while index < len(ordered):
             current = ordered[index]
+            previous_item = merged[-1] if merged else None
+            next_item = ordered[index + 1] if index + 1 < len(ordered) else None
+            if (
+                previous_item
+                and self._should_attach_short_backchannel_to_previous(
+                    previous_item,
+                    current,
+                    next_item,
+                    short_ms=short_ms,
+                    merge_gap_ms=merge_gap_ms,
+                )
+            ):
+                merged[-1] = self._merge_subtitle_items(previous_item, current)
+                merge_count += 1
+                index += 1
+                continue
             if index + 1 < len(ordered) and self._should_merge_short_display_item(
                 current,
                 ordered[index + 1],
@@ -1026,6 +1320,35 @@ class ScreenSubtitleEditor:
         if merge_count:
             logger.info("Screen subtitle short display items merged before ids: %s", merge_count)
         return merged
+
+    def _should_attach_short_backchannel_to_previous(
+        self,
+        previous_item: ScreenSubtitleItem,
+        current: ScreenSubtitleItem,
+        next_item: Optional[ScreenSubtitleItem],
+        *,
+        short_ms: int,
+        merge_gap_ms: int,
+    ) -> bool:
+        """Keep a tiny acknowledgement with its preceding completed thought.
+
+        This applies only before IDs are assigned and only when the same
+        short backchannel cannot be an independent answer.  It prevents a
+        one-word acknowledgement from forcing the following sentence past the
+        display limit while preserving the frozen word order and timing ledger.
+        """
+        if not self._is_short_backchannel_text(current.original):
+            return False
+        if self._is_independent_discourse_answer(current, previous_item, next_item):
+            return False
+        timing = self._item_word_timing(current)
+        if not timing or timing[1] - timing[0] >= short_ms:
+            return False
+        if not self._can_attach_discourse_marker(previous_item, current, merge_gap_ms):
+            return False
+        return self._word_count(
+            self._join_subtitle_text(previous_item.original, current.original)
+        ) <= self.max_english_words
 
     def _safe_direct_short_item_merge(
         self,
@@ -1237,7 +1560,7 @@ class ScreenSubtitleEditor:
         normalized = cls._normalize_text(text)
         normalized = re.sub(r"[^a-z]+", " ", normalized.lower()).strip()
         normalized = re.sub(r"\s+", " ", normalized)
-        if normalized in {"i mean", "you know", "i guess", "well i mean"}:
+        if normalized in {"i mean", "you know", "i guess", "well i mean", "plus"}:
             return normalized
         return ""
 
@@ -1261,13 +1584,36 @@ class ScreenSubtitleEditor:
                 return False
         return True
 
+    def _can_keep_one_word_discourse_overflow(
+        self,
+        marker: ScreenSubtitleItem,
+        combined: ScreenSubtitleItem,
+        combined_words: int,
+    ) -> bool:
+        """Keep a complete connector-led sense unit over one isolated marker.
+
+        The configured English value is a soft display target.  This narrow
+        exception is only for a one-word ``Plus,`` lead-in where splitting
+        would leave the connector alone and the complete unit exceeds the
+        target by exactly one word.
+        """
+        return bool(
+            self._standalone_discourse_marker(marker.original) == "plus"
+            and combined_words == self.max_english_words + 1
+            and re.search(r"[.!?][\"')\]]*\s*$", combined.original or "")
+        )
+
     def _attach_marker_to_next_item(
         self,
         marker: ScreenSubtitleItem,
         next_item: ScreenSubtitleItem,
     ) -> tuple[Optional[ScreenSubtitleItem], Optional[ScreenSubtitleItem]]:
         combined = self._merge_subtitle_items(marker, next_item)
-        if self._word_count(combined.original) <= self.max_english_words:
+        combined_words = self._word_count(combined.original)
+        if (
+            combined_words <= self.max_english_words
+            or self._can_keep_one_word_discourse_overflow(marker, combined, combined_words)
+        ):
             return combined, None
         if next_item.word_start is None or next_item.word_end is None:
             return None, None
@@ -1397,6 +1743,12 @@ class ScreenSubtitleEditor:
                 source_end=span_end,
             )
             if not boundary["legal"]:
+                continue
+            candidate_gate = self._can_apply_pre_id_repair_candidate(
+                [left, right],
+                [left_item, right_item],
+            )
+            if not candidate_gate["accepted"]:
                 continue
             score = (
                 len(boundary["soft_issues"]),
@@ -1636,13 +1988,733 @@ class ScreenSubtitleEditor:
                 old_items=old_items,
                 new_items=new_items,
                 evaluation=evaluation,
-                repair_reason="hard_syntax_boundary_repaired",
+                repair_reason=(
+                    "forced_overflow_syntax_split"
+                    if any(
+                        candidate.get("selected")
+                        and candidate.get("forced_overflow_fallback")
+                        for candidate in candidates
+                    )
+                    else "hard_syntax_boundary_repaired"
+                ),
                 candidates_considered=candidates,
             )
             result[start:end] = new_items
             index = max(0, start - 1)
         result = self._validate_final_display_fragments(result)
+        result = self._repair_final_overlong_display_items(result)
+        # A safe overflow split can expose a local short fragment only after
+        # its neighboring boundary has changed. Re-run the same fragment gate
+        # before IDs freeze rather than leaving the new boundary unchecked.
+        result = self._validate_final_display_fragments(result)
+        # This final local rebalance has a parser-verified exception for an
+        # ellipted non-finite condition ending in ``to,``. Running it after the
+        # generic boundary loop prevents its lexical preposition fallback from
+        # undoing the already validated move.
+        result = self._rebalance_leading_nonfinite_dependent_prefixes(result)
         return result
+
+    def _rebalance_leading_nonfinite_dependent_prefixes(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> List[ScreenSubtitleItem]:
+        """Move a short leading non-finite condition back to its prior clause.
+
+        A stable cut can legally fall before a complete right-hand cue even
+        though that cue starts with a short ellipted condition such as
+        ``unless forced to,``. That condition semantically completes the
+        preceding action, while the complete clause after its comma belongs on
+        the following screen. Rebalance only this parser-confirmed local
+        shape; finite conditional introductions remain untouched.
+        """
+        result = list(items)
+        for index in range(len(result) - 1):
+            left = result[index]
+            right = result[index + 1]
+            prefix_end = self._leading_nonfinite_dependent_prefix_end(right)
+            if prefix_end is None:
+                continue
+            if (
+                left.subtitle_id
+                or right.subtitle_id
+                or not self._items_are_continuous(left, right)
+                or self._items_cross_speaker(left, right)
+                or re.search(r"[.!?][\"')\]]*\s*$", self._normalize_text(left.original))
+            ):
+                continue
+            pause_ms = self._boundary_pause_ms(left, right)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            if (
+                left.word_start is None
+                or right.word_end is None
+                or prefix_end >= right.word_end
+            ):
+                continue
+            new_left = self._item_from_word_span(left.word_start, prefix_end)
+            new_right = self._item_from_word_span(prefix_end + 1, right.word_end)
+            if not new_left or not new_right:
+                continue
+            if (
+                self._word_count(new_left.original) > self.max_english_words
+                or self._word_count(new_right.original) > self.max_english_words
+                or self._word_count(new_right.original) < VISUAL_TEMPORAL_MIN_WORDS
+            ):
+                continue
+            right_shape = self._visual_temporal_clause_shape(new_right)
+            boundary = self._evaluate_item_pair_for_final_boundary(new_left, new_right)
+            # ``unless forced to,`` ends in an ellipted infinitive, not a
+            # preposition waiting for the next cue's object. The shared lexical
+            # fallback cannot see that comma-scoped parse, so relax only this
+            # one false positive after the non-finite-prefix parser gate above.
+            relaxed_hard_issues = [
+                issue
+                for issue in list(boundary.get("hard_issues") or [])
+                if issue == "preposition_object_split"
+            ]
+            disallowed_hard_issues = [
+                issue
+                for issue in list(boundary.get("hard_issues") or [])
+                if issue not in relaxed_hard_issues
+            ]
+            new_left_fragment = self._evaluate_final_display_fragment(
+                new_left,
+                result[index - 1] if index > 0 else None,
+                new_right,
+            )
+            new_right_fragment = self._evaluate_final_display_fragment(
+                new_right,
+                new_left,
+                result[index + 2] if index + 2 < len(result) else None,
+            )
+            candidates = [{
+                "prefix_word_range": [right.word_start, prefix_end],
+                "prefix_text": self._text_from_word_span(right.word_start, prefix_end),
+                "new_boundary": [prefix_end, prefix_end + 1],
+                "new_left": new_left.original,
+                "new_right": new_right.original,
+                "pause_ms": pause_ms,
+                "right_complete_main_clause": right_shape["complete_main_clause"],
+                "hard_issues": disallowed_hard_issues,
+                "relaxed_hard_issues": relaxed_hard_issues,
+                "hard_fragment_issues": list(
+                    dict.fromkeys(
+                        list(new_left_fragment.get("hard_fragment_issues") or [])
+                        + list(new_right_fragment.get("hard_fragment_issues") or [])
+                    )
+                ),
+            }]
+            if (
+                not right_shape["complete_main_clause"]
+                or disallowed_hard_issues
+                or new_left_fragment.get("hard_fragment_issues")
+                or new_right_fragment.get("hard_fragment_issues")
+            ):
+                continue
+            candidate_gate = self._can_apply_pre_id_repair_candidate(
+                [left, right],
+                [new_left, new_right],
+                previous_item=result[index - 1] if index > 0 else None,
+                next_item=result[index + 2] if index + 2 < len(result) else None,
+                allowed_hard_issues=relaxed_hard_issues,
+            )
+            if not candidate_gate["accepted"]:
+                continue
+            candidates[0]["candidate_gate"] = candidate_gate
+            self._record_pre_id_boundary_repair(
+                repaired_by="_rebalance_leading_nonfinite_dependent_prefixes",
+                old_items=[left, right],
+                new_items=[new_left, new_right],
+                evaluation={
+                    "legal": False,
+                    "hard_issues": ["leading_nonfinite_dependent_prefix"],
+                    "allowed_hard_issues": relaxed_hard_issues,
+                    "soft_issues": [],
+                    "boundary_score": boundary.get("boundary_score", 0.0),
+                    "protected_syntax": False,
+                    "pause_ms": pause_ms,
+                    "fragment_type": "leading_nonfinite_dependent_prefix",
+                },
+                repair_reason="leading_nonfinite_dependent_prefix_rebalanced",
+                candidates_considered=candidates,
+                unresolved_is_hard=False,
+            )
+            result[index:index + 2] = [new_left, new_right]
+        return result
+
+    def _leading_nonfinite_dependent_prefix_end(
+        self,
+        item: ScreenSubtitleItem,
+    ) -> Optional[int]:
+        """Return a short comma-terminated non-finite condition prefix end."""
+        if (
+            item.word_start is None
+            or item.word_end is None
+            or item.word_end - item.word_start < 5
+        ):
+            return None
+        nlp = self._load_syntax_nlp()
+        if not nlp:
+            return None
+        prefix_end = None
+        max_prefix_end = min(item.word_start + 5, item.word_end - VISUAL_TEMPORAL_MIN_WORDS)
+        for word_index in range(item.word_start + 1, max_prefix_end + 1):
+            surface = str(self._active_word_entries[word_index].get("surface") or "")
+            if re.search(r",\s*$", surface):
+                prefix_end = word_index
+                break
+        if prefix_end is None:
+            return None
+        prefix = self._text_from_word_span(item.word_start, prefix_end)
+        try:
+            doc = nlp(self._normalize_text(prefix))
+        except Exception as exc:
+            logger.debug("Leading non-finite prefix parse skipped: %s", exc)
+            return None
+        root = next((token for token in doc if token.dep_ == "ROOT"), None)
+        if root is None:
+            return None
+        has_clause_marker = any(
+            token.pos_ == "SCONJ" or token.dep_ == "mark"
+            for token in doc
+        )
+        has_subject = any(token.dep_ in {"nsubj", "nsubjpass", "csubj"} for token in doc)
+        root_is_nonfinite = (
+            root.pos_ in {"VERB", "AUX"}
+            and root.tag_ in {"VB", "VBG", "VBN"}
+        )
+        return prefix_end if has_clause_marker and root_is_nonfinite and not has_subject else None
+
+    def _repair_final_overlong_display_items(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> List[ScreenSubtitleItem]:
+        """Split only overlong pre-ID items that have a fully legal local cut."""
+        result = list(items)
+        index = 0
+        while index < len(result):
+            item = result[index]
+            if self._word_count(item.original) <= self.max_english_words:
+                index += 1
+                continue
+            repaired, candidates = self._safe_overlong_item_split(item)
+            if not repaired:
+                index += 1
+                continue
+            candidate_gate = self._can_apply_pre_id_repair_candidate(
+                [item],
+                repaired,
+                previous_item=result[index - 1] if index > 0 else None,
+                next_item=result[index + 1] if index + 1 < len(result) else None,
+            )
+            selected_candidate = next(
+                (candidate for candidate in candidates if candidate.get("cuts")),
+                None,
+            )
+            if selected_candidate is not None:
+                selected_candidate["candidate_gate"] = candidate_gate
+            if not candidate_gate["accepted"]:
+                index += 1
+                continue
+            self._record_pre_id_boundary_repair(
+                repaired_by="_repair_final_overlong_display_items",
+                old_items=[item],
+                new_items=repaired,
+                evaluation={
+                    "legal": False,
+                    "hard_issues": ["overlong_english"],
+                    "soft_issues": [],
+                    "boundary_score": 0.0,
+                    "protected_syntax": False,
+                    "pause_ms": None,
+                    "fragment_type": "",
+                },
+                repair_reason="safe_overlong_item_split",
+                candidates_considered=candidates,
+            )
+            result[index:index + 1] = repaired
+            index = max(0, index - 1)
+        return result
+
+    @classmethod
+    def _visible_english_character_count(cls, text: str) -> int:
+        """Count rendered English characters after normalizing source spacing."""
+        return len(re.sub(r"\s+", " ", cls._normalize_text(text)))
+
+    def _visual_reading_budget(self, item: ScreenSubtitleItem) -> Dict[str, int | bool]:
+        word_count = self._word_count(item.original)
+        character_count = self._visible_english_character_count(item.original)
+        return {
+            "word_count": word_count,
+            "character_count": character_count,
+            "word_limit": VISUAL_ENGLISH_WORD_SOFT_LIMIT,
+            "character_limit": VISUAL_ENGLISH_CHARACTER_SOFT_LIMIT,
+            "exceeds": (
+                word_count > VISUAL_ENGLISH_WORD_SOFT_LIMIT
+                or character_count > VISUAL_ENGLISH_CHARACTER_SOFT_LIMIT
+            ),
+        }
+
+    def _apply_visual_reading_budget(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> List[ScreenSubtitleItem]:
+        """Create only evidence-backed visual time boundaries before IDs freeze.
+
+        A character budget alone cannot own subtitle timing: the former visual
+        pass created fragments simply because a complete cue was long.  This
+        stage instead treats the budget as a trigger, then requires a local
+        display-unit boundary backed by syntax, punctuation, word timing, and
+        minimum on-screen duration.  It runs before global IDs and Chinese
+        allocation, so every downstream stage receives one coherent boundary
+        set rather than presentation-only text edits.
+        """
+        result: List[ScreenSubtitleItem] = []
+        source_items = list(items)
+        for index, item in enumerate(source_items):
+            budget = self._visual_reading_budget(item)
+            if not budget["exceeds"]:
+                result.append(item)
+                continue
+            split_items, candidates = self._safe_visual_temporal_item_split(item)
+            if not split_items:
+                result.append(item)
+                continue
+            selected = next(
+                (candidate for candidate in candidates if candidate.get("selected")),
+                {},
+            )
+            candidate_gate = self._can_apply_pre_id_repair_candidate(
+                [item],
+                split_items,
+                previous_item=source_items[index - 1] if index > 0 else None,
+                next_item=source_items[index + 1] if index + 1 < len(source_items) else None,
+            )
+            selected["candidate_gate"] = candidate_gate
+            if not candidate_gate["accepted"]:
+                result.append(item)
+                continue
+            evaluation = dict(selected.get("evaluation") or {})
+            evaluation["visual_reading_budget"] = budget
+            evaluation["visual_temporal_category"] = selected.get("category", "")
+            evaluation["display_durations_ms"] = list(selected.get("display_durations_ms") or [])
+            self._record_pre_id_boundary_repair(
+                repaired_by="_apply_visual_reading_budget",
+                old_items=[item],
+                new_items=split_items,
+                evaluation=evaluation,
+                repair_reason="visual_temporal_display_unit_split",
+                candidates_considered=candidates,
+                unresolved_is_hard=False,
+            )
+            result.extend(split_items)
+        return result
+
+    def _safe_visual_temporal_item_split(
+        self,
+        item: ScreenSubtitleItem,
+    ) -> tuple[List[ScreenSubtitleItem], List[Dict]]:
+        """Select one deterministic, readable visual time split for a long cue."""
+        if (
+            item.subtitle_id
+            or item.word_start is None
+            or item.word_end is None
+            or item.word_end - item.word_start + 1 < VISUAL_TEMPORAL_MIN_WORDS * 2
+        ):
+            return [], []
+        if not self._load_syntax_nlp():
+            # Visual time splitting is optional. Without local syntax evidence
+            # the renderer still wraps the original frozen cue.
+            return [], []
+
+        candidates: List[Dict] = []
+        best: Optional[tuple] = None
+        first_cut = item.word_start + VISUAL_TEMPORAL_MIN_WORDS - 1
+        last_cut = item.word_end - VISUAL_TEMPORAL_MIN_WORDS
+        for cut in range(first_cut, last_cut + 1):
+            left = self._item_from_word_span(item.word_start, cut)
+            right = self._item_from_word_span(cut + 1, item.word_end)
+            if not left or not right:
+                continue
+            candidate = self._evaluate_visual_temporal_split_candidate(left, right)
+            candidates.append(candidate)
+            if not candidate["eligible"]:
+                continue
+            score = (
+                int(candidate["category_rank"]),
+                -int(candidate["pause_ms"]),
+                abs(int(candidate["word_counts"][0]) - int(candidate["word_counts"][1])),
+                abs(int(candidate["character_counts"][0]) - int(candidate["character_counts"][1])),
+                int(cut),
+            )
+            if best is None or score < best[:5]:
+                best = (*score, left, right, candidate)
+
+        if best is None:
+            return [], candidates
+        selected = best[7]
+        selected["selected"] = True
+        return [best[5], best[6]], candidates
+
+    def _evaluate_visual_temporal_split_candidate(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+    ) -> Dict:
+        """Evaluate a candidate as a visual display boundary, not a text wrap.
+
+        A valid result is one of three generic shapes: a sentence terminal,
+        two complete clauses, or a punctuated non-finite introduction followed
+        by its complete main clause. Subject-to-finite-verb cuts intentionally
+        remain structural hard failures in this first pass.
+        """
+        evaluation = self._evaluate_item_pair_for_final_boundary(left, right)
+        pause_ms = int(evaluation.get("pause_ms") or 0)
+        word_counts = [self._word_count(left.original), self._word_count(right.original)]
+        character_counts = [
+            self._visible_english_character_count(left.original),
+            self._visible_english_character_count(right.original),
+        ]
+        display_durations_ms = [
+            self._short_item_duration_ms(left),
+            self._short_item_duration_ms(right),
+        ]
+        left_shape = self._visual_temporal_clause_shape(left)
+        right_shape = self._visual_temporal_clause_shape(right)
+        left_issues = self._visual_split_display_unit_issues(left, None, right)
+        right_issues = self._visual_split_display_unit_issues(right, left, None)
+        left_terminal = bool(re.search(r"[.!?][\"')\]]*\s*$", self._normalize_text(left.original)))
+        left_comma_boundary = bool(re.search(r"[,;:]\s*$", self._normalize_text(left.original)))
+        duration_floor = [
+            max(VISUAL_TEMPORAL_MIN_DISPLAY_MS, count * VISUAL_TEMPORAL_MIN_MS_PER_WORD)
+            for count in word_counts
+        ]
+        base_reasons: List[str] = []
+        if evaluation.get("hard_issues"):
+            base_reasons.append("hard_syntax_issue")
+        if not self._items_are_continuous(left, right):
+            base_reasons.append("non_continuous_word_range")
+        if self._items_cross_speaker(left, right):
+            base_reasons.append("speaker_change")
+        if any(count < VISUAL_TEMPORAL_MIN_WORDS for count in word_counts):
+            base_reasons.append("short_display_unit")
+        if any(count > VISUAL_ENGLISH_WORD_SOFT_LIMIT for count in word_counts):
+            base_reasons.append("word_budget_exceeded")
+        if any(count > VISUAL_ENGLISH_CHARACTER_SOFT_LIMIT for count in character_counts):
+            base_reasons.append("character_budget_exceeded")
+        if any(duration < floor for duration, floor in zip(display_durations_ms, duration_floor)):
+            base_reasons.append("display_duration_too_short")
+
+        category = ""
+        category_rank = 99
+        allowed_left_issues: set[str] = set()
+        if (
+            left_terminal
+            and left_shape["complete_main_clause"]
+            and right_shape["complete_main_clause"]
+            and pause_ms >= VISUAL_TEMPORAL_TERMINAL_MIN_PAUSE_MS
+        ):
+            category = "sentence_terminal"
+            category_rank = 0
+        elif (
+            left_comma_boundary
+            and left_shape["complete_main_clause"]
+            and right_shape["complete_main_clause"]
+            and pause_ms >= VISUAL_TEMPORAL_MIN_PAUSE_MS
+        ):
+            category = "complete_clause_boundary"
+            category_rank = 1
+        elif (
+            left_comma_boundary
+            and left_shape["fronted_nonfinite_introduction"]
+            and right_shape["complete_main_clause"]
+            and pause_ms >= VISUAL_TEMPORAL_MIN_PAUSE_MS
+        ):
+            category = "fronted_introduction_boundary"
+            category_rank = 2
+            allowed_left_issues = {
+                "visual_open_phrase_fragment",
+                "visual_short_subject_or_connector_fragment",
+                "visual_connector_led_noun_phrase_fragment",
+            }
+        else:
+            base_reasons.append("no_supported_display_unit_boundary")
+
+        disallowed_display_issues = [
+            issue for issue in left_issues if issue not in allowed_left_issues
+        ] + [
+            issue
+            for issue in right_issues
+            if not (
+                right_shape["complete_main_clause"]
+                and issue == "visual_connector_led_noun_phrase_fragment"
+            )
+        ]
+        if disallowed_display_issues:
+            base_reasons.append("display_fragment")
+
+        return {
+            "cuts": [[left.word_end, right.word_start]],
+            "word_counts": word_counts,
+            "character_counts": character_counts,
+            "display_durations_ms": display_durations_ms,
+            "display_duration_floors_ms": duration_floor,
+            "pause_ms": pause_ms,
+            "category": category,
+            "category_rank": category_rank,
+            "left": left.original,
+            "right": right.original,
+            "hard_issues": list(evaluation.get("hard_issues") or []),
+            "soft_issues": list(evaluation.get("soft_issues") or []),
+            "hard_fragment_issues": disallowed_display_issues,
+            "left_display_issues": left_issues,
+            "right_display_issues": right_issues,
+            "left_clause_shape": left_shape,
+            "right_clause_shape": right_shape,
+            "evaluation": evaluation,
+            "rejection_reasons": list(dict.fromkeys(base_reasons)),
+            "eligible": not base_reasons,
+            "selected": False,
+        }
+
+    def _visual_temporal_clause_shape(self, item: ScreenSubtitleItem) -> Dict[str, bool]:
+        """Classify one local display unit with the existing local spaCy model."""
+        nlp = self._load_syntax_nlp()
+        if not nlp:
+            return {
+                "complete_main_clause": False,
+                "fronted_nonfinite_introduction": False,
+            }
+        doc = nlp(self._normalize_text(item.original))
+        root = next((token for token in doc if token.dep_ == "ROOT"), None)
+        if root is None:
+            return {
+                "complete_main_clause": False,
+                "fronted_nonfinite_introduction": False,
+            }
+        root_is_finite = (
+            root.pos_ in {"VERB", "AUX"}
+            and root.tag_ not in {"VB", "VBG", "VBN"}
+        )
+        root_has_finite_auxiliary = bool(
+            root.pos_ == "VERB"
+            and root.tag_ in {"VB", "VBG", "VBN"}
+            and any(
+                child.dep_ in {"aux", "auxpass"}
+                and child.tag_ in {"MD", "VBD", "VBP", "VBZ"}
+                for child in root.children
+            )
+        )
+        leading_subordinator = any(
+            token.i < root.i
+            and (token.dep_ == "mark" or token.pos_ == "SCONJ")
+            for token in doc
+        )
+        normalized = self._normalize_text(item.original)
+        comma_terminated = bool(re.search(r"[,;:]\s*$", normalized))
+        has_nonfinite_action = any(
+            token.pos_ in {"VERB", "AUX"}
+            and token.tag_ in {"VB", "VBG", "VBN"}
+            for token in doc
+        )
+        fronted_nonfinite = (
+            comma_terminated
+            and root.pos_ in {"VERB", "AUX", "ADP"}
+            and not root_is_finite
+            and not root_has_finite_auxiliary
+            and has_nonfinite_action
+            and not leading_subordinator
+        )
+        return {
+            "complete_main_clause": bool(
+                (root_is_finite or root_has_finite_auxiliary)
+                and not leading_subordinator
+            ),
+            "fronted_nonfinite_introduction": bool(fronted_nonfinite),
+        }
+
+    def _safe_overlong_item_split(
+        self,
+        item: ScreenSubtitleItem,
+    ) -> tuple[List[ScreenSubtitleItem], List[Dict]]:
+        return self._safe_item_split_for_budget(
+            item,
+            word_limit=self.max_english_words,
+        )
+
+    def _safe_item_split_for_budget(
+        self,
+        item: ScreenSubtitleItem,
+        *,
+        word_limit: int,
+        character_limit: Optional[int] = None,
+        require_independent_display_units: bool = False,
+    ) -> tuple[List[ScreenSubtitleItem], List[Dict]]:
+        if item.subtitle_id or item.word_start is None or item.word_end is None:
+            return [], []
+        if item.word_end <= item.word_start:
+            return [], []
+        candidates_considered: List[Dict] = []
+        best: Optional[tuple] = None
+        for cut in range(item.word_start + 3, item.word_end - 2):
+            left = self._item_from_word_span(item.word_start, cut)
+            right = self._item_from_word_span(cut + 1, item.word_end)
+            if not left or not right:
+                continue
+            word_counts = [self._word_count(left.original), self._word_count(right.original)]
+            evaluation = self._evaluate_item_pair_for_final_boundary(left, right)
+            right_fragment = self._evaluate_final_display_fragment(right, left, None)
+            hard_fragment_issues = list(
+                dict.fromkeys(
+                    list(evaluation.get("hard_fragment_issues") or [])
+                    + list(right_fragment.get("hard_fragment_issues") or [])
+                )
+            )
+            character_counts = [
+                self._visible_english_character_count(left.original),
+                self._visible_english_character_count(right.original),
+            ]
+            visual_display_issues: List[str] = []
+            if require_independent_display_units:
+                visual_display_issues = list(
+                    dict.fromkeys(
+                        self._visual_split_display_unit_issues(left, None, right)
+                        + self._visual_split_display_unit_issues(right, left, None)
+                    )
+                )
+            candidate = {
+                "cuts": [[cut, cut + 1]],
+                "word_counts": word_counts,
+                "character_counts": character_counts,
+                "word_limit": word_limit,
+                "character_limit": character_limit,
+                "hard_issues": list(evaluation.get("hard_issues") or []),
+                "hard_fragment_issues": hard_fragment_issues,
+                "visual_display_issues": visual_display_issues,
+                "boundary_scores": [float(evaluation.get("boundary_score") or 0.0)],
+            }
+            candidates_considered.append(candidate)
+            if (
+                candidate["hard_issues"]
+                or candidate["hard_fragment_issues"]
+                or candidate["visual_display_issues"]
+                or any(count > word_limit for count in word_counts)
+                or (
+                    character_limit is not None
+                    and any(count > character_limit for count in character_counts)
+                )
+                or not self._items_are_continuous(left, right)
+                or self._items_cross_speaker(left, right)
+                or self._internal_sentence_transition_word_index(left) is not None
+                or self._internal_sentence_transition_word_index(right) is not None
+            ):
+                continue
+            score = (
+                len(evaluation.get("soft_issues") or []),
+                float(candidate["boundary_scores"][0]),
+                abs(word_counts[0] - word_counts[1]),
+                abs(character_counts[0] - character_counts[1]),
+                abs(word_counts[0] - 9),
+                cut,
+            )
+            if best is None or score < best[:6]:
+                best = (*score, [left, right])
+        return (best[6], candidates_considered) if best else ([], candidates_considered)
+
+    def _visual_split_display_unit_issues(
+        self,
+        item: ScreenSubtitleItem,
+        previous_item: Optional[ScreenSubtitleItem],
+        next_item: Optional[ScreenSubtitleItem],
+    ) -> List[str]:
+        """Reject visual-only splits that leave a non-readable display unit.
+
+        The structural cut gate intentionally permits some short phrases when
+        they are necessary for the 16-word hard limit.  The visual budget is
+        optional, so it has a stricter contract: it may split only when both
+        new cues can stand on screen as independently readable units.
+        """
+        fragment = self._evaluate_final_display_fragment(
+            item,
+            previous_item,
+            next_item,
+        )
+        issues = list(fragment.get("hard_fragment_issues") or [])
+        if fragment.get("is_independent_response"):
+            return issues
+
+        text = self._normalize_text(item.original)
+        words = [word.casefold() for word in self._word_tokens(text)]
+        if not words:
+            return issues
+        word_count = len(words)
+        has_finite_predicate = bool(fragment.get("has_finite_predicate"))
+        has_terminal_punctuation = bool(re.search(r"[.!?]\s*$", text))
+        leading_prepositions = {
+            "about", "after", "around", "at", "before", "between", "by",
+            "for", "from", "in", "into", "of", "on", "over", "through",
+            "to", "under", "with", "without",
+        }
+        leading_connectors = {"and", "but", "or", "so", "yet"}
+
+        # A short preposition-led phrase, or an unfinished phrase ending with
+        # comma-like punctuation, reads as a continuation even when the
+        # structural syntax gate has no hard dependency to protect.
+        if not has_finite_predicate and words[0] in leading_prepositions:
+            issues.append("visual_preposition_led_fragment")
+        if word_count <= 5 and not has_finite_predicate:
+            if re.search(r"[,;:]\s*$", text):
+                issues.append("visual_open_phrase_fragment")
+            if words[0] in leading_connectors or self._looks_like_subject_without_predicate(words):
+                issues.append("visual_short_subject_or_connector_fragment")
+            if words[0] in {"how", "what", "why", "when", "where", "whether"}:
+                issues.append("visual_open_clause_fragment")
+
+        # A connector followed by a determiner-led noun phrase remains an
+        # unfinished display until its main clause is reached.  This stays
+        # deliberately short-range so ordinary multi-clause sentences remain
+        # eligible for a visual split at a genuine clause boundary.
+        if (
+            word_count <= 8
+            and not has_finite_predicate
+            and words[0] in leading_connectors
+            and any(word in self._stable_determiners() for word in words[1:4])
+        ):
+            issues.append("visual_connector_led_noun_phrase_fragment")
+
+        # Keep embedded question/degree clauses intact.  A split inside
+        # "how fast this is evolving" can leave two grammatical-looking but
+        # incomplete displays, so detect the local clause shape rather than a
+        # sample-specific phrase.
+        if (
+            previous_item is not None
+            and word_count <= 4
+            and words[0] in {"this", "that", "it", "they", "we", "you", "he", "she"}
+        ):
+            previous_words = [
+                word.casefold()
+                for word in self._word_tokens(previous_item.original)
+            ]
+            if any(word in {"how", "what", "why", "when", "where", "whether"} for word in previous_words[-3:]):
+                issues.append("visual_embedded_clause_fragment")
+
+        # Do not use a visual-only split to end a cue on a preposition or an
+        # auxiliary.  The final fragment gate catches many of these already;
+        # this keeps the visual stage self-contained when it evaluates a
+        # candidate before the final gate runs.
+        if not has_terminal_punctuation:
+            if words[-1] in {"how", "what", "why", "when", "where", "whether"}:
+                issues.append("visual_trailing_clause_intro_fragment")
+            if words[-1] in leading_prepositions:
+                issues.append("visual_trailing_preposition_fragment")
+            if words[-1] in {
+                "am", "is", "are", "was", "were", "be", "been", "being",
+                "do", "does", "did", "have", "has", "had",
+                "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+            }:
+                issues.append("visual_trailing_auxiliary_fragment")
+
+        return list(dict.fromkeys(issues))
 
     def _validate_final_display_fragments(
         self,
@@ -1719,7 +2791,15 @@ class ScreenSubtitleEditor:
                     "soft_issues": fragment["soft_fragment_issues"],
                     "fragment_type": fragment["fragment_type"],
                 },
-                repair_reason="hard_fragment_repaired",
+                repair_reason=(
+                    "forced_overflow_syntax_split"
+                    if any(
+                        candidate.get("selected")
+                        and candidate.get("forced_overflow_fallback")
+                        for candidate in candidates
+                    )
+                    else "hard_fragment_repaired"
+                ),
                 candidates_considered=candidates,
             )
             result[start:end] = new_items
@@ -1731,7 +2811,8 @@ class ScreenSubtitleEditor:
         items: Sequence[ScreenSubtitleItem],
     ) -> List[ScreenSubtitleItem]:
         result: List[ScreenSubtitleItem] = []
-        for item in items:
+        source_items = list(items)
+        for index, item in enumerate(source_items):
             transition_index = self._internal_sentence_transition_word_index(item)
             if transition_index is None or item.word_start is None or item.word_end is None:
                 result.append(item)
@@ -1743,6 +2824,15 @@ class ScreenSubtitleEditor:
             )
             right = self._item_from_word_span(transition_index, item.word_end)
             if not left or not right:
+                result.append(item)
+                continue
+            candidate_gate = self._can_apply_pre_id_repair_candidate(
+                [item],
+                [left, right],
+                previous_item=source_items[index - 1] if index > 0 else None,
+                next_item=source_items[index + 1] if index + 1 < len(source_items) else None,
+            )
+            if not candidate_gate["accepted"]:
                 result.append(item)
                 continue
             self._record_pre_id_boundary_repair(
@@ -1757,6 +2847,7 @@ class ScreenSubtitleEditor:
                     "protected_syntax": False,
                     "pause_ms": None,
                     "fragment_type": "",
+                    "candidate_gate": candidate_gate,
                 },
                 repair_reason="internal_transition_split",
                 candidates_considered=[],
@@ -2144,10 +3235,21 @@ class ScreenSubtitleEditor:
         boundary_index: int,
         evaluation: Dict,
     ) -> Optional[tuple[int, int, List[ScreenSubtitleItem], List[Dict]]]:
+        if boundary_index < 0 or boundary_index >= len(items) - 1:
+            return None
+        target_boundary = self._pre_id_boundary_pair(
+            items[boundary_index],
+            items[boundary_index + 1],
+        )
+        if target_boundary is None:
+            return None
+        is_fragment_repair = bool(
+            evaluation.get("fragment_type") or evaluation.get("hard_fragment_issues")
+        )
         attempts = [
             (boundary_index, boundary_index + 2),
             (max(0, boundary_index - 1), boundary_index + 1),
-            (max(0, boundary_index - 1), boundary_index + 2),
+            (max(0, boundary_index - 1), min(len(items), boundary_index + 2)),
             (boundary_index, min(len(items), boundary_index + 3)),
         ]
         seen = set()
@@ -2156,24 +3258,255 @@ class ScreenSubtitleEditor:
                 continue
             seen.add((start, end))
             window = list(items[start:end])
+            if (
+                not is_fragment_repair
+                and target_boundary not in self._pre_id_boundary_pairs(window)
+            ):
+                continue
             if not self._can_repair_pre_id_window(window):
                 continue
             direct = self._direct_merge_weak_fragment_window(window, evaluation)
-            if direct:
+            if direct and self._pre_id_repair_resolves_target_boundary(
+                window,
+                direct,
+                target_boundary,
+                require_target_removal=not is_fragment_repair,
+            ):
+                gate = self._can_apply_pre_id_repair_candidate(
+                    window,
+                    direct,
+                    previous_item=items[start - 1] if start > 0 else None,
+                    next_item=items[end] if end < len(items) else None,
+                    allowed_hard_issues=evaluation.get("allowed_hard_issues") or (),
+                )
+                direct_candidate = {
+                    "cuts": [],
+                    "word_counts": [self._word_count(item.original) for item in direct],
+                    "hard_issues": [],
+                    "hard_fragment_issues": [],
+                    "boundary_scores": [],
+                    "candidate_gate": gate,
+                }
+                if not gate["accepted"]:
+                    continue
                 return start, end, direct, [
-                    {
-                        "cuts": [],
-                        "word_counts": [self._word_count(item.original) for item in direct],
-                        "hard_issues": [],
-                        "hard_fragment_issues": [],
-                        "boundary_scores": [],
-                    }
+                    direct_candidate
                 ]
             repaired, candidates = self._repartition_pre_id_window(window)
+            if not repaired and self._requires_forced_overflow_repartition(window, evaluation):
+                repaired, forced_candidates = self._repartition_pre_id_window(
+                    window,
+                    allowed_hard_issues={
+                        "verb_complement_split",
+                        "short_verb_complement_split",
+                        "short_verb_object_split",
+                    },
+                    forced_overflow_fallback=True,
+                )
+                candidates.extend(forced_candidates)
+                if repaired:
+                    selected_cuts = {
+                        (left.word_end, right.word_start)
+                        for left, right in zip(repaired, repaired[1:])
+                    }
+                    for candidate in forced_candidates:
+                        candidate_cuts = {
+                            tuple(cut)
+                            for cut in candidate.get("cuts", [])
+                            if len(cut) == 2
+                        }
+                        candidate["selected"] = candidate_cuts == selected_cuts
             if not repaired:
                 continue
-            return start, end, repaired, candidates
+            if self._pre_id_repair_resolves_target_boundary(
+                window,
+                repaired,
+                target_boundary,
+                require_target_removal=not is_fragment_repair,
+            ):
+                accepted = False
+                for candidate in candidates:
+                    candidate_cuts = {
+                        tuple(cut)
+                        for cut in candidate.get("cuts", [])
+                        if isinstance(cut, (list, tuple)) and len(cut) == 2
+                    }
+                    repaired_cuts = {
+                        (left.word_end, right.word_start)
+                        for left, right in zip(repaired, repaired[1:])
+                    }
+                    if candidate_cuts == repaired_cuts:
+                        gate = self._can_apply_pre_id_repair_candidate(
+                            window,
+                            repaired,
+                            previous_item=items[start - 1] if start > 0 else None,
+                            next_item=items[end] if end < len(items) else None,
+                            allowed_hard_issues=evaluation.get("allowed_hard_issues") or (),
+                        )
+                        candidate["candidate_gate"] = gate
+                        accepted = bool(gate["accepted"])
+                        break
+                if accepted:
+                    return start, end, repaired, candidates
         return None
+
+    def _can_apply_pre_id_repair_candidate(
+        self,
+        old_items: Sequence[ScreenSubtitleItem],
+        new_items: Sequence[ScreenSubtitleItem],
+        *,
+        previous_item: Optional[ScreenSubtitleItem] = None,
+        next_item: Optional[ScreenSubtitleItem] = None,
+        allowed_hard_issues: Sequence[str] = (),
+    ) -> Dict:
+        """Validate a pre-ID candidate before it can replace frozen word spans.
+
+        The candidate is evaluated against the original word ledger.  This is
+        the single write gate for local boundary repairs: it verifies exact
+        coverage, checks every new internal and edge boundary, and checks each
+        newly created display item with the same fragment evaluator used by
+        final validation.
+        """
+        allowed = set(allowed_hard_issues or ())
+        reasons: List[str] = []
+        hard_issues: List[str] = []
+        fragment_issues: List[str] = []
+
+        if not new_items:
+            reasons.append("empty_candidate")
+        if any(item.subtitle_id for item in new_items):
+            reasons.append("subtitle_id_already_assigned")
+        if self._items_word_tokens(old_items) != self._items_word_tokens(new_items):
+            reasons.append("word_order_changed")
+        if self._items_word_range(old_items) != self._items_word_range(new_items):
+            reasons.append("word_coverage_changed")
+
+        for left, right in zip(new_items, new_items[1:]):
+            if not self._items_are_continuous(left, right):
+                reasons.append("non_continuous_word_range")
+            if self._items_cross_speaker(left, right):
+                reasons.append("speaker_change")
+            evaluation = self._evaluate_item_pair_for_final_boundary(left, right)
+            hard_issues.extend(evaluation.get("hard_issues") or [])
+
+        # The first and last edge boundaries were not internal to the
+        # candidate, but a repartition can still change their neighboring
+        # text. Only evaluate an edge when its word-range boundary is new;
+        # otherwise an unrelated pre-existing audit warning would veto a
+        # candidate that did not touch that edge.
+        old_context = list(old_items)
+        if previous_item is not None:
+            old_context.insert(0, previous_item)
+        if next_item is not None:
+            old_context.append(next_item)
+        old_context_boundaries = self._pre_id_boundary_pairs(old_context)
+        edge_pairs = []
+        if previous_item is not None and new_items:
+            edge_pairs.append((previous_item, new_items[0]))
+        if next_item is not None and new_items:
+            edge_pairs.append((new_items[-1], next_item))
+        for left, right in edge_pairs:
+            if self._pre_id_boundary_pair(left, right) in old_context_boundaries:
+                continue
+            if not self._items_are_continuous(left, right):
+                reasons.append("non_continuous_word_range")
+            if self._items_cross_speaker(left, right):
+                reasons.append("speaker_change")
+            hard_issues.extend(
+                self._evaluate_item_boundary(left, right).get("hard_issues") or []
+            )
+
+        for index, item in enumerate(new_items):
+            fragment = self._evaluate_final_display_fragment(
+                item,
+                new_items[index - 1] if index > 0 else previous_item,
+                new_items[index + 1] if index + 1 < len(new_items) else next_item,
+            )
+            fragment_issues.extend(fragment.get("hard_fragment_issues") or [])
+            if self._is_ordinary_one_word_fragment(item.original):
+                reasons.append("ordinary_one_word_fragment")
+            if self._word_count(item.original) > self.max_english_words:
+                reasons.append("max_english_words_exceeded")
+
+        hard_issues = list(dict.fromkeys(issue for issue in hard_issues if issue not in allowed))
+        fragment_issues = list(dict.fromkeys(fragment_issues))
+        reasons.extend(hard_issues)
+        reasons.extend(fragment_issues)
+        reasons = list(dict.fromkeys(reasons))
+        return {
+            "accepted": not reasons,
+            "reasons": reasons,
+            "hard_issues": hard_issues,
+            "hard_fragment_issues": fragment_issues,
+            "allowed_hard_issues": sorted(allowed),
+            "old_word_range": self._items_word_range(old_items),
+            "new_word_range": self._items_word_range(new_items),
+            "old_word_count": len(self._items_word_tokens(old_items)),
+            "new_word_count": len(self._items_word_tokens(new_items)),
+        }
+
+    def _requires_forced_overflow_repartition(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        evaluation: Dict,
+    ) -> bool:
+        """Permit one auditable least-bad split only for an unsplittable tail.
+
+        A strict grammar boundary can occasionally conflict with the finite
+        display limit, producing a long line followed by a dependent 1-3 word
+        tail.  This narrow fallback never applies to ordinary prose or an
+        independent short response: it is limited to a continuous two-item
+        window whose strict repartition has already failed.
+        """
+        if len(items) != 2 or not (evaluation.get("hard_issues") or []):
+            return False
+        counts = [self._word_count(item.original) for item in items]
+        return bool(
+            max(counts, default=0) > self.max_english_words
+            and min(counts, default=0) <= 3
+            and sum(counts) <= self.max_english_words * 2
+        )
+
+    @staticmethod
+    def _pre_id_boundary_pair(
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+    ) -> Optional[tuple[int, int]]:
+        if left.word_end is None or right.word_start is None:
+            return None
+        return int(left.word_end), int(right.word_start)
+
+    @classmethod
+    def _pre_id_boundary_pairs(
+        cls,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> set[tuple[int, int]]:
+        return {
+            pair
+            for pair in (
+                cls._pre_id_boundary_pair(left, right)
+                for left, right in zip(items, items[1:])
+            )
+            if pair is not None
+        }
+
+    @classmethod
+    def _pre_id_repair_resolves_target_boundary(
+        cls,
+        old_items: Sequence[ScreenSubtitleItem],
+        new_items: Sequence[ScreenSubtitleItem],
+        target_boundary: tuple[int, int],
+        *,
+        require_target_removal: bool,
+    ) -> bool:
+        """Reject no-op repairs while allowing a fragment to merge left or right."""
+        old_boundaries = cls._pre_id_boundary_pairs(old_items)
+        new_boundaries = cls._pre_id_boundary_pairs(new_items)
+        if old_boundaries == new_boundaries:
+            return False
+        if not require_target_removal:
+            return True
+        return target_boundary in old_boundaries and target_boundary not in new_boundaries
 
     def _direct_merge_weak_fragment_window(
         self,
@@ -2249,6 +3582,9 @@ class ScreenSubtitleEditor:
     def _repartition_pre_id_window(
         self,
         items: Sequence[ScreenSubtitleItem],
+        *,
+        allowed_hard_issues: Optional[set[str]] = None,
+        forced_overflow_fallback: bool = False,
     ) -> tuple[List[ScreenSubtitleItem], List[Dict]]:
         span_start = items[0].word_start
         span_end = items[-1].word_end
@@ -2256,7 +3592,8 @@ class ScreenSubtitleEditor:
             return [], []
         target_count = len(items)
         candidates_considered: List[Dict] = []
-        best: Optional[tuple[float, float, float, List[ScreenSubtitleItem]]] = None
+        allowed_hard_issues = set(allowed_hard_issues or set())
+        best: Optional[tuple[int, float, float, float, List[ScreenSubtitleItem]]] = None
         if target_count == 2:
             candidate_cuts = [(cut,) for cut in range(span_start, span_end)]
         else:
@@ -2299,8 +3636,21 @@ class ScreenSubtitleEditor:
                 "hard_fragment_issues": list(dict.fromkeys(hard_fragment_issues)),
                 "boundary_scores": boundary_scores,
             }
+            relaxed_hard_issues = [
+                issue
+                for issue in candidate_record["hard_issues"]
+                if issue in allowed_hard_issues
+            ]
+            if relaxed_hard_issues:
+                candidate_record["relaxed_hard_issues"] = relaxed_hard_issues
+                candidate_record["forced_overflow_fallback"] = forced_overflow_fallback
             candidates_considered.append(candidate_record)
-            if hard_issues or hard_fragment_issues:
+            disallowed_hard_issues = [
+                issue
+                for issue in candidate_record["hard_issues"]
+                if issue not in allowed_hard_issues
+            ]
+            if disallowed_hard_issues or hard_fragment_issues:
                 continue
             if any(count > self.max_english_words for count in word_counts):
                 continue
@@ -2315,13 +3665,14 @@ class ScreenSubtitleEditor:
                 continue
             balance = max(word_counts) - min(word_counts)
             score = (
+                len(relaxed_hard_issues),
                 balance,
                 sum(boundary_scores),
                 sum(abs(count - self.max_english_words * 0.72) for count in word_counts),
             )
-            if best is None or score < best[:3]:
-                best = (score[0], score[1], score[2], candidate_items)
-        return (best[3], candidates_considered) if best else ([], candidates_considered)
+            if best is None or score < best[:4]:
+                best = (score[0], score[1], score[2], score[3], candidate_items)
+        return (best[4], candidates_considered) if best else ([], candidates_considered)
 
     @staticmethod
     def _ranges_from_cuts(
@@ -2346,6 +3697,7 @@ class ScreenSubtitleEditor:
         evaluation: Dict,
         repair_reason: str,
         candidates_considered: Sequence[Dict],
+        unresolved_is_hard: bool = True,
     ) -> None:
         old_cut = (
             [old_items[0].word_end, old_items[1].word_start]
@@ -2356,12 +3708,17 @@ class ScreenSubtitleEditor:
             [left.word_end, right.word_start]
             for left, right in zip(new_items or [], (new_items or [])[1:])
         ]
+        allowed_hard_issues = set(evaluation.get("allowed_hard_issues") or [])
         hard_after = [
-            self._evaluate_item_pair_for_final_boundary(
-                left,
-                right,
-                (new_items or [])[index - 1] if index > 0 else None,
-            ).get("hard_issues", [])
+            [
+                issue
+                for issue in self._evaluate_item_pair_for_final_boundary(
+                    left,
+                    right,
+                    (new_items or [])[index - 1] if index > 0 else None,
+                ).get("hard_issues", [])
+                if issue not in allowed_hard_issues
+            ]
             for index, (left, right) in enumerate(zip(new_items or [], (new_items or [])[1:]))
         ]
         hard_fragment_after = [
@@ -2380,9 +3737,13 @@ class ScreenSubtitleEditor:
                 "repair_reason": repair_reason,
                 "fragment_type": evaluation.get("fragment_type", ""),
                 "hard_issues": list(evaluation.get("hard_issues") or []),
+                "allowed_hard_issues": sorted(allowed_hard_issues),
                 "soft_issues": list(evaluation.get("soft_issues") or []),
                 "hard_fragment_issues": list(evaluation.get("hard_fragment_issues") or []),
                 "soft_fragment_issues": list(evaluation.get("soft_fragment_issues") or []),
+                "visual_reading_budget": dict(evaluation.get("visual_reading_budget") or {}),
+                "visual_temporal_category": str(evaluation.get("visual_temporal_category") or ""),
+                "display_durations_ms": list(evaluation.get("display_durations_ms") or []),
                 "hard_issues_before": list(evaluation.get("hard_issues") or []),
                 "hard_issues_after": hard_after,
                 "hard_fragment_issues_after": hard_fragment_after,
@@ -2428,7 +3789,8 @@ class ScreenSubtitleEditor:
                 "speaker_boundary_preserved": True,
                 "repair_attempted": True,
                 "repair_succeeded": new_items is not None,
-                "unresolved_hard_issue": new_items is None,
+                "unresolved_hard_issue": new_items is None and unresolved_is_hard,
+                "unresolved_visual_warning": new_items is None and not unresolved_is_hard,
                 "unresolved_reason": "" if new_items is not None else repair_reason,
             }
         )
@@ -2734,6 +4096,297 @@ class ScreenSubtitleEditor:
                 setattr(copied, attr, getattr(seg, attr))
         return copied
 
+    def rebuild_final_cue_timeline(
+        self,
+        asr_data: ASRData,
+        word_ledger: ASRData,
+        *,
+        alignment_backend: str,
+    ) -> ASRData:
+        """Build the sole final cue timeline from frozen ID-bound word spans.
+
+        This is intentionally after Chinese allocation and before export.  It
+        changes no English, Chinese, subtitle IDs, word ranges, or ordering;
+        it only updates ledger word times and derives each cue range from the
+        exact frozen words that cue owns.
+        """
+        alignment_state = dict(getattr(self, "_final_timeline_alignment", {}) or {})
+        if not alignment_state:
+            alignment_state = {
+                "requested_backend": str(alignment_backend or "stable-ts"),
+                "applied_backend": str(alignment_backend or "stable-ts"),
+                "fallback_used": False,
+                "fallback_reason": "",
+            }
+        else:
+            alignment_state["applied_backend"] = str(alignment_backend or "stable-ts")
+        self._final_timeline_alignment = alignment_state
+
+        self._final_cue_timeline_seed_errors = self._replace_frozen_word_timing(
+            word_ledger,
+            alignment_backend=alignment_backend,
+        )
+        self._final_cue_timeline_seed_errors.extend(
+            self._reconcile_final_word_timing()
+        )
+        cues = self._final_timeline_cue_payload(asr_data.segments)
+        words = self._final_timeline_word_payload()
+        timeline = derive_final_cue_timeline(
+            cues,
+            words,
+            expected_subtitle_ids=list(self._frozen_subtitle_ids),
+            lead_in_ms=DISPLAY_LEAD_IN_MS,
+            tail_padding_ms=DISPLAY_TAIL_PADDING_MS,
+        )
+        validation = final_cue_timeline_artifact(
+            timeline.get("records") or [],
+            words,
+            expected_subtitle_ids=list(self._frozen_subtitle_ids),
+            prior_errors=self._final_cue_timeline_seed_errors,
+        ).get("validation") or {}
+        timeline["validation"] = validation
+        timeline["word_timing_reconciliations"] = list(
+            getattr(self, "_final_word_timing_reconciliations", []) or []
+        )
+        timeline["alignment"] = dict(self._final_timeline_alignment)
+        self._final_cue_timeline = timeline
+
+        records_by_id = {
+            str(record.get("subtitle_id") or ""): record
+            for record in timeline.get("records") or []
+        }
+        segments_by_id: Dict[str, ASRDataSeg] = {}
+        unexpected_segments: List[ASRDataSeg] = []
+        for segment in asr_data.segments:
+            subtitle_id = str(getattr(segment, "subtitle_id", "") or "")
+            if subtitle_id in segments_by_id or subtitle_id not in self._frozen_subtitle_ids:
+                unexpected_segments.append(segment)
+                continue
+            segments_by_id[subtitle_id] = segment
+
+        rebuilt: List[ASRDataSeg] = []
+        for subtitle_id in self._frozen_subtitle_ids:
+            segment = segments_by_id.get(subtitle_id)
+            if segment is None:
+                continue
+            record = records_by_id.get(subtitle_id)
+            if record is None:
+                rebuilt.append(self._copy_segment(segment))
+                continue
+            rebuilt_segment = self._copy_segment(
+                segment,
+                start_time=int(record["start_ms"]),
+                end_time=int(record["end_ms"]),
+            )
+            rebuilt_segment.stable_word_start_ms = int(record["word_envelope_start_ms"])
+            rebuilt_segment.stable_word_end_ms = int(record["word_envelope_end_ms"])
+            rebuilt_segment.timing_backend = str(alignment_backend or "stable-ts")
+            rebuilt.append(rebuilt_segment)
+        # Keep invalid inputs visible to the final ID validator. They cannot
+        # silently replace or reorder a frozen cue, and export is blocked.
+        rebuilt.extend(self._copy_segment(segment) for segment in unexpected_segments)
+
+        logger.info(
+            "Final cue timeline rebuilt from frozen ledger: cues=%s errors=%s backend=%s",
+            len(rebuilt),
+            int(validation.get("error_count") or 0),
+            alignment_backend,
+        )
+        return ASRData(rebuilt)
+
+    def refresh_final_cue_timeline_artifact(
+        self,
+        segments: Sequence[ASRDataSeg],
+    ) -> Dict[str, Any]:
+        """Validate the exact final cue objects used by SRT and ASS writers."""
+        artifact = final_cue_timeline_artifact(
+            self._final_timeline_cue_payload(segments),
+            self._final_timeline_word_payload(),
+            expected_subtitle_ids=list(self._frozen_subtitle_ids),
+            prior_errors=getattr(self, "_final_cue_timeline_seed_errors", []) or [],
+        )
+        artifact["word_timing_reconciliations"] = list(
+            getattr(self, "_final_word_timing_reconciliations", []) or []
+        )
+        artifact["alignment"] = dict(
+            getattr(self, "_final_timeline_alignment", {}) or {}
+        )
+        self._final_cue_timeline = artifact
+        return artifact
+
+    def record_final_timeline_alignment(
+        self,
+        *,
+        requested_backend: str,
+        applied_backend: str,
+        fallback_reason: str = "",
+        local_timing_fallbacks: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> None:
+        """Record the selected and actual timing backend for final artifacts."""
+        self._final_timeline_alignment = {
+            "requested_backend": str(requested_backend or "stable-ts"),
+            "applied_backend": str(applied_backend or "stable-ts"),
+            "fallback_used": bool(fallback_reason or local_timing_fallbacks),
+            "fallback_reason": str(fallback_reason or ""),
+        }
+        if local_timing_fallbacks:
+            self._final_timeline_alignment["local_timing_fallbacks"] = [
+                dict(item) for item in local_timing_fallbacks
+            ]
+
+    def _reconcile_final_word_timing(self) -> List[Dict[str, Any]]:
+        """Resolve only adjacent word-envelope overlap before cue derivation."""
+        result = reconcile_frozen_word_ledger(self._final_timeline_word_payload())
+        self._final_word_timing_reconciliations = list(result.get("reconciliations") or [])
+        for word in result.get("words") or []:
+            word_id = int(word["word_id"])
+            if word_id < 0 or word_id >= len(self._active_word_entries):
+                continue
+            self._active_word_entries[word_id]["start_time"] = int(word["start_ms"])
+            self._active_word_entries[word_id]["end_time"] = int(word["end_ms"])
+            self._active_word_entries[word_id]["alignment_source"] = str(
+                word.get("alignment_source") or "stable-ts"
+            )
+        return list(result.get("errors") or [])
+
+    def _replace_frozen_word_timing(
+        self,
+        word_ledger: ASRData,
+        *,
+        alignment_backend: str,
+    ) -> List[Dict[str, Any]]:
+        """Update timing fields only after proving the ledger identity is unchanged."""
+        errors: List[Dict[str, Any]] = []
+        by_word_id: Dict[int, ASRDataSeg] = {}
+        for position, segment in enumerate(getattr(word_ledger, "segments", []) or []):
+            try:
+                word_id = int(getattr(segment, "word_id", position))
+            except (TypeError, ValueError):
+                errors.append({"code": "final_timeline_word_id_invalid", "position": position})
+                continue
+            if word_id in by_word_id:
+                errors.append({"code": "final_timeline_word_id_duplicate", "word_id": word_id})
+                continue
+            by_word_id[word_id] = segment
+
+        expected_word_ids = set(range(len(self._active_word_entries)))
+        if set(by_word_id) != expected_word_ids:
+            errors.append(
+                {
+                    "code": "final_timeline_word_id_set_mismatch",
+                    "expected_word_count": len(expected_word_ids),
+                    "returned_word_count": len(by_word_id),
+                }
+            )
+            return errors
+
+        for word_id in sorted(expected_word_ids):
+            segment = by_word_id[word_id]
+            entries = self._word_time_entries([segment])
+            if len(entries) != 1:
+                errors.append(
+                    {
+                        "code": "final_timeline_word_ledger_token_invalid",
+                        "word_id": word_id,
+                        "text": segment.text,
+                    }
+                )
+                continue
+            replacement = entries[0]
+            current = self._active_word_entries[word_id]
+            if replacement.get("token") != current.get("token"):
+                errors.append(
+                    {
+                        "code": "final_timeline_word_ledger_text_mismatch",
+                        "word_id": word_id,
+                        "expected": current.get("surface") or current.get("token") or "",
+                        "returned": replacement.get("surface") or replacement.get("token") or "",
+                    }
+                )
+                continue
+            current["start_time"] = int(replacement["start_time"])
+            current["end_time"] = int(replacement["end_time"])
+            current["alignment_source"] = str(
+                getattr(segment, "alignment_source", "") or alignment_backend or "stable-ts"
+            )
+        return errors
+
+    def _final_timeline_word_payload(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "word_id": word_id,
+                "surface": entry.get("surface") or entry.get("token") or "",
+                "start_ms": int(entry.get("start_time") or 0),
+                "end_ms": int(entry.get("end_time") or 0),
+                "alignment_source": str(entry.get("alignment_source") or "stable-ts"),
+            }
+            for word_id, entry in enumerate(self._active_word_entries)
+        ]
+
+    def export_frozen_word_ledger(self) -> ASRData:
+        """Export the authoritative final word ledger as one segment per word.
+
+        Stable cutting expands source ASR segments into display words. Any
+        alignment backend that runs after that expansion must consume these
+        exact word IDs, rather than the coarser source ASR segment list.
+        """
+        words: List[ASRDataSeg] = []
+        for word_id, entry in enumerate(self._active_word_entries):
+            surface = str(entry.get("surface") or entry.get("token") or "").strip()
+            if not surface:
+                continue
+            segment = ASRDataSeg(
+                text=surface,
+                start_time=int(entry.get("start_time") or 0),
+                end_time=max(
+                    int(entry.get("end_time") or 0),
+                    int(entry.get("start_time") or 0) + 1,
+                ),
+            )
+            segment.word_id = word_id
+            segment.alignment_source = str(entry.get("alignment_source") or "stable-ts")
+            segment.source_segment_ids = self._source_ids_for_word_range(word_id, word_id)
+            words.append(segment)
+        return ASRData(words)
+
+    def _final_timeline_cue_payload(
+        self,
+        segments: Sequence[ASRDataSeg],
+    ) -> List[Dict[str, Any]]:
+        payload: List[Dict[str, Any]] = []
+        for segment in segments:
+            word_start = getattr(segment, "word_start", None)
+            word_end = getattr(segment, "word_end", None)
+            envelope_start = None
+            envelope_end = None
+            sources: List[str] = []
+            if (
+                isinstance(word_start, int)
+                and isinstance(word_end, int)
+                and 0 <= word_start <= word_end < len(self._active_word_entries)
+            ):
+                envelope_start = int(self._active_word_entries[word_start].get("start_time") or 0)
+                envelope_end = int(self._active_word_entries[word_end].get("end_time") or 0)
+                sources = sorted(
+                    {
+                        str(self._active_word_entries[index].get("alignment_source") or "stable-ts")
+                        for index in range(word_start, word_end + 1)
+                    }
+                )
+            payload.append(
+                {
+                    "subtitle_id": str(getattr(segment, "subtitle_id", "") or ""),
+                    "word_start": word_start,
+                    "word_end": word_end,
+                    "word_envelope_start_ms": envelope_start,
+                    "word_envelope_end_ms": envelope_end,
+                    "start_ms": int(segment.start_time),
+                    "end_ms": int(segment.end_time),
+                    "word_alignment_sources": sources,
+                }
+            )
+        return payload
+
     @classmethod
     def _segment_index_by_subtitle_id(
         cls, segments: Sequence[ASRDataSeg]
@@ -2767,11 +4420,18 @@ class ScreenSubtitleEditor:
             "llm_cache_stats": self._llm_cache_stats,
             "allocation_runtime_stats": self._allocation_runtime_stats,
             "qa_review_points_count": self._qa_review_points_count,
-            "safe_auto_repair_enabled": bool(getattr(self, "enable_safe_auto_repair", False)),
-            "safe_auto_repair_count": len(getattr(self, "_safe_auto_repair_log", []) or []),
-            "safe_auto_repair_log": list(getattr(self, "_safe_auto_repair_log", []) or []),
-            "safe_auto_repair_candidate_count": len(getattr(self, "_safe_auto_repair_candidates", []) or []),
-            "safe_auto_repair_candidates": list(getattr(self, "_safe_auto_repair_candidates", []) or [])[:200],
+            "chinese_polish_enabled": bool(getattr(self, "enable_chinese_polish", False)),
+            "chinese_polish_count": len(
+                [item for item in getattr(self, "_chinese_polish_log", []) if item.get("decision") == "applied"]
+            ),
+            "chinese_polish_log": list(getattr(self, "_chinese_polish_log", []) or [])[:200],
+            "final_cue_timeline_path": str(getattr(self, "_final_cue_timeline_path", "") or ""),
+            "final_cue_timeline_validation": dict(
+                (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}) or {}
+            ),
+            "final_timeline_alignment": dict(
+                getattr(self, "_final_timeline_alignment", {}) or {}
+            ),
         }
         if self._qa_review_points_path:
             metadata["qa_review_points_srt"] = self._qa_review_points_path
@@ -3101,56 +4761,18 @@ class ScreenSubtitleEditor:
     def _stable_word_ranges_for_span(
         self, span: tuple[int, int], target_words: Optional[int] = None
     ) -> List[tuple[int, int]]:
-        target = target_words or min(self.max_english_words, 16)
-        emergency = max(target, min(16, max(self.max_english_words, target)))
+        # The configured value is a preferred display length, not a grammar
+        # override. Normal cues stay within 16 words; 17-19 is reserved for a
+        # rare structural exception when a shorter cut would be ungrammatical.
+        target = max(1, min(target_words or self.max_english_words, 16))
+        emergency = 19
         start, end = span
         if end < start:
             return []
         count = end - start + 1
-        if count <= emergency:
+        if count <= target:
             return [(start, end)]
-
-        dp: List[tuple[float, Optional[int]]] = [(float("inf"), None)] * (count + 1)
-        dp[0] = (0.0, None)
-        for right in range(1, count + 1):
-            max_len = min(emergency, right)
-            for length in range(1, max_len + 1):
-                left = right - length
-                prev_score, _ = dp[left]
-                if prev_score == float("inf"):
-                    continue
-                abs_left = start + left
-                abs_right = start + right - 1
-                score = (
-                    prev_score
-                    + self._segment_length_score(length, target, emergency)
-                    + self._segment_boundary_score(abs_left, abs_right, start, end)
-                )
-                if left > 0:
-                    boundary = self._evaluate_stable_cut_boundary(
-                        abs_left - 1,
-                        abs_left,
-                        source_start=start,
-                        source_end=end,
-                    )
-                    if not boundary["legal"]:
-                        score += 100_000
-                    score += float(boundary["boundary_score"])
-                if score < dp[right][0]:
-                    dp[right] = (score, left)
-
-        ranges: List[tuple[int, int]] = []
-        cursor = count
-        while cursor > 0:
-            prev = dp[cursor][1]
-            if prev is None:
-                break
-            ranges.append((start + prev, start + cursor - 1))
-            cursor = prev
-        if cursor != 0 or not ranges:
-            return self._stable_greedy_ranges(start, end, target, emergency)
-        ranges.reverse()
-        return self._merge_tiny_stable_ranges(ranges, target, emergency)
+        return self._stable_greedy_ranges(start, end, target, emergency)
 
     @staticmethod
     def _segment_length_score(length: int, target: int, emergency: int) -> float:
@@ -3320,19 +4942,34 @@ class ScreenSubtitleEditor:
         right: int,
         pause_ms: Optional[int],
     ) -> List[str]:
-        if pause_ms is not None and pause_ms >= 450:
-            return []
         entries = self._active_word_entries
         left_token = self._clean_boundary_token(entries[left].get("token") or "")
         right_token = self._clean_boundary_token(entries[right].get("token") or "")
-        issues: List[str] = []
         prepositions = {
             "into", "of", "for", "with", "without", "in", "on", "at", "by",
             "from", "to", "about", "around", "through", "over", "under",
             "between", "among", "against", "within", "across",
         }
-        if left_token in prepositions and right_token:
-            issues.append("preposition_object_split")
+        # Some prepositions also occur as sentence-final adverbs or
+        # complements (for example, "the era is over.").  A terminal
+        # punctuation mark is an explicit sentence boundary and must win over
+        # the token-only preposition heuristic.
+        left_surface = str(entries[left].get("surface") or "")
+        right_surface = str(entries[right].get("surface") or "")
+        if self._is_unambiguous_sentence_terminal(left_surface, right_surface):
+            return []
+        left_is_open_preposition = (
+            left_token in prepositions
+            and right_token
+            and not re.search(r"[.!?]\s*$", left_surface)
+        )
+        # A recognisable pause is useful evidence for ordinary clause
+        # boundaries, but it cannot make an unbreakable phrase boundary legal.
+        # Forced-alignment gaps around function words are common enough that
+        # allowing them here produces visible function-word stranded cuts.
+        strict_issues: List[str] = []
+        if left_is_open_preposition:
+            strict_issues.append("preposition_object_split")
         context_start = max(0, left - 4)
         context_end = min(len(entries) - 1, right + 4)
         context = [
@@ -3340,6 +4977,33 @@ class ScreenSubtitleEditor:
             for index in range(context_start, context_end + 1)
         ]
         boundary_offset = left - context_start
+        if self._boundary_inside_determiner_numeric_noun(context, boundary_offset):
+            strict_issues.append("determiner_numeric_noun_split")
+        if self._boundary_inside_quantifier_phrase(context, boundary_offset):
+            strict_issues.append("quantifier_phrase_split")
+        if self._is_numeric_unit_or_noun_split(left, right):
+            strict_issues.append("numeric_unit_or_noun_split")
+        if self._is_auxiliary_predicate_split(left_token, right_token):
+            strict_issues.append("auxiliary_predicate_split")
+        if self._is_determiner_head_phrase_split(left_token, right_token):
+            strict_issues.append("determiner_head_phrase_split")
+        if self._is_time_range_continuation_split(left, right):
+            strict_issues.append("time_range_continuation_split")
+        parser_issues = list(
+            (getattr(self, "_syntax_hard_cut_issues", {}) or {}).get((left, right), [])
+        )
+        if strict_issues:
+            return list(dict.fromkeys(strict_issues + parser_issues))
+        # A forced-alignment pause is evidence for a clause boundary, not a
+        # permission slip to split a parser-confirmed dependency.
+        if parser_issues:
+            return parser_issues
+        if pause_ms is not None and pause_ms >= 450:
+            return []
+
+        issues: List[str] = []
+        if left_is_open_preposition:
+            issues.append("preposition_object_split")
         if self._boundary_inside_determiner_numeric_noun(context, boundary_offset):
             issues.append("determiner_numeric_noun_split")
         if self._boundary_inside_quantifier_phrase(context, boundary_offset):
@@ -3374,13 +5038,18 @@ class ScreenSubtitleEditor:
             issues.append("coordinated_modifier_split")
         if self._is_transition_attached_to_previous_sentence(left, right, pause_ms):
             issues.append("transition_attached_to_previous_sentence")
-        for issue in (getattr(self, "_syntax_hard_cut_issues", {}) or {}).get((left, right), []):
+        for issue in parser_issues:
             if issue not in issues:
                 issues.append(issue)
         return issues
 
     def _soft_stable_cut_issues(self, left: int, right: int) -> List[str]:
         entries = self._active_word_entries
+        if self._is_unambiguous_sentence_terminal(
+            str(entries[left].get("surface") or ""),
+            str(entries[right].get("surface") or ""),
+        ):
+            return []
         left_token = self._clean_boundary_token(entries[left].get("token") or "")
         right_token = self._clean_boundary_token(entries[right].get("token") or "")
         issues: List[str] = []
@@ -3397,6 +5066,33 @@ class ScreenSubtitleEditor:
         if self._is_phrasal_verb_particle_split(left_token, right_token):
             issues.append("phrasal_verb_particle_split")
         return issues
+
+    @classmethod
+    def _is_unambiguous_sentence_terminal(
+        cls,
+        left_surface: str,
+        right_surface: str,
+    ) -> bool:
+        """Recognize a true sentence terminal before token-only cut heuristics.
+
+        A period after a title or an initial is not a sentence boundary, so it
+        remains subject to the normal abbreviation/name guard.  Otherwise an
+        explicit terminal mark must not be reinterpreted as a determiner,
+        modifier, or preposition merely because its final word has another
+        possible part of speech.
+        """
+        left = str(left_surface or "").strip()
+        right = str(right_surface or "").strip()
+        if re.search(r"[!?]\s*$", left):
+            return True
+        if not re.search(r"\.\s*$", left):
+            return False
+        title = re.sub(r"[^A-Za-z]", "", left).casefold()
+        if title in {"st", "mt", "mr", "mrs", "ms", "dr", "prof", "jr", "sr"}:
+            return not bool(re.match(r"[A-Z][A-Za-z'-]{2,}\b", right))
+        if re.fullmatch(r"(?:[A-Za-z]\.){1,}", left):
+            return False
+        return True
 
     def _is_transition_attached_to_previous_sentence(
         self,
@@ -3554,6 +5250,13 @@ class ScreenSubtitleEditor:
 
     def _is_numeric_unit_or_noun_split(self, left: int, right: int) -> bool:
         entries = self._active_word_entries
+        left_surface = str(entries[left].get("surface") or "")
+        # A number ending an explicit sentence is not the first half of a
+        # numeric noun phrase.  Treating ``2019. / Right.`` as one caused the
+        # final boundary repair to move a correct sentence boundary into the
+        # following clause.
+        if re.search(r"[.!?][\"')\]]*\s*$", left_surface):
+            return False
         left_token = self._clean_boundary_token(entries[left].get("token") or "")
         right_token = self._clean_boundary_token(entries[right].get("token") or "")
         if not right_token or not self._token_looks_noun_like(right_token):
@@ -3962,27 +5665,57 @@ class ScreenSubtitleEditor:
         ranges = []
         cursor = start
         while cursor <= end:
-            right = min(cursor + emergency - 1, end)
-            if right < end:
-                best = right
-                best_score = float("inf")
-                for candidate in range(max(cursor, cursor + 5), right + 1):
+            remaining = end - cursor + 1
+            if remaining <= target:
+                ranges.append((cursor, end))
+                break
+
+            # First search within the normal display limit. Only if every
+            # candidate is structurally illegal do we use the 17-19 exception.
+            best: Optional[int] = None
+            best_score = float("inf")
+            max_length = min(target, remaining - 1)
+            for candidate in range(cursor + 4, cursor + max_length):
+                boundary = self._evaluate_stable_cut_boundary(
+                    candidate,
+                    candidate + 1,
+                    source_start=cursor,
+                    source_end=end,
+                )
+                if not boundary["legal"]:
+                    continue
+                length = candidate - cursor + 1
+                score = float(boundary["boundary_score"]) + abs(length - target) * 1.5
+                if score < best_score:
+                    best_score = score
+                    best = candidate
+
+            if best is None:
+                max_length = min(emergency, remaining - 1)
+                for candidate in range(cursor + target - 1, cursor + max_length):
                     boundary = self._evaluate_stable_cut_boundary(
                         candidate,
                         candidate + 1,
                         source_start=cursor,
                         source_end=end,
                     )
-                    score = 100_000 if not boundary["legal"] else 0.0
-                    score += float(boundary["boundary_score"])
-                    score += abs((candidate - cursor) - target)
+                    if not boundary["legal"]:
+                        continue
+                    length = candidate - cursor + 1
+                    score = float(boundary["boundary_score"]) + (length - target) * 12.0
                     if score < best_score:
                         best_score = score
                         best = candidate
-                right = best
+
+            if best is None:
+                # No grammar-safe boundary exists in the exception window. Do
+                # not silently create an unlimited cue; the final audit will
+                # retain the forced boundary as a visible warning.
+                best = min(cursor + emergency - 1, end - 1)
+            right = best
             ranges.append((cursor, right))
             cursor = right + 1
-        return ranges
+        return self._merge_tiny_stable_ranges(ranges, target, emergency)
 
     def _merge_tiny_stable_ranges(
         self, ranges: List[tuple[int, int]], target: int, emergency: int
@@ -4055,7 +5788,18 @@ class ScreenSubtitleEditor:
                 if right - left <= 3:
                     self._protect_internal_boundaries(range(left, right + 1), protected)
             self._protect_short_verb_complement_boundaries(doc, doc_to_word)
+            self._protect_short_dative_object_chains(doc, doc_to_word)
+            self._protect_verb_particle_boundaries(doc, doc_to_word)
+            self._protect_short_gerundial_modifier_boundaries(doc, doc_to_word)
+            self._protect_clause_introducer_boundaries(doc, doc_to_word)
+            self._protect_preposition_object_boundaries(doc, doc_to_word)
+            self._protect_verb_preposition_complement_boundaries(doc, doc_to_word)
+            self._protect_verb_adverb_preposition_boundaries(doc, doc_to_word)
+            self._protect_verb_numeric_result_boundaries(doc, doc_to_word)
+            self._protect_numeric_range_boundaries(doc, doc_to_word)
             self._protect_subject_verb_boundaries(doc, doc_to_word)
+            self._protect_coordinated_subject_boundaries(doc, doc_to_word)
+            self._protect_comma_bracketed_adverb_boundaries(doc, doc_to_word)
             self._protect_modifier_head_boundaries(doc, doc_to_word)
 
         self._syntax_protected_cuts = protected
@@ -4114,16 +5858,414 @@ class ScreenSubtitleEditor:
             )
             if not subtree_indices:
                 continue
-            if min(subtree_indices) != head_index + 1:
+            complement_start = min(subtree_indices)
+            if complement_start <= head_index:
                 continue
-            if len(subtree_indices) > 3:
-                continue
-            timing_gap = self._word_pause_ms(head_index, min(subtree_indices))
-            if timing_gap is not None and timing_gap > 180:
+            between_indices = range(head_index + 1, complement_start)
+            # Allow only a phrasal-verb particle between a verb and its direct
+            # complement. A long object may follow it, but the boundary before
+            # the object is still grammatically inseparable.
+            if any(
+                item.i in doc_to_word
+                and getattr(item, "dep_", "") not in {"prt", "aux", "auxpass", "neg", "advmod"}
+                for item in doc
+                if doc_to_word.get(item.i) in between_indices
+            ):
                 continue
             issue = "short_verb_object_split" if token.dep_ in {"obj", "dobj"} else "verb_complement_split"
-            self._record_syntax_hard_issue_for_indices([head_index] + subtree_indices, issue)
-            self._record_syntax_hard_issue_for_indices([head_index] + subtree_indices, "short_verb_complement_split")
+            protected_indices = list(range(head_index, complement_start + 1))
+            self._record_syntax_hard_issue_for_indices(protected_indices, issue)
+            self._record_syntax_hard_issue_for_indices(protected_indices, "short_verb_complement_split")
+
+    def _protect_short_dative_object_chains(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a compact verb-dative-object start together.
+
+        The ordinary object guard starts at the direct object.  In a short
+        ``give you a ...`` shape, that leaves the boundary after the dative
+        open and can strand the object's determiner on the next cue.
+        """
+        object_deps = {"obj", "dobj"}
+        for verb in doc:
+            if getattr(verb, "pos_", "") not in {"VERB", "AUX"}:
+                continue
+            if verb.i not in doc_to_word:
+                continue
+            dative_children = [
+                child for child in verb.children
+                if getattr(child, "dep_", "") == "dative" and child.i in doc_to_word
+            ]
+            object_children = [
+                child for child in verb.children
+                if getattr(child, "dep_", "") in object_deps and child.i in doc_to_word
+            ]
+            if not dative_children or not object_children:
+                continue
+            verb_index = doc_to_word[verb.i]
+            for dative in dative_children:
+                dative_index = doc_to_word[dative.i]
+                if dative_index != verb_index + 1:
+                    continue
+                object_indices = sorted(
+                    doc_to_word[item.i]
+                    for object_child in object_children
+                    for item in object_child.subtree
+                    if item.i in doc_to_word
+                )
+                if not object_indices:
+                    continue
+                object_start = min(object_indices)
+                if object_start <= dative_index or object_start - dative_index > 2:
+                    continue
+                pauses = [
+                    self._word_pause_ms(index, index + 1)
+                    for index in range(verb_index, object_start)
+                ]
+                if any(pause is not None and pause >= 450 for pause in pauses):
+                    continue
+                self._record_syntax_hard_issue_for_indices(
+                    range(verb_index, object_start + 1),
+                    "short_verb_complement_split",
+                )
+
+    def _protect_verb_particle_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Protect a direct verb-particle shape when no object follows it."""
+        for particle in doc:
+            if (
+                getattr(particle, "dep_", "") not in {"prep", "prt"}
+                or particle.i not in doc_to_word
+                or getattr(particle, "pos_", "") not in {"ADP", "ADV"}
+            ):
+                continue
+            verb = particle.head
+            if (
+                getattr(verb, "pos_", "") not in {"VERB", "AUX"}
+                or verb.i not in doc_to_word
+            ):
+                continue
+            verb_index = doc_to_word[verb.i]
+            particle_index = doc_to_word[particle.i]
+            if particle_index != verb_index + 1:
+                continue
+            if re.search(r"[.!?]\s*$", str(particle.text or "")):
+                continue
+            if any(
+                getattr(child, "dep_", "") in {"pobj", "pcomp"}
+                for child in particle.children
+            ):
+                continue
+            pause = self._word_pause_ms(verb_index, particle_index)
+            if pause is not None and pause >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [verb_index, particle_index],
+                "verb_particle_split",
+            )
+
+    def _protect_short_gerundial_modifier_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a compact unpunctuated VBG modifier with the action it completes.
+
+        A participial manner phrase such as ``spot the pattern using your own
+        eyes`` is often parsed as ``VERB -> VBG/advcl`` after the main verb's
+        object. It is not an independent display beat when it has no leading
+        punctuation, no meaningful pause, and only a short local complement.
+        The visual pass must leave a 13-16 word sentence intact in that case,
+        rather than create a four-word gerundial tail solely for character
+        budget reasons.
+        """
+        for token in doc:
+            if (
+                getattr(token, "pos_", "") != "VERB"
+                or getattr(token, "tag_", "") != "VBG"
+                or getattr(token, "dep_", "") != "advcl"
+                or token.i not in doc_to_word
+            ):
+                continue
+            head = token.head
+            if (
+                getattr(head, "pos_", "") not in {"VERB", "AUX"}
+                or head.i not in doc_to_word
+            ):
+                continue
+            modifier_indices = sorted(
+                doc_to_word[item.i]
+                for item in token.subtree
+                if item.i in doc_to_word
+            )
+            if not modifier_indices or len(modifier_indices) > 4:
+                continue
+            modifier_start = min(modifier_indices)
+            if modifier_start <= 0:
+                continue
+            previous_surface = str(self._active_word_entries[modifier_start - 1].get("surface") or "")
+            if re.search(r"[,;:.!?]\s*$", previous_surface):
+                continue
+            pause_ms = self._word_pause_ms(modifier_start - 1, modifier_start)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [modifier_start - 1, modifier_start],
+                "short_gerundial_modifier_split",
+            )
+
+    def _protect_clause_introducer_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        for token in doc:
+            if token.i not in doc_to_word:
+                continue
+            if getattr(token, "dep_", "") != "mark" and getattr(token, "pos_", "") != "SCONJ":
+                continue
+            head = token.head
+            if head.i not in doc_to_word:
+                continue
+            token_index = doc_to_word[token.i]
+            head_index = doc_to_word[head.i]
+            if head_index <= token_index or token_index + 1 >= len(self._active_word_entries):
+                continue
+            # A subordinate-clause introducer belongs to the clause that
+            # follows it. Splitting immediately after it creates a visible
+            # dangling "if / how / because / that" subtitle.
+            self._record_syntax_hard_issue_for_indices(
+                [token_index, token_index + 1],
+                "clause_introducer_split",
+            )
+
+    def _protect_preposition_object_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Protect a parser-confirmed preposition from its local complement.
+
+        Lexical fallback rules cover common prepositions, but a noun-attached
+        example phrase such as ``clues like excessive em dashes`` is parsed as
+        ``NOUN -> ADP/prep -> NOUN/pobj``. The ADP is not itself a noun-chunk
+        member, so the generic noun-phrase guard does not own its following
+        boundary. This parser-backed rule supplies that missing ownership for
+        every continuous ``prep -> pobj/pcomp`` relation.
+        """
+        for token in doc:
+            if getattr(token, "dep_", "") != "prep" or token.i not in doc_to_word:
+                continue
+            prep_index = doc_to_word[token.i]
+            complement_indices = []
+            for child in token.children:
+                if getattr(child, "dep_", "") not in {"pobj", "pcomp"}:
+                    continue
+                complement_indices.extend(
+                    doc_to_word[item.i]
+                    for item in child.subtree
+                    if item.i in doc_to_word
+                )
+            if not complement_indices:
+                continue
+            complement_start = min(complement_indices)
+            if complement_start <= prep_index:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(prep_index, complement_start + 1),
+                "preposition_object_split",
+            )
+
+    def _protect_verb_preposition_complement_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        for token in doc:
+            if getattr(token, "dep_", "") != "prep":
+                continue
+            head = token.head
+            if token.i not in doc_to_word or head.i not in doc_to_word:
+                continue
+            if getattr(head, "pos_", "") not in {"VERB", "AUX"}:
+                continue
+            head_index = doc_to_word[head.i]
+            prep_index = doc_to_word[token.i]
+            if prep_index != head_index + 1:
+                continue
+            if not any(getattr(child, "dep_", "") in {"pobj", "pcomp"} for child in token.children):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [head_index, prep_index],
+                "verb_preposition_complement_split",
+            )
+
+    def _protect_verb_adverb_preposition_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a verb's directional adverb and following preposition together.
+
+        spaCy can parse ``come back to`` as VERB -> ADV -> ADP rather than a
+        verb directly governing the preposition. The existing verb-preposition
+        protection intentionally does not cover that shape. Protect the whole
+        contiguous VERB/ADV/ADP chain when there is no meaningful pause, so a
+        repair cannot merely move a bad cut from ``back / to`` to
+        ``coming / back``.
+        """
+        for token in doc:
+            if getattr(token, "dep_", "") != "prep" or token.i not in doc_to_word:
+                continue
+            adverb = token.head
+            verb = adverb.head
+            if (
+                getattr(adverb, "pos_", "") != "ADV"
+                or getattr(adverb, "dep_", "") not in {"advmod", "prt"}
+                or getattr(verb, "pos_", "") not in {"VERB", "AUX"}
+                or adverb.i not in doc_to_word
+                or verb.i not in doc_to_word
+            ):
+                continue
+            verb_index = doc_to_word[verb.i]
+            adverb_index = doc_to_word[adverb.i]
+            prep_index = doc_to_word[token.i]
+            if adverb_index != verb_index + 1 or prep_index != adverb_index + 1:
+                continue
+            pauses = (
+                self._word_pause_ms(verb_index, adverb_index),
+                self._word_pause_ms(adverb_index, prep_index),
+            )
+            if any(pause_ms is not None and pause_ms >= 450 for pause_ms in pauses):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [verb_index, adverb_index, prep_index],
+                "verb_adverb_preposition_split",
+            )
+
+    def _protect_verb_numeric_result_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a verb attached to its compact numeric result expression.
+
+        This covers constructions such as ``fell 52% from its peak``.  The
+        numeric object is part of the action's result, not an independent
+        subtitle unit.  Long ordinary objects remain eligible for a cut;
+        only direct numeric-result objects are protected here.
+        """
+        result_deps = {"obj", "dobj", "attr", "oprd", "npadvmod"}
+        for token in doc:
+            # Some ASR word ledgers preserve ``52%`` as one word while spaCy
+            # parses it as NUM + NOUN. In that case the mapped NUM is attached
+            # to an unmapped unit token (``%``); use that unit as the result
+            # head while retaining the mapped numeric token as the boundary.
+            result_token = token
+            numeric_anchor = token
+            if (
+                getattr(token, "pos_", "") == "NUM"
+                and getattr(token, "dep_", "") in {"nummod", "quantmod"}
+                and getattr(token.head, "dep_", "") in result_deps
+            ):
+                result_token = token.head
+            elif getattr(token, "dep_", "") not in result_deps:
+                continue
+
+            head = result_token.head
+            if (
+                numeric_anchor.i not in doc_to_word
+                or getattr(head, "pos_", "") not in {"VERB", "AUX"}
+                or head.i not in doc_to_word
+            ):
+                continue
+            has_numeric_result = (
+                getattr(numeric_anchor, "like_num", False)
+                or getattr(numeric_anchor, "pos_", "") == "NUM"
+                or any(
+                    getattr(child, "dep_", "") in {"nummod", "quantmod"}
+                    or getattr(child, "like_num", False)
+                    for child in result_token.children
+                )
+            )
+            if not has_numeric_result:
+                continue
+            # Keep the numeric core compact, but do not turn every following
+            # prepositional or relative modifier into an unbreakable span.
+            # "sold 100 homes in three cities" may safely break after homes;
+            # "fell 52% from its peak" is handled below as a one-boundary
+            # qualifier attachment.
+            result_indices = []
+            for item in result_token.subtree:
+                if item.i not in doc_to_word:
+                    continue
+                ancestor = item
+                belongs_to_modifier = False
+                while (
+                    ancestor.i != result_token.i
+                    and ancestor.head.i != ancestor.i
+                ):
+                    if getattr(ancestor, "dep_", "") in {"prep", "relcl", "acl", "advcl"}:
+                        belongs_to_modifier = True
+                        break
+                    ancestor = ancestor.head
+                if not belongs_to_modifier:
+                    result_indices.append(doc_to_word[item.i])
+            result_indices = sorted(set(result_indices))
+            if not result_indices:
+                continue
+            verb_index = doc_to_word[head.i]
+            result_start = min(result_indices)
+            result_end = max(result_indices)
+            if result_start <= verb_index or result_start - verb_index > 2:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(verb_index, result_end + 1),
+                "verb_numeric_result_split",
+            )
+
+            # A following source/baseline preposition belongs to the numeric
+            # result as well: "fell 52% from ...", "rose 10% to ...".
+            following_preps = [
+                child
+                for child in head.children
+                if getattr(child, "dep_", "") == "prep"
+                and child.i in doc_to_word
+                and doc_to_word[child.i] == result_end + 1
+                and self._clean_boundary_token(child.text) in {"from", "to", "by", "at"}
+            ]
+            for prep in following_preps:
+                self._record_syntax_hard_issue_for_indices(
+                    [result_end, doc_to_word[prep.i]],
+                    "numeric_result_qualifier_split",
+                )
+
+    def _protect_numeric_range_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep parser-confirmed ``from number to number`` ranges intact."""
+        for from_token in doc:
+            if (
+                self._clean_boundary_token(getattr(from_token, "text", "")) != "from"
+                or getattr(from_token, "dep_", "") != "prep"
+                or from_token.i not in doc_to_word
+            ):
+                continue
+            head = from_token.head
+            if (
+                getattr(head, "pos_", "") not in {"VERB", "AUX"}
+                or head.i not in doc_to_word
+            ):
+                continue
+            from_index = doc_to_word[from_token.i]
+            to_tokens = [
+                token for token in from_token.subtree
+                if token.i in doc_to_word
+                and self._clean_boundary_token(getattr(token, "text", "")) == "to"
+            ]
+            if not to_tokens:
+                continue
+            to_token = min(to_tokens, key=lambda token: token.i)
+            numeric_before_to = [
+                token for token in from_token.subtree
+                if token.i in doc_to_word
+                and from_token.i < token.i < to_token.i
+                and (getattr(token, "like_num", False) or getattr(token, "pos_", "") == "NUM")
+            ]
+            if not numeric_before_to:
+                continue
+            numeric_after_to = [
+                token for token in to_token.subtree
+                if token.i in doc_to_word
+                and (getattr(token, "like_num", False) or getattr(token, "pos_", "") == "NUM")
+            ]
+            if not numeric_after_to:
+                continue
+            start = min(doc_to_word[head.i], from_index)
+            end = max(doc_to_word[token.i] for token in numeric_after_to)
+            if end <= start or end - start > 8:
+                continue
+            pauses = [
+                self._word_pause_ms(index, index + 1)
+                for index in range(start, end)
+            ]
+            if any(pause is not None and pause >= 450 for pause in pauses):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(start, end + 1),
+                "numeric_range_split",
+            )
 
     def _protect_subject_verb_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
         for token in doc:
@@ -4163,6 +6305,76 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 list(range(subject_end, verb_index + 1)),
                 issue,
+            )
+
+    def _protect_coordinated_subject_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a compact coordinated subject from being split internally."""
+        for subject in doc:
+            if (
+                getattr(subject, "dep_", "") not in {"nsubj", "nsubjpass", "expl"}
+                or subject.i not in doc_to_word
+            ):
+                continue
+            subtree = [token for token in subject.subtree if token.i in doc_to_word]
+            if not any(getattr(token, "dep_", "") == "conj" for token in subtree):
+                continue
+            indices = sorted(doc_to_word[token.i] for token in subtree)
+            if not indices or indices[-1] - indices[0] > 7:
+                continue
+            if any(
+                self._word_pause_ms(index, index + 1) is not None
+                and self._word_pause_ms(index, index + 1) >= 450
+                for index in range(indices[0], indices[-1])
+            ):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(indices[0], indices[-1] + 1),
+                "coordinated_subject_split",
+            )
+
+    def _protect_comma_bracketed_adverb_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a comma-bracketed sentence adverb off a new cue's first word.
+
+        A word-ledger entry owns adjacent punctuation, so a structure such as
+        ``for me, really, for anyone`` appears as three adjacent entries.  If
+        spaCy confirms that the middle word is an adverb modifying the
+        following preposition, splitting immediately before it produces a
+        visually orphaned sentence-internal aside.  Keep that adverb with the
+        preceding list item; the next cue may begin at the following complete
+        prepositional phrase.  This is intentionally limited to a local,
+        punctuation-bracketed dependency and does not affect sentence-initial
+        adverbs or ordinary adverb-verb boundaries.
+        """
+        for token in doc:
+            if (
+                getattr(token, "pos_", "") != "ADV"
+                or getattr(token, "dep_", "") != "advmod"
+                or token.i not in doc_to_word
+            ):
+                continue
+            head = token.head
+            if (
+                getattr(head, "pos_", "") != "ADP"
+                or head.i not in doc_to_word
+            ):
+                continue
+            adverb_index = doc_to_word[token.i]
+            head_index = doc_to_word[head.i]
+            if head_index != adverb_index + 1 or adverb_index <= 0:
+                continue
+            previous_surface = str(self._active_word_entries[adverb_index - 1].get("surface") or "")
+            adverb_surface = str(self._active_word_entries[adverb_index].get("surface") or "")
+            if not (
+                re.search(r"[,;:]\s*$", previous_surface)
+                and re.search(r"[,;:]\s*$", adverb_surface)
+            ):
+                continue
+            pause_ms = self._word_pause_ms(adverb_index - 1, adverb_index)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [adverb_index - 1, adverb_index],
+                "comma_bracketed_adverb_split",
             )
 
     def _protect_modifier_head_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
@@ -4237,9 +6449,25 @@ class ScreenSubtitleEditor:
     ) -> Dict[int, int]:
         mapping: Dict[int, int] = {}
         cursor = span_start
+        last_entry_token = ""
         for token in doc:
+            if getattr(token, "is_punct", False):
+                continue
             normalized = self._clean_boundary_token(token.text)
             if not normalized:
+                continue
+            # The word ledger keeps ASR tokens intact (for example
+            # ``six-fold``), while spaCy may split the same surface into
+            # ``six``, ``-`` and ``fold``. Once a sub-token has consumed the
+            # ledger word, ignore later sub-tokens from that same compound so
+            # they cannot advance the cursor and misalign the rest of the
+            # sentence.
+            if (
+                last_entry_token
+                and normalized != last_entry_token
+                and normalized in last_entry_token
+                and bool(re.search(r"[-/'’]", last_entry_token))
+            ):
                 continue
             while cursor <= span_end:
                 entry_token = self._clean_boundary_token(
@@ -4247,10 +6475,12 @@ class ScreenSubtitleEditor:
                 )
                 if entry_token == normalized:
                     mapping[token.i] = cursor
+                    last_entry_token = entry_token
                     cursor += 1
                     break
                 if normalized in entry_token or entry_token in normalized:
                     mapping[token.i] = cursor
+                    last_entry_token = entry_token
                     cursor += 1
                     break
                 cursor += 1
@@ -4372,6 +6602,10 @@ class ScreenSubtitleEditor:
         validation_summary = self._validation_summary(
             gaps, translation_gaps, health, final_segments or []
         )
+        final_timeline_errors = list(
+            (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("errors", [])
+            or []
+        )
         self.last_validation_summary = validation_summary
         if not self.coverage_report_path:
             return
@@ -4382,6 +6616,7 @@ class ScreenSubtitleEditor:
                 gaps
                 or translation_gaps
                 or health["overlong_english"]
+                or health.get("structural_english_overflow", [])
                 or health["bad_cuts"]
                 or health["translationese"]
                 or health["reading_speed_errors"]
@@ -4394,6 +6629,7 @@ class ScreenSubtitleEditor:
                 or health["syntax_boundary_audit"]
                 or health["chinese_semantic_group_warnings"]
                 or health["chinese_semantic_group_info"]
+                or final_timeline_errors
             )
             lines = [
                 "字幕体检报告",
@@ -4403,8 +6639,11 @@ class ScreenSubtitleEditor:
                 f"WARNING 数量：{len(validation_summary['warnings'])}",
                 f"INFO 数量：{len(validation_summary['info'])}",
                 f"覆盖缺口数量：{len(gaps)}",
+                f"最终显示连续化修复数量：{len(getattr(self, '_display_coverage_repairs', []))}",
+                f"未自动修复的显示空档数量：{len(getattr(self, '_display_coverage_unresolved', []))}",
                 f"缺中文字幕数量：{len(translation_gaps)}",
                 f"英文超长数量：{len(health['overlong_english'])}",
+                f"英文结构性超长警告数量：{len(health.get('structural_english_overflow', []))}",
                 f"疑似坏切点数量：{len(health['bad_cuts'])}",
                 f"疑似翻译腔数量：{len(health['translationese'])}",
                 f"阅读速度严重问题数量：{len(health['reading_speed_errors'])}",
@@ -4413,6 +6652,7 @@ class ScreenSubtitleEditor:
                 f"字幕时长警告数量：{len(health['duration_warnings'])}",
                 f"相邻中文疑似重复数量：{len(health['duplicate_chinese'])}",
                 f"ASR 可疑文本数量：{len(health['asr_suspicious'])}",
+                f"最终词账本时间轴错误数量：{len(final_timeline_errors)}",
                 "",
             ]
             if validation_summary["errors"]:
@@ -4453,6 +6693,18 @@ class ScreenSubtitleEditor:
                             f"时间：{issue['start']} --> {issue['end']}",
                             f"词数：{issue['word_count']}，上限：{self.max_english_words}",
                             f"英文：{issue['text']}",
+                            "",
+                        ]
+                    )
+            if health.get("structural_english_overflow", []):
+                lines.append("三点五、英文结构性超长警告")
+                for issue in health.get("structural_english_overflow", []):
+                    lines.extend(
+                        [
+                            f"时间：{issue['start']} --> {issue['end']}",
+                            f"词数：{issue['word_count']}，正常上限：{issue['hard_limit']}",
+                            f"原文：{issue['text']}",
+                            "说明：所有不超过正常上限的内部切点都会破坏受保护句法；保留完整句并建议人工复核。",
                             "",
                         ]
                     )
@@ -4586,7 +6838,7 @@ class ScreenSubtitleEditor:
         points = self._editor_review_points(final_segments)
         self._qa_review_points_count = len(points)
         srt_path = report_path.parent / "qa-review-points.srt"
-        artifact_dir = self._artifact_dir(report_path)
+        artifact_dir = stable_artifact_dir(report_path)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_srt_path = artifact_dir / "qa-review-points.srt"
         artifact_json_path = artifact_dir / "qa-review-points.json"
@@ -4595,7 +6847,7 @@ class ScreenSubtitleEditor:
         try:
             srt_path.write_text(srt_text, encoding="utf-8-sig")
             artifact_srt_path.write_text(srt_text, encoding="utf-8-sig")
-            self._write_json_artifact(artifact_json_path, points)
+            write_json_artifact(artifact_json_path, points)
         except Exception as e:
             logger.warning("剪辑检查点字幕保存失败 / QA review SRT save failed: %s", str(e))
 
@@ -4734,10 +6986,17 @@ class ScreenSubtitleEditor:
         return labels.get(issue_code, issue_code)
 
     def has_blocking_validation_errors(self) -> bool:
-        return bool(self._translation_structure_errors)
+        final_timeline_errors = list(
+            (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("errors", [])
+            or []
+        )
+        return bool(self._translation_structure_errors or final_timeline_errors)
 
     def blocking_validation_message(self) -> str:
-        errors = self._translation_structure_errors or []
+        errors = list(self._translation_structure_errors or []) + list(
+            (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("errors", [])
+            or []
+        )
         if not errors:
             return ""
         messages = [str(error.get("message") or error.get("code") or "未知错误") for error in errors]
@@ -4778,6 +7037,14 @@ class ScreenSubtitleEditor:
                     "items": health["overlong_english"],
                 }
             )
+        if health.get("structural_english_overflow", []):
+            warnings.append(
+                {
+                    "code": "structural_english_overflow",
+                    "message": f"存在 {len(health.get('structural_english_overflow', []))} 条无法安全缩至正常上限的完整英文句。",
+                    "items": health.get("structural_english_overflow", []),
+                }
+            )
 
         timing_errors = self._timing_validation_issues(final_segments)
         if timing_errors:
@@ -4807,6 +7074,19 @@ class ScreenSubtitleEditor:
 
         if self._translation_structure_errors:
             errors.extend(self._translation_structure_errors)
+
+        final_timeline_errors = list(
+            (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("errors", [])
+            or []
+        )
+        if final_timeline_errors:
+            errors.append(
+                {
+                    "code": "final_cue_timeline_invalid",
+                    "message": f"最终字幕词账本时间轴存在 {len(final_timeline_errors)} 处契约错误。",
+                    "items": final_timeline_errors,
+                }
+            )
 
         if health["bad_cuts"]:
             warnings.append(
@@ -4977,7 +7257,7 @@ class ScreenSubtitleEditor:
         for entry in entries:
             counts[entry["severity"]] = counts.get(entry["severity"], 0) + int(entry.get("item_count") or 1)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "summary": {
                 "blocker_count": counts.get("BLOCKER", 0),
                 "review_count": counts.get("REVIEW", 0),
@@ -4999,6 +7279,7 @@ class ScreenSubtitleEditor:
             "translation_id_unknown",
             "translation_group_cardinality_mismatch",
             "final_translation_id_mismatch",
+            "final_cue_timeline_invalid",
             "allocation_quality_unresolved",
         }
         review_codes = {
@@ -5025,6 +7306,7 @@ class ScreenSubtitleEditor:
         reasons = {
             "missing_translation": "Chinese text is missing for one or more frozen subtitle IDs.",
             "overlong_english": "English text exceeds the hard subtitle word limit.",
+            "structural_english_overflow": "A complete English sentence has no safe internal cut within the normal word limit.",
             "invalid_timing": "Subtitle timestamps are invalid or overlapping.",
             "subtitle_duration_invalid": "Subtitle duration is below the hard display limit.",
             "translation_id_missing": "LLM allocation omitted an expected subtitle ID.",
@@ -5032,6 +7314,7 @@ class ScreenSubtitleEditor:
             "translation_id_unknown": "LLM allocation returned a subtitle ID outside the frozen set.",
             "translation_group_cardinality_mismatch": "Returned allocation ID set differs from the expected group ID set.",
             "final_translation_id_mismatch": "Final writeback ID set differs from frozen English subtitle IDs.",
+            "final_cue_timeline_invalid": "Final cue timing does not match the frozen subtitle ID and word-ledger contract.",
             "allocation_quality_unresolved": "A high-confidence allocation issue remained after retry or retry was rejected.",
             "reading_speed_error": "A subtitle likely needs manual shortening or timing review.",
             "suspicious_cut": "English boundary may split a phrase unnaturally.",
@@ -5142,12 +7425,9 @@ class ScreenSubtitleEditor:
 
     def _write_validation_artifact(self, report_path: Path, summary: Dict) -> None:
         try:
-            artifact_dir = self._artifact_dir(report_path)
+            artifact_dir = stable_artifact_dir(report_path)
             artifact_dir.mkdir(parents=True, exist_ok=True)
-            (artifact_dir / "validation-report.json").write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            write_json_artifact(artifact_dir / "validation-report.json", summary)
         except Exception as e:
             logger.warning("验证 JSON 保存失败 / Validation JSON save failed: %s", str(e))
 
@@ -5162,7 +7442,7 @@ class ScreenSubtitleEditor:
             return
         try:
             report_path = Path(self.coverage_report_path)
-            artifact_dir = self._artifact_dir(report_path)
+            artifact_dir = stable_artifact_dir(report_path)
             artifact_dir.mkdir(parents=True, exist_ok=True)
 
             manifest = {
@@ -5176,7 +7456,7 @@ class ScreenSubtitleEditor:
                 "target_language": self.target_language,
                 "max_cjk_chars": self.max_cjk_chars,
                 "max_english_words": self.max_english_words,
-                "enable_quality_check": self.enable_quality_check,
+                "chinese_polish_enabled": self.enable_chinese_polish,
                 "allocation_max_concurrency": self.allocation_max_concurrency,
                 "allocation_batch_size": self.allocation_batch_size,
                 "llm_cache_stats": self._llm_cache_stats,
@@ -5186,87 +7466,82 @@ class ScreenSubtitleEditor:
                 "subtitle_count": len(final_segments),
                 "frozen_subtitle_ids": list(self._frozen_subtitle_ids),
                 "translation_structure_error_count": len(self._translation_structure_errors),
-                "artifact_schema_version": 1,
+                "display_coverage_bridge_count": len(getattr(self, "_display_coverage_repairs", [])),
+                "display_coverage_unresolved_count": len(getattr(self, "_display_coverage_unresolved", [])),
+                "final_cue_timeline_validation_status": str(
+                    (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("status")
+                    or "NOT_BUILT"
+                ),
+                "final_cue_timeline_error_count": int(
+                    (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("error_count")
+                    or 0
+                ),
+                "final_word_timing_reconciliation_count": len(
+                    getattr(self, "_final_word_timing_reconciliations", []) or []
+                ),
+                "artifact_schema_version": 2,
             }
-            self._write_json_artifact(artifact_dir / "run-manifest.json", manifest)
-            self._write_json_artifact(
-                artifact_dir / "transcript.json",
-                [self._segment_to_dict(index, seg) for index, seg in enumerate(source_segments, 1)],
-            )
-            self._write_json_artifact(
-                artifact_dir / "word-ledger.json",
-                self._word_ledger_payload(source_segments),
-            )
-            self._write_json_artifact(
-                artifact_dir / "semantic-groups.json",
-                self._semantic_groups_payload(semantic_groups),
-            )
-            self._write_json_artifact(
-                artifact_dir / "subtitle-spans.json",
-                [self._item_to_span_dict(index, item) for index, item in enumerate(subtitle_items, 1)],
-            )
-            self._write_json_artifact(
-                artifact_dir / "stable-boundary-snapshots.json",
-                self._boundary_snapshot_payload(),
-            )
-            self._write_json_artifact(
-                artifact_dir / "translations.json",
-                [self._segment_to_dict(index, seg) for index, seg in enumerate(final_segments, 1)],
-            )
-            self._write_json_artifact(
-                artifact_dir / "llm-raw-returns.json",
-                self._last_llm_raw_returns,
-            )
-            self._write_json_artifact(
-                artifact_dir / "allocation-inputs.json",
-                self._last_allocation_inputs,
-            )
-            self._write_json_artifact(
-                artifact_dir / "allocation-raw-returns.json",
-                self._last_allocation_raw_returns,
-            )
-            self._write_json_artifact(
-                artifact_dir / "allocation-validation.json",
-                self._last_allocation_validation,
-            )
-            self._write_json_artifact(
-                artifact_dir / "allocation-retry-log.json",
-                self._last_allocation_retry_log,
-            )
-            self._write_json_artifact(
-                artifact_dir / "allocation-final.json",
-                self._last_allocation_final,
-            )
-            self._write_json_artifact(
-                artifact_dir / "allocation-unresolved.json",
-                self._last_allocation_unresolved,
-            )
-            self._write_json_artifact(
-                artifact_dir / "allocation-isolation-report.json",
-                self._allocation_isolation_report,
-            )
-            self._write_json_artifact(
-                artifact_dir / "semantic-group-debug.json",
-                self._last_semantic_group_debug,
-            )
-            self._write_json_artifact(
-                artifact_dir / "translation-structure-errors.json",
-                self._translation_structure_errors,
+            final_timeline_path = artifact_dir / "final-cue-timeline.json"
+            self._final_cue_timeline_path = str(final_timeline_path)
+            write_json_artifact_set(
+                artifact_dir,
+                (
+                    ("run-manifest.json", manifest),
+                    (
+                        "transcript.json",
+                        [
+                            self._segment_to_dict(index, seg)
+                            for index, seg in enumerate(source_segments, 1)
+                        ],
+                    ),
+                    ("word-ledger.json", self._word_ledger_payload(source_segments)),
+                    (
+                        "final-cue-timeline.json",
+                        getattr(self, "_final_cue_timeline", {}) or {},
+                    ),
+                    ("semantic-groups.json", self._semantic_groups_payload(semantic_groups)),
+                    (
+                        "subtitle-spans.json",
+                        [
+                            self._item_to_span_dict(index, item)
+                            for index, item in enumerate(subtitle_items, 1)
+                        ],
+                    ),
+                    ("stable-boundary-snapshots.json", self._boundary_snapshot_payload()),
+                    (
+                        "translations.json",
+                        [
+                            self._segment_to_dict(index, seg)
+                            for index, seg in enumerate(final_segments, 1)
+                        ],
+                    ),
+                    ("llm-raw-returns.json", self._last_llm_raw_returns),
+                    (
+                        "full-translation-style-retry-log.json",
+                        getattr(self, "_last_full_translation_style_retry_log", []),
+                    ),
+                    ("allocation-inputs.json", self._last_allocation_inputs),
+                    ("allocation-raw-returns.json", self._last_allocation_raw_returns),
+                    ("allocation-validation.json", self._last_allocation_validation),
+                    ("allocation-retry-log.json", self._last_allocation_retry_log),
+                    ("allocation-final.json", self._last_allocation_final),
+                    ("allocation-unresolved.json", self._last_allocation_unresolved),
+                    ("allocation-isolation-report.json", self._allocation_isolation_report),
+                    ("semantic-group-debug.json", self._last_semantic_group_debug),
+                    ("translation-structure-errors.json", self._translation_structure_errors),
+                    (
+                        "display-coverage-repairs.json",
+                        getattr(self, "_display_coverage_repairs", []),
+                    ),
+                    (
+                        "display-coverage-unresolved.json",
+                        getattr(self, "_display_coverage_unresolved", []),
+                    ),
+                ),
             )
             logger.info("稳定模式中间产物已保存 / Stable artifacts saved: %s", artifact_dir)
         except Exception as e:
             logger.warning("稳定模式中间产物保存失败 / Stable artifacts save failed: %s", str(e))
-
-    @staticmethod
-    def _artifact_dir(report_path: Path) -> Path:
-        stem = report_path.stem
-        if stem.endswith("-coverage-report"):
-            stem = stem[: -len("-coverage-report")]
-        return report_path.with_name(f"{stem}-artifacts")
-
-    @staticmethod
-    def _write_json_artifact(path: Path, payload) -> None:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _boundary_snapshot_payload(self) -> Dict:
         focus_phrases = [
@@ -5307,6 +7582,10 @@ class ScreenSubtitleEditor:
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "word_ledger_hash": self._word_ledger_hash(),
             "max_english_words": self.max_english_words,
+            "visual_reading_budget": {
+                "word_limit": VISUAL_ENGLISH_WORD_SOFT_LIMIT,
+                "character_limit": VISUAL_ENGLISH_CHARACTER_SOFT_LIMIT,
+            },
             "stages": self._boundary_snapshots,
             "changes": self._boundary_snapshot_changes,
             "pre_id_boundary_repairs": repairs,
@@ -5326,6 +7605,12 @@ class ScreenSubtitleEditor:
                     for repair in repairs
                     if repair.get("unresolved_hard_issue")
                     and repair.get("repair_reason") == "unresolved_final_fragment_issue"
+                ),
+                "unresolved_visual_reading_budget_count": sum(
+                    1
+                    for repair in repairs
+                    if repair.get("unresolved_visual_warning")
+                    and repair.get("repair_reason") == "visual_budget_unresolved"
                 ),
             },
             "focus_phrases": self._boundary_focus_phrase_report(focus_phrases),
@@ -5396,6 +7681,7 @@ class ScreenSubtitleEditor:
                     "normalized": entry.get("token") or "",
                     "start_ms": int(entry.get("start_time") or 0),
                     "end_ms": int(entry.get("end_time") or 0),
+                    "alignment_source": str(entry.get("alignment_source") or "stable-ts"),
                     "source_segment_ids": self._source_ids_for_word_range(index, index),
                 }
                 for index, entry in enumerate(self._active_word_entries)
@@ -5490,42 +7776,31 @@ class ScreenSubtitleEditor:
             ]
             for index, entry in enumerate(self._active_word_entries)
         ]
-        return {
-            "stage": stage,
-            "asr_text_hash": self._stable_hash(source_payload),
-            "corrected_english_hash": self._stable_hash(source_payload),
-            "word_ledger_hash": self._word_ledger_hash(),
-            "english_text_hash": self._stable_hash(item_payload),
-            "word_timing_hash": self._stable_hash(word_timing_payload),
-            "subtitle_id_time_hash": self._stable_hash(item_time_payload),
-            "semantic_group_input_hash": self._stable_hash(group_payload),
-            "authoritative_full_translation_hash": self._stable_hash(full_translation_payload),
-            "final_subtitle_time_hash": self._stable_hash(final_time_payload) if final_segments is not None else "",
-            "payloads": {
-                "source_segments": source_payload,
-                "subtitle_items": item_payload,
-                "subtitle_id_times": item_time_payload,
-                "semantic_groups": group_payload,
-                "full_translations": full_translation_payload,
-                "word_timing": word_timing_payload,
-                "final_segments": final_time_payload,
-            },
-        }
+        return FrozenPipelineSnapshot.build(
+            stage=stage,
+            source_segments=source_payload,
+            subtitle_items=item_payload,
+            subtitle_id_times=item_time_payload,
+            semantic_groups=group_payload,
+            full_translations=full_translation_payload,
+            word_timing=word_timing_payload,
+            word_ledger_hash=self._word_ledger_hash(),
+            final_segments=final_time_payload,
+            include_final_segment_timing=final_segments is not None,
+        ).to_artifact()
 
     def _build_allocation_isolation_report(self, before: Dict, after: Dict) -> Dict:
-        frozen_keys = [
-            "asr_text_hash",
-            "corrected_english_hash",
-            "word_ledger_hash",
-            "english_text_hash",
-            "word_timing_hash",
-            "subtitle_id_time_hash",
-            "semantic_group_input_hash",
-            "authoritative_full_translation_hash",
-        ]
-        changed_keys = [
-            key for key in frozen_keys if before.get(key) and after.get(key) and before.get(key) != after.get(key)
-        ]
+        before_snapshot = FrozenPipelineSnapshot(
+            stage=str(before.get("stage") or ""),
+            hashes={key: str(before.get(key) or "") for key in FROZEN_PIPELINE_HASH_KEYS},
+            payloads=dict(before.get("payloads") or {}),
+        )
+        after_snapshot = FrozenPipelineSnapshot(
+            stage=str(after.get("stage") or ""),
+            hashes={key: str(after.get(key) or "") for key in FROZEN_PIPELINE_HASH_KEYS},
+            payloads=dict(after.get("payloads") or {}),
+        )
+        changed_keys = before_snapshot.changed_frozen_keys(after_snapshot)
         first_differences = {
             key: self._allocation_isolation_first_difference(before, after, key)
             for key in changed_keys
@@ -5534,15 +7809,10 @@ class ScreenSubtitleEditor:
             "schema_version": 1,
             "status": "allocation_isolation_failed" if changed_keys else "passed",
             "changed_keys": changed_keys,
-            "before": {key: before.get(key, "") for key in frozen_keys},
-            "after": {key: after.get(key, "") for key in frozen_keys},
+            "before": {key: before.get(key, "") for key in FROZEN_PIPELINE_HASH_KEYS},
+            "after": {key: after.get(key, "") for key in FROZEN_PIPELINE_HASH_KEYS},
             "first_differences": first_differences,
         }
-
-    @staticmethod
-    def _stable_hash(payload) -> str:
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _allocation_isolation_first_difference(self, before: Dict, after: Dict, key: str) -> Dict:
         payload_key = {
@@ -5635,6 +7905,7 @@ class ScreenSubtitleEditor:
         ]
         return {
             "overlong_english": self._overlong_english_issues(english_segments),
+            "structural_english_overflow": self._structural_english_overflow_issues(english_segments),
             "bad_cuts": self._bad_cut_issues(english_segments),
             "translationese": self._translationese_issues(final_segments),
             "reading_speed_errors": self._reading_speed_issues(final_segments, "ERROR"),
@@ -5657,6 +7928,10 @@ class ScreenSubtitleEditor:
         for seg in segments:
             text = self._normalize_text(seg.text)
             word_count = self._word_count(text)
+            if self._is_allowed_plus_discourse_overflow(text, word_count, hard_limit):
+                continue
+            if self._is_allowed_structural_english_overflow(seg, text, word_count, hard_limit):
+                continue
             if word_count <= hard_limit:
                 continue
             issues.append(
@@ -5680,6 +7955,11 @@ class ScreenSubtitleEditor:
             previous_last = self._clean_boundary_token(previous_text.split()[-1])
             current_first = self._clean_boundary_token(current_text.split()[0])
             reasons = self._bad_cut_reasons(previous_last, current_first)
+            reasons = [
+                reason
+                for reason in reasons
+                if not self._boundary_has_audited_issue_exception(previous, current, reason)
+            ]
             if not reasons:
                 continue
             combined_words = self._word_count(f"{previous_text} {current_text}")
@@ -5707,6 +7987,11 @@ class ScreenSubtitleEditor:
             if not previous_text or not current_text:
                 continue
             reasons = self._syntax_boundary_reasons(previous_text, current_text)
+            reasons = [
+                reason
+                for reason in reasons
+                if not self._boundary_has_audited_issue_exception(previous, current, reason)
+            ]
             if not reasons:
                 continue
             previous_last = self._clean_boundary_token(previous_text.split()[-1])
@@ -7126,13 +9411,9 @@ class ScreenSubtitleEditor:
         semantic_groups: Optional[Sequence[Dict]] = None,
         subtitle_items: Optional[Sequence[ScreenSubtitleItem]] = None,
     ) -> List[ASRDataSeg]:
-        repaired = self._repair_overlong_english_segments_local(segments)
-        repaired = self._compress_fast_chinese_segments(
-            repaired,
-            semantic_groups=semantic_groups,
-            subtitle_items=subtitle_items,
-        )
-        return repaired
+        # Stable-mode English is already frozen by this stage.  Chinese speed
+        # repair happens once, after the final timing backend has completed.
+        return self._repair_overlong_english_segments_local(segments)
 
     def _safe_auto_repair_segments(
         self,
@@ -7712,8 +9993,8 @@ class ScreenSubtitleEditor:
                 "If the target is overloaded and an adjacent same-group subtitle is much shorter, prefer moving dependent meaning into that adjacent subtitle.\n"
                 "Avoid title-like fragments and dangling clauses such as 而若..., 如果..., 因为..., 对于..., 在..., 把..., 将..., 意味着..., 的..., 以及...\n"
                 "Keep facts, numbers, names, negation, contrast, causality, modality, and core conclusions.\n"
-                "Return pure JSON:\n"
-                "{\"items\":[{\"index\":0,\"chinese\":\"压缩后的中文\"}]}"
+                "Return pure JSON using the existing subtitle_id only:\n"
+                "{\"items\":[{\"subtitle_id\":\"S0001\",\"chinese\":\"压缩后的中文\"}]}"
             )
             try:
                 data = self._request_chinese_compression(
@@ -7727,10 +10008,26 @@ class ScreenSubtitleEditor:
                 return list(segments)
 
         by_id: Dict[str, str] = {}
+        id_to_index = self._segment_index_by_subtitle_id(segments)
         for item in data.get("items", []) if isinstance(data, dict) else []:
-            if not isinstance(item, dict) or not str(item.get("index", "")).isdigit():
+            if not isinstance(item, dict):
                 continue
-            index = int(item["index"])
+            subtitle_id = str(item.get("subtitle_id") or item.get("id") or "").strip()
+            if subtitle_id:
+                index = id_to_index.get(subtitle_id)
+                if index is None:
+                    self._record_translation_structure_error(
+                        "translation_id_unknown",
+                        returned_ids=[subtitle_id],
+                        message=f"Compression returned unknown subtitle_id: {subtitle_id}",
+                    )
+                    continue
+            elif str(item.get("index", "")).isdigit():
+                # Read old cached responses safely, but all new requests use IDs.
+                index = int(item["index"])
+                subtitle_id = self._segment_subtitle_id(segments[index], index + 1) if 0 <= index < len(segments) else ""
+            else:
+                continue
             if index < 0 or index >= len(segments):
                 self._record_translation_structure_error(
                     "translation_id_unknown",
@@ -7739,7 +10036,7 @@ class ScreenSubtitleEditor:
                 continue
             text = str(item.get("chinese", "")).strip()
             if text:
-                by_id[self._segment_subtitle_id(segments[index], index + 1)] = text
+                by_id[subtitle_id or self._segment_subtitle_id(segments[index], index + 1)] = text
 
         group_reallocation_payload = []
         for index, seg in targets:
@@ -7771,7 +10068,8 @@ class ScreenSubtitleEditor:
                 "Return only existing indices from sense_group.parts. Keep every returned line natural and readable.\n"
                 "The concatenated group Chinese must preserve the core meaning and form a complete Chinese sentence.\n"
                 "Balance Chinese reading load across the same-group subtitles according to each part duration.\n"
-                "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
+                "Return pure JSON using existing subtitle_id values only: "
+                "{\"groups\":[{\"target_subtitle_id\":\"S0001\",\"segments\":[{\"subtitle_id\":\"S0001\",\"zh\":\"中文\"}]}]}"
             )
             try:
                 allocation_data = self._request_chinese_compression(
@@ -7826,7 +10124,8 @@ class ScreenSubtitleEditor:
                 "Do not change English, IDs, order, timing, or subtitle count.\n"
                 "Prefer direct complete Chinese sentences. Keep core actions and conclusions.\n"
                 "Balance overloaded Chinese lines into adjacent same-group subtitle IDs when that preserves meaning better than overcompressing one line.\n"
-                "Return pure JSON: {\"groups\":[{\"target_index\":0,\"segments\":[{\"index\":0,\"zh\":\"中文\"}]}]}"
+                "Return pure JSON using existing subtitle_id values only: "
+                "{\"groups\":[{\"target_subtitle_id\":\"S0001\",\"segments\":[{\"subtitle_id\":\"S0001\",\"zh\":\"中文\"}]}]}"
             )
             try:
                 retry_data = self._request_chinese_compression(
@@ -8003,31 +10302,87 @@ class ScreenSubtitleEditor:
                 self._segment_subtitle_id(before_segments[index], index + 1): before_segments[index].translated_text
                 for index in range(start, end)
             }
-            before_valid = self._validate_group_chinese_allocation(before_entry, before_allocation)["valid"]
+            before_validation = self._validate_group_chinese_allocation(
+                before_entry,
+                before_allocation,
+            )
             after_validation = self._validate_group_chinese_allocation(entry, after_allocation)
+            candidate_decision = self._decide_id_bound_allocation_candidate(
+                original_allocation=before_allocation,
+                candidate_allocation=after_allocation,
+                group_context=entry,
+                original_validation=before_validation,
+                candidate_validation=after_validation,
+                candidate_source="compression_or_reallocation",
+                require_high_confidence_fix=False,
+            )
+            candidate_comparison = candidate_decision["quality_comparison"]
+            before_speed_pressure = self._group_chinese_speed_pressure(
+                before_segments[start:end]
+            )
+            after_speed_pressure = self._group_chinese_speed_pressure(
+                result[start:end]
+            )
+            before_severe_count = sum(
+                1 for segment in before_segments[start:end]
+                if self._is_severe_chinese_speed(segment)
+            )
+            after_severe_count = sum(
+                1 for segment in result[start:end]
+                if self._is_severe_chinese_speed(segment)
+            )
+            speed_improved = (
+                after_speed_pressure + 0.01 < before_speed_pressure
+                or (
+                    after_severe_count < before_severe_count
+                    and after_speed_pressure <= before_speed_pressure + 0.01
+                )
+            )
+            candidate_comparison.update(
+                {
+                    "postprocess_stage": "compression_or_reallocation",
+                    "before_speed_pressure": round(before_speed_pressure, 3),
+                    "after_speed_pressure": round(after_speed_pressure, 3),
+                    "before_severe_count": before_severe_count,
+                    "after_severe_count": after_severe_count,
+                    "speed_improved": speed_improved,
+                }
+            )
             self._last_allocation_validation.append(
                 {
                     **after_validation,
                     "postprocess_stage": "compression_or_reallocation",
+                    "candidate_comparison": candidate_comparison,
                 }
             )
-            if before_valid and not after_validation["valid"]:
-                if self._should_keep_speed_repair_despite_soft_omission(
-                    before_segments[start:end],
-                    result[start:end],
-                    after_validation,
-                ):
-                    continue
+            if not candidate_decision["accepted"] or not speed_improved:
                 for index in range(start, end):
                     result[index] = before_segments[index]
-                self._last_allocation_unresolved.append(
-                    {
-                        "semantic_group_id": f"G{int(group.get('id') or 0):04d}",
-                        "reason": "postprocess_allocation_quality_regression_restored",
-                        "issue_codes": after_validation["issue_codes"],
-                    }
-                )
+                if not candidate_comparison["accepted"]:
+                    self._last_allocation_unresolved.append(
+                        {
+                            "semantic_group_id": f"G{int(group.get('id') or 0):04d}",
+                            "reason": "postprocess_allocation_quality_regression_restored",
+                            "issue_codes": after_validation["issue_codes"],
+                            "candidate_comparison": candidate_comparison,
+                        }
+                    )
         return result
+
+    def _group_chinese_speed_pressure(
+        self,
+        segments: Sequence[ASRDataSeg],
+    ) -> float:
+        """Measure local reading-load excess without changing any threshold."""
+        pressure = 0.0
+        for segment in segments:
+            chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", segment.translated_text or ""))
+            duration_seconds = max(
+                0.1,
+                (int(segment.end_time) - int(segment.start_time)) / 1000.0,
+            )
+            pressure += max(0.0, chinese_chars / duration_seconds - CHINESE_CPS_WARNING)
+        return pressure
 
     def _should_keep_speed_repair_despite_soft_omission(
         self,
@@ -8142,23 +10497,33 @@ class ScreenSubtitleEditor:
     ) -> Dict[str, Dict[str, str]]:
         result: Dict[str, Dict[str, str]] = {}
         groups = data.get("groups", []) if isinstance(data, dict) else []
+        id_to_index = self._segment_index_by_subtitle_id(segments)
         for group in groups:
-            if not isinstance(group, dict) or not str(group.get("target_index", "")).isdigit():
+            if not isinstance(group, dict):
                 continue
-            target_index = int(group["target_index"])
-            if target_index < 0 or target_index >= len(segments):
-                continue
-            target_id = self._segment_subtitle_id(segments[target_index], target_index + 1)
+            target_id = str(group.get("target_subtitle_id") or "").strip()
+            if target_id not in id_to_index:
+                if not str(group.get("target_index", "")).isdigit():
+                    continue
+                target_index = int(group["target_index"])
+                if target_index < 0 or target_index >= len(segments):
+                    continue
+                target_id = self._segment_subtitle_id(segments[target_index], target_index + 1)
             allocation: Dict[str, str] = {}
             for item in group.get("segments", []):
-                if not isinstance(item, dict) or not str(item.get("index", "")).isdigit():
+                if not isinstance(item, dict):
                     continue
-                index = int(item["index"])
-                if index < 0 or index >= len(segments):
-                    continue
+                subtitle_id = str(item.get("subtitle_id") or item.get("id") or "").strip()
+                if subtitle_id not in id_to_index:
+                    if not str(item.get("index", "")).isdigit():
+                        continue
+                    index = int(item["index"])
+                    if index < 0 or index >= len(segments):
+                        continue
+                    subtitle_id = self._segment_subtitle_id(segments[index], index + 1)
                 text = str(item.get("zh", item.get("chinese", ""))).strip()
                 if text:
-                    allocation[self._segment_subtitle_id(segments[index], index + 1)] = text
+                    allocation[subtitle_id] = text
             if allocation:
                 result[target_id] = allocation
         return result
@@ -8195,6 +10560,7 @@ class ScreenSubtitleEditor:
             subtitle_items=subtitle_items,
         )
         return {
+            "subtitle_id": self._segment_subtitle_id(seg, index + 1),
             "index": index,
             "target": {
                 "subtitle_id": self._segment_subtitle_id(seg, index + 1),
@@ -8440,6 +10806,10 @@ class ScreenSubtitleEditor:
             "\u4ec0\u4e48\u95ee\u9898",
         }:
             return False
+        # Sentence-final 是的/对的/好的 are complete response forms; their final
+        # 的 must not be treated as a dangling modifier by the group audit.
+        if normalized.endswith(("\u662f\u7684", "\u5bf9\u7684", "\u597d\u7684", "\u6ca1\u9519", "\u5f53\u7136")):
+            return False
         if normalized.startswith("\u5982\u679c") and re.search(r"[\u5c31\u4f1a\u8981\u80fd\u53ef\u5fc5\u987b]", normalized):
             return False
         if normalized.endswith("\u4f60\u61c2\u7684"):
@@ -8485,11 +10855,13 @@ class ScreenSubtitleEditor:
         full_zh = re.sub(r"\s+", "", full_translation or "")
         full_en = (full_english or "").lower()
 
+        # Chinese negation can be written as “并非”; account for it before
+        # treating an otherwise complete allocation as a semantic-loss risk.
         semantic_markers = [
             ("ponder", ("\u60f3", "\u601d\u8003", "\u7422\u78e8")),
             ("think", ("\u60f3", "\u601d\u8003")),
             ("question", ("\u95ee\u9898", "\u7591\u95ee", "\u8d28\u7591")),
-            ("not ", ("\u4e0d", "\u6ca1", "\u65e0")),
+            ("not ", ("\u4e0d", "\u6ca1", "\u65e0", "\u975e")),
             ("because", ("\u56e0\u4e3a", "\u56e0", "\u6240\u4ee5")),
             ("but", ("\u4f46", "\u4e0d\u8fc7", "\u800c")),
         ]
@@ -8525,6 +10897,18 @@ class ScreenSubtitleEditor:
     def _absolute_zh_chars_for_duration(seg: ASRDataSeg) -> int:
         duration_sec = max(0.1, (int(seg.end_time) - int(seg.start_time)) / 1000.0)
         return max(6, int(duration_sec * CHINESE_CPS_ERROR))
+
+    def _chinese_display_budget(self, duration_ms: Optional[int]) -> Dict[str, int]:
+        """Return advisory Chinese budgets without changing the fixed cue time."""
+        duration_sec = max(0.1, int(duration_ms or 0) / 1000.0)
+        configured_limit = max(4, int(self.max_cjk_chars or 0))
+        return {
+            "target_zh_chars": min(configured_limit, max(4, int(duration_sec * 8))),
+            "absolute_max_zh_chars": min(
+                configured_limit,
+                max(6, int(duration_sec * CHINESE_CPS_ERROR)),
+            ),
+        }
 
     def _proportional_segment_timings(
         self, seg: ASRDataSeg, parts: Sequence[str]
@@ -9818,10 +12202,223 @@ class ScreenSubtitleEditor:
         )
         allocated = self._allocate_semantic_group_translations(groups, full_translations)
         if allocated:
+            allocated = self._polish_semantic_group_translations(
+                groups, full_translations, allocated
+            )
             return self._apply_semantic_group_translations(items, groups, allocated)
 
         logger.warning("语义组两阶段翻译失败，保留冻结英文并交由结构门禁阻止渲染")
         return items
+
+    def _polish_semantic_group_translations(
+        self,
+        groups: Sequence[Dict],
+        full_translations: Dict[int, str],
+        allocations: Dict[int, Dict[str, str]],
+    ) -> Dict[int, Dict[str, str]]:
+        """Polish Chinese per fixed semantic group without touching English or timing."""
+        if not self.enable_chinese_polish:
+            return allocations
+        if not hasattr(self, "_chinese_polish_log"):
+            self._chinese_polish_log = []
+
+        candidates: List[tuple[int, int, Dict, List[str]]] = []
+        groups_by_id = {
+            int(group.get("id") or 0): group
+            for group in groups
+            if str(group.get("id", "")).isdigit()
+        }
+        for group_id, group in groups_by_id.items():
+            current = allocations.get(group_id, {})
+            subtitle_parts = []
+            for offset, item in enumerate(group.get("items") or [], 1):
+                subtitle_id = self._item_subtitle_id(
+                    item, int(group.get("start_index") or 0) + offset
+                )
+                timing = self._item_word_timing(item)
+                subtitle_parts.append(
+                    {
+                        "subtitle_id": subtitle_id,
+                        "english": item.original,
+                        "duration_ms": max(0, timing[1] - timing[0]) if timing else None,
+                        "max_zh_chars": self.max_cjk_chars,
+                        **self._chinese_display_budget(
+                            max(0, timing[1] - timing[0]) if timing else None
+                        ),
+                        "current_zh": self._normalize_text(current.get(subtitle_id, "")),
+                    }
+                )
+            expected_ids = [part["subtitle_id"] for part in subtitle_parts]
+            if set(current) != set(expected_ids):
+                self._chinese_polish_log.append(
+                    {
+                        "semantic_group_id": f"G{group_id:04d}",
+                        "decision": "skipped",
+                        "reason": "current_allocation_id_mismatch",
+                    }
+                )
+                continue
+            entry = {
+                "id": group_id,
+                "polish_prompt_version": SEMANTIC_CHINESE_POLISH_PROMPT_VERSION,
+                "full_english": " ".join(item.original for item in group["items"]),
+                "full_translation": full_translations.get(group_id, ""),
+                "subtitle_parts": subtitle_parts,
+            }
+            validation = self._validate_group_chinese_allocation(entry, current)
+            strong_codes = {
+                "group_allocation_information_omission",
+                "adjacent_chinese_semantic_duplication",
+                "entity_allocation_mismatch",
+                "number_allocation_mismatch",
+                "negation_allocation_mismatch",
+                "cross_subtitle_predicate_break",
+                "translation_group_cardinality_mismatch",
+                "unnatural_chinese_fragment",
+            }
+            matched_codes = [
+                code for code in validation.get("issue_codes") or [] if code in strong_codes
+            ]
+            matched_codes.extend(
+                code
+                for code in self._chinese_polish_risk_codes(entry, current)
+                if code not in matched_codes
+            )
+            if not matched_codes:
+                continue
+            score = sum(
+                3 if code != "unnatural_chinese_fragment" else 1
+                for code in matched_codes
+            )
+            candidates.append((score, group_id, entry, matched_codes))
+
+        # The optional polish pass is deliberately selective.  It targets only
+        # groups with structural evidence of a bad allocation, then applies a
+        # fixed cap so long-form jobs cannot turn into a third full translation.
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        payload: List[Dict] = []
+        for _, group_id, entry, matched_codes in candidates[:MAX_SELECTIVE_CHINESE_POLISH_GROUPS]:
+            payload.append(entry)
+            self._chinese_polish_log.append(
+                {
+                    "semantic_group_id": f"G{group_id:04d}",
+                    "decision": "selected",
+                    "reason": "high_confidence_allocation_issue",
+                    "issue_codes": matched_codes,
+                }
+            )
+        for _, group_id, _, matched_codes in candidates[MAX_SELECTIVE_CHINESE_POLISH_GROUPS:]:
+            self._chinese_polish_log.append(
+                {
+                    "semantic_group_id": f"G{group_id:04d}",
+                    "decision": "skipped",
+                    "reason": "selective_polish_limit",
+                    "issue_codes": matched_codes,
+                }
+            )
+
+        result = {group_id: dict(value) for group_id, value in allocations.items()}
+        prompt = self._compose_prompt(SEMANTIC_CHINESE_POLISH_PROMPT)
+        for payload_chunk in self._semantic_allocation_payload_chunks(payload):
+            data = self._request_semantic_translation_allocation(
+                prompt,
+                payload_chunk,
+                cache_task=SEMANTIC_CHINESE_POLISH_CACHE_TASK,
+            )
+            if data is None:
+                self._chinese_polish_log.append(
+                    {"decision": "batch_skipped", "reason": "request_failed"}
+                )
+                continue
+            polished, complete, errors, _ = self._parse_allocation_chunk_data_isolated(
+                payload_chunk, groups_by_id, data
+            )
+            if errors or not complete:
+                self._chinese_polish_log.append(
+                    {
+                        "decision": "batch_skipped",
+                        "reason": "response_structure_invalid",
+                        "error_codes": sorted(
+                            {str(error.get("code") or "invalid") for error in errors}
+                        ),
+                    }
+                )
+                continue
+            for entry in payload_chunk:
+                group_id = int(entry["id"])
+                current = result.get(group_id, {})
+                candidate = polished.get(group_id, {})
+                validation = self._validate_group_chinese_allocation(entry, candidate)
+                expected_ids = [part["subtitle_id"] for part in entry["subtitle_parts"]]
+                current_validation = self._validate_group_chinese_allocation(
+                    entry, current
+                )
+                candidate_decision = self._decide_id_bound_allocation_candidate(
+                    original_allocation=current,
+                    candidate_allocation=candidate,
+                    group_context=entry,
+                    original_validation=current_validation,
+                    candidate_validation=validation,
+                    candidate_source="polish",
+                    require_high_confidence_fix=False,
+                )
+                comparison = candidate_decision["quality_comparison"]
+                if not candidate_decision["accepted"]:
+                    self._chinese_polish_log.append(
+                        {
+                            "semantic_group_id": f"G{group_id:04d}",
+                            "decision": "rejected",
+                            "reason": "validation_failed" if not validation["valid"] else "quality_regressed",
+                            "issue_codes": list(validation.get("issue_codes") or []),
+                            "quality_comparison": comparison,
+                        }
+                    )
+                    continue
+                if candidate != current:
+                    result[group_id] = candidate
+                    self._chinese_polish_log.append(
+                        {
+                            "semantic_group_id": f"G{group_id:04d}",
+                            "decision": "applied",
+                            "subtitle_ids": expected_ids,
+                            "before": current,
+                            "after": candidate,
+                            "quality_comparison": comparison,
+                        }
+                    )
+        return result
+
+    def _chinese_polish_risk_codes(
+        self,
+        entry: Dict,
+        allocation: Dict[str, str],
+    ) -> List[str]:
+        """Identify a small set of groups where fixed-ID Chinese needs review.
+
+        This is deliberately a selection signal for the optional polish pass,
+        not a generation failure or an automatic rewrite trigger.
+        """
+        parts = list(entry.get("subtitle_parts") or [])
+        if len(parts) < 3:
+            return []
+        english = self._normalize_text(str(entry.get("full_english") or "")).lower()
+        chinese_parts = [
+            self._normalize_text(str((allocation or {}).get(part.get("subtitle_id"), "")))
+            for part in parts
+        ]
+        if not all(chinese_parts):
+            return []
+
+        comma_count = english.count(",") + english.count(";")
+        comparison_or_source_list = bool(
+            re.search(r"\b(?:against|between|from|including|such as|compared?)\b", english)
+        )
+        continued_list_shape = sum(
+            1 for text in chinese_parts[:-1] if text.rstrip().endswith(("，", "、", "：", "——"))
+        ) >= 1
+        if comma_count >= 2 and comparison_or_source_list and continued_list_shape:
+            return ["complex_enumeration_or_comparison_allocation"]
+        return []
 
     def _translate_semantic_group_full_translations(
         self, groups: Sequence[Dict]
@@ -9837,13 +12434,35 @@ class ScreenSubtitleEditor:
         prompt = self._compose_prompt(SEMANTIC_FULL_TRANSLATION_PROMPT)
         result: Dict[int, str] = {}
         payload_chunks = self._semantic_allocation_payload_chunks(payload)
-        for payload_chunk in payload_chunks:
+        cache_hits = 0
+        self._emit_progress_event(
+            "full_translation",
+            completed=0,
+            total=len(payload_chunks),
+            cache_hits=0,
+            retries=0,
+        )
+        for batch_index, payload_chunk in enumerate(payload_chunks, 1):
             data = self._request_semantic_full_translation_chunk(
                 prompt,
                 payload_chunk,
                 cache_task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
             )
             result.update(self._semantic_full_translations_from_response(data))
+            latest = self._last_llm_raw_returns[-1] if self._last_llm_raw_returns else {}
+            cache_hits += int(
+                bool(
+                    latest.get("task") == SEMANTIC_FULL_TRANSLATION_CACHE_TASK
+                    and latest.get("cache_hit")
+                )
+            )
+            self._emit_progress_event(
+                "full_translation",
+                completed=batch_index,
+                total=len(payload_chunks),
+                cache_hits=cache_hits,
+                retries=0,
+            )
 
         missing_ids = [int(entry["id"]) for entry in payload if int(entry["id"]) not in result]
         if missing_ids:
@@ -9857,6 +12476,19 @@ class ScreenSubtitleEditor:
                 cache_task=f"{SEMANTIC_FULL_TRANSLATION_CACHE_TASK}_retry",
             )
             result.update(self._semantic_full_translations_from_response(data))
+            self._emit_progress_event(
+                "full_translation",
+                completed=len(payload_chunks),
+                total=len(payload_chunks),
+                cache_hits=cache_hits,
+                retries=1,
+                retry_group_id=group_id,
+            )
+
+        result = self._retry_full_translations_for_em_dash_style(
+            payload_by_id=payload_by_id,
+            full_translations=result,
+        )
 
         final_missing_ids = [int(entry["id"]) for entry in payload if int(entry["id"]) not in result]
         groups_by_id = {
@@ -9875,6 +12507,128 @@ class ScreenSubtitleEditor:
                 missing_ids=expected_ids,
                 message="LLM omitted semantic group full_translation after retry.",
             )
+        return result
+
+    @staticmethod
+    def _full_translation_em_dash_findings(translation: str) -> List[Dict]:
+        """Report only em-dash style risks; lexical hyphens are intentionally ignored."""
+        text = (translation or "").strip()
+        dash_runs = re.findall(r"—+", text)
+        if not dash_runs:
+            return []
+
+        findings: List[Dict] = []
+        if text.startswith("—") or text.endswith("—"):
+            findings.append(
+                {
+                    "code": "em_dash_at_translation_boundary",
+                    "em_dash_runs": len(dash_runs),
+                }
+            )
+        if len(dash_runs) > 1:
+            findings.append(
+                {
+                    "code": "excessive_em_dash_usage",
+                    "em_dash_runs": len(dash_runs),
+                }
+            )
+        return findings
+
+    @classmethod
+    def _full_translation_em_dash_style_score(cls, translation: str) -> int:
+        findings = cls._full_translation_em_dash_findings(translation)
+        if not findings:
+            return 0
+        dash_runs = len(re.findall(r"—+", (translation or "").strip()))
+        boundary_count = sum(
+            1 for finding in findings if finding.get("code") == "em_dash_at_translation_boundary"
+        )
+        return dash_runs + boundary_count * 2
+
+    def _full_translation_style_candidate_regressions(
+        self,
+        english: str,
+        original_translation: str,
+        candidate_translation: str,
+    ) -> List[str]:
+        candidate = self._normalize_text(candidate_translation)
+        original = self._normalize_text(original_translation)
+        if not candidate or not re.search(r"[\u4e00-\u9fff]", candidate):
+            return ["candidate_not_chinese_translation"]
+
+        regressions: List[str] = []
+        for anchor in self._build_group_allocation_anchors(english):
+            anchor_type = str(anchor.get("type") or "")
+            value = str(anchor.get("value") or "")
+            if not value:
+                continue
+            if self._allocation_anchor_present(value, anchor_type, original) and not self._allocation_anchor_present(
+                value, anchor_type, candidate
+            ):
+                regressions.append(f"lost_{anchor_type}_anchor:{value}")
+        return list(dict.fromkeys(regressions))
+
+    def _retry_full_translations_for_em_dash_style(
+        self,
+        *,
+        payload_by_id: Dict[int, Dict],
+        full_translations: Dict[int, str],
+    ) -> Dict[int, str]:
+        """Retry only high-signal em-dash style violations without touching frozen inputs."""
+        if not hasattr(self, "_last_full_translation_style_retry_log"):
+            self._last_full_translation_style_retry_log = []
+
+        result = dict(full_translations)
+        retry_prompt = self._compose_prompt(SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT)
+        for group_id in sorted(result):
+            original_translation = result[group_id]
+            original_findings = self._full_translation_em_dash_findings(original_translation)
+            original_score = self._full_translation_em_dash_style_score(original_translation)
+            if not original_findings:
+                continue
+
+            original_payload = payload_by_id.get(int(group_id))
+            if not original_payload:
+                continue
+            retry_payload = dict(original_payload)
+            retry_payload["current_translation"] = original_translation
+            data = self._request_semantic_full_translation_chunk(
+                retry_prompt,
+                [retry_payload],
+                cache_task=SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK,
+            )
+            candidate_translation = self._semantic_full_translations_from_response(data).get(int(group_id), "")
+            candidate_findings = self._full_translation_em_dash_findings(candidate_translation)
+            candidate_score = self._full_translation_em_dash_style_score(candidate_translation)
+            regressions = self._full_translation_style_candidate_regressions(
+                str(original_payload.get("full_english") or ""),
+                original_translation,
+                candidate_translation,
+            )
+            rejection_reasons: List[str] = list(regressions)
+            if not candidate_translation:
+                rejection_reasons.append("style_retry_missing_translation")
+            if candidate_score >= original_score:
+                rejection_reasons.append("em_dash_style_not_improved")
+
+            accepted = not rejection_reasons
+            self._last_full_translation_style_retry_log.append(
+                {
+                    "semantic_group_id": f"G{int(group_id):04d}",
+                    "cache_task": SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK,
+                    "original_translation": original_translation,
+                    "candidate_translation": candidate_translation,
+                    "original_style_findings": original_findings,
+                    "candidate_style_findings": candidate_findings,
+                    "original_style_score": original_score,
+                    "candidate_style_score": candidate_score,
+                    "accepted": accepted,
+                    "decision": "accept_style_retry" if accepted else "keep_original",
+                    "rejection_reasons": rejection_reasons,
+                }
+            )
+            if accepted:
+                result[int(group_id)] = candidate_translation
         return result
 
     def _request_semantic_full_translation_chunk(
@@ -9968,6 +12722,8 @@ class ScreenSubtitleEditor:
         if not full_translations:
             return {}
         payload = []
+        allocation_entries = []
+        direct_allocations: Dict[int, Dict[str, str]] = {}
         for group in groups:
             full_translation = full_translations.get(group["id"], "")
             if not full_translation:
@@ -9989,20 +12745,63 @@ class ScreenSubtitleEditor:
                         "english": item.original,
                         "duration_ms": duration_ms,
                         "max_zh_chars": self.max_cjk_chars,
+                        **self._chinese_display_budget(duration_ms),
                     }
                 )
-            payload.append(
+            entry = {
+                "id": group["id"],
+                "allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
+                "full_english": " ".join(item.original for item in group["items"]),
+                "full_translation": full_translation,
+                "subtitle_parts": subtitle_parts,
+            }
+            allocation_entries.append(entry)
+            if len(subtitle_parts) != 1:
+                payload.append(entry)
+                continue
+
+            # A one-cue group has no allocation boundary to decide.  The
+            # approved group translation is the only lossless, ID-bound
+            # result, so do not spend a second LLM request paraphrasing it.
+            subtitle_id = str(subtitle_parts[0]["subtitle_id"])
+            direct_allocation = {subtitle_id: full_translation}
+            validation = self._validate_group_chinese_allocation(entry, direct_allocation)
+            self._last_allocation_validation.append(validation)
+            if not validation["valid"]:
+                self._record_allocation_quality_unresolved(
+                    entry,
+                    direct_allocation,
+                    validation,
+                    "authoritative_single_cue_allocation_invalid",
+                )
+                return {}
+            direct_allocations[int(group["id"])] = direct_allocation
+            self._last_allocation_final.append(
                 {
-                    "id": group["id"],
-                    "allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
-                    "full_english": " ".join(item.original for item in group["items"]),
-                    "full_translation": full_translation,
-                    "subtitle_parts": subtitle_parts,
+                    "semantic_group_id": f"G{int(group['id']):04d}",
+                    "subtitle_ids": [subtitle_id],
+                    "allocation": dict(direct_allocation),
+                    "source": "authoritative_full_translation",
                 }
             )
 
-        self._last_allocation_inputs.extend(payload)
-        result: Dict[int, Dict[str, str]] = {}
+        self._last_allocation_inputs.extend(allocation_entries)
+        result: Dict[int, Dict[str, str]] = dict(direct_allocations)
+        if not payload:
+            self._record_allocation_runtime_stat("batch_size", self.allocation_batch_size)
+            self._record_allocation_runtime_stat("batch_count", 0)
+            self._record_allocation_runtime_stat("pending_batch_count", 0)
+            self._record_allocation_runtime_stat("cached_batch_count", 0)
+            self._record_allocation_runtime_stat("actual_max_workers", 0)
+            self._emit_progress_event(
+                "allocation",
+                completed=0,
+                total=0,
+                cache_hits=0,
+                retries=0,
+                authoritative_single_cue_groups=len(direct_allocations),
+            )
+            return result
         expected_groups_by_id = {
             int(group.get("id") or 0): group
             for group in groups
@@ -10011,11 +12810,12 @@ class ScreenSubtitleEditor:
         prompt = self._compose_prompt(SEMANTIC_TRANSLATION_ALLOCATION_PROMPT)
         payload_chunks = self._semantic_allocation_payload_chunks(payload)
         if self.allocation_max_concurrency > 1 and len(payload_chunks) > 1:
-            return self._allocate_semantic_group_translations_concurrent(
+            result.update(self._allocate_semantic_group_translations_concurrent(
                 prompt,
                 payload_chunks,
                 expected_groups_by_id,
-            )
+            ))
+            return result
         self._record_allocation_runtime_stat("batch_size", self.allocation_batch_size)
         self._record_allocation_runtime_stat("batch_count", len(payload_chunks))
         self._record_allocation_runtime_stat("pending_batch_count", len(payload_chunks))
@@ -10028,15 +12828,30 @@ class ScreenSubtitleEditor:
             self.allocation_max_concurrency,
             self.allocation_batch_size,
         )
-        for payload_chunk in payload_chunks:
+        cache_hits = 0
+        retries = 0
+        self._emit_progress_event(
+            "allocation",
+            completed=0,
+            total=len(payload_chunks),
+            cache_hits=cache_hits,
+            retries=retries,
+            pending_batches=len(payload_chunks),
+            configured_concurrency=self.allocation_max_concurrency,
+            actual_workers=1,
+        )
+        for batch_id, payload_chunk in enumerate(payload_chunks, 1):
             chunk_result, complete, data = self._request_and_parse_allocation_chunk(
                 prompt,
                 payload_chunk,
                 expected_groups_by_id,
             )
+            latest = self._last_allocation_raw_returns[-1] if self._last_allocation_raw_returns else {}
+            cache_hits += int(bool(latest.get("cache_hit")))
             if data is None:
                 return {}
             if not complete:
+                retries += 1
                 chunk_result, complete = self._retry_incomplete_allocation_chunk(
                     prompt,
                     payload_chunk,
@@ -10055,6 +12870,17 @@ class ScreenSubtitleEditor:
                     expected_groups_by_id,
                     chunk_result,
                 )
+            self._emit_progress_event(
+                "allocation",
+                completed=batch_id,
+                total=len(payload_chunks),
+                cache_hits=cache_hits,
+                retries=retries,
+                batch_id=batch_id,
+                pending_batches=max(0, len(payload_chunks) - batch_id),
+                configured_concurrency=self.allocation_max_concurrency,
+                actual_workers=1,
+            )
         return result
 
     def _allocate_semantic_group_translations_concurrent(
@@ -10093,6 +12919,16 @@ class ScreenSubtitleEditor:
             self.allocation_max_concurrency,
             max_workers if pending else 0,
             self.allocation_batch_size,
+        )
+        self._emit_progress_event(
+            "allocation",
+            completed=len(results_by_batch),
+            total=len(payload_chunks),
+            cache_hits=len(results_by_batch),
+            retries=0,
+            pending_batches=len(pending),
+            configured_concurrency=self.allocation_max_concurrency,
+            actual_workers=max_workers if pending else 0,
         )
         if pending:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -10140,6 +12976,21 @@ class ScreenSubtitleEditor:
                         batch_result.elapsed_seconds,
                         batch_result.complete,
                         bool(batch_result.error_message),
+                    )
+                    self._emit_progress_event(
+                        "allocation",
+                        completed=len(results_by_batch),
+                        total=len(payload_chunks),
+                        cache_hits=len(
+                            [result for result in results_by_batch.values() if result.cache_hit]
+                        ),
+                        retries=0,
+                        batch_id=batch_id,
+                        batch_elapsed_seconds=round(batch_result.elapsed_seconds, 3),
+                        batch_error=bool(batch_result.error_message),
+                        pending_batches=max(0, len(payload_chunks) - len(results_by_batch)),
+                        configured_concurrency=self.allocation_max_concurrency,
+                        actual_workers=max_workers,
                     )
 
         merged: Dict[int, Dict[str, str]] = {}
@@ -10472,8 +13323,17 @@ class ScreenSubtitleEditor:
                 entry,
                 allocation,
             )
+            initial_decision = self._decide_id_bound_allocation_candidate(
+                original_allocation=allocation,
+                candidate_allocation=allocation,
+                group_context=entry,
+                original_validation=validation,
+                candidate_validation=validation,
+                candidate_source="initial",
+                require_high_confidence_fix=False,
+            )
             self._last_allocation_validation.append(validation)
-            if validation["valid"]:
+            if initial_decision["accepted"]:
                 self._last_allocation_final.append(
                     {
                         "semantic_group_id": f"G{group_id:04d}",
@@ -10490,6 +13350,14 @@ class ScreenSubtitleEditor:
                 "attempted": True,
                 "success": False,
             }
+            self._emit_progress_event(
+                "allocation_retry",
+                completed=len(self._last_allocation_retry_log),
+                total=None,
+                cache_hits=0,
+                retries=len(self._last_allocation_retry_log) + 1,
+                semantic_group_id=f"G{group_id:04d}",
+            )
             data = self._request_semantic_translation_allocation(
                 prompt,
                 [entry],
@@ -10524,19 +13392,21 @@ class ScreenSubtitleEditor:
                 retry_of=validation,
             )
             self._last_allocation_validation.append(retry_validation)
-            retry_quality_check = self._compare_allocation_candidates(
+            retry_decision = self._decide_id_bound_allocation_candidate(
                 original_allocation=allocation,
-                retry_allocation=retry_allocation,
+                candidate_allocation=retry_allocation,
                 group_context=entry,
                 original_validation=validation,
-                retry_validation=retry_validation,
+                candidate_validation=retry_validation,
+                candidate_source="quality_retry",
             )
+            retry_quality_check = retry_decision["quality_comparison"]
             retry_record["quality_comparison"] = retry_quality_check
             retry_record["original_allocation"] = dict(allocation or {})
             retry_record["retry_allocation"] = dict(retry_allocation or {})
             retry_record["original_validation"] = validation
             retry_record["retry_validation"] = retry_validation
-            if retry_validation["valid"] and retry_quality_check["accepted"]:
+            if retry_decision["accepted"]:
                 result[group_id] = retry_allocation
                 self._last_semantic_group_debug.extend(debug)
                 retry_record["success"] = True
@@ -10599,13 +13469,54 @@ class ScreenSubtitleEditor:
         original_validation: Dict,
         retry_validation: Dict,
     ) -> Dict:
-        return self._compare_allocation_candidates(
+        return self._decide_id_bound_allocation_candidate(
             original_allocation=original_allocation,
-            retry_allocation=retry_allocation,
+            candidate_allocation=retry_allocation,
             group_context=entry,
             original_validation=original_validation,
-            retry_validation=retry_validation,
+            candidate_validation=retry_validation,
+            candidate_source="quality_retry",
+        )["quality_comparison"]
+
+    def _decide_id_bound_allocation_candidate(
+        self,
+        *,
+        original_allocation: Dict[str, str],
+        candidate_allocation: Dict[str, str],
+        group_context: Dict,
+        original_validation: Optional[Dict] = None,
+        candidate_validation: Optional[Dict] = None,
+        candidate_source: str,
+        require_high_confidence_fix: bool = True,
+    ) -> Dict:
+        """Return the sole writeback decision for a fixed-ID Chinese candidate."""
+        original = dict(original_allocation or {})
+        candidate = dict(candidate_allocation or {})
+        original_validation = original_validation or self._validate_group_chinese_allocation(
+            group_context,
+            original,
         )
+        candidate_validation = candidate_validation or self._validate_group_chinese_allocation(
+            group_context,
+            candidate,
+        )
+        comparison = self._compare_allocation_candidates(
+            original_allocation=original,
+            retry_allocation=candidate,
+            group_context=group_context,
+            original_validation=original_validation,
+            retry_validation=candidate_validation,
+            require_high_confidence_fix=require_high_confidence_fix,
+        )
+        accepted = bool(candidate_validation.get("valid")) and bool(comparison.get("accepted"))
+        return {
+            "candidate_source": candidate_source,
+            "accepted": accepted,
+            "decision": "accept_candidate" if accepted else "keep_original",
+            "original_validation": original_validation,
+            "candidate_validation": candidate_validation,
+            "quality_comparison": comparison,
+        }
 
     def _compare_allocation_candidates(
         self,
@@ -10615,27 +13526,15 @@ class ScreenSubtitleEditor:
         group_context: Dict,
         original_validation: Dict,
         retry_validation: Dict,
+        require_high_confidence_fix: bool = True,
     ) -> Dict:
-        high_confidence_codes = {
-            "adjacent_chinese_semantic_duplication",
-            "cross_id_semantic_leakage",
-            "group_allocation_information_omission",
-            "entity_allocation_mismatch",
-            "number_allocation_mismatch",
-            "negation_allocation_mismatch",
-            "unnatural_chinese_fragment",
-            "translation_group_cardinality_mismatch",
-        }
-        original_codes = set(original_validation.get("issue_codes") or [])
-        retry_codes = set(retry_validation.get("issue_codes") or [])
-        fixed_codes = sorted((original_codes - retry_codes) & high_confidence_codes)
-        new_codes = sorted((retry_codes - original_codes) & high_confidence_codes)
-        reasons: List[str] = []
-        if not fixed_codes:
-            reasons.append("no_high_confidence_issue_fixed")
-        if new_codes:
-            reasons.append("new_high_confidence_issue")
+        """Decide whether a fixed-ID Chinese candidate may replace the current one.
 
+        Allocation retries must prove a high-confidence repair.  A selective
+        polish request is different: it is already preselected by a local risk
+        signal, so it only needs to stay structurally valid and avoid any
+        measured regression.  Both paths use the same comparison evidence.
+        """
         expected_ids = [
             str(part.get("subtitle_id") or "").strip()
             for part in list(group_context.get("subtitle_parts") or [])
@@ -10646,23 +13545,13 @@ class ScreenSubtitleEditor:
             retry_allocation or {},
             expected_ids,
         )
-        reasons.extend(regression_reasons)
-        original_issue_count = len(original_codes & high_confidence_codes)
-        retry_issue_count = len(retry_codes & high_confidence_codes)
-        if retry_issue_count > original_issue_count:
-            reasons.append("high_confidence_issue_count_regressed")
-        return {
-            "accepted": not reasons,
-            "decision": "accept_retry" if not reasons else "keep_original",
-            "fixed_issue_codes": fixed_codes,
-            "new_issue_codes": new_codes,
-            "original_issue_codes": sorted(original_codes),
-            "retry_issue_codes": sorted(retry_codes),
-            "original_high_confidence_issue_count": original_issue_count,
-            "retry_high_confidence_issue_count": retry_issue_count,
-            "expected_subtitle_ids": expected_ids,
-            "reasons": reasons,
-        }
+        return compare_fixed_id_allocation_candidates(
+            original_validation=original_validation,
+            candidate_validation=retry_validation,
+            expected_subtitle_ids=expected_ids,
+            regression_reasons=regression_reasons,
+            require_high_confidence_fix=require_high_confidence_fix,
+        )
 
     def _detect_retry_allocation_quality_regressions(
         self,
@@ -10796,6 +13685,14 @@ class ScreenSubtitleEditor:
         issue_codes.extend(issue["code"] for issue in anchor_issues)
         issues.extend(anchor_issues)
 
+        predicate_breaks = self._detect_cross_subtitle_predicate_breaks(
+            expected_ids,
+            ordered_texts,
+        )
+        if predicate_breaks:
+            issue_codes.append("cross_subtitle_predicate_break")
+            issues.extend(predicate_breaks)
+
         issue_codes = list(dict.fromkeys(issue_codes))
         blocking_issue_codes = [
             code for code in issue_codes if code != "full_translation_quality_issue"
@@ -10813,6 +13710,186 @@ class ScreenSubtitleEditor:
             "merged_allocation": merged,
             "retry_of": retry_of.get("semantic_group_id") if retry_of else "",
         }
+
+    @staticmethod
+    def _detect_cross_subtitle_predicate_breaks(
+        subtitle_ids: Sequence[str],
+        texts: Sequence[str],
+    ) -> List[Dict]:
+        """Detect a reporting clause whose delayed predicate was mapped as English order.
+
+        This deliberately requires three adjacent signals: a reporting verb at
+        the preceding boundary, a time/aspect-led relative clause ending in an
+        agent noun, and a following predicate. It avoids treating ordinary
+        Chinese line continuation as a defect.
+        """
+        reporting_verbs = r"(?:发现|表明|显示|指出|证明|说明|认为)$"
+        time_or_aspect = r"^(?:目前|如今|现在|正在|已经|已|仍|将|会|也|都)"
+        agent_nouns = r"(?:模型|系统|公司|企业|政府|机构|研究者|学者|人们|他们|它们|我们|读者|用户)$"
+        following_predicate = r"^(?:已|正在|会|将|仍|又|也|突然|不|没|开始|继续|停止|变得|成为|导致|带来|使用|采用|放弃|出现)"
+        issues: List[Dict] = []
+        compact = [re.sub(r"\s+", "", text or "") for text in texts]
+        for index in range(len(compact) - 2):
+            left, middle, right = compact[index : index + 3]
+            if not left or not middle or not right:
+                continue
+            if re.search(r"[。！？；：]$", left):
+                continue
+            if not re.search(reporting_verbs, left):
+                continue
+            if not re.search(time_or_aspect, middle):
+                continue
+            if not re.search(agent_nouns, middle):
+                continue
+            if not re.search(following_predicate, right):
+                continue
+            issues.append(
+                {
+                    "code": "cross_subtitle_predicate_break",
+                    "subtitle_ids": list(subtitle_ids[index : index + 3]),
+                    "reason": "reporting_clause_relative_subject_then_delayed_predicate",
+                    "confidence": "high",
+                }
+            )
+        return issues
+
+    def _boundary_has_audited_issue_exception(
+        self,
+        previous: ASRDataSeg,
+        current: ASRDataSeg,
+        issue: str,
+    ) -> bool:
+        """Use a recorded parser-backed exception instead of text-only guessing."""
+        previous_end = getattr(previous, "word_end", None)
+        current_start = getattr(current, "word_start", None)
+        if previous_end is None or current_start is None:
+            return False
+        for repair in getattr(self, "_pre_id_boundary_repairs", []) or []:
+            if issue not in set(repair.get("allowed_hard_issues") or []):
+                continue
+            for cut in repair.get("new_boundary") or []:
+                if (
+                    isinstance(cut, (list, tuple))
+                    and len(cut) == 2
+                    and int(cut[0]) == int(previous_end)
+                    and int(cut[1]) == int(current_start)
+                ):
+                    return True
+        return False
+
+    def _structural_english_overflow_issues(
+        self,
+        segments: Sequence[ASRDataSeg],
+    ) -> List[Dict]:
+        hard_limit = max(int(self.max_english_words or 0), HARD_ENGLISH_WORD_LIMIT)
+        issues: List[Dict] = []
+        for seg in segments:
+            text = self._normalize_text(seg.text)
+            word_count = self._word_count(text)
+            if not self._is_allowed_structural_english_overflow(seg, text, word_count, hard_limit):
+                continue
+            issues.append(
+                {
+                    "subtitle_id": str(getattr(seg, "subtitle_id", "") or ""),
+                    "start": self._format_ms(seg.start_time),
+                    "end": self._format_ms(seg.end_time),
+                    "word_count": word_count,
+                    "hard_limit": hard_limit,
+                    "text": text,
+                    "reason": "no_legal_internal_cut_within_normal_limit",
+                }
+            )
+        return issues
+
+    def _is_allowed_structural_english_overflow(
+        self,
+        segment: ASRDataSeg,
+        text: str,
+        word_count: int,
+        hard_limit: int,
+    ) -> bool:
+        """Allow only a complete 17-19 word cue with no legal <=16 split."""
+        if word_count <= hard_limit or word_count > hard_limit + 3:
+            return False
+        terminal_sentence = bool(re.search(r"[.!?][\"')\]]*\s*$", text or ""))
+        protected_comma_clause = self._is_parser_confirmed_comma_subordinate_clause(text)
+        if not terminal_sentence and not protected_comma_clause:
+            return False
+        word_start = getattr(segment, "word_start", None)
+        word_end = getattr(segment, "word_end", None)
+        if (
+            not isinstance(word_start, int)
+            or not isinstance(word_end, int)
+            or word_end <= word_start
+            or word_start < 0
+            or word_end >= len(self._active_word_entries)
+        ):
+            return False
+        item = ScreenSubtitleItem(
+            source_ids=self._source_ids_for_word_range(word_start, word_end),
+            original=text,
+            translated="",
+            word_start=word_start,
+            word_end=word_end,
+        )
+        repaired, _ = self._safe_overlong_item_split(item)
+        return not repaired
+
+    def _is_parser_confirmed_comma_subordinate_clause(self, text: str) -> bool:
+        """Allow a short parser-confirmed leading subordinate clause as overflow.
+
+        This is intentionally narrower than treating every comma-ended display
+        as complete. It applies only when the local parser finds a leading
+        subordinating marker whose predicate is finite (including an auxiliary
+        plus non-finite lexical verb). Without the parser, the normal hard word
+        limit remains in force.
+        """
+        normalized = self._normalize_text(text)
+        if not re.search(r",[\"')\]]*\s*$", normalized):
+            return False
+        nlp = self._load_syntax_nlp()
+        if not nlp:
+            return False
+        doc = nlp(normalized)
+        tokens = list(doc)
+        if not tokens:
+            return False
+
+        def is_finite_predicate(token) -> bool:
+            if token.pos_ in {"VERB", "AUX"} and token.tag_ not in {"VB", "VBG", "VBN"}:
+                return True
+            return bool(
+                token.pos_ == "VERB"
+                and token.tag_ in {"VB", "VBG", "VBN"}
+                and any(
+                    child.dep_ in {"aux", "auxpass"}
+                    and child.tag_ in {"MD", "VBD", "VBP", "VBZ"}
+                    for child in token.children
+                )
+            )
+
+        for marker in tokens:
+            if marker.dep_ != "mark" and marker.pos_ != "SCONJ":
+                continue
+            predicate = marker.head
+            if predicate.i <= marker.i or not is_finite_predicate(predicate):
+                continue
+            leading_tokens = [
+                token
+                for token in tokens[: marker.i]
+                if token.pos_ != "PUNCT"
+            ]
+            if any(is_finite_predicate(token) for token in leading_tokens):
+                continue
+            if all(token.pos_ in {"ADV", "CCONJ", "INTJ", "PART", "SCONJ"} for token in leading_tokens):
+                return True
+        return False
+
+    @classmethod
+    def _is_allowed_plus_discourse_overflow(
+        cls, text: str, word_count: int, hard_limit: int
+    ) -> bool:
+        return is_allowed_discourse_overflow(text, word_count, hard_limit)
 
     def _detect_adjacent_chinese_duplication(
         self,
@@ -10951,6 +14028,21 @@ class ScreenSubtitleEditor:
                         anchor_type,
                         str(entry.get("full_translation") or ""),
                     )
+                    if anchor_type in {"number", "negation"} and not full_translation_has_anchor:
+                        # Allocation may distribute a completed translation,
+                        # but it must not invent a number or negation that is
+                        # already absent from the authoritative group text.
+                        issues.append(
+                            {
+                                "code": "full_translation_quality_issue",
+                                "anchor": value,
+                                "anchor_type": anchor_type,
+                                "reason": "authoritative_full_translation_missing_anchor",
+                                "expected_english": expected_english,
+                                "full_translation": str(entry.get("full_translation") or ""),
+                            }
+                        )
+                        continue
                     issues.append(
                         {
                             "code": f"{anchor_type}_allocation_mismatch",
@@ -11544,11 +14636,15 @@ class ScreenSubtitleEditor:
             for offset, item in enumerate(group_items):
                 subtitle_id = expected_ids[offset]
                 translated = str(translations.get(subtitle_id, "")).strip()
+                translated = self._repair_atomic_response_polarity(
+                    item.original,
+                    translated or item.translated,
+                )
                 result.append(
                     ScreenSubtitleItem(
                         source_ids=item.source_ids,
                         original=item.original,
-                        translated=translated or item.translated,
+                        translated=translated,
                         word_start=item.word_start,
                         word_end=item.word_end,
                         subtitle_id=item.subtitle_id,
@@ -11562,6 +14658,21 @@ class ScreenSubtitleEditor:
                     result.append(item)
             result.sort(key=lambda item: self._item_order_key(item, items))
         return result
+
+    @classmethod
+    def _repair_atomic_response_polarity(cls, english: str, chinese: str) -> str:
+        """Prevent an ID-bound one-word ``No.`` from becoming an affirmative reply.
+
+        This is deliberately narrower than a backchannel dictionary: it only
+        corrects a direct semantic contradiction in an isolated response and
+        leaves all longer conversational text to the semantic-group allocator.
+        """
+        english_key = re.sub(r"[^a-z]", "", (english or "").casefold())
+        chinese_key = re.sub(r"[\s，,。.!！?？]", "", chinese or "")
+        affirmative = {"对", "对的", "没错", "是", "是的", "当然"}
+        if english_key == "no" and chinese_key in affirmative:
+            return "不是。"
+        return chinese
 
     def _translate_semantic_subtitle_groups_single_stage(
         self, items: List[ScreenSubtitleItem], groups: Sequence[Dict]

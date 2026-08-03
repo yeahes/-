@@ -564,8 +564,7 @@ class SubtitleConfig:
     need_remove_punctuation: bool = False
     need_screen_subtitle_edit: bool = False
     screen_subtitle_stable_mode: bool = True
-    need_screen_subtitle_quality_check: bool = False
-    screen_subtitle_safe_auto_repair: bool = False
+    screen_subtitle_chinese_polish: bool = False
     screen_subtitle_max_cjk: int = 24
     screen_subtitle_max_english: int = 16
     screen_subtitle_allocation_max_concurrency: int = 3

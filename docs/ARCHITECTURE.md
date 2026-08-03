@@ -32,6 +32,42 @@ audio input
   - Uses frozen global subtitle IDs for Chinese allocation and final validation.
   - High regression risk. Avoid broad edits.
 
+- `app/core/subtitle_processor/stable_pipeline_contracts.py`
+  - Defines the serializable frozen-input contract shared by allocation and
+  validation stages.
+  - Hashes English source, word ledger, subtitle IDs/times, semantic groups,
+  and authoritative full translations without depending on list positions.
+
+- `app/core/subtitle_processor/stable_english_boundaries.py`
+  - Owns the fixed pre-ID English boundary stage order and snapshot handoff.
+  - Contains no grammar rules, LLM calls, translation/allocation state,
+    rendering state, or subtitle-ID assignment.
+
+- `app/core/subtitle_processor/stable_artifacts.py`
+  - Owns stable artifact path resolution and ordered UTF-8 JSON serialization.
+  - The editor still constructs payloads because it owns the active run state
+    and must preserve existing artifact schemas.
+
+- `app/core/subtitle_processor/allocation_quality.py`
+  - Owns the deterministic acceptance decision for fixed-ID Chinese allocation
+    candidates after local validation has produced comparable evidence.
+  - Does not own prompts, cache access, retries, or subtitle-object writeback.
+
+- `app/core/subtitle_processor/final_cue_timeline.py`
+  - Owns the ID-addressable final cue timeline.
+  - Derives every cue from its frozen `subtitle_id -> word_start/word_end`
+    range and the final word ledger, then validates ID coverage, non-overlap,
+    and own-word envelope coverage before export.
+
+- Chinese candidate acceptance
+  - Allocation retry and selective polish share one ID-bound candidate
+    comparator. Retry requires a high-confidence issue to be fixed; polish
+    requires a valid, non-regressive result because it is selected separately.
+  - Speed compression and same-group reallocation use the same comparator
+    before writeback. They must lower local reading pressure without adding a
+    semantic, entity, number, negation, duplicate, or fragment regression;
+    rejected candidates restore the original ID-bound Chinese fields.
+
 - `app/thread/video_synthesis_thread.py`
   - Chooses subtitles for video synthesis.
   - Podcast template should prefer `stable-final-manifest.json`.
@@ -42,6 +78,8 @@ audio input
 
 - `tests/test_stable_caption_rules.py`
   - Unit/smoke coverage for segmentation, timing, coverage checks, and synthesis subtitle resolution.
+  - Includes frozen-pipeline isolation checks for Chinese-only changes versus
+    illegal English/ID/timing mutations.
 
 - `tests/audit_stable_outputs.py`
   - Audits existing generated subtitles for timing gaps, short displays, overlong English, and missing Chinese.
@@ -67,8 +105,9 @@ audio input
   - Inspect `stable-final-manifest.json` and `resolve_podcast_template_subtitle`.
 
 - Subtitle disappears too early:
-  - Inspect final stable SRT/ASS timing first.
-  - Then inspect word-level timestamp gaps.
+  - Inspect `final-cue-timeline.json` first; the cue must contain its own
+    first and final frozen ledger words.
+  - Then inspect word-level alignment evidence for that exact word span.
 
 ## Coupling Warnings
 

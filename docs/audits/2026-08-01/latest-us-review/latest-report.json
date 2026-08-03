@@ -1,0 +1,231 @@
+{
+  "status": "WARNING",
+  "work_dir": "work-dir",
+  "samples": {
+    "美国已成为": {
+      "path": "E:\\VideoCaptioner-screen-subtitle\\work-dir\\美国已成为\\subtitle\\stable-final-original-top.srt",
+      "status": "WARNING",
+      "count": 102,
+      "metrics": {
+        "max_words": 17,
+        "avg_words": 9.22,
+        "avg_duration_ms": 3027.91
+      },
+      "errors": [],
+      "warnings": [
+        {
+          "code": "english_speed_warning",
+          "index": 1,
+          "start_ms": 200,
+          "end_ms": 2161,
+          "duration_ms": 1961,
+          "english": "Have you ever sat at your desk and thought, like,",
+          "chinese": "你有没有坐在办公桌前想过，比如，",
+          "message": "英文阅读速度 5.10 词/秒，可能偏快",
+          "wps": 5.1,
+          "word_count": 10
+        },
+        {
+          "code": "chinese_speed_warning",
+          "index": 8,
+          "start_ms": 16833,
+          "end_ms": 19115,
+          "duration_ms": 2282,
+          "english": "Wait, is he the one projecting eight-figure sales this year?",
+          "chinese": "等等，他就是那个预计今年销售额达到八位数的人吗？",
+          "message": "中文阅读速度 9.64 字/秒，建议压缩",
+          "cps": 9.64,
+          "zh_chars": 22
+        },
+        {
+          "code": "short_duration",
+          "index": 12,
+          "start_ms": 31264,
+          "end_ms": 32024,
+          "duration_ms": 760,
+          "english": "No, not at all.",
+          "chinese": "不，完全不是。",
+          "message": "字幕显示时长 760ms，低于 900ms"
+        },
+        {
+          "code": "english_speed_warning",
+          "index": 12,
+          "start_ms": 31264,
+          "end_ms": 32024,
+          "duration_ms": 760,
+          "english": "No, not at all.",
+          "chinese": "不，完全不是。",
+          "message": "英文阅读速度 5.26 词/秒，可能偏快",
+          "wps": 5.26,
+          "word_count": 4
+        },
+        {
+          "code": "short_duration",
+          "index": 16,
+          "start_ms": 46456,
+          "end_ms": 47257,
+          "duration_ms": 801,
+          "english": "America were,",
+          "chinese": "美国人",
+          "message": "字幕显示时长 801ms，低于 900ms"
+        },
+        {
+          "code": "short_duration",
+          "index": 30,
+          "start_ms": 98714,
+          "end_ms": 99574,
+          "duration_ms": 860,
+          "english": "It really is.",
+          "chinese": "确实如此。",
+          "message": "字幕显示时长 860ms，低于 900ms"
+        },
+        {
+          "code": "short_duration",
+          "index": 47,
+          "start_ms": 162540,
+          "end_ms": 163320,
+          "duration_ms": 780,
+          "english": "Oh, absolutely.",
+          "chinese": "哦，绝对是这样。",
+          "message": "字幕显示时长 780ms，低于 900ms"
+        },
+        {
+          "code": "short_duration",
+          "index": 53,
+          "start_ms": 177450,
+          "end_ms": 178231,
+          "duration_ms": 781,
+          "english": "Activation potential?",
+          "chinese": "活化能？",
+          "message": "字幕显示时长 781ms，低于 900ms"
+        },
+        {
+          "code": "short_duration",
+          "index": 54,
+          "start_ms": 178271,
+          "end_ms": 179111,
+          "duration_ms": 840,
+          "english": "Like in chemistry?",
+          "chinese": "就像化学里的那种？",
+          "message": "字幕显示时长 840ms，低于 900ms"
+        },
+        {
+          "code": "chinese_speed_warning",
+          "index": 54,
+          "start_ms": 178271,
+          "end_ms": 179111,
+          "duration_ms": 840,
+          "english": "Like in chemistry?",
+          "chinese": "就像化学里的那种？",
+          "message": "中文阅读速度 9.52 字/秒，建议压缩",
+          "cps": 9.52,
+          "zh_chars": 8
+        },
+        {
+          "code": "subtitle_duration_too_short",
+          "index": 77,
+          "start_ms": 245440,
+          "end_ms": 245860,
+          "duration_ms": 420,
+          "english": "No.",
+          "chinese": "不是。",
+          "message": "字幕显示时长 420ms，低于 500ms",
+          "threshold_ms": 500,
+          "simple_response": true,
+          "text_load": 3
+        },
+        {
+          "code": "short_duration",
+          "index": 77,
+          "start_ms": 245440,
+          "end_ms": 245860,
+          "duration_ms": 420,
+          "english": "No.",
+          "chinese": "不是。",
+          "message": "字幕显示时长 420ms，低于 900ms"
+        },
+        {
+          "code": "short_duration",
+          "index": 98,
+          "start_ms": 307504,
+          "end_ms": 308265,
+          "duration_ms": 761,
+          "english": "Oh, really? Yeah.",
+          "chinese": "哦，真的吗？没错",
+          "message": "字幕显示时长 761ms，低于 900ms"
+        },
+        {
+          "code": "english_speed_warning",
+          "index": 102,
+          "start_ms": 320238,
+          "end_ms": 322360,
+          "duration_ms": 2122,
+          "english": "when there is no one left who wants to be their worker?",
+          "chinese": "当再也没有人愿意为他们工作时",
+          "message": "英文阅读速度 5.66 词/秒，可能偏快",
+          "wps": 5.66,
+          "word_count": 12
+        },
+        {
+          "code": "asr_capitalized_variant",
+          "index": 13,
+          "subtitle_id": "S0013",
+          "time_range": "32064 --> 37829",
+          "suspicious_text": "So our mission for this deep dive is unpacking this sudden, massive boom in America entrepreneurship.",
+          "rule_code": "asr_capitalized_variant",
+          "confidence": "medium",
+          "evidence": "similar capitalized variants in nearby subtitles",
+          "indices": [
+            13,
+            15,
+            16
+          ],
+          "variants": [
+            {
+              "text": "America",
+              "indices": [
+                13,
+                15,
+                16
+              ]
+            },
+            {
+              "text": "American",
+              "indices": [
+                15
+              ]
+            }
+          ],
+          "pairs": [
+            [
+              "America",
+              "American",
+              0.933
+            ]
+          ],
+          "message": "?????????????????????? ASR ??"
+        },
+        {
+          "code": "syntax_boundary_audit",
+          "index": 28,
+          "from_index": 27,
+          "left_subtitle_id": "S0027",
+          "right_subtitle_id": "S0028",
+          "rule_codes": [
+            "preposition_object_split"
+          ],
+          "confidence": "high",
+          "confidence_score": 0.77,
+          "evidence": "left_last=about; right_first=finding; left_tokens=['to', '34', 'year-olds', 'about']; right_tokens=['finding', 'a', 'good', 'job']",
+          "duplicates_legacy_bad_cut": false,
+          "message": "英文句法边界疑似坏切点: preposition_object_split",
+          "english": "I mean, Gallup data shows optimism among 15 to 34 year-olds about | finding a good job plummeted from 75% to just 43% recently.",
+          "previous_english": "I mean, Gallup data shows optimism among 15 to 34 year-olds about",
+          "current_english": "finding a good job plummeted from 75% to just 43% recently.",
+          "chinese": "盖洛普的数据显示，15至34岁人群对找到好工作的乐观情绪最近从75%骤降至仅43%。"
+        }
+      ],
+      "info": []
+    }
+  }
+}

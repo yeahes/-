@@ -5,7 +5,9 @@ import subprocess
 import sys
 import tempfile
 import json
+import logging
 from pathlib import Path
+from threading import Thread
 
 from PyQt5.QtCore import Qt, QTime, QUrl, QAbstractTableModel, pyqtSignal
 from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent
@@ -15,10 +17,11 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QVBoxLayout,
     QWidget,
 )
-from qfluentwidgets import Action, BodyLabel, CommandBar
+from qfluentwidgets import Action, BodyLabel, CommandBar, isDarkTheme
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
     InfoBar,
@@ -38,6 +41,16 @@ from app.common.signal_bus import signalBus
 from app.components.SubtitleSettingDialog import SubtitleSettingDialog
 from app.config import SUBTITLE_STYLE_PATH
 from app.core.bk_asr.asr_data import ASRData
+from app.core.subtitle_processor.manual_final_subtitle_editor import (
+    ManualFinalSubtitleEditError,
+    ManualFinalSubtitleSession,
+)
+from app.core.subtitle_processor.subtitle_review_marks import (
+    SubtitleReviewMark,
+    load_subtitle_review_marks,
+    review_marks_from_payload,
+    syntax_review_parser_available,
+)
 from app.core.entities import (
     OutputSubtitleFormatEnum,
     SubtitleTask,
@@ -49,10 +62,14 @@ from app.core.utils.get_subtitle_style import get_subtitle_style
 from app.thread.subtitle_thread import SubtitleThread
 
 
+LOG = logging.getLogger(__name__)
+
+
 class SubtitleTableModel(QAbstractTableModel):
     def __init__(self, data=""):
         super().__init__()
         self._data = {}
+        self._review_marks_by_subtitle_id = {}
         if isinstance(data, str):
             self.load_data(data)
         else:
@@ -61,8 +78,7 @@ class SubtitleTableModel(QAbstractTableModel):
     def load_data(self, data: str):
         """加载字幕数据"""
         try:
-            self._data = json.loads(data)
-            self.layoutChanged.emit()
+            self.update_all(json.loads(data))
         except json.JSONDecodeError:
             pass
 
@@ -77,6 +93,11 @@ class SubtitleTableModel(QAbstractTableModel):
         if not segment:
             return None
 
+        marks = self._marks_for_segment(segment)
+        if role == Qt.BackgroundRole:
+            return self._review_background(marks, col)
+        if role == Qt.ToolTipRole:
+            return self._review_tooltip(marks, col)
         if role == Qt.DisplayRole or role == Qt.EditRole:
             if col == 0:
                 return (
@@ -180,18 +201,122 @@ class SubtitleTableModel(QAbstractTableModel):
 
     def update_all(self, data: dict):
         """更新所有数据"""
-        self._data = data
-        self.layoutChanged.emit()
+        self.beginResetModel()
+        self._data = data or {}
+        self.endResetModel()
+
+    def set_review_marks(self, marks_by_subtitle_id: dict) -> None:
+        self._review_marks_by_subtitle_id = {
+            str(subtitle_id): list(marks)
+            for subtitle_id, marks in (marks_by_subtitle_id or {}).items()
+        }
+        if not self._data:
+            return
+        self.dataChanged.emit(
+            self.index(0, 0),
+            self.index(max(0, self.rowCount() - 1), self.columnCount() - 1),
+            [Qt.BackgroundRole, Qt.ToolTipRole],
+        )
+
+    def _marks_for_segment(self, segment: dict) -> list[SubtitleReviewMark]:
+        subtitle_ids = list(segment.get("source_subtitle_ids") or [])
+        subtitle_ids.extend(
+            [segment.get("subtitle_id"), segment.get("manual_cue_id")]
+        )
+        marks = []
+        seen = set()
+        for subtitle_id in subtitle_ids:
+            for mark in self._review_marks_by_subtitle_id.get(str(subtitle_id or ""), []):
+                key = (mark.subtitle_id, mark.severity, mark.target, mark.code, mark.reason)
+                if key not in seen:
+                    seen.add(key)
+                    marks.append(mark)
+        if segment.get("chinese_review_required"):
+            marks.append(
+                SubtitleReviewMark(
+                    subtitle_id=str(segment.get("manual_cue_id") or "人工终稿"),
+                    severity="REVIEW",
+                    category="manual_chinese_review",
+                    target="chinese",
+                    code="english_boundary_manually_moved",
+                    reason="英文边界已人工调整，请检查中文是否仍与本条英文对应。",
+                )
+            )
+        return marks
+
+    @staticmethod
+    def _review_marks_for_column(
+        marks: list[SubtitleReviewMark], column: int
+    ) -> list[SubtitleReviewMark]:
+        target = "english" if column == 2 else "chinese" if column == 3 else ""
+        return [
+            mark
+            for mark in marks
+            if mark.target == "both" or (target and mark.target == target)
+        ]
+
+    def _review_background(self, marks: list[SubtitleReviewMark], column: int):
+        relevant = self._review_marks_for_column(marks, column)
+        if isDarkTheme():
+            colors = {
+                "blocker": "#282225",
+                "english_cut": "#24364A",
+                "timeline_alignment": "#302C3A",
+                "chinese_allocation": "#29251E",
+                "manual_chinese_review": "#27241F",
+            }
+        else:
+            colors = {
+                "blocker": "#FFF9F8",
+                "english_cut": "#EAF4FF",
+                "timeline_alignment": "#F4F1FB",
+                "chinese_allocation": "#FFFCF7",
+                "manual_chinese_review": "#FFFBF4",
+            }
+        if any(mark.severity == "BLOCKER" for mark in relevant):
+            return QColor(colors["blocker"])
+        if any(mark.category == "english_cut" for mark in relevant):
+            return QColor(colors["english_cut"])
+        if any(mark.category == "timeline_alignment" for mark in relevant):
+            return QColor(colors["timeline_alignment"])
+        if any(mark.category == "chinese_allocation" for mark in relevant):
+            return QColor(colors["chinese_allocation"])
+        if any(mark.category == "manual_chinese_review" for mark in relevant):
+            return QColor(colors["manual_chinese_review"])
+        return None
+
+    def _review_tooltip(self, marks: list[SubtitleReviewMark], column: int):
+        relevant = self._review_marks_for_column(marks, column)
+        if not relevant:
+            return None
+        labels = {
+            "structure": "结构阻断",
+            "validation": "质量阻断",
+            "english_cut": "英文切分复查",
+            "timeline_alignment": "时间轴复查",
+            "chinese_allocation": "中文分配复查",
+            "manual_chinese_review": "人工调整后中文待检查",
+        }
+        lines = []
+        for mark in relevant:
+            label = labels.get(mark.category, "字幕复查")
+            lines.append(f"[{label}] {mark.subtitle_id}: {mark.reason}")
+        return "\n".join(lines)
 
 
 class SubtitleInterface(QWidget):
     finished = pyqtSignal(str, str)
+    review_marks_loaded = pyqtSignal(int, object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.task = None
         self.subtitle_path = None
+        self.manual_final_session = None
+        self._manual_review_mark_count = 0
+        self._review_mark_request_id = 0
+        self._review_mark_rows = []
         self.custom_prompt_text = cfg.custom_prompt_text.value
         self.setAttribute(Qt.WA_DeleteOnClose)
         self._init_ui()
@@ -260,14 +385,14 @@ class SubtitleInterface(QWidget):
 
         self.command_bar.addSeparator()
 
-        # 添加字幕优化按钮
+        # Compatibility-only controls stay available without competing with the
+        # stable bilingual production actions in the primary command bar.
         self.optimize_button = Action(
             FIF.EDIT,
-            self.tr("字幕校正"),
+            self.tr("兼容字幕校正"),
             triggered=self.on_subtitle_optimization_changed,
             checkable=True,
         )
-        self.command_bar.addAction(self.optimize_button)
 
         # 添加字幕翻译按钮
         self.translate_button = Action(
@@ -296,13 +421,10 @@ class SubtitleInterface(QWidget):
 
         self.command_bar.addWidget(self.target_language_button)
 
-        self.command_bar.addSeparator()
-
-        # 添加文稿提示按钮
+        # 文稿提示与旧流程校正属于低频高级操作，收进“更多”。
         self.prompt_button = Action(
             FIF.DOCUMENT, self.tr("文稿提示"), triggered=self.show_prompt_dialog
         )
-        self.command_bar.addAction(self.prompt_button)
 
         self.quality_report_action = Action(
             FIF.SEARCH, self.tr("质量报告"), triggered=self.open_quality_report
@@ -310,25 +432,49 @@ class SubtitleInterface(QWidget):
         self.quality_report_action.setEnabled(False)
         self.command_bar.addAction(self.quality_report_action)
 
-        # 添加设置按钮
-        self.command_bar.addAction(
-            Action(FIF.SETTING, "", triggered=self.show_subtitle_settings)
+        self.next_review_action = Action(
+            FIF.SEARCH, self.tr("下一处复查"), triggered=self.focus_next_review_mark
         )
+        self.next_review_action.setEnabled(False)
+        self.next_review_action.setVisible(False)
+        self.command_bar.addAction(self.next_review_action)
 
-        # 添加视频播放按钮
-        # self.command_bar.addAction(Action(FIF.VIDEO, "", triggered=self.show_video_player))
-
-        # 添加打开文件夹按钮
-        self.command_bar.addAction(
-            Action(FIF.FOLDER, "", triggered=self.on_open_folder_clicked)
+        self.manual_final_save_action = Action(
+            FIF.SAVE, self.tr("保存人工终稿"), triggered=self.save_manual_final_output
         )
+        self.manual_final_save_action.setEnabled(False)
+        self.manual_final_save_action.setVisible(False)
+        self.command_bar.addAction(self.manual_final_save_action)
+
+        self.manual_final_undo_action = Action(
+            FIF.SYNC, self.tr("撤销终稿编辑"), triggered=self.undo_manual_final_edit
+        )
+        self.manual_final_undo_action.setEnabled(False)
+        self.manual_final_undo_action.setVisible(False)
+        self.command_bar.addAction(self.manual_final_undo_action)
+
+        self.more_menu = RoundMenu(parent=self)
+        self.more_menu.addAction(self.optimize_button)
+        self.more_menu.addAction(self.prompt_button)
+        self.more_menu.addSeparator()
+        self.subtitle_settings_action = Action(
+            FIF.SETTING, self.tr("字幕设置"), triggered=self.show_subtitle_settings
+        )
+        self.open_folder_action = Action(
+            FIF.FOLDER, self.tr("打开输出文件夹"), triggered=self.on_open_folder_clicked
+        )
+        self.import_subtitle_action = Action(
+            FIF.FOLDER_ADD, self.tr("导入字幕"), triggered=self.on_file_select
+        )
+        self.more_menu.addAction(self.subtitle_settings_action)
+        self.more_menu.addAction(self.open_folder_action)
+        self.more_menu.addAction(self.import_subtitle_action)
+        self.more_button = TransparentDropDownPushButton(self.tr("更多"), self, FIF.MORE)
+        self.more_button.setMenu(self.more_menu)
+        self.more_button.setFixedHeight(34)
+        self.command_bar.addWidget(self.more_button)
 
         self.command_bar.addSeparator()
-
-        # 添加文件选择按钮
-        self.command_bar.addAction(
-            Action(FIF.FOLDER_ADD, "", triggered=self.on_file_select)
-        )
 
         # 添加开始按钮到水平布局
         self.start_button = PrimaryPushButton(self.tr("开始"), self, icon=FIF.PLAY)
@@ -392,6 +538,7 @@ class SubtitleInterface(QWidget):
         self.main_layout.addLayout(self.bottom_layout)
 
     def _setup_signals(self):
+        self.review_marks_loaded.connect(self._apply_loaded_manual_review_marks)
         signalBus.subtitle_layout_changed.connect(self.on_subtitle_layout_changed)
         signalBus.target_language_changed.connect(self.on_target_language_changed)
         signalBus.subtitle_optimization_changed.connect(
@@ -431,9 +578,8 @@ class SubtitleInterface(QWidget):
         """更新页面信息"""
         original_subtitle_save_path = Path(self.task.subtitle_path)
         asr_data = ASRData.from_subtitle_file(original_subtitle_save_path)
-        self.model._data = asr_data.to_json()
-        self.model.layoutChanged.emit()
-        self.status_label.setText(self.tr("已加载文件"))
+        self.model.update_all(asr_data.to_json())
+        self._load_manual_final_session(original_subtitle_save_path)
 
     def start_subtitle_optimization(self, need_create_task=True):
         # 检查是否有任务
@@ -476,6 +622,7 @@ class SubtitleInterface(QWidget):
     def on_subtitle_optimization_finished(self, video_path, output_path):
         self.start_button.setEnabled(True)
         self.cancel_button.hide()  # 隐藏取消按钮
+        self._load_manual_final_session_from_output(output_path)
         if self.task.need_next_task:
             self.finished.emit(video_path, output_path)
         InfoBar.success(
@@ -659,12 +806,327 @@ class SubtitleInterface(QWidget):
         else:  # Linux
             subprocess.run(["xdg-open", target_dir])
 
-    def load_subtitle_file(self, file_path):
+    def load_subtitle_file(self, file_path) -> bool:
+        """Load a subtitle file without leaving the table in an indeterminate state."""
+        try:
+            asr_data = ASRData.from_subtitle_file(file_path)
+        except Exception as exc:
+            LOG.exception("Unable to import subtitle file: %s", file_path)
+            self.status_label.setText(self.tr("字幕导入失败：") + str(exc))
+            InfoBar.error(
+                self.tr("导入失败"),
+                self.tr("无法读取字幕文件：") + str(exc),
+                duration=5000,
+                parent=self,
+            )
+            return False
+
         self.subtitle_path = file_path
-        asr_data = ASRData.from_subtitle_file(file_path)
-        self.model._data = asr_data.to_json()
-        self.model.layoutChanged.emit()
-        self.status_label.setText(self.tr("已加载文件"))
+        self.model.update_all(asr_data.to_json())
+        self._load_manual_final_session(Path(file_path))
+        return True
+
+    def _load_manual_final_session(self, subtitle_path: Path) -> None:
+        self.manual_final_session = None
+        self._manual_review_mark_count = 0
+        self._review_mark_rows = []
+        self._review_mark_request_id += 1
+        self.model.set_review_marks({})
+        self.next_review_action.setEnabled(False)
+        self.next_review_action.setVisible(False)
+        self.manual_final_save_action.setEnabled(False)
+        self.manual_final_save_action.setVisible(False)
+        self.manual_final_undo_action.setEnabled(False)
+        self.manual_final_undo_action.setVisible(False)
+        try:
+            session = ManualFinalSubtitleSession.load_for_subtitle(
+                subtitle_path,
+                work_dir=cfg.work_dir.value,
+            )
+        except ManualFinalSubtitleEditError as exc:
+            self.status_label.setText(
+                self.tr("已加载文件；人工终稿编辑不可用：") + str(exc)
+            )
+            return
+        self.manual_final_session = session
+        self.subtitle_path = str(session.subtitle_path)
+        self._load_manual_final_review_marks(session)
+        self._apply_manual_final_session()
+        self.status_label.setText(
+            self.tr(
+                f"已加载 {self.model.rowCount()} 条稳定终稿，可按词级时间移动相邻字幕边界；正在检查高优先复查点"
+            )
+        )
+
+    def _load_manual_final_session_from_output(self, output_path: str) -> None:
+        manifest_path = Path(output_path).parent / "stable-final-manifest.json"
+        if not manifest_path.exists():
+            return
+        self.manual_final_session = None
+        self._manual_review_mark_count = 0
+        self._review_mark_rows = []
+        self._review_mark_request_id += 1
+        self.model.set_review_marks({})
+        self.next_review_action.setEnabled(False)
+        self.next_review_action.setVisible(False)
+        self.manual_final_save_action.setEnabled(False)
+        self.manual_final_save_action.setVisible(False)
+        self.manual_final_undo_action.setEnabled(False)
+        self.manual_final_undo_action.setVisible(False)
+        try:
+            session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        except ManualFinalSubtitleEditError as exc:
+            self.status_label.setText(self.tr("字幕已生成，但人工终稿编辑不可用：") + str(exc))
+            return
+        self.manual_final_session = session
+        self.subtitle_path = str(session.subtitle_path)
+        self._load_manual_final_review_marks(session)
+        self._apply_manual_final_session()
+        self.status_label.setText(
+            self.tr(
+                f"稳定终稿已就绪（{self.model.rowCount()} 条），可按词级时间手动调整边界；正在检查高优先复查点"
+            )
+        )
+
+    def _load_manual_final_review_marks(self, session: ManualFinalSubtitleSession) -> None:
+        request_id = self._review_mark_request_id
+        artifact_dir = session.artifact_dir
+        Thread(
+            target=self._read_manual_review_marks,
+            args=(request_id, artifact_dir),
+            daemon=True,
+        ).start()
+
+    def _read_manual_review_marks(self, request_id: int, artifact_dir: Path) -> None:
+        try:
+            marks_by_subtitle_id = load_subtitle_review_marks(artifact_dir)
+            if not syntax_review_parser_available():
+                marks_by_subtitle_id = self._load_review_marks_in_isolated_runtime(
+                    artifact_dir
+                )
+            error = ""
+        except Exception as exc:
+            LOG.exception("Unable to load subtitle review marks from: %s", artifact_dir)
+            marks_by_subtitle_id = {}
+            error = str(exc)
+        self.review_marks_loaded.emit(request_id, marks_by_subtitle_id, error)
+
+    @staticmethod
+    def _load_review_marks_in_isolated_runtime(
+        artifact_dir: Path,
+    ) -> dict[str, list[SubtitleReviewMark]]:
+        """Run spaCy away from the GUI's already-loaded GPU runtime."""
+        project_root = Path(__file__).resolve().parents[2]
+        runtime_python = project_root / "runtime" / "python.exe"
+        if not runtime_python.exists():
+            raise RuntimeError("本地复查运行环境不存在。")
+        completed = subprocess.run(
+            [
+                str(runtime_python),
+                "-X",
+                "utf8",
+                "-m",
+                "app.core.subtitle_processor.subtitle_review_marks",
+                str(artifact_dir),
+            ],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(detail or "本地复查运行进程失败。")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("本地复查运行进程返回了无效结果。") from exc
+        if not isinstance(payload, dict) or not payload.get("syntax_parser_available"):
+            raise RuntimeError("本地英文句法复查引擎不可用。")
+        return review_marks_from_payload(payload.get("marks"))
+
+    def _apply_loaded_manual_review_marks(
+        self, request_id: int, marks_by_subtitle_id: dict, error: str
+    ) -> None:
+        if request_id != self._review_mark_request_id or not self.manual_final_session:
+            return
+        if error:
+            self.status_label.setText(
+                self.tr("稳定终稿已加载；高优先复查标记加载失败，字幕内容未受影响。")
+            )
+            return
+        self.model.set_review_marks(marks_by_subtitle_id)
+        self._manual_review_mark_count = sum(
+            len(marks) for marks in marks_by_subtitle_id.values()
+        )
+        self._review_mark_rows = self._rows_with_review_marks(marks_by_subtitle_id)
+        self.next_review_action.setEnabled(bool(self._review_mark_rows))
+        self.next_review_action.setVisible(bool(self._review_mark_rows))
+        if self._review_mark_rows:
+            time_ranges = "、".join(
+                self._review_time_range(row) for row in self._review_mark_rows
+            )
+            self.status_label.setText(
+                self.tr(
+                    f"已加载稳定终稿；已标出 {self._manual_review_mark_count} 个高优先复查点（{time_ranges}），可点“下一处复查”定位"
+                )
+            )
+        else:
+            self.status_label.setText(
+                self.tr("已加载稳定终稿；未发现高优先复查点。")
+            )
+
+    def _rows_with_review_marks(self, marks_by_subtitle_id: dict) -> list[int]:
+        marked_ids = {str(subtitle_id) for subtitle_id in marks_by_subtitle_id}
+        rows = []
+        for row in range(self.model.rowCount()):
+            segment = self.model._data.get(str(row + 1), {})
+            source_ids = {str(value) for value in segment.get("source_subtitle_ids") or []}
+            source_ids.update(
+                str(value)
+                for value in (segment.get("subtitle_id"), segment.get("manual_cue_id"))
+                if value
+            )
+            if source_ids & marked_ids:
+                rows.append(row)
+        return rows
+
+    def _review_time_range(self, row: int) -> str:
+        segment = self.model._data.get(str(row + 1), {})
+        start = QTime(0, 0).addMSecs(int(segment.get("start_time") or 0))
+        end = QTime(0, 0).addMSecs(int(segment.get("end_time") or 0))
+        return f"{start.toString('hh:mm:ss.zzz')}–{end.toString('hh:mm:ss.zzz')}"
+
+    def focus_next_review_mark(self) -> None:
+        if not self._review_mark_rows:
+            return
+        current_row = self.subtitle_table.currentIndex().row()
+        target_row = next(
+            (row for row in self._review_mark_rows if row > current_row),
+            self._review_mark_rows[0],
+        )
+        target = self.model.index(target_row, 2)
+        self.subtitle_table.setCurrentIndex(target)
+        self.subtitle_table.selectRow(target_row)
+        self.subtitle_table.scrollTo(target, QAbstractItemView.PositionAtCenter)
+
+    def _manual_review_status_suffix(self) -> str:
+        if not self._manual_review_mark_count:
+            return ""
+        return self.tr(f"；已标出 {self._manual_review_mark_count} 个高优先复查点")
+
+    def _sync_manual_final_text_edits(self) -> None:
+        if not self.manual_final_session:
+            return
+        if len(self.model._data) != len(self.manual_final_session.cues):
+            raise ManualFinalSubtitleEditError("字幕行数已变化，无法安全应用人工终稿操作。")
+        for index, cue in enumerate(self.manual_final_session.cues, 1):
+            row = self.model._data.get(str(index))
+            if not row:
+                raise ManualFinalSubtitleEditError("字幕表数据不完整。")
+            cue["original_subtitle"] = str(row.get("original_subtitle") or "")
+            cue["translated_subtitle"] = str(row.get("translated_subtitle") or "")
+
+    def _apply_manual_final_session(self) -> None:
+        if not self.manual_final_session:
+            return
+        self.model.update_all(self.manual_final_session.to_model_data())
+        self.manual_final_save_action.setEnabled(True)
+        self.manual_final_save_action.setVisible(True)
+        self.manual_final_undo_action.setEnabled(bool(self.manual_final_session.history))
+        self.manual_final_undo_action.setVisible(True)
+
+    def _move_suffix_to_next(self, row: int) -> None:
+        if not self.manual_final_session:
+            return
+        left = self.manual_final_session.cues[row]
+        maximum = int(left["word_end"]) - int(left["word_start"])
+        count, accepted = QInputDialog.getInt(
+            self,
+            self.tr("移动末尾词"),
+            self.tr("移动到下一条的末尾英文词数："),
+            1,
+            1,
+            maximum,
+        )
+        if not accepted:
+            return
+        try:
+            self._sync_manual_final_text_edits()
+            self.manual_final_session.move_suffix_to_next(row, count)
+            self._apply_manual_final_session()
+            InfoBar.success(
+                self.tr("边界已更新"),
+                self.tr("英文词范围和两条时间轴已按词级账本同步更新，请检查中文。"),
+                duration=3000,
+                parent=self,
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(self.tr("无法移动边界"), str(exc), duration=5000, parent=self)
+
+    def _move_prefix_to_previous(self, row: int) -> None:
+        if not self.manual_final_session:
+            return
+        right = self.manual_final_session.cues[row]
+        maximum = int(right["word_end"]) - int(right["word_start"])
+        count, accepted = QInputDialog.getInt(
+            self,
+            self.tr("移动开头词"),
+            self.tr("移动到上一条的开头英文词数："),
+            1,
+            1,
+            maximum,
+        )
+        if not accepted:
+            return
+        try:
+            self._sync_manual_final_text_edits()
+            self.manual_final_session.move_prefix_to_previous(row, count)
+            self._apply_manual_final_session()
+            InfoBar.success(
+                self.tr("边界已更新"),
+                self.tr("英文词范围和两条时间轴已按词级账本同步更新，请检查中文。"),
+                duration=3000,
+                parent=self,
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(self.tr("无法移动边界"), str(exc), duration=5000, parent=self)
+
+    def undo_manual_final_edit(self) -> None:
+        if not self.manual_final_session:
+            return
+        try:
+            self._sync_manual_final_text_edits()
+            if self.manual_final_session.undo():
+                self._apply_manual_final_session()
+                self.status_label.setText(self.tr("已撤销最近一次人工终稿边界编辑"))
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(self.tr("无法撤销"), str(exc), duration=5000, parent=self)
+
+    def save_manual_final_output(self) -> None:
+        if not self.manual_final_session:
+            InfoBar.warning(
+                self.tr("人工终稿不可用"),
+                self.tr("请加载带稳定 artifacts 的最终双语字幕。"),
+                duration=5000,
+                parent=self,
+            )
+            return
+        try:
+            self._sync_manual_final_text_edits()
+            paths = self.manual_final_session.save_to_source_folder()
+            self.status_label.setText(self.tr("人工终稿已保存，视频合成将优先使用它"))
+            InfoBar.success(
+                self.tr("人工终稿已保存"),
+                self.tr("字幕：") + paths["subtitle_path"],
+                duration=5000,
+                parent=self,
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(self.tr("保存失败"), str(exc), duration=5000, parent=self)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         event.accept() if event.mimeData().hasUrls() else event.ignore()
@@ -682,14 +1144,14 @@ class SubtitleInterface(QWidget):
             is_supported = file_ext in supported_formats
 
             if is_supported:
-                self.load_subtitle_file(file_path)
-                InfoBar.success(
-                    self.tr("导入成功"),
-                    self.tr(f"成功导入") + os.path.basename(file_path),
-                    duration=3000,
-                    position=InfoBarPosition.BOTTOM,
-                    parent=self,
-                )
+                if self.load_subtitle_file(file_path):
+                    InfoBar.success(
+                        self.tr("导入成功"),
+                        self.tr(f"成功导入") + os.path.basename(file_path),
+                        duration=3000,
+                        position=InfoBarPosition.BOTTOM,
+                        parent=self,
+                    )
                 break
             else:
                 InfoBar.error(
@@ -763,6 +1225,17 @@ class SubtitleInterface(QWidget):
 
     def show_context_menu(self, pos):
         """显示右键菜单"""
+        clicked_index = self.subtitle_table.indexAt(pos)
+        if not clicked_index.isValid():
+            return
+
+        # Qt does not select the row on a right-click. Select the clicked row
+        # before reading the selection so its contextual actions are available.
+        selected_rows = {index.row() for index in self.subtitle_table.selectedIndexes()}
+        if clicked_index.row() not in selected_rows:
+            self.subtitle_table.clearSelection()
+            self.subtitle_table.selectRow(clicked_index.row())
+
         menu = RoundMenu(parent=self)
 
         # 获取选中的行
@@ -775,20 +1248,31 @@ class SubtitleInterface(QWidget):
         if not rows:
             return
 
-        # 添加菜单项
-        # retranslate_action = Action(FIF.SYNC, self.tr("重新翻译"))
-        merge_action = Action(FIF.LINK, self.tr("合并"))  # 添加快捷键提示
-        # menu.addAction(retranslate_action)
+        rows_are_contiguous = rows == list(range(rows[0], rows[-1] + 1))
+        merge_action = Action(FIF.LINK, self.tr("合并相邻字幕"))
         menu.addAction(merge_action)
         merge_action.setShortcut("Ctrl+M")  # 设置快捷键
-
-        # 设置动作状态
-        # retranslate_action.setEnabled(cfg.need_translate.value)
-        merge_action.setEnabled(len(rows) > 1)
-
-        # 连接动作信号
-        # retranslate_action.triggered.connect(lambda: self.retranslate_selected_rows(rows))
+        merge_action.setEnabled(len(rows) > 1 and rows_are_contiguous)
         merge_action.triggered.connect(lambda: self.merge_selected_rows(rows))
+
+        if self.manual_final_session and len(rows) == 1:
+            row = rows[0]
+            left = self.manual_final_session.cues[row]
+            move_tail_action = Action(FIF.EDIT, self.tr("将末尾词移到下一条"))
+            move_tail_action.setEnabled(
+                row + 1 < len(self.manual_final_session.cues)
+                and int(left["word_end"]) > int(left["word_start"])
+            )
+            move_tail_action.triggered.connect(lambda: self._move_suffix_to_next(row))
+            menu.addAction(move_tail_action)
+
+            right = self.manual_final_session.cues[row]
+            move_head_action = Action(FIF.EDIT, self.tr("将开头词移到上一条"))
+            move_head_action.setEnabled(
+                row > 0 and int(right["word_end"]) > int(right["word_start"])
+            )
+            move_head_action.triggered.connect(lambda: self._move_prefix_to_previous(row))
+            menu.addAction(move_head_action)
 
         # 显示菜单
         menu.exec(self.subtitle_table.viewport().mapToGlobal(pos))
@@ -796,6 +1280,29 @@ class SubtitleInterface(QWidget):
     def merge_selected_rows(self, rows):
         """合并选中的字幕行"""
         if not rows or len(rows) < 2:
+            return
+        if rows != list(range(rows[0], rows[-1] + 1)):
+            InfoBar.warning(
+                self.tr("无法合并"),
+                self.tr("只能合并连续相邻的字幕行，避免丢失中间字幕。"),
+                duration=5000,
+                parent=self,
+            )
+            return
+
+        if self.manual_final_session:
+            try:
+                self._sync_manual_final_text_edits()
+                self.manual_final_session.merge_adjacent(rows[0], rows[-1])
+                self._apply_manual_final_session()
+                InfoBar.success(
+                    self.tr("合并成功"),
+                    self.tr("已按原始词范围合并相邻字幕，请检查合并后的中文。"),
+                    duration=3000,
+                    parent=self,
+                )
+            except ManualFinalSubtitleEditError as exc:
+                InfoBar.warning(self.tr("无法合并"), str(exc), duration=5000, parent=self)
             return
 
         # 获取选中行的数据
@@ -817,7 +1324,7 @@ class SubtitleInterface(QWidget):
             translated_subtitles.append(item["translated_subtitle"])
 
         merged_original = " ".join(original_subtitles)
-        merged_translated = " ".join(translated_subtitles)
+        merged_translated = "".join(translated_subtitles)
 
         # 创建新的合并后的字幕项
         merged_item = {

@@ -124,7 +124,7 @@ class VideoSynthesisInterface(QWidget):
         self.podcast_title_label = BodyLabel(self.tr("模板标题"), self)
         self.podcast_title_input = LineEdit(self)
         self.podcast_title_input.setPlaceholderText(
-            self.tr("英语学习模板顶部标题，可留空使用默认标题")
+            self.tr("视频标题；文章模板会自动缩小并保持在三行内")
         )
         self.podcast_title_layout.addWidget(self.podcast_title_label)
         self.podcast_title_layout.addWidget(self.podcast_title_input)
@@ -155,15 +155,6 @@ class VideoSynthesisInterface(QWidget):
         self.podcast_cover_layout.addWidget(self.podcast_cover_input)
         self.podcast_cover_layout.addWidget(self.podcast_cover_button)
         self.config_layout.addLayout(self.podcast_cover_layout)
-
-        self.podcast_date_layout = QHBoxLayout()
-        self.podcast_date_layout.setSpacing(15)
-        self.podcast_date_label = BodyLabel(self.tr("模板日期"), self)
-        self.podcast_date_input = LineEdit(self)
-        self.podcast_date_input.setPlaceholderText(self.tr("例如 Jul 23rd 2026"))
-        self.podcast_date_layout.addWidget(self.podcast_date_label)
-        self.podcast_date_layout.addWidget(self.podcast_date_input)
-        self.config_layout.addLayout(self.podcast_date_layout)
 
         self.main_layout.addWidget(self.config_card)
 
@@ -303,7 +294,7 @@ class VideoSynthesisInterface(QWidget):
             }
         """
         )
-        for line_edit in (self.podcast_cover_input, self.podcast_date_input):
+        for line_edit in (self.podcast_cover_input,):
             line_edit.focusOutEvent = lambda e, widget=line_edit: super(
                 LineEdit, widget
             ).focusOutEvent(e)
@@ -337,8 +328,6 @@ class VideoSynthesisInterface(QWidget):
         )
         self.podcast_cover_button.clicked.connect(self.choose_podcast_cover)
         self.podcast_cover_input.editingFinished.connect(self.save_podcast_cover)
-        self.podcast_date_input.editingFinished.connect(self.save_podcast_date)
-
         # 合成和文件夹相关信号
         self.synthesize_button.clicked.connect(
             lambda: self.start_video_synthesis(need_create_task=True)
@@ -360,7 +349,6 @@ class VideoSynthesisInterface(QWidget):
         self.podcast_title_input.setText(cfg.podcast_template_title.value)
         self.podcast_background_input.setText(cfg.podcast_template_background.value)
         self.podcast_cover_input.setText(cfg.podcast_template_cover.value)
-        self.podcast_date_input.setText(cfg.podcast_template_date.value)
         self.update_podcast_template_fields()
 
     def set_layout_visible(self, layout, visible: bool):
@@ -378,10 +366,9 @@ class VideoSynthesisInterface(QWidget):
         is_article = self.podcast_style_combo.currentText() == self.tr("文章单词")
         self.ai_vocab_action.setVisible(enabled)
         self.set_layout_visible(self.podcast_style_layout, enabled)
-        self.set_layout_visible(self.podcast_title_layout, enabled and not is_article)
+        self.set_layout_visible(self.podcast_title_layout, enabled)
         self.set_layout_visible(self.podcast_background_layout, enabled and not is_article)
         self.set_layout_visible(self.podcast_cover_layout, enabled and is_article)
-        self.set_layout_visible(self.podcast_date_layout, enabled and is_article)
 
     def on_soft_subtitle_changed(self, checked: bool):
         """处理软字幕选项变更"""
@@ -426,9 +413,6 @@ class VideoSynthesisInterface(QWidget):
 
     def save_podcast_cover(self):
         cfg.set(cfg.podcast_template_cover, self.podcast_cover_input.text().strip())
-
-    def save_podcast_date(self):
-        cfg.set(cfg.podcast_template_date, self.podcast_date_input.text().strip())
 
     def choose_podcast_background(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -487,7 +471,6 @@ class VideoSynthesisInterface(QWidget):
         self.save_podcast_title()
         self.save_podcast_background()
         self.save_podcast_cover()
-        self.save_podcast_date()
         subtitle_file = self.subtitle_input.text()
         video_file = self.video_input.text()
         if not subtitle_file or not video_file:

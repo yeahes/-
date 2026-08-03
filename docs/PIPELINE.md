@@ -35,6 +35,16 @@ Rules:
 - Preserve source order and token coverage.
 - Prefer clause, punctuation, discourse, and phrase boundaries.
 - Avoid cutting after prepositions, articles, auxiliaries, or connectors.
+- Before IDs are assigned, cues above the 12-word/68-character soft visual
+  budget may be split only at a high-confidence temporal display boundary:
+  sentence terminal (>=120ms pause), two complete punctuated clauses (>=250ms
+  pause), or a punctuated non-finite introduction followed by a complete main
+  clause (>=250ms pause). Both sides must have at least four words and meet
+  the local display-duration floor. Otherwise renderer wrapping owns the cue.
+- The same pre-ID finalizer may rebalance a short, parser-confirmed non-finite
+  conditional prefix from the start of one cue to the preceding incomplete
+  clause. It requires continuity, one speaker, a sub-450ms pause, a complete
+  following main clause, and both resulting cues within the hard word limit.
 
 ## Stage 3: Semantic Chinese Translation
 
@@ -68,11 +78,16 @@ Output:
 
 Rules:
 
-- Do not change English text.
-- Merge very short spoken beats only when safe and under length limit.
-- Apply minimum display duration when room allows.
-- Bridge short display gaps when the next subtitle follows soon.
-- Do not overlap adjacent subtitles.
+- The final word ledger is the only timing authority after English boundaries
+  and IDs are frozen.
+- Each final cue is derived from its own `subtitle_id -> [word_start, word_end]`
+  envelope. WhisperX may update ledger word times but cannot map final cue text
+  to a separate time range.
+- A padding overlap may be reconciled only at a shared boundary that stays
+  between the adjacent word envelopes.
+- Do not change English text, Chinese text, subtitle ID, word range, or order.
+- Missing, duplicate, unknown, or synthetic final timeline IDs are ERRORs and
+  block export.
 
 ## Stage 5: Validation and Artifacts
 
@@ -92,6 +107,18 @@ Outputs:
 - `allocation-final.json`
 - `allocation-unresolved.json`
 - `translation-structure-errors.json`
+- `final-cue-timeline.json`
+- `run-state.json`
+
+Run-state rules:
+
+- It is a progress/recovery record, never a subtitle source of truth.
+- It hashes the input subtitle, article state, relevant stable configuration,
+  model/prompt values, and selected timing backend.
+- A stage artifact is reusable only when its recorded digest and full input
+  fingerprint match; otherwise the normal stage executes.
+- Existing LLM batch caches may be reused under their current cache keys, but
+  completion order never controls translation or subtitle writeback order.
 
 Validation checks:
 

@@ -1,5 +1,5 @@
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QWidget
+from PyQt5.QtWidgets import QToolButton, QVBoxLayout, QWidget
 from qfluentwidgets import BodyLabel
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import MessageBoxBase, SwitchSettingCard, ComboBoxSettingCard
@@ -64,8 +64,8 @@ class SubtitleSettingDialog(MessageBoxBase):
 
         self.stable_mode_card = SwitchSettingCard(
             FIF.TILES,
-            self.tr("\u4e0a\u5c4f\u7a33\u5b9a\u6a21\u5f0f"),
-            self.tr("\u672c\u5730\u5207\u82f1\u6587\uff0c\u6a21\u578b\u53ea\u7ffb\u4e2d\u6587\uff0c\u4fdd\u62a4\u65f6\u95f4\u8f74\u548c\u82f1\u6587\u539f\u6587"),
+            self.tr("\u7a33\u5b9a\u53cc\u8bed\u5b57\u5e55"),
+            self.tr("\u672c\u5730\u5207\u82f1\u6587\uff0c\u6a21\u578b\u53ea\u5199\u4e2d\u6587\uff0c\u4fdd\u62a4\u65f6\u95f4\u8f74\u548c\u82f1\u6587\u539f\u6587"),
             cfg.need_screen_subtitle_edit,
             self,
         )
@@ -88,19 +88,11 @@ class SubtitleSettingDialog(MessageBoxBase):
         )
         self.legacy_settings_status.setWordWrap(True)
 
-        self.screen_quality_check_card = SwitchSettingCard(
-            FIF.SEARCH,
-            self.tr("\u4e0a\u5c4f\u5019\u9009\u8d28\u68c0"),
-            self.tr("\u4e8c\u6b21\u68c0\u67e5\u53ef\u7591\u65ad\u53e5\uff0c\u4f1a\u589e\u52a0 Token \u6d88\u8017"),
-            cfg.need_screen_subtitle_quality_check,
-            self,
-        )
-
-        self.safe_auto_repair_card = SwitchSettingCard(
-            FIF.ACCEPT,
-            self.tr("自动复查与安全修复"),
-            self.tr("只修缺中文、严重超速、句首标点和明显重复中文；不改英文和时间轴"),
-            cfg.screen_subtitle_safe_auto_repair,
+        self.chinese_polish_card = SwitchSettingCard(
+            FIF.EDIT,
+            self.tr("中文字幕润色"),
+            self.tr("仅润色本地检查出的高风险中文；不改英文、时间轴或字幕条数"),
+            cfg.screen_subtitle_chinese_polish,
             self,
         )
 
@@ -124,13 +116,6 @@ class SubtitleSettingDialog(MessageBoxBase):
             parent=self,
         )
 
-        # 添加到布局
-        self.viewLayout.addWidget(self.titleLabel)
-        self.viewLayout.addWidget(self.stable_mode_card)
-        self.viewLayout.addWidget(self.stable_mode_status)
-        self.viewLayout.addWidget(self.screen_quality_check_card)
-        self.viewLayout.addWidget(self.safe_auto_repair_card)
-        self.viewLayout.addWidget(self.screen_cjk_card)
         self.allocation_concurrency_card = SpinBoxSettingCard(
             cfg.screen_subtitle_allocation_max_concurrency,
             FIF.TILES,
@@ -149,20 +134,57 @@ class SubtitleSettingDialog(MessageBoxBase):
             maximum=24,
             parent=self,
         )
+
+        self.production_status = BodyLabel(
+            self.tr("生产流程：词级时间轴 -> 本地英文切分 -> 固定 ID 中文分配 -> 覆盖检查"),
+            self,
+        )
+        self.production_status.setWordWrap(True)
+
+        self.performance_section = QWidget(self)
+        performance_layout = QVBoxLayout(self.performance_section)
+        performance_layout.setContentsMargins(0, 0, 0, 0)
+        performance_layout.setSpacing(10)
+        performance_layout.addWidget(self.allocation_concurrency_card)
+        performance_layout.addWidget(self.allocation_batch_size_card)
+
+        self.compatibility_section = QWidget(self)
+        compatibility_layout = QVBoxLayout(self.compatibility_section)
+        compatibility_layout.setContentsMargins(0, 0, 0, 0)
+        compatibility_layout.setSpacing(10)
+        compatibility_layout.addWidget(self.legacy_settings_status)
+        compatibility_layout.addWidget(self.split_card)
+        compatibility_layout.addWidget(self.split_type_card)
+        compatibility_layout.addWidget(self.word_count_cjk_card)
+        compatibility_layout.addWidget(self.word_count_english_card)
+        compatibility_layout.addWidget(self.remove_punctuation_card)
+
+        self.performance_toggle = self._create_section_toggle(
+            self.tr("高级性能设置"), self.performance_section, expanded=False
+        )
+        self.compatibility_toggle = self._create_section_toggle(
+            self.tr("兼容旧流程设置"), self.compatibility_section, expanded=False
+        )
+
+        # 添加到布局
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.production_status)
+        self.viewLayout.addWidget(self.stable_mode_card)
+        self.viewLayout.addWidget(self.stable_mode_status)
+        self.viewLayout.addWidget(self.chinese_polish_card)
+        self.viewLayout.addWidget(self.screen_cjk_card)
         self.viewLayout.addWidget(self.screen_english_card)
-        self.viewLayout.addWidget(self.allocation_concurrency_card)
-        self.viewLayout.addWidget(self.allocation_batch_size_card)
-        self.viewLayout.addWidget(self.legacy_settings_status)
-        self.viewLayout.addWidget(self.split_card)
-        self.viewLayout.addWidget(self.split_type_card)
-        self.viewLayout.addWidget(self.word_count_cjk_card)
-        self.viewLayout.addWidget(self.word_count_english_card)
-        self.viewLayout.addWidget(self.remove_punctuation_card)
+        self.viewLayout.addWidget(self.performance_toggle)
+        self.viewLayout.addWidget(self.performance_section)
+        self.viewLayout.addWidget(self.compatibility_toggle)
+        self.viewLayout.addWidget(self.compatibility_section)
+        self.stable_mode_card.checkedChanged.connect(self._sync_legacy_split_controls)
+        self._sync_legacy_split_controls(self.stable_mode_card.isChecked())
         # 设置间距
 
         self.viewLayout.setSpacing(10)
-        self.setMinimumSize(920, 820)
-        self.resize(920, 760)
+        self.setMinimumSize(760, 600)
+        self.resize(760, 660)
 
         # 设置窗口标题
         self.setWindowTitle(self.tr("字幕设置"))
@@ -170,3 +192,63 @@ class SubtitleSettingDialog(MessageBoxBase):
         # 只显示取消按钮
         self.yesButton.hide()
         self.cancelButton.setText(self.tr("关闭"))
+
+    def _create_section_toggle(
+        self,
+        title: str,
+        content: QWidget,
+        *,
+        expanded: bool,
+    ) -> QToolButton:
+        toggle = QToolButton(self)
+        toggle.setText(title)
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        toggle.setCheckable(True)
+        toggle.setChecked(expanded)
+        toggle.setStyleSheet(
+            "QToolButton { font-weight: 600; padding: 6px 0; text-align: left; }"
+        )
+        content.setVisible(expanded)
+        toggle.toggled.connect(
+            lambda checked: self._set_section_expanded(toggle, content, checked)
+        )
+        return toggle
+
+    def _set_section_expanded(
+        self,
+        toggle: QToolButton,
+        content: QWidget,
+        expanded: bool,
+    ) -> None:
+        content.setVisible(expanded)
+        toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.adjustSize()
+
+    def _sync_legacy_split_controls(self, screen_subtitle_enabled: bool) -> None:
+        """Keep compatibility controls from implying they own stable cutting."""
+        stable_mode_active = bool(screen_subtitle_enabled) and bool(
+            cfg.screen_subtitle_stable_mode.value
+        )
+        legacy_cards = (
+            self.split_card,
+            self.split_type_card,
+            self.word_count_cjk_card,
+            self.word_count_english_card,
+        )
+        for card in legacy_cards:
+            card.setEnabled(not stable_mode_active)
+
+        if stable_mode_active:
+            self.legacy_settings_status.setText(
+                self.tr(
+                    "兼容切分设置：稳定模式已固定使用词级英语语法切分；"
+                    "这些设置不参与最终英文边界，也不会影响字幕 ID。"
+                )
+            )
+        else:
+            self.legacy_settings_status.setText(
+                self.tr(
+                    "普通/兼容设置：关闭上屏稳定模式后，可在这里选择传统断句方式和长度。"
+                )
+            )

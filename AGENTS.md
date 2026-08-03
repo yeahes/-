@@ -15,6 +15,40 @@ This working copy optimizes VideoCaptioner for NotebookLM-style English podcast 
 - Chinese translation may use an LLM, but it must map back to fixed English subtitle IDs.
 - Do not silently change subtitle timing behavior. Document timing behavior changes in `docs/CURRENT_STATE.md`.
 
+## Root-Cause-First Engineering Rule
+
+- For every defect, first identify and correct the responsible data flow, state ownership,
+  interface contract, or invariant. Do not treat a visible symptom as the implementation
+  target when the underlying cause remains unresolved.
+- Do not use sample-specific conditions, blacklist/allowlist growth, silent fallback,
+  threshold relaxation, output-file patching, or repeated downstream repair as a substitute
+  for a root-cause fix. A local exception is allowed only when the general invariant is
+  already correct, the boundary condition is demonstrably isolated, and regression coverage
+  proves it cannot affect unrelated inputs.
+- Before adding a rule, state which invariant it enforces, which upstream owner is
+  responsible, and why an earlier stage cannot enforce it. Prefer removing conflicting
+  duplicate logic over adding another compensating layer.
+- Every fix must add a regression test at the layer where the defect originated, and must
+  preserve the project's frozen cross-stage contracts unless their explicit migration is
+  part of the task.
+
+## Root-Cause-First Timing Rule
+
+- Treat a root-cause architectural fix as the first priority for every subtitle/audio
+  timing defect. Do not use isolated cue padding, threshold relaxation, sample-specific
+  exceptions, or downstream SRT/ASS patches as a substitute for repairing a conflicting
+  timing data flow.
+- There must be one authoritative final word ledger. Alignment backends may update that
+  ledger's word times, but must not independently rewrite final cue times.
+- Frozen cue spans map each global `subtitle_id` to its first and last word IDs. Final
+  cue timings must be derived from those spans and must cover their own word envelope.
+- Any final display-boundary reconciliation must preserve word-envelope coverage, frozen
+  cue order, subtitle IDs, English text, and word timestamps. It must be validated before
+  SRT/ASS export.
+- Final SRT, ASS, and timing audit artifacts must be generated from the same ID-addressable
+  cue timeline. Lost or synthetic IDs such as `S0000` are a validation failure, not
+  acceptable diagnostic output.
+
 ## Required Context Read Order
 
 Before substantial edits, read:

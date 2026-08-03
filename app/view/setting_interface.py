@@ -96,8 +96,8 @@ class SettingInterface(ScrollArea):
         # 翻译与优化配置卡片
         self.subtitleCorrectCard = SwitchSettingCard(
             FIF.EDIT,
-            self.tr("字幕校正"),
-            self.tr("字幕处理过程是否对生成的字幕进行校正"),
+            self.tr("兼容字幕校正"),
+            self.tr("传统字幕流程才使用；稳定双语字幕不会让模型改写英文"),
             cfg.need_optimize,
             self.translateGroup,
         )

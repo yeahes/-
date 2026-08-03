@@ -13,3 +13,18 @@ def word_count(text: str) -> int:
 
 def word_tokens(text: str) -> List[str]:
     return WORD_RE.findall((text or "").lower())
+
+
+def is_allowed_discourse_overflow(text: str, count: int, hard_limit: int) -> bool:
+    """Allow one complete Plus sentence above the soft display limit.
+
+    This narrow exception avoids creating a one-word subtitle just to satisfy a
+    numeric limit. It is shared by generation and audit code so the same cue
+    cannot be accepted by one path and rejected by another.
+    """
+    normalized = str(text or "").strip()
+    return bool(
+        count == hard_limit + 1
+        and re.match(r"^plus\s*,?\s+", normalized, re.IGNORECASE)
+        and re.search(r"[.!?][\"')\]]*\s*$", normalized)
+    )

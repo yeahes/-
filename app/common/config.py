@@ -266,11 +266,8 @@ class Config(QConfig):
     screen_subtitle_stable_mode = ConfigItem(
         "Subtitle", "ScreenSubtitleStableMode", True, BoolValidator()
     )
-    need_screen_subtitle_quality_check = ConfigItem(
-        "Subtitle", "NeedScreenSubtitleQualityCheck", False, BoolValidator()
-    )
-    screen_subtitle_safe_auto_repair = ConfigItem(
-        "Subtitle", "ScreenSubtitleSafeAutoRepair", False, BoolValidator()
+    screen_subtitle_chinese_polish = ConfigItem(
+        "Subtitle", "ScreenSubtitleChinesePolish", False, BoolValidator()
     )
     screen_subtitle_max_cjk = ConfigItem(
         "Subtitle", "ScreenSubtitleMaxCJK", 28, RangeValidator(8, 60)
