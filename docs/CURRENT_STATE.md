@@ -522,14 +522,39 @@ Result:
   wrapped lines. A grammatically protected 37-word English cue therefore
   retained its frozen subtitle boundary but silently lost the tail of its
   77-character Chinese translation in the article-template video.
-- Fix: article-template rendering now reduces Chinese display scale from its
-  normal size down to a bounded minimum until the full translation fits its
-  two-line visual region. It then renders every resulting line; no renderer
-  slice may omit translated text. English text, cue boundaries, IDs, word
-  spans, timings, allocation, and manifest behavior are unchanged.
+- Initial containment: article-template rendering no longer slices wrapped
+  Chinese text. The subsequent visual-pagination behavior below is now the
+  acceptance path for long bilingual cues; fitting an entire long cue into one
+  two-line panel is not considered readable output.
 - Regression and real-frame validation used the former S0004 shape. The PNG
   at `E:\VideoCaptioner-e2e-runs\ai-writing-style-full-e2e-20260804\overflow-fix-frame\S0004-fixed.png`
   contains the entire Chinese text with no English/Chinese alpha-mask overlap.
   `tests\test_stable_caption_rules.py`, `scripts\run_regression.py`, and
   `git diff --check` passed. No full video was rerendered for this layout-only
   verification.
+
+## 2026-08-04 Article Template Visual Pagination
+
+- Root cause: the structural-overflow path deliberately retained a grammatically
+  protected English cue as one frozen subtitle timeline item. The renderer only
+  wrapped that cue, so the real 37-word S0004 was still displayed as a large
+  bilingual paragraph in one frame. Keeping all characters visible did not
+  satisfy the template's reading requirement.
+- Fix: article-template rendering now creates deterministic visual pages inside
+  one existing cue when it exceeds the normal 16-English-word screen ceiling or
+  30 visible Chinese characters. English pages preserve exact word order and
+  prefer nearby punctuation; Chinese pages prefer nearby Chinese punctuation.
+  Otherwise both use balanced local splits. The active page is selected from
+  the current render time as an equal fraction of the original cue envelope.
+- Invariant: the renderer does not change SRT/ASS text, subtitle IDs, frozen
+  word spans, cue start/end times, Chinese allocation, or manifest resolution.
+  A visual page is presentation state only. Video frame caching includes the
+  visual page index so a long cue actually advances instead of reusing page 1.
+- The real S0004 envelope (`13.290s` to `25.440s`) renders as three readable
+  pages. Delegated PNG checks at `13.5s`, `17.5s`, and `21.5s` found two English
+  lines plus one Chinese line per page, no crop, and zero visible English/
+  Chinese alpha-mask overlap. The page texts concatenate exactly to the frozen
+  source cue. Evidence: `E:\VideoCaptioner-e2e-runs\ai-writing-style-full-e2e-20260804\visual-pagination-validation`.
+- `runtime\python.exe -X utf8 tests\test_stable_caption_rules.py`,
+  `runtime\python.exe -X utf8 scripts\run_regression.py`, and
+  `git diff --check` passed. No ASR, LLM call, or full-video synthesis was run.
