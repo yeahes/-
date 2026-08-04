@@ -3514,6 +3514,56 @@ def test_article_template_does_not_truncate_a_long_english_subtitle():
     assert " ".join(rendered_lines) == text
 
 
+def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
+    article_image = Image.new(
+        "RGB",
+        (
+            podcast_learning_video.acx(854),
+            podcast_learning_video.acy(480),
+        ),
+    )
+    english = (
+        "Yeah. And, you know, what is genuinely consequential about that 1.2 "
+        "million word study is that while everyone is still looking for outdated "
+        "clues like excessive em dashes, these large language models have quietly "
+        "mutated their syntax."
+    )
+    chinese = (
+        "是的。而且，你知道，那项120万词研究真正要紧的地方在于，"
+        "当所有人还在寻找过时的线索，比如大量使用的破折号时，"
+        "这些大语言模型已经在悄然改变自己的句法结构。"
+    )
+    cue = podcast_learning_video.Cue(1, 0.0, 12.15, english, chinese, "male")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    zh_font = podcast_learning_video.fit_article_zh_font(
+        draw,
+        chinese,
+        podcast_learning_video.acx(1455),
+    )
+    zh_lines = podcast_learning_video.wrap_zh(
+        draw,
+        chinese,
+        zh_font,
+        podcast_learning_video.acx(1455),
+    )
+    rendered_lines = []
+    original_draw_text = podcast_learning_video.draw_stroked_text
+
+    def capture_draw_text(draw, xy, line, *args, **kwargs):
+        if line in zh_lines:
+            rendered_lines.append(line)
+        return original_draw_text(draw, xy, line, *args, **kwargs)
+
+    with patch.object(
+        podcast_learning_video, "draw_stroked_text", side_effect=capture_draw_text
+    ):
+        podcast_learning_video.draw_article_frame(article_image, cue, vocab_plan={})
+
+    assert len(zh_lines) <= 2
+    assert zh_font.size < podcast_learning_video.article_cjk_font(46, 700).size
+    assert "".join(rendered_lines) == chinese
+
+
 def test_standard_chinese_subtitle_font_uses_48_then_46_before_two_lines():
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     width = podcast_learning_video.scx(1459)

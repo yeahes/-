@@ -127,6 +127,7 @@ VOCAB_MIN_CARDS_PER_EPISODE = 3
 VOCAB_MAX_CARDS_PER_EPISODE = 22
 VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 3
 ARTICLE_SUBTITLE_EN_MIN_SIZE = 38
+ARTICLE_SUBTITLE_ZH_MIN_SIZE = 24
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
 )
@@ -1660,6 +1661,25 @@ def fit_article_en_font(draw, text: str, max_width: int) -> ImageFont.FreeTypeFo
     return article_en_font(ARTICLE_SUBTITLE_EN_MIN_SIZE, 600)
 
 
+def fit_article_zh_font(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_lines: int = 2,
+) -> ImageFont.FreeTypeFont:
+    """Fit every translated character into the article subtitle panel.
+
+    Structural English-overflow cues remain one frozen timeline cue.  The
+    renderer must therefore reduce the Chinese display scale before it ever
+    omits a wrapped line.
+    """
+    for size in range(46, ARTICLE_SUBTITLE_ZH_MIN_SIZE - 1, -2):
+        fnt = article_cjk_font(size, 700)
+        if len(wrap_zh(draw, text, fnt, max_width)) <= max_lines:
+            return fnt
+    return article_cjk_font(ARTICLE_SUBTITLE_ZH_MIN_SIZE, 700)
+
+
 def wrap_article_en_subtitle(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -2545,9 +2565,9 @@ def draw_article_frame(
         if len(en_lines) == 2:
             en_lines = wrap_en_preserving_highlight(d, cue.en, en_font, acx(en_width), key)
         highlight_ranges = highlight_ranges_for_lines(en_lines, key)
-        zh_font = article_cjk_font(46, 700)
         zh_width = 1455
-        zh_lines = wrap_zh(d, cue.zh, zh_font, acx(zh_width))[:2] if cue.zh else []
+        zh_font = fit_article_zh_font(d, cue.zh, acx(zh_width)) if cue.zh else None
+        zh_lines = wrap_zh(d, cue.zh, zh_font, acx(zh_width)) if cue.zh else []
         en_gap = int(en_font.size * 1.16)
         zh_gap = 58
         en_count = max(1, len(en_lines))
