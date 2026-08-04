@@ -3716,6 +3716,74 @@ def test_article_page_timeline_uses_fixed_fonts_and_word_boundaries():
         assert podcast_learning_video.article_visual_page_index(cue, transition) == following["index"]
 
 
+def test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile():
+    text = "A practical guide to clear reasoning beyond doubt."
+    cue = podcast_learning_video.Cue(202, 5.0, 8.0, text, "一条简短的中文说明。", "male")
+    cue.subtitle_id = "S0202"
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    page = plan["pages"][0]
+    assert page["en_lines"] == [text]
+    assert page["en_width"] == podcast_learning_video.ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH
+    assert page["start"] == cue.start
+    assert page["end"] == cue.end
+
+
+def test_article_renderer_uses_wide_two_line_profile_without_time_pagination():
+    text = "You know, this robotic vocabulary actually connects to a very human critique from way back."
+    cue = podcast_learning_video.Cue(110, 335.5, 340.62, text, "其实，这种机械化的措辞，与一种相当人性化、由来已久的批评是相通的。", "male")
+    cue.subtitle_id = "S0110"
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    page = plan["pages"][0]
+    assert page["en_lines"] == [
+        "You know, this robotic vocabulary actually",
+        "connects to a very human critique from way back.",
+    ]
+    assert page["en_width"] == podcast_learning_video.ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH
+    assert page["start"] == cue.start
+    assert page["end"] == cue.end
+
+
+def test_article_renderer_uses_pixel_width_for_43_character_chinese_cue():
+    chinese = "这是一段包含数字和英文缩写AI的中文文本用于测试实际像素宽度而非字符数量是否能显示即可"
+    cue = podcast_learning_video.Cue(208, 8.0, 11.0, "A short cue remains on one page.", chinese, "male")
+    cue.subtitle_id = "S0208"
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    assert len(chinese) == 43
+    lines = podcast_learning_video._article_fixed_chinese_lines(draw, chinese)
+    assert len(lines) == 2
+    assert all(
+        podcast_learning_video.text_w(
+            draw,
+            line,
+            podcast_learning_video.article_cjk_font(46, 700),
+        )
+        <= podcast_learning_video.acx(podcast_learning_video.ARTICLE_SUBTITLE_ZH_WIDTH)
+        for line in lines
+    )
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    assert plan["pages"][0]["zh"] == chinese
+    assert plan["pages"][0]["start"] == cue.start
+    assert plan["pages"][0]["end"] == cue.end
+
+
 def test_article_renderer_blocks_paginated_cue_without_verified_word_ledger():
     text = " ".join(f"word{index}" for index in range(24))
     cue = podcast_learning_video.Cue(1, 0.0, 8.0, text, "这是一段需要分页的中文字幕。" * 3, "male")
@@ -3727,7 +3795,7 @@ def test_article_renderer_blocks_paginated_cue_without_verified_word_ledger():
     assert plan["errors"][0]["reason"] == "missing_or_mismatched_word_ledger"
 
 
-def test_article_page_plan_reports_unschedulable_word_boundary_before_total_duration():
+def test_article_renderer_keeps_s0188_shape_as_static_two_line_page():
     cue = podcast_learning_video.Cue(
         188,
         0.0,
@@ -3741,9 +3809,16 @@ def test_article_page_plan_reports_unschedulable_word_boundary_before_total_dura
 
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
 
-    assert plan["status"] == "render_structural_overflow"
-    assert plan["errors"][0]["reason"] == "no_word_boundary_with_minimum_page_duration"
-    assert "cue_duration_below_page_minimum" in plan["errors"][0]["attempted_reasons"]
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    page = plan["pages"][0]
+    assert page["en"] == cue.en
+    assert page["en_lines"] == [
+        "through reinforcement learning",
+        "from human feedback.",
+    ]
+    assert page["start"] == cue.start
+    assert page["end"] == cue.end
 
 
 def test_article_renderer_rejects_word_ledger_text_mismatch():
@@ -8728,8 +8803,11 @@ if __name__ == "__main__":
     test_article_template_does_not_truncate_a_long_english_subtitle()
     test_article_template_keeps_full_chinese_for_structural_overflow_cue()
     test_article_page_timeline_uses_fixed_fonts_and_word_boundaries()
+    test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile()
+    test_article_renderer_uses_wide_two_line_profile_without_time_pagination()
+    test_article_renderer_uses_pixel_width_for_43_character_chinese_cue()
     test_article_renderer_blocks_paginated_cue_without_verified_word_ledger()
-    test_article_page_plan_reports_unschedulable_word_boundary_before_total_duration()
+    test_article_renderer_keeps_s0188_shape_as_static_two_line_page()
     test_article_renderer_rejects_word_ledger_text_mismatch()
     test_article_renderer_blocks_before_ffmpeg_for_unplanned_fixed_font_page()
     test_article_renderer_requires_verified_word_ledger_even_for_single_page_cues()

@@ -613,3 +613,26 @@ Result:
   artifact found 212 valid plans and three intentional render blocks:
   `S0188`, `S0202`, and `S0208`. Evidence is under
   `E:\VideoCaptioner-e2e-runs\renderer-word-timeline-validation`.
+
+## 2026-08-04 Article Renderer Static Fixed-Width Layout
+
+- Root cause: the page planner treated a normal same-page line wrap as a
+  timed page requirement. It also treated Chinese character count above 30 as
+  overflow despite a valid 46px two-line pixel layout. Short source cues could
+  therefore be blocked when no legal 900ms word-gap transition existed.
+- Fix: fixed-font planning now accepts a static page with up to two English
+  lines at either the normal 1455px width or a 1498px safe-width profile, and
+  up to two Chinese lines measured at 46px. Character count is not a layout
+  authority. A timed page is still permitted only when static layout fails,
+  and it retains the word-ledger gap and 900ms duration gate.
+- Frozen English text, subtitle IDs, word spans, cue times, Chinese allocation,
+  SRT/ASS output, and manifest resolution are unchanged. No font reduction,
+  cue merge, or direct output patch is used.
+- Offline replay of the 215-cue `ai-writing-style-full-e2e-20260804` artifact
+  now produces 215 valid page plans. Representative fixed-font PNGs for
+  `S0188`, `S0202`, and `S0208` are at
+  `E:\VideoCaptioner-e2e-runs\renderer-layout-profile-validation`; they show
+  no crop or English/Chinese overlap. `S0110` also uses the safe-width static
+  two-line profile instead of a time page.
+- `tests\test_stable_caption_rules.py`, `scripts\run_regression.py`, and
+  `git diff --check` passed. No ASR, LLM request, or full-video synthesis ran.

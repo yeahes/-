@@ -163,7 +163,11 @@ Rule:
 - If rendered subtitles are wrong, first verify the resolved subtitle path.
 - The article-template renderer must verify the stable manifest, final cue
   timeline, and word ledger before synthesis. It plans fixed 58px English and
-  46px Chinese pages inside each frozen cue, switches only at ledger word
-  gaps, and requires at least 900ms per page. Missing or mismatched timing,
-  fixed-font overflow, or an unschedulable page raises
+  46px Chinese pages inside each frozen cue. It first keeps a whole cue on one
+  static page using measured pixels: the normal 1455px English panel, then the
+  1498px safe-width profile, with at most two English and two Chinese lines.
+  Chinese character count alone never creates a page. Only an actual
+  fixed-font overflow may require a timed page; those transitions switch only
+  at ledger word gaps and require at least 900ms per page. Missing or
+  mismatched timing, fixed-font overflow, or an unschedulable page raises
   `render_structural_overflow` before ffmpeg starts.
