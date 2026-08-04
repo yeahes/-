@@ -6611,6 +6611,48 @@ def test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned():
     assert len(editor._overlong_english_issues([incomplete])) == 1
 
 
+def test_stable_cut_splits_complete_comma_clauses_at_twenty_words():
+    text = (
+        "And you know the really strange consequence of that massive volume is that "
+        "you are constantly swimming in synthetic text, yet the very tricks you "
+        "probably used to spot it are completely contradicted by the latest linguistic data."
+    )
+    words = text.split()
+    editor = _marker_editor(words, max_words=16)
+
+    ranges = editor._stable_word_ranges_for_span((0, len(words) - 1))
+
+    assert ranges == [(0, 19), (20, len(words) - 1)]
+    assert [end - start + 1 for start, end in ranges] == [20, 18]
+    first = editor._item_from_word_span(*ranges[0])
+    second = editor._item_from_word_span(*ranges[1])
+    assert first is not None and second is not None
+    assert first.original.endswith("text,")
+    assert second.original.startswith("yet the very tricks")
+    assert editor._evaluate_item_pair_for_final_boundary(first, second)["legal"]
+    assert not editor._evaluate_final_display_fragment(second, first, None)[
+        "hard_fragment_issues"
+    ]
+
+    segment = ASRDataSeg(first.original, 0, 7080, "完整中文。")
+    segment.subtitle_id = "S0001"
+    segment.word_start, segment.word_end = ranges[0]
+    editor._safe_overlong_item_split = lambda item: ([], [])
+
+    assert editor._overlong_english_issues([segment]) == []
+    assert editor._structural_english_overflow_issues([segment]) == [
+        {
+            "subtitle_id": "S0001",
+            "start": "00:00:00.000",
+            "end": "00:00:07.080",
+            "word_count": 20,
+            "hard_limit": 16,
+            "text": first.original,
+            "reason": "no_legal_internal_cut_within_normal_limit",
+        }
+    ]
+
+
 def test_stable_cut_does_not_leave_terminal_prepositional_phrase():
     text = (
         "By one estimate artificial intelligence is currently drafting more than "

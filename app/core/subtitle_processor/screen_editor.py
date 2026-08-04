@@ -4933,10 +4933,10 @@ class ScreenSubtitleEditor:
         self, span: tuple[int, int], target_words: Optional[int] = None
     ) -> List[tuple[int, int]]:
         # The configured value is a preferred display length, not a grammar
-        # override. Normal cues stay within 16 words; 17-19 is reserved for a
+        # override. Normal cues stay within 16 words; 17-20 is reserved for a
         # rare structural exception when a shorter cut would be ungrammatical.
         target = max(1, min(target_words or self.max_english_words, 16))
-        emergency = 19
+        emergency = 20
         start, end = span
         if end < start:
             return []
@@ -5924,11 +5924,16 @@ class ScreenSubtitleEditor:
         word_start: int,
         word_end: int,
     ) -> bool:
-        """Permit a 17-19 word exception only for a complete local cue."""
+        """Permit a 17-20 word exception only for a complete local cue."""
         text = self._text_from_word_span(word_start, word_end)
         if re.search(r"[.!?][\"')\]]*\s*$", text or ""):
             return True
-        return self._is_parser_confirmed_comma_subordinate_clause(text)
+        if self._is_parser_confirmed_comma_subordinate_clause(text):
+            return True
+        item = self._item_from_word_span(word_start, word_end)
+        if not item or not re.search(r",[\"')\]]*\s*$", text or ""):
+            return False
+        return bool(self._visual_temporal_clause_shape(item).get("complete_main_clause"))
 
     def _merge_tiny_stable_ranges(
         self, ranges: List[tuple[int, int]], target: int, emergency: int
@@ -14122,8 +14127,6 @@ class ScreenSubtitleEditor:
             return False
         terminal_sentence = bool(re.search(r"[.!?][\"')\]]*\s*$", text or ""))
         protected_comma_clause = self._is_parser_confirmed_comma_subordinate_clause(text)
-        if not terminal_sentence and not protected_comma_clause:
-            return False
         word_start = getattr(segment, "word_start", None)
         word_end = getattr(segment, "word_end", None)
         if (
@@ -14141,6 +14144,13 @@ class ScreenSubtitleEditor:
             word_start=word_start,
             word_end=word_end,
         )
+        complete_comma_main_clause = (
+            word_count <= hard_limit + 4
+            and bool(re.search(r",[\"')\]]*\s*$", text or ""))
+            and bool(self._visual_temporal_clause_shape(item).get("complete_main_clause"))
+        )
+        if not terminal_sentence and not protected_comma_clause and not complete_comma_main_clause:
+            return False
         repaired, _ = self._safe_overlong_item_split(item)
         return not repaired
 
