@@ -1,12 +1,12 @@
 # Project State
-Status: in_progress
-Last verified: 2026-08-04 23:43:20 Asia/Shanghai
+Status: complete
+Last verified: 2026-08-04 23:45:18 Asia/Shanghai
 Branch: codex/e2e-caption-regression
-Verified HEAD: b1324b4
-Working tree: modified: renderer regression tests, documentation, task log, and state record
+Verified HEAD: d0ac431
+Working tree: clean after the state-record commit
 
 ## Current Goal
-Finish the renderer static-layout correction, verify its representative frames, then commit it on this branch.
+The renderer static-layout correction is committed and verified from frozen E2E artifacts.
 
 ## Confirmed Facts
 - Formal stable English boundaries no longer invoke the visual word/character budget.
@@ -36,7 +36,7 @@ Finish the renderer static-layout correction, verify its representative frames, 
 - `git diff --check`: PASS.
 
 ## Next Action
-Review the delegated visual report, then commit the renderer and documentation changes. Do not synthesize a full video.
+Await integration review. Do not synthesize a full video without a fresh production request.
 
 ## Do Not Regress
 - Keep fixed English text, word ranges, subtitle IDs, Chinese allocation, SRT/ASS timing, and manifest resolution unchanged by rendering.
