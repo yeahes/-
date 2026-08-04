@@ -126,8 +126,14 @@ VOCAB_CARDS_PER_MINUTE = 1.25
 VOCAB_MIN_CARDS_PER_EPISODE = 3
 VOCAB_MAX_CARDS_PER_EPISODE = 22
 VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 3
-ARTICLE_SUBTITLE_EN_MIN_SIZE = 38
-ARTICLE_SUBTITLE_ZH_MIN_SIZE = 24
+ARTICLE_SUBTITLE_EN_FONT_SIZE = 58
+ARTICLE_SUBTITLE_ZH_FONT_SIZE = 46
+ARTICLE_SUBTITLE_EN_MIN_SIZE = ARTICLE_SUBTITLE_EN_FONT_SIZE
+ARTICLE_SUBTITLE_ZH_MIN_SIZE = ARTICLE_SUBTITLE_ZH_FONT_SIZE
+ARTICLE_PAGE_MIN_DURATION_MS = 900
+ARTICLE_PAGE_LEAD_IN_MS = 70
+ARTICLE_PAGE_TAIL_HOLD_MS = 120
+ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
 # A long frozen cue remains one subtitle ID and one timing envelope, but the
 # article template may paginate it inside that envelope.  These are render
 # budgets, not segmentation or translation limits.
@@ -173,6 +179,23 @@ class Cue:
     en: str
     zh: str
     speaker: str
+    subtitle_id: str = ""
+    word_timing: tuple[dict, ...] = ()
+    article_page_plan: dict | None = None
+
+
+class RenderStructuralOverflowError(RuntimeError):
+    """Block video synthesis when a fixed-font render page cannot be planned."""
+
+    code = "render_structural_overflow"
+
+    def __init__(self, errors: list[dict]):
+        self.errors = list(errors)
+        details = "; ".join(
+            f"cue={error.get('cue_index')} reason={error.get('reason')}"
+            for error in self.errors
+        )
+        super().__init__(f"{self.code}: {details}")
 
 
 @dataclass(frozen=True)
@@ -339,6 +362,85 @@ def parse_srt(path: str | Path) -> list[Cue]:
         if len(en.split()) >= 4 or en.endswith("?"):
             speaker = "female" if speaker == "male" else "male"
     return cues
+
+
+def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bool:
+    """Attach only verified frozen-ledger timings for renderer page planning.
+
+    The SRT remains the display source.  The adjacent stable manifest supplies
+    timing evidence only after its final cue records agree with that SRT.
+    """
+    for cue in cues:
+        cue.subtitle_id = ""
+        cue.word_timing = ()
+        cue.article_page_plan = None
+
+    manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        timeline_path = Path(str(manifest.get("final_cue_timeline_path") or ""))
+        if not timeline_path.is_file():
+            return False
+        timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+        ledger_path = timeline_path.with_name("word-ledger.json")
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        records = list(timeline.get("records") or [])
+        words = list(ledger.get("words") or [])
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Article renderer could not load frozen word timing: %s", exc)
+        return False
+
+    if len(records) != len(cues) or not words:
+        return False
+    attached: list[tuple[Cue, str, tuple[dict, ...]]] = []
+    for cue, record in zip(cues, records):
+        try:
+            subtitle_id = str(record["subtitle_id"])
+            word_start = int(record["word_start"])
+            word_end = int(record["word_end"])
+            record_start = int(record["start_ms"]) / 1000.0
+            record_end = int(record["end_ms"]) / 1000.0
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            not subtitle_id
+            or word_start < 0
+            or word_end < word_start
+            or word_end >= len(words)
+            or abs(record_start - cue.start) > 0.005
+            or abs(record_end - cue.end) > 0.005
+        ):
+            return False
+        timed_words: list[dict] = []
+        for word in words[word_start : word_end + 1]:
+            try:
+                timed_words.append(
+                    {
+                        "surface": str(word["surface"]),
+                        "start": int(word["start_ms"]) / 1000.0,
+                        "end": int(word["end_ms"]) / 1000.0,
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                return False
+        cue_tokens = [
+            re.sub(r"[^a-z0-9']", "", token.lower())
+            for token in cue.en.split()
+        ]
+        ledger_tokens = [
+            re.sub(r"[^a-z0-9']", "", word["surface"].lower())
+            for word in timed_words
+        ]
+        if not cue_tokens or cue_tokens != ledger_tokens:
+            return False
+        attached.append((cue, subtitle_id, tuple(timed_words)))
+
+    for cue, subtitle_id, timed_words in attached:
+        cue.subtitle_id = subtitle_id
+        cue.word_timing = timed_words
+    return True
 
 
 def get_duration(media_path: str | Path) -> float:
@@ -1651,21 +1753,8 @@ def draw_frame(
 
 
 def fit_article_en_font(draw, text: str, max_width: int) -> ImageFont.FreeTypeFont:
-    max_width = acx(max_width)
-    # Stable subtitle cues may be grammatically protected long sentences. Keep
-    # a readable visual floor; callers display a third line when two are not
-    # enough instead of silently omitting text.
-    for size in range(58, ARTICLE_SUBTITLE_EN_MIN_SIZE - 1, -2):
-        fnt = article_en_font(size, 600)
-        lines = wrap_en(draw, text, fnt, max_width)
-        if (
-            len(lines) <= 2
-            and all(text_w(draw, line, fnt) <= max_width for line in lines)
-            and not _has_short_caption_line(lines)
-            and not _has_discouraged_caption_break(text, lines)
-        ):
-            return fnt
-    return article_en_font(ARTICLE_SUBTITLE_EN_MIN_SIZE, 600)
+    """Article subtitle typography is fixed; page planning owns overflow."""
+    return article_en_font(ARTICLE_SUBTITLE_EN_FONT_SIZE, 600)
 
 
 def article_visual_page_count(cue: Cue | None) -> int:
@@ -1683,6 +1772,15 @@ def article_visual_page_count(cue: Cue | None) -> int:
 
 def article_visual_page_index(cue: Cue | None, display_time: float | None) -> int:
     """Map an absolute render time to a page without changing cue timing."""
+    plan = cue.article_page_plan if cue is not None else None
+    if plan and plan.get("status") == "ok":
+        pages = list(plan.get("pages") or [])
+        if display_time is None or len(pages) <= 1:
+            return 0
+        for index, page in enumerate(pages):
+            if float(display_time) < float(page["end"]) or index == len(pages) - 1:
+                return index
+        return len(pages) - 1
     page_count = article_visual_page_count(cue)
     if cue is None or page_count <= 1 or display_time is None:
         return 0
@@ -1748,6 +1846,12 @@ def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tup
     """Return the page text for a cue while retaining its frozen source text."""
     if cue is None:
         return "", ""
+    plan = cue.article_page_plan
+    if plan and plan.get("status") == "ok":
+        pages = list(plan.get("pages") or [])
+        if pages:
+            page = pages[article_visual_page_index(cue, display_time)]
+            return str(page["en"]), str(page["zh"])
     page_count = article_visual_page_count(cue)
     page_index = article_visual_page_index(cue, display_time)
     english_pages = split_article_visual_pages(cue.en, page_count)
@@ -1758,23 +1862,244 @@ def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tup
     )
 
 
+def _article_fixed_english_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    key: str | None = None,
+) -> list[str]:
+    if len(str(text or "").split()) > ARTICLE_VISUAL_PAGE_MAX_WORDS:
+        return []
+    fnt = article_en_font(ARTICLE_SUBTITLE_EN_FONT_SIZE, 600)
+    lines = wrap_en_preserving_highlight(draw, text, fnt, acx(1455), key)
+    if (
+        not lines
+        or len(lines) > 2
+        or any(text_w(draw, line, fnt) > acx(1455) for line in lines)
+        or _has_short_caption_line(lines)
+        or _has_discouraged_caption_break(text, lines)
+    ):
+        return []
+    return lines
+
+
+def _article_fixed_chinese_lines(draw: ImageDraw.ImageDraw, text: str) -> list[str]:
+    if not text:
+        return []
+    if len(re.sub(r"\s+", "", text)) > ARTICLE_VISUAL_PAGE_MAX_ZH_CHARS:
+        return []
+    fnt = article_cjk_font(ARTICLE_SUBTITLE_ZH_FONT_SIZE, 700)
+    lines = wrap_zh(draw, text, fnt, acx(1455))
+    if len(lines) > 2 or any(text_w(draw, line, fnt) > acx(1455) for line in lines):
+        return []
+    return lines
+
+
+def _article_page_break_score(
+    words: list[str],
+    split: int,
+    target_words: float,
+    word_timing: tuple[dict, ...],
+) -> int:
+    score = abs(split - target_words) * 240
+    if split >= len(words):
+        return int(score)
+    break_penalty = _article_visual_break_penalty(words, split)
+    if break_penalty >= CAPTION_HARD_BREAK_PENALTY:
+        return CAPTION_HARD_BREAK_PENALTY
+    score += break_penalty
+    if len(word_timing) == len(words):
+        pause_ms = max(
+            0,
+            round((word_timing[split]["start"] - word_timing[split - 1]["end"]) * 1000),
+        )
+        score -= min(pause_ms, ARTICLE_PAGE_PAUSE_PREFERENCE_MS) * 4
+    return int(score)
+
+
+def _partition_article_english_pages(
+    draw: ImageDraw.ImageDraw,
+    words: list[str],
+    page_count: int,
+    word_timing: tuple[dict, ...],
+) -> list[tuple[int, int]] | None:
+    """Find fixed-font page spans without creating a hard phrase split."""
+    memo: dict[tuple[int, int], tuple[int, list[tuple[int, int]]] | None] = {}
+
+    def solve(start: int, remaining_pages: int):
+        key = (start, remaining_pages)
+        if key in memo:
+            return memo[key]
+        remaining_words = len(words) - start
+        if remaining_words < remaining_pages:
+            memo[key] = None
+            return None
+        if remaining_pages == 1:
+            text = " ".join(words[start:])
+            result = (0, [(start, len(words))]) if _article_fixed_english_lines(draw, text) else None
+            memo[key] = result
+            return result
+
+        best: tuple[int, list[tuple[int, int]]] | None = None
+        target_words = remaining_words / remaining_pages
+        last_end = len(words) - (remaining_pages - 1)
+        for end in range(start + 1, last_end + 1):
+            text = " ".join(words[start:end])
+            if not _article_fixed_english_lines(draw, text):
+                continue
+            score = _article_page_break_score(words, end, start + target_words, word_timing)
+            if score >= CAPTION_HARD_BREAK_PENALTY:
+                continue
+            suffix = solve(end, remaining_pages - 1)
+            if suffix is None:
+                continue
+            candidate = (score + suffix[0], [(start, end), *suffix[1]])
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+        memo[key] = best
+        return best
+
+    result = solve(0, page_count)
+    return result[1] if result is not None else None
+
+
+def _schedule_article_page_boundaries(
+    cue: Cue,
+    spans: list[tuple[int, int]],
+) -> tuple[list[float] | None, str]:
+    if len(spans) <= 1:
+        return [float(cue.start), float(cue.end)], ""
+    words = cue.word_timing
+    if len(words) != len(str(cue.en or "").split()):
+        return None, "missing_or_mismatched_word_ledger"
+    min_duration = ARTICLE_PAGE_MIN_DURATION_MS / 1000.0
+    if float(cue.end) - float(cue.start) + 1e-6 < len(spans) * min_duration:
+        return None, "cue_duration_below_page_minimum"
+
+    boundaries = [float(cue.start)]
+    for index, (_, end) in enumerate(spans[:-1]):
+        previous_word = words[end - 1]
+        next_word = words[spans[index + 1][0]]
+        previous_end = float(previous_word["end"])
+        next_start = float(next_word["start"])
+        remaining_pages = len(spans) - index - 1
+        lower = max(previous_end, boundaries[-1] + min_duration)
+        upper = min(next_start, float(cue.end) - remaining_pages * min_duration)
+        if lower > upper + 1e-6:
+            return None, "no_word_boundary_with_minimum_page_duration"
+        comfortable_lower = max(lower, previous_end + ARTICLE_PAGE_TAIL_HOLD_MS / 1000.0)
+        comfortable_upper = min(upper, next_start - ARTICLE_PAGE_LEAD_IN_MS / 1000.0)
+        if comfortable_lower <= comfortable_upper:
+            boundary = (comfortable_lower + comfortable_upper) / 2.0
+        else:
+            boundary = (lower + upper) / 2.0
+        boundaries.append(boundary)
+    boundaries.append(float(cue.end))
+    return boundaries, ""
+
+
+def build_article_visual_page_plan(
+    cue: Cue,
+    draw: ImageDraw.ImageDraw,
+) -> dict:
+    """Plan presentation-only fixed-font pages for one frozen subtitle cue."""
+    words = str(cue.en or "").split()
+    chinese = re.sub(r"\s+", "", str(cue.zh or ""))
+    if not words:
+        return {
+            "status": "render_structural_overflow",
+            "errors": [{"cue_index": cue.index, "reason": "empty_english_cue"}],
+        }
+    failure_reasons: set[str] = set()
+    for page_count in range(1, len(words) + 1):
+        spans = _partition_article_english_pages(draw, words, page_count, cue.word_timing)
+        if spans is None:
+            continue
+        chinese_pages = split_chinese_visual_pages(chinese, page_count)
+        if chinese and len(chinese_pages) != page_count:
+            failure_reasons.add("chinese_page_cardinality_mismatch")
+            continue
+        if not chinese:
+            chinese_pages = [""] * page_count
+        if any(not _article_fixed_chinese_lines(draw, page) for page in chinese_pages if page):
+            failure_reasons.add("chinese_does_not_fit_fixed_font")
+            continue
+        boundaries, timing_reason = _schedule_article_page_boundaries(cue, spans)
+        if boundaries is None:
+            failure_reasons.add(timing_reason)
+            continue
+        pages = [
+            {
+                "index": index,
+                "en": " ".join(words[start:end]),
+                "zh": chinese_pages[index],
+                "word_start": start,
+                "word_end": end - 1,
+                "start": boundaries[index],
+                "end": boundaries[index + 1],
+            }
+            for index, (start, end) in enumerate(spans)
+        ]
+        return {
+            "status": "ok",
+            "font_size": {
+                "english": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+                "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+            },
+            "pages": pages,
+        }
+    reason_priority = (
+        "missing_or_mismatched_word_ledger",
+        "no_word_boundary_with_minimum_page_duration",
+        "cue_duration_below_page_minimum",
+        "chinese_does_not_fit_fixed_font",
+        "chinese_page_cardinality_mismatch",
+        "no_fixed_font_page_partition",
+    )
+    primary_reason = next(
+        (reason for reason in reason_priority if reason in failure_reasons),
+        "no_fixed_font_page_partition",
+    )
+    return {
+        "status": "render_structural_overflow",
+        "errors": [
+            {
+                "cue_index": cue.index,
+                "reason": primary_reason,
+                "attempted_reasons": sorted(failure_reasons),
+            }
+        ],
+    }
+
+
+def prepare_article_visual_page_plans(cues: list[Cue], subtitle_path: str | Path) -> None:
+    """Prepare every article-template page plan before starting ffmpeg."""
+    if not attach_article_word_timing(cues, subtitle_path):
+        raise RenderStructuralOverflowError(
+            [
+                {
+                    "cue_index": "all",
+                    "reason": "missing_or_mismatched_word_ledger",
+                }
+            ]
+        )
+    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    errors: list[dict] = []
+    for cue in cues:
+        cue.article_page_plan = build_article_visual_page_plan(cue, draw)
+        if cue.article_page_plan.get("status") != "ok":
+            errors.extend(cue.article_page_plan.get("errors") or [])
+    if errors:
+        raise RenderStructuralOverflowError(errors)
+
+
 def fit_article_zh_font(
     draw: ImageDraw.ImageDraw,
     text: str,
     max_width: int,
     max_lines: int = 2,
 ) -> ImageFont.FreeTypeFont:
-    """Fit every translated character into the article subtitle panel.
-
-    Structural English-overflow cues remain one frozen timeline cue.  The
-    renderer must therefore reduce the Chinese display scale before it ever
-    omits a wrapped line.
-    """
-    for size in range(46, ARTICLE_SUBTITLE_ZH_MIN_SIZE - 1, -2):
-        fnt = article_cjk_font(size, 700)
-        if len(wrap_zh(draw, text, fnt, max_width)) <= max_lines:
-            return fnt
-    return article_cjk_font(ARTICLE_SUBTITLE_ZH_MIN_SIZE, 700)
+    """Article subtitle typography is fixed; page planning owns overflow."""
+    return article_cjk_font(ARTICLE_SUBTITLE_ZH_FONT_SIZE, 700)
 
 
 def wrap_article_en_subtitle(
@@ -2654,6 +2979,10 @@ def draw_article_frame(
     draw_article_panel(img, article_rect(16, 546, 1584, 884), acx(16), (241, 236, 227, 255))
 
     if cue:
+        if cue.article_page_plan is None:
+            cue.article_page_plan = build_article_visual_page_plan(cue, d)
+        if cue.article_page_plan.get("status") != "ok":
+            raise RenderStructuralOverflowError(cue.article_page_plan.get("errors") or [])
         key = vocab["key"] if vocab else None
         visual_en, visual_zh = article_visual_page_text(cue, display_time)
         en_x = 68
@@ -2746,6 +3075,11 @@ def render_podcast_learning_video(
     cues = parse_srt(subtitle_path)
     if not cues:
         raise RuntimeError("字幕文件没有可用内容")
+    is_article_template = template_style == "文章单词"
+    if is_article_template:
+        # Reject any unreadable fixed-font page before a vocabulary request or
+        # ffmpeg process can create a partial output.
+        prepare_article_visual_page_plans(cues, subtitle_path)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     vocab_plan = load_or_generate_vocab_plan(
         subtitle_path,
@@ -2757,7 +3091,6 @@ def render_podcast_learning_video(
     # clip. Keep the entire audio/video even when its final subtitle ends early.
     duration = get_duration(media_path)
     frames = int(math.ceil(duration * FPS))
-    is_article_template = template_style == "文章单词"
     out_width = ARTICLE_WIDTH if is_article_template else WIDTH
     out_height = ARTICLE_HEIGHT if is_article_template else HEIGHT
     base = None if is_article_template else make_base(background_path)
