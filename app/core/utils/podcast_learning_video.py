@@ -130,6 +130,11 @@ ARTICLE_SUBTITLE_EN_FONT_SIZE = 58
 ARTICLE_SUBTITLE_ZH_FONT_SIZE = 46
 ARTICLE_SUBTITLE_EN_MIN_SIZE = ARTICLE_SUBTITLE_EN_FONT_SIZE
 ARTICLE_SUBTITLE_ZH_MIN_SIZE = ARTICLE_SUBTITLE_ZH_FONT_SIZE
+ARTICLE_SUBTITLE_EN_WIDTH = 1455
+# A cue may use the full safe panel width while retaining the fixed 58px
+# font. This is a layout profile, never a segmentation budget.
+ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH = 1498
+ARTICLE_SUBTITLE_ZH_WIDTH = 1455
 ARTICLE_PAGE_MIN_DURATION_MS = 900
 ARTICLE_PAGE_LEAD_IN_MS = 70
 ARTICLE_PAGE_TAIL_HOLD_MS = 120
@@ -140,7 +145,6 @@ ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
 # Keep the existing normal hard ceiling as the renderer page ceiling. The
 # preferred 6-12 word target still guides the balanced split when possible.
 ARTICLE_VISUAL_PAGE_MAX_WORDS = 16
-ARTICLE_VISUAL_PAGE_MAX_ZH_CHARS = 30
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
 )
@@ -1758,16 +1762,11 @@ def fit_article_en_font(draw, text: str, max_width: int) -> ImageFont.FreeTypeFo
 
 
 def article_visual_page_count(cue: Cue | None) -> int:
-    """Return the deterministic number of pages needed by one frozen cue."""
+    """Return the conservative fallback page count for an unplanned cue."""
     if cue is None:
         return 1
     english_words = len(str(cue.en or "").split())
-    chinese_chars = len(re.sub(r"\s+", "", str(cue.zh or "")))
-    return max(
-        1,
-        math.ceil(english_words / ARTICLE_VISUAL_PAGE_MAX_WORDS),
-        math.ceil(chinese_chars / ARTICLE_VISUAL_PAGE_MAX_ZH_CHARS),
-    )
+    return max(1, math.ceil(english_words / ARTICLE_VISUAL_PAGE_MAX_WORDS))
 
 
 def article_visual_page_index(cue: Cue | None, display_time: float | None) -> int:
@@ -1846,12 +1845,9 @@ def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tup
     """Return the page text for a cue while retaining its frozen source text."""
     if cue is None:
         return "", ""
-    plan = cue.article_page_plan
-    if plan and plan.get("status") == "ok":
-        pages = list(plan.get("pages") or [])
-        if pages:
-            page = pages[article_visual_page_index(cue, display_time)]
-            return str(page["en"]), str(page["zh"])
+    page = _article_visual_page(cue, display_time)
+    if page is not None:
+        return str(page["en"]), str(page["zh"])
     page_count = article_visual_page_count(cue)
     page_index = article_visual_page_index(cue, display_time)
     english_pages = split_article_visual_pages(cue.en, page_count)
@@ -1862,6 +1858,18 @@ def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tup
     )
 
 
+def _article_visual_page(cue: Cue | None, display_time: float | None) -> dict | None:
+    """Return the active planned page, including its fixed-font line layout."""
+    if cue is None:
+        return None
+    plan = cue.article_page_plan
+    if plan and plan.get("status") == "ok":
+        pages = list(plan.get("pages") or [])
+        if pages:
+            return pages[article_visual_page_index(cue, display_time)]
+    return None
+
+
 def _article_fixed_english_lines(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -1870,26 +1878,47 @@ def _article_fixed_english_lines(
     if len(str(text or "").split()) > ARTICLE_VISUAL_PAGE_MAX_WORDS:
         return []
     fnt = article_en_font(ARTICLE_SUBTITLE_EN_FONT_SIZE, 600)
-    lines = wrap_en_preserving_highlight(draw, text, fnt, acx(1455), key)
+    # First use a wider, still panel-safe profile for a complete one-line cue.
+    # A page transition is only needed when neither fixed-font layout fits.
+    if text_w(draw, text, fnt) <= acx(ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH):
+        return [text]
+    lines = wrap_en_preserving_highlight(draw, text, fnt, acx(ARTICLE_SUBTITLE_EN_WIDTH), key)
+    if (
+        lines
+        and len(lines) <= 2
+        and not any(text_w(draw, line, fnt) > acx(ARTICLE_SUBTITLE_EN_WIDTH) for line in lines)
+        and not _has_short_caption_line(lines)
+    ):
+        return lines
+    lines = wrap_en_preserving_highlight(
+        draw,
+        text,
+        fnt,
+        acx(ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH),
+        key,
+    )
     if (
         not lines
         or len(lines) > 2
-        or any(text_w(draw, line, fnt) > acx(1455) for line in lines)
+        or any(
+            text_w(draw, line, fnt) > acx(ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH)
+            for line in lines
+        )
         or _has_short_caption_line(lines)
-        or _has_discouraged_caption_break(text, lines)
     ):
         return []
+    # A line break inside one static page is not a timed English boundary. If
+    # no orphan line or pixel overflow is introduced, retain the complete text
+    # on screen and reserve hard grammar penalties for page transitions.
     return lines
 
 
 def _article_fixed_chinese_lines(draw: ImageDraw.ImageDraw, text: str) -> list[str]:
     if not text:
         return []
-    if len(re.sub(r"\s+", "", text)) > ARTICLE_VISUAL_PAGE_MAX_ZH_CHARS:
-        return []
     fnt = article_cjk_font(ARTICLE_SUBTITLE_ZH_FONT_SIZE, 700)
-    lines = wrap_zh(draw, text, fnt, acx(1455))
-    if len(lines) > 2 or any(text_w(draw, line, fnt) > acx(1455) for line in lines):
+    lines = wrap_zh(draw, text, fnt, acx(ARTICLE_SUBTITLE_ZH_WIDTH))
+    if len(lines) > 2 or any(text_w(draw, line, fnt) > acx(ARTICLE_SUBTITLE_ZH_WIDTH) for line in lines):
         return []
     return lines
 
@@ -2023,6 +2052,13 @@ def build_article_visual_page_plan(
         if any(not _article_fixed_chinese_lines(draw, page) for page in chinese_pages if page):
             failure_reasons.add("chinese_does_not_fit_fixed_font")
             continue
+        english_layouts = [
+            _article_fixed_english_lines(draw, " ".join(words[start:end]))
+            for start, end in spans
+        ]
+        if any(not lines for lines in english_layouts):
+            failure_reasons.add("english_does_not_fit_fixed_font")
+            continue
         boundaries, timing_reason = _schedule_article_page_boundaries(cue, spans)
         if boundaries is None:
             failure_reasons.add(timing_reason)
@@ -2036,6 +2072,29 @@ def build_article_visual_page_plan(
                 "word_end": end - 1,
                 "start": boundaries[index],
                 "end": boundaries[index + 1],
+                "en_lines": english_layouts[index],
+                "en_width": (
+                    ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH
+                    if any(
+                        text_w(
+                            draw,
+                            line,
+                            article_en_font(ARTICLE_SUBTITLE_EN_FONT_SIZE, 600),
+                        )
+                        > acx(ARTICLE_SUBTITLE_EN_WIDTH)
+                        for line in english_layouts[index]
+                    )
+                    else ARTICLE_SUBTITLE_EN_WIDTH
+                ),
+                # A same-page line wrap can be review-worthy without becoming
+                # a timed boundary error. It remains available to render
+                # inspection but cannot create or move a cue/page boundary.
+                "line_wrap_review": bool(
+                    _has_discouraged_caption_break(
+                        " ".join(words[start:end]),
+                        english_layouts[index],
+                    )
+                ),
             }
             for index, (start, end) in enumerate(spans)
         ]
@@ -2984,15 +3043,18 @@ def draw_article_frame(
         if cue.article_page_plan.get("status") != "ok":
             raise RenderStructuralOverflowError(cue.article_page_plan.get("errors") or [])
         key = vocab["key"] if vocab else None
+        page = _article_visual_page(cue, display_time)
         visual_en, visual_zh = article_visual_page_text(cue, display_time)
-        en_x = 68
-        en_width = 1455
+        en_width = int(page.get("en_width", ARTICLE_SUBTITLE_EN_WIDTH)) if page else ARTICLE_SUBTITLE_EN_WIDTH
+        en_x = (1600 - en_width) // 2
         en_font = fit_article_en_font(d, visual_en, en_width)
-        en_lines = wrap_article_en_subtitle(d, visual_en, en_font, acx(en_width))
-        if len(en_lines) == 2:
-            en_lines = wrap_en_preserving_highlight(d, visual_en, en_font, acx(en_width), key)
+        en_lines = list(page.get("en_lines") or []) if page else []
+        if not en_lines:
+            en_lines = wrap_article_en_subtitle(d, visual_en, en_font, acx(en_width))
+            if len(en_lines) == 2:
+                en_lines = wrap_en_preserving_highlight(d, visual_en, en_font, acx(en_width), key)
         highlight_ranges = highlight_ranges_for_lines(en_lines, key)
-        zh_width = 1455
+        zh_width = ARTICLE_SUBTITLE_ZH_WIDTH
         zh_font = fit_article_zh_font(d, visual_zh, acx(zh_width)) if visual_zh else None
         zh_lines = wrap_zh(d, visual_zh, zh_font, acx(zh_width)) if visual_zh else []
         en_gap = int(en_font.size * 1.16)
