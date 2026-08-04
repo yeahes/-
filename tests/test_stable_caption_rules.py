@@ -6653,6 +6653,109 @@ def test_stable_cut_splits_complete_comma_clauses_at_twenty_words():
     ]
 
 
+def test_overlong_repair_keeps_relative_clause_with_its_main_predicate():
+    text = (
+        "And you know the really strange consequence of that massive volume is that "
+        "you are constantly swimming in synthetic text, yet the very tricks you "
+        "probably used to spot it are completely contradicted by the latest linguistic data."
+    )
+    editor = _marker_editor(text.split(), max_words=16)
+    editor._prepare_syntax_cut_hints()
+    first = _word_item(editor, 0, 19, 1)
+    second = _word_item(editor, 20, len(editor._active_word_entries) - 1, 1)
+
+    split, candidates = editor._safe_overlong_item_split(second)
+
+    assert split == []
+    predicate_split = next(
+        candidate
+        for candidate in candidates
+        if candidate["cuts"] == [[29, 30]]
+    )
+    assert "subject_finite_verb_split" in predicate_split["hard_issues"]
+    assert predicate_split["continuation_display_issues"] == [
+        "right_orphaned_finite_predicate"
+    ]
+    noun_phrase_split = next(
+        candidate
+        for candidate in candidates
+        if candidate["cuts"] == [[23, 24]]
+    )
+    assert noun_phrase_split["continuation_display_issues"] == [
+        "left_connector_led_noun_phrase_fragment"
+    ]
+    preposition_split = next(
+        candidate
+        for candidate in candidates
+        if candidate["cuts"] == [[32, 33]]
+    )
+    assert preposition_split["continuation_display_issues"] == [
+        "right_preposition_led_fragment"
+    ]
+    assert editor._repair_final_overlong_display_items([first, second]) == [first, second]
+
+
+def test_final_pre_id_repair_keeps_the_relative_clause_with_its_predicate():
+    text = (
+        "And you know the really strange consequence of that massive volume is that "
+        "you are constantly swimming in synthetic text, yet the very tricks you "
+        "probably used to spot it are completely contradicted by the latest linguistic data."
+    )
+    editor = _marker_editor(text.split(), max_words=16)
+    editor._prepare_syntax_cut_hints()
+    items = [
+        _word_item(editor, 0, 19, 1),
+        _word_item(editor, 20, 32, 1),
+        _word_item(editor, 33, len(editor._active_word_entries) - 1, 1),
+    ]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [(item.word_start, item.word_end) for item in repaired] == [
+        (0, 19),
+        (20, len(editor._active_word_entries) - 1),
+    ]
+    assert repaired[1].original.endswith("latest linguistic data.")
+
+
+def test_final_pre_id_repair_merges_subjectless_predicate_across_a_long_pause():
+    text = (
+        "And you know the really strange consequence of that massive volume is that "
+        "you are constantly swimming in synthetic text, yet the very tricks you "
+        "probably used to spot it are completely contradicted by the latest linguistic data."
+    )
+    words = text.split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    relative_start = words.index("yet")
+    predicate_start = words.index("are", relative_start)
+    for entry in editor._active_word_entries[predicate_start:]:
+        entry["start_time"] += 400
+        entry["end_time"] += 400
+    items = [
+        _word_item(editor, 0, relative_start - 1, 1),
+        _word_item(editor, relative_start, predicate_start - 1, 1),
+        _word_item(editor, predicate_start, len(words) - 1, 1),
+    ]
+
+    evaluation = editor._evaluate_item_pair_for_final_boundary(items[1], items[2], items[0])
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert editor._boundary_pause_ms(items[1], items[2]) == 480
+    assert evaluation["legal"] is False
+    assert evaluation["continuation_display_issues"] == [
+        "right_orphaned_finite_predicate"
+    ]
+    assert [(item.word_start, item.word_end) for item in repaired] == [
+        (0, relative_start - 1),
+        (relative_start, len(words) - 1),
+    ]
+    assert repaired[1].original == (
+        "yet the very tricks you probably used to spot it are completely "
+        "contradicted by the latest linguistic data."
+    )
+
+
 def test_stable_cut_does_not_leave_terminal_prepositional_phrase():
     text = (
         "By one estimate artificial intelligence is currently drafting more than "
@@ -8400,6 +8503,9 @@ if __name__ == "__main__":
     test_short_nonindependent_backchannel_attaches_to_previous_display_item()
     test_complete_unsplittable_overflow_is_warning_not_overlong_error()
     test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned()
+    test_overlong_repair_keeps_relative_clause_with_its_main_predicate()
+    test_final_pre_id_repair_keeps_the_relative_clause_with_its_predicate()
+    test_final_pre_id_repair_merges_subjectless_predicate_across_a_long_pause()
     test_stable_cut_does_not_leave_terminal_prepositional_phrase()
     test_comma_terminated_parser_confirmed_subordinate_overflow_is_warning_not_error()
     test_comma_overflow_requires_parser_proof_and_no_safe_split()

@@ -2603,6 +2603,7 @@ class ScreenSubtitleEditor:
         return self._safe_item_split_for_budget(
             item,
             word_limit=self.max_english_words,
+            reject_orphaned_finite_predicate=True,
         )
 
     def _safe_item_split_for_budget(
@@ -2612,6 +2613,7 @@ class ScreenSubtitleEditor:
         word_limit: int,
         character_limit: Optional[int] = None,
         require_independent_display_units: bool = False,
+        reject_orphaned_finite_predicate: bool = False,
     ) -> tuple[List[ScreenSubtitleItem], List[Dict]]:
         if item.subtitle_id or item.word_start is None or item.word_end is None:
             return [], []
@@ -2638,12 +2640,18 @@ class ScreenSubtitleEditor:
                 self._visible_english_character_count(right.original),
             ]
             visual_display_issues: List[str] = []
+            continuation_display_issues: List[str] = []
             if require_independent_display_units:
                 visual_display_issues = list(
                     dict.fromkeys(
                         self._visual_split_display_unit_issues(left, None, right)
                         + self._visual_split_display_unit_issues(right, left, None)
                     )
+                )
+            if reject_orphaned_finite_predicate:
+                continuation_display_issues = self._pre_id_continuation_display_issues(
+                    left,
+                    right,
                 )
             candidate = {
                 "cuts": [[cut, cut + 1]],
@@ -2654,6 +2662,7 @@ class ScreenSubtitleEditor:
                 "hard_issues": list(evaluation.get("hard_issues") or []),
                 "hard_fragment_issues": hard_fragment_issues,
                 "visual_display_issues": visual_display_issues,
+                "continuation_display_issues": continuation_display_issues,
                 "boundary_scores": [float(evaluation.get("boundary_score") or 0.0)],
             }
             candidates_considered.append(candidate)
@@ -2661,6 +2670,7 @@ class ScreenSubtitleEditor:
                 candidate["hard_issues"]
                 or candidate["hard_fragment_issues"]
                 or candidate["visual_display_issues"]
+                or candidate["continuation_display_issues"]
                 or any(count > word_limit for count in word_counts)
                 or (
                     character_limit is not None
@@ -2683,6 +2693,95 @@ class ScreenSubtitleEditor:
             if best is None or score < best[:6]:
                 best = (*score, [left, right])
         return (best[6], candidates_considered) if best else ([], candidates_considered)
+
+    def _orphaned_finite_predicate_issues(
+        self,
+        item: ScreenSubtitleItem,
+    ) -> List[str]:
+        """Reject a repair that puts a finite predicate in a subjectless cue."""
+        nlp = self._load_syntax_nlp()
+        if not nlp:
+            return []
+        text = self._normalize_text(item.original)
+        if not text:
+            return []
+        try:
+            doc = nlp(text)
+        except Exception:
+            return []
+        root = next((token for token in doc if token.dep_ == "ROOT"), None)
+        if root is None:
+            return []
+        has_subject = any(
+            child.dep_ in {"nsubj", "nsubjpass", "csubj", "expl"}
+            for child in root.children
+        )
+        root_is_finite = (
+            root.pos_ in {"VERB", "AUX"}
+            and root.tag_ not in {"VB", "VBG", "VBN"}
+        )
+        root_has_finite_auxiliary = bool(
+            root.pos_ == "VERB"
+            and root.tag_ in {"VB", "VBG", "VBN"}
+            and any(
+                child.dep_ in {"aux", "auxpass"}
+                and child.tag_ in {"MD", "VBD", "VBP", "VBZ"}
+                for child in root.children
+            )
+        )
+        imperative = bool(
+            root.pos_ == "VERB"
+            and root.tag_ == "VB"
+            and re.search(r"[.!?][\"')\]]*\s*$", text)
+            and not has_subject
+        )
+        if (root_is_finite or root_has_finite_auxiliary) and not has_subject and not imperative:
+            return ["right_orphaned_finite_predicate"]
+        return []
+
+    def _pre_id_continuation_display_issues(
+        self,
+        left: ScreenSubtitleItem,
+        right: ScreenSubtitleItem,
+    ) -> List[str]:
+        """Keep pre-ID repairs from creating a continuation-only display cue."""
+        issues: List[str] = []
+        left_display_issues = self._visual_split_display_unit_issues(
+            left,
+            None,
+            right,
+        )
+        right_display_issues = self._visual_split_display_unit_issues(
+            right,
+            left,
+            None,
+        )
+        if "visual_connector_led_noun_phrase_fragment" in left_display_issues:
+            issues.append("left_connector_led_noun_phrase_fragment")
+        if "visual_preposition_led_fragment" in right_display_issues:
+            issues.append("right_preposition_led_fragment")
+        issues.extend(self._orphaned_finite_predicate_issues(right))
+        return list(dict.fromkeys(issues))
+
+    def _is_parallel_prepositional_list_continuation(
+        self,
+        item: ScreenSubtitleItem,
+        previous_item: Optional[ScreenSubtitleItem],
+    ) -> bool:
+        """Keep a comma-delimited parallel prepositional list readable."""
+        if previous_item is None:
+            return False
+        current_words = [word.casefold() for word in self._word_tokens(item.original)]
+        if not current_words:
+            return False
+        previous_text = self._normalize_text(previous_item.original)
+        if not re.search(r",[\"')\]]*\s*$", previous_text):
+            return False
+        previous_words = {
+            word.casefold()
+            for word in self._word_tokens(previous_text)
+        }
+        return current_words[0] in previous_words
 
     def _visual_split_display_unit_issues(
         self,
@@ -2976,6 +3075,14 @@ class ScreenSubtitleEditor:
         else:
             evaluation = self._evaluate_item_boundary(left, right)
         hard_issues = list(evaluation.get("hard_issues") or [])
+        continuation_display_issues = (
+            self._orphaned_finite_predicate_issues(right)
+            if right is not None
+            else []
+        )
+        for issue in continuation_display_issues:
+            if issue not in hard_issues:
+                hard_issues.append(issue)
         fragment_evaluation = self._evaluate_final_display_fragment(
             left,
             previous_item,
@@ -2989,6 +3096,7 @@ class ScreenSubtitleEditor:
         result["hard_fragment_issues"] = fragment_evaluation["hard_fragment_issues"]
         result["soft_fragment_issues"] = fragment_evaluation["soft_fragment_issues"]
         result["fragment_type"] = fragment_evaluation["fragment_type"]
+        result["continuation_display_issues"] = continuation_display_issues
         result["legal"] = not hard_issues
         return result
 
@@ -3076,9 +3184,12 @@ class ScreenSubtitleEditor:
             issues.append("negation_or_emphasis_fragment")
         if (
             previous_item is not None
-            and word_count <= 4
             and words[0] in {"of", "for", "with", "by", "from", "at", "in", "on", "around", "as", "to"}
             and not result["has_finite_predicate"]
+            and not self._is_parallel_prepositional_list_continuation(
+                item,
+                previous_item,
+            )
         ):
             issues.append("leading_prepositional_fragment")
         if self._looks_like_incomplete_bare_verb_fragment(item, words, next_item):
@@ -3333,7 +3444,16 @@ class ScreenSubtitleEditor:
                 and target_boundary not in self._pre_id_boundary_pairs(window)
             ):
                 continue
-            if not self._can_repair_pre_id_window(window):
+            allowed_long_pause_boundary = (
+                target_boundary
+                if "right_orphaned_finite_predicate"
+                in (evaluation.get("continuation_display_issues") or [])
+                else None
+            )
+            if not self._can_repair_pre_id_window(
+                window,
+                allowed_long_pause_boundary=allowed_long_pause_boundary,
+            ):
                 continue
             direct = self._direct_merge_weak_fragment_window(window, evaluation)
             if direct and self._pre_id_repair_resolves_target_boundary(
@@ -3551,6 +3671,8 @@ class ScreenSubtitleEditor:
             "trailing_modifier_fragment",
             "trailing_protected_named_phrase_fragment",
             "trailing_protected_phrasal_fragment",
+            "leading_prepositional_fragment",
+            "right_orphaned_finite_predicate",
             "trailing_possessive_fragment",
             "trailing_quantifier_fragment",
         }
@@ -3665,10 +3787,14 @@ class ScreenSubtitleEditor:
             "trailing_modifier_fragment",
             "trailing_protected_named_phrase_fragment",
             "trailing_protected_phrasal_fragment",
+            "leading_prepositional_fragment",
+            "right_orphaned_finite_predicate",
         }
         if len(items) != 2:
             return []
-        if not any(issue in weak_codes for issue in (evaluation.get("hard_issues") or [])):
+        candidate_issues = list(evaluation.get("hard_issues") or [])
+        candidate_issues.extend(evaluation.get("hard_fragment_issues") or [])
+        if not any(issue in weak_codes for issue in candidate_issues):
             return []
         merged = self._merge_subtitle_items(items[0], items[1])
         if (
@@ -3676,7 +3802,7 @@ class ScreenSubtitleEditor:
             and not self._is_allowed_pre_id_structural_overflow_merge(
                 items,
                 [merged],
-                evaluation.get("hard_issues") or (),
+                candidate_issues,
             )
         ):
             return []
@@ -3707,7 +3833,12 @@ class ScreenSubtitleEditor:
             "it's", "that's", "there's", "he's", "she's", "what's",
         }
 
-    def _can_repair_pre_id_window(self, items: Sequence[ScreenSubtitleItem]) -> bool:
+    def _can_repair_pre_id_window(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+        *,
+        allowed_long_pause_boundary: Optional[tuple[int, int]] = None,
+    ) -> bool:
         if len(items) < 2 or len(items) > 3:
             return False
         if any(item.subtitle_id for item in items):
@@ -3718,7 +3849,12 @@ class ScreenSubtitleEditor:
             if self._items_cross_speaker(left, right):
                 return False
             pause = self._boundary_pause_ms(left, right)
-            if pause is not None and pause >= 450:
+            boundary = self._pre_id_boundary_pair(left, right)
+            if (
+                pause is not None
+                and pause >= 450
+                and boundary != allowed_long_pause_boundary
+            ):
                 return False
         return True
 
@@ -3754,6 +3890,7 @@ class ScreenSubtitleEditor:
             word_counts = [self._word_count(item.original) for item in candidate_items]
             hard_issues: List[str] = []
             hard_fragment_issues: List[str] = []
+            continuation_display_issues: List[str] = []
             boundary_scores: List[float] = []
             for boundary_index, (left, right) in enumerate(zip(candidate_items, candidate_items[1:])):
                 evaluation = self._evaluate_item_pair_for_final_boundary(
@@ -3763,6 +3900,9 @@ class ScreenSubtitleEditor:
                 )
                 hard_issues.extend(evaluation["hard_issues"])
                 hard_fragment_issues.extend(evaluation.get("hard_fragment_issues", []))
+                continuation_display_issues.extend(
+                    self._pre_id_continuation_display_issues(left, right)
+                )
                 boundary_scores.append(float(evaluation["boundary_score"]))
             if candidate_items:
                 trailing_evaluation = self._evaluate_item_pair_for_final_boundary(
@@ -3777,6 +3917,9 @@ class ScreenSubtitleEditor:
                 "word_counts": word_counts,
                 "hard_issues": list(dict.fromkeys(hard_issues)),
                 "hard_fragment_issues": list(dict.fromkeys(hard_fragment_issues)),
+                "continuation_display_issues": list(
+                    dict.fromkeys(continuation_display_issues)
+                ),
                 "boundary_scores": boundary_scores,
             }
             relaxed_hard_issues = [
@@ -3793,7 +3936,11 @@ class ScreenSubtitleEditor:
                 for issue in candidate_record["hard_issues"]
                 if issue not in allowed_hard_issues
             ]
-            if disallowed_hard_issues or hard_fragment_issues:
+            if (
+                disallowed_hard_issues
+                or hard_fragment_issues
+                or continuation_display_issues
+            ):
                 continue
             if any(count > self.max_english_words for count in word_counts):
                 continue
