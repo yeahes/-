@@ -128,6 +128,13 @@ VOCAB_MAX_CARDS_PER_EPISODE = 22
 VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 3
 ARTICLE_SUBTITLE_EN_MIN_SIZE = 38
 ARTICLE_SUBTITLE_ZH_MIN_SIZE = 24
+# A long frozen cue remains one subtitle ID and one timing envelope, but the
+# article template may paginate it inside that envelope.  These are render
+# budgets, not segmentation or translation limits.
+# Keep the existing normal hard ceiling as the renderer page ceiling. The
+# preferred 6-12 word target still guides the balanced split when possible.
+ARTICLE_VISUAL_PAGE_MAX_WORDS = 16
+ARTICLE_VISUAL_PAGE_MAX_ZH_CHARS = 30
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
 )
@@ -1661,6 +1668,96 @@ def fit_article_en_font(draw, text: str, max_width: int) -> ImageFont.FreeTypeFo
     return article_en_font(ARTICLE_SUBTITLE_EN_MIN_SIZE, 600)
 
 
+def article_visual_page_count(cue: Cue | None) -> int:
+    """Return the deterministic number of pages needed by one frozen cue."""
+    if cue is None:
+        return 1
+    english_words = len(str(cue.en or "").split())
+    chinese_chars = len(re.sub(r"\s+", "", str(cue.zh or "")))
+    return max(
+        1,
+        math.ceil(english_words / ARTICLE_VISUAL_PAGE_MAX_WORDS),
+        math.ceil(chinese_chars / ARTICLE_VISUAL_PAGE_MAX_ZH_CHARS),
+    )
+
+
+def article_visual_page_index(cue: Cue | None, display_time: float | None) -> int:
+    """Map an absolute render time to a page without changing cue timing."""
+    page_count = article_visual_page_count(cue)
+    if cue is None or page_count <= 1 or display_time is None:
+        return 0
+    duration = max(float(cue.end) - float(cue.start), 0.001)
+    progress = min(0.999999, max(0.0, (float(display_time) - float(cue.start)) / duration))
+    return min(page_count - 1, int(progress * page_count))
+
+
+def _article_visual_break_score(words: list[str], split: int, target: int) -> int:
+    """Prefer phrase-safe punctuation while staying near a balanced page."""
+    score = abs(split - target) * 100
+    score += _article_visual_break_penalty(words, split)
+    previous = words[split - 1].rstrip() if split else ""
+    if previous.endswith((",", ";", ":", ".", "?", "!")):
+        score -= 1_500
+    return score
+
+
+def split_article_visual_pages(text: str, page_count: int) -> list[str]:
+    """Split frozen English text into readable render pages, preserving words."""
+    words = str(text or "").split()
+    page_count = max(1, min(int(page_count or 1), len(words) or 1))
+    if page_count == 1:
+        return [" ".join(words)] if words else []
+    boundaries = [0]
+    for page in range(1, page_count):
+        target = round(len(words) * page / page_count)
+        min_split = boundaries[-1] + 1
+        max_split = min(
+            len(words) - (page_count - page),
+            boundaries[-1] + ARTICLE_VISUAL_PAGE_MAX_WORDS,
+        )
+        candidates = range(max(min_split, target - 5), min(max_split, target + 5) + 1)
+        split = min(candidates, key=lambda value: _article_visual_break_score(words, value, target))
+        boundaries.append(split)
+    boundaries.append(len(words))
+    return [" ".join(words[start:end]) for start, end in zip(boundaries, boundaries[1:])]
+
+
+def split_chinese_visual_pages(text: str, page_count: int) -> list[str]:
+    """Split Chinese at nearby punctuation, falling back to character balance."""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    page_count = max(1, min(int(page_count or 1), len(compact) or 1))
+    if page_count == 1:
+        return [compact] if compact else []
+    boundaries = [0]
+    punctuation = set("，。；：！？、")
+    for page in range(1, page_count):
+        target = round(len(compact) * page / page_count)
+        minimum = boundaries[-1] + 1
+        maximum = len(compact) - (page_count - page)
+        candidates = [
+            value
+            for value in range(max(minimum, target - 8), min(maximum, target + 8) + 1)
+            if value > 0 and compact[value - 1] in punctuation
+        ]
+        boundaries.append(min(candidates or [target], key=lambda value: abs(value - target)))
+    boundaries.append(len(compact))
+    return [compact[start:end] for start, end in zip(boundaries, boundaries[1:])]
+
+
+def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tuple[str, str]:
+    """Return the page text for a cue while retaining its frozen source text."""
+    if cue is None:
+        return "", ""
+    page_count = article_visual_page_count(cue)
+    page_index = article_visual_page_index(cue, display_time)
+    english_pages = split_article_visual_pages(cue.en, page_count)
+    chinese_pages = split_chinese_visual_pages(cue.zh, page_count)
+    return (
+        english_pages[min(page_index, len(english_pages) - 1)] if english_pages else "",
+        chinese_pages[min(page_index, len(chinese_pages) - 1)] if chinese_pages else "",
+    )
+
+
 def fit_article_zh_font(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -2558,16 +2655,17 @@ def draw_article_frame(
 
     if cue:
         key = vocab["key"] if vocab else None
+        visual_en, visual_zh = article_visual_page_text(cue, display_time)
         en_x = 68
         en_width = 1455
-        en_font = fit_article_en_font(d, cue.en, en_width)
-        en_lines = wrap_article_en_subtitle(d, cue.en, en_font, acx(en_width))
+        en_font = fit_article_en_font(d, visual_en, en_width)
+        en_lines = wrap_article_en_subtitle(d, visual_en, en_font, acx(en_width))
         if len(en_lines) == 2:
-            en_lines = wrap_en_preserving_highlight(d, cue.en, en_font, acx(en_width), key)
+            en_lines = wrap_en_preserving_highlight(d, visual_en, en_font, acx(en_width), key)
         highlight_ranges = highlight_ranges_for_lines(en_lines, key)
         zh_width = 1455
-        zh_font = fit_article_zh_font(d, cue.zh, acx(zh_width)) if cue.zh else None
-        zh_lines = wrap_zh(d, cue.zh, zh_font, acx(zh_width)) if cue.zh else []
+        zh_font = fit_article_zh_font(d, visual_zh, acx(zh_width)) if visual_zh else None
+        zh_lines = wrap_zh(d, visual_zh, zh_font, acx(zh_width)) if visual_zh else []
         en_gap = int(en_font.size * 1.16)
         zh_gap = 58
         en_count = max(1, len(en_lines))
@@ -2732,6 +2830,7 @@ def render_podcast_learning_video(
                 cue.zh if cue else None,
                 alpha,
                 title_text,
+                article_visual_page_index(cue, t) if is_article_template else 0,
                 vocab_display_id,
             )
             if cue_key != last_cue_key:

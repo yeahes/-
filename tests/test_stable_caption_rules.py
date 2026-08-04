@@ -3484,12 +3484,19 @@ def test_article_template_does_not_truncate_a_long_english_subtitle():
     )
     cue = podcast_learning_video.Cue(1, 0.0, 2.0, text, "中文译文。", "male")
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
-    en_font = podcast_learning_video.fit_article_en_font(draw, text, 1455)
-    en_lines = podcast_learning_video.wrap_article_en_subtitle(
-        draw, text, en_font, podcast_learning_video.acx(1455)
-    )
+    page_count = podcast_learning_video.article_visual_page_count(cue)
+    en_pages = podcast_learning_video.split_article_visual_pages(text, page_count)
     rendered_lines = []
-    expected_lines = set(en_lines)
+    expected_lines = {
+        line
+        for page in en_pages
+        for line in podcast_learning_video.wrap_article_en_subtitle(
+            draw,
+            page,
+            podcast_learning_video.fit_article_en_font(draw, page, 1455),
+            podcast_learning_video.acx(1455),
+        )
+    }
     original_draw_text = podcast_learning_video.draw_stroked_text
 
     def capture_draw_text(draw, xy, line, *args, **kwargs):
@@ -3500,18 +3507,18 @@ def test_article_template_does_not_truncate_a_long_english_subtitle():
     with patch.object(
         podcast_learning_video, "draw_stroked_text", side_effect=capture_draw_text
     ):
-        podcast_learning_video.draw_article_frame(article_image, cue, vocab_plan={})
+        for display_time in (0.5, 1.5):
+            podcast_learning_video.draw_article_frame(
+                article_image,
+                cue,
+                vocab_plan={},
+                display_time=display_time,
+            )
 
-    assert en_font.size == podcast_learning_video.acx(
-        podcast_learning_video.ARTICLE_SUBTITLE_EN_MIN_SIZE
-    )
-    assert len(en_lines) == 3
-    assert en_lines[0].endswith("Institute")
-    assert en_lines[1].endswith("out")
-    assert en_lines[2].startswith("the ")
-    assert len(en_lines[-1].split()) >= 3
-    assert " ".join(en_lines) == text
-    assert " ".join(rendered_lines) == text
+    assert page_count == 2
+    assert all(4 <= len(page.split()) <= 16 for page in en_pages)
+    assert " ".join(en_pages) == text
+    assert set(rendered_lines) == expected_lines
 
 
 def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
@@ -3535,33 +3542,46 @@ def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
     )
     cue = podcast_learning_video.Cue(1, 0.0, 12.15, english, chinese, "male")
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
-    zh_font = podcast_learning_video.fit_article_zh_font(
-        draw,
-        chinese,
-        podcast_learning_video.acx(1455),
-    )
-    zh_lines = podcast_learning_video.wrap_zh(
-        draw,
-        chinese,
-        zh_font,
-        podcast_learning_video.acx(1455),
-    )
+    page_count = podcast_learning_video.article_visual_page_count(cue)
+    zh_pages = podcast_learning_video.split_chinese_visual_pages(chinese, page_count)
     rendered_lines = []
+    expected_lines = set()
+    for page in zh_pages:
+        zh_font = podcast_learning_video.fit_article_zh_font(
+            draw,
+            page,
+            podcast_learning_video.acx(1455),
+        )
+        expected_lines.update(
+            podcast_learning_video.wrap_zh(
+                draw,
+                page,
+                zh_font,
+                podcast_learning_video.acx(1455),
+            )
+        )
     original_draw_text = podcast_learning_video.draw_stroked_text
 
     def capture_draw_text(draw, xy, line, *args, **kwargs):
-        if line in zh_lines:
+        if line in expected_lines:
             rendered_lines.append(line)
         return original_draw_text(draw, xy, line, *args, **kwargs)
 
     with patch.object(
         podcast_learning_video, "draw_stroked_text", side_effect=capture_draw_text
     ):
-        podcast_learning_video.draw_article_frame(article_image, cue, vocab_plan={})
+        for display_time in (1.0, 5.0, 9.0):
+            podcast_learning_video.draw_article_frame(
+                article_image,
+                cue,
+                vocab_plan={},
+                display_time=display_time,
+            )
 
-    assert len(zh_lines) <= 2
-    assert zh_font.size < podcast_learning_video.article_cjk_font(46, 700).size
-    assert "".join(rendered_lines) == chinese
+    assert page_count == 3
+    assert all(len(page) <= 30 for page in zh_pages)
+    assert "".join(zh_pages) == chinese
+    assert set(rendered_lines) == expected_lines
 
 
 def test_standard_chinese_subtitle_font_uses_48_then_46_before_two_lines():
