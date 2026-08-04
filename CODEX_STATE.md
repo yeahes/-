@@ -1,24 +1,32 @@
 # Project State
 
 Status: active
-Last verified: 2026-08-05 01:04:25 Asia/Shanghai
+Last verified: 2026-08-05 02:11:14 Asia/Shanghai
 Branch: codex/e2e-caption-regression
-Verified HEAD: 43f5d78
-Working tree: modified (source-audio contract fix and regression)
+Verified HEAD: efe368b
+Working tree: modified (E2E boundary-audit documentation)
 
 ## Current Goal
-Repair final E2E alignment input without changing frozen English, IDs, Chinese mapping, or rendering.
+Complete the current-code E2E verification after the boundary-audit false-positive fix.
 
 ## Confirmed Facts
 - The E2E report anchor did not exist, so time-only alignment recorded `source_audio_missing` before WhisperX.
 - `SubtitleTask.source_audio_path` now owns the alignment input; the factory defaults it to legacy `video_path`.
 - The task-level time-only regression and unified regression pass.
 - Production-model ASR preflight reproduced the historical transcript byte-for-byte.
-- Full E2E stops before WhisperX at hard boundary `S0160 -> S0161` (`to | so`); no final timeline or video exists.
+- Boundary audit now classifies the comma-scoped `forced to, | so it...` case as `review`.
+- Current-code E2E completed with 210 fixed IDs, `applied_backend=whisperx-time-only`, and a synthesized video under `E:\VideoCaptioner-e2e-runs\ai-writing-current-boundary-fix-e2e-20260805`.
 
 ## Approved Decisions
 - The original `.m4a` remains read-only; E2E report sidecars remain under `E:\VideoCaptioner-e2e-runs`.
 - Do not bypass the hard boundary by changing English text, boundaries, fixed IDs, Chinese allocation, or rendering.
+
+## Next action
+Review the three unresolved display-coverage warnings with a targeted visual audit before treating the current E2E as production-clean.
+
+## Unknowns
+- The renderer's vocabulary-card request count is not persisted separately from the synthesis log.
+- The three unresolved display-coverage warnings need targeted visual confirmation even though final timeline validation passed.
 
 ## Relevant Paths
 - `app/core/entities.py`

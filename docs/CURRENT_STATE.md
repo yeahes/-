@@ -655,3 +655,25 @@ Result:
   final alignment, so no new `final-cue-timeline.json` or video was produced.
   This task does not alter English boundaries, IDs, or text to bypass that
   independent blocker.
+
+## 2026-08-05 Comma-Scoped Elliptical Infinitive Boundary Audit
+
+- Root cause: the whole-file English boundary audit treated every `to | so`
+  boundary as a high-confidence `preposition_object_split`, even when the
+  left cue ended in comma-scoped ellipted infinitive syntax, a real pause was
+  present, and the right cue was a complete result clause.
+- Fix: that combination is now recorded as `review` evidence with
+  `preposition_object_split` retained in `rule_codes`; it no longer creates a
+  render-blocking `hard_english_boundary`. Ordinary preposition/object,
+  numeric, comparative, and named-phrase splits retain their hard gates.
+- Regression coverage adds the real `forced to, | so it doesn't...` shape with
+  a 380ms pause. The focused English-boundary tests, unified regression, and
+  `git diff --check` pass.
+- Commit: `efe368b` (`fix boundary audit ellipted result clauses`).
+- A fresh full E2E using the current code completed under
+  `E:\VideoCaptioner-e2e-runs\ai-writing-current-boundary-fix-e2e-20260805`:
+  210 fixed IDs, 210 English/Chinese mappings, final timeline `PASS`,
+  `applied_backend=whisperx-time-only`, no `source_audio_missing`, and one
+  synthesized 11:07.36 video. Three display-coverage warnings remain in the
+  runtime log for later targeted visual review; they did not block this final
+  timeline or synthesis.
