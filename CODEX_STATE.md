@@ -1,8 +1,8 @@
 # Project State
 Status: complete
-Last verified: 2026-08-04 23:45:18 Asia/Shanghai
+Last verified: 2026-08-04 23:50:35 Asia/Shanghai
 Branch: codex/e2e-caption-regression
-Verified HEAD: d0ac431
+Verified HEAD: 5f0b7c7
 Working tree: clean after the state-record commit
 
 ## Current Goal
@@ -16,6 +16,7 @@ The renderer static-layout correction is committed and verified from frozen E2E 
 - Fixed-ID Chinese allocation cache entries include the frozen English, span, prompt, and allocation fingerprints.
 - Article rendering verifies the stable manifest, final cue timeline, and word ledger before ffmpeg. It first uses one static fixed-font page with up to two lines, then paginates only at safe word gaps when static layout fails.
 - The 215-cue offline replay now produces valid page plans for every cue, including the former `S0188`, `S0202`, `S0208`, and `S0110` structural-overflow cases.
+- Final visual validation checked 215 cues and 229 planned pages: fixed fonts, crop, overlap, target static-page transitions, and frozen text/time coverage all passed.
 
 ## Approved Decisions
 - Formal English boundaries are owned only by deterministic language and timing stages before fixed IDs.
