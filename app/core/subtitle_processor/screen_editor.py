@@ -3074,6 +3074,13 @@ class ScreenSubtitleEditor:
             issues.append("incomplete_interrogative_fragment")
         if self._looks_like_negation_or_emphasis_fragment(words):
             issues.append("negation_or_emphasis_fragment")
+        if (
+            previous_item is not None
+            and word_count <= 4
+            and words[0] in {"of", "for", "with", "by", "from", "at", "in", "on", "around", "as", "to"}
+            and not result["has_finite_predicate"]
+        ):
+            issues.append("leading_prepositional_fragment")
         if self._looks_like_incomplete_bare_verb_fragment(item, words, next_item):
             issues.append("incomplete_short_fragment")
         trailing_issue = self._trailing_dependent_fragment_issue(item, next_item)
@@ -5848,6 +5855,8 @@ class ScreenSubtitleEditor:
                 )
                 if not boundary["legal"]:
                     continue
+                if not self._stable_greedy_candidate_display_safe(cursor, candidate, end):
+                    continue
                 length = candidate - cursor + 1
                 score = float(boundary["boundary_score"]) + abs(length - target) * 1.5
                 if score < best_score:
@@ -5864,6 +5873,8 @@ class ScreenSubtitleEditor:
                         source_end=end,
                     )
                     if not boundary["legal"]:
+                        continue
+                    if not self._stable_greedy_candidate_display_safe(cursor, candidate, end):
                         continue
                     length = candidate - cursor + 1
                     if (
@@ -5891,6 +5902,22 @@ class ScreenSubtitleEditor:
             ranges.append((cursor, right))
             cursor = right + 1
         return self._merge_tiny_stable_ranges(ranges, target, emergency)
+
+    def _stable_greedy_candidate_display_safe(
+        self, start: int, cut: int, end: int
+    ) -> bool:
+        """Reject pre-ID cuts that create a non-displayable cue on either side."""
+        if not hasattr(self, "_active_source_word_spans"):
+            self._active_source_word_spans = {}
+        left = self._item_from_word_span(start, cut)
+        right = self._item_from_word_span(cut + 1, end)
+        if not left or not right:
+            return False
+        if not self._evaluate_item_pair_for_final_boundary(left, right)["legal"]:
+            return False
+        return not self._evaluate_final_display_fragment(
+            right, left, None
+        )["hard_fragment_issues"]
 
     def _is_complete_pre_id_structural_overflow_range(
         self,

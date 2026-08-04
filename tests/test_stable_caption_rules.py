@@ -6611,6 +6611,27 @@ def test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned():
     assert len(editor._overlong_english_issues([incomplete])) == 1
 
 
+def test_stable_cut_does_not_leave_terminal_prepositional_phrase():
+    text = (
+        "By one estimate artificial intelligence is currently drafting more than "
+        "a third of all new websites on the internet."
+    )
+    editor = _marker_editor(text.split(), max_words=16)
+
+    def only_prepositional_fragment_cut(left, *args, **kwargs):
+        return {
+            "legal": left == 15,
+            "hard_issues": [] if left == 15 else ["protected_syntax_cut"],
+            "boundary_score": 0.0,
+        }
+
+    editor._evaluate_stable_cut_boundary = only_prepositional_fragment_cut
+
+    ranges = editor._stable_word_ranges_for_span((0, len(text.split()) - 1))
+
+    assert ranges == [(0, len(text.split()) - 1)]
+
+
 def test_comma_terminated_parser_confirmed_subordinate_overflow_is_warning_not_error():
     text = "Yeah. And now that mobile coffee cart is bringing in between 10 000 and 15 000 every single month,"
     editor = _marker_editor(text.split(), max_words=16)
@@ -8336,6 +8357,8 @@ if __name__ == "__main__":
     test_whisperx_time_only_uses_expanded_frozen_ledger_not_source_segment_count()
     test_short_nonindependent_backchannel_attaches_to_previous_display_item()
     test_complete_unsplittable_overflow_is_warning_not_overlong_error()
+    test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned()
+    test_stable_cut_does_not_leave_terminal_prepositional_phrase()
     test_comma_terminated_parser_confirmed_subordinate_overflow_is_warning_not_error()
     test_comma_overflow_requires_parser_proof_and_no_safe_split()
     test_visual_reading_budget_keeps_complete_13_word_cue_for_renderer_wrapping()
