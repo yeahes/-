@@ -598,3 +598,18 @@ Result:
 - `tests\test_english_boundary_rules.py`,
   `tests\test_stable_caption_rules.py`, `scripts\run_regression.py`, and
   `git diff --check` passed. No ASR, LLM request, or synthesis ran.
+
+## 2026-08-04 Article Renderer Word-Timeline Gate
+
+- Article-template rendering now requires a verified stable manifest, final
+  cue timeline, and word ledger for every cue, including cues that fit on one
+  visual page. A missing or mismatched ledger raises
+  `render_structural_overflow` before any vocabulary work or ffmpeg process.
+- Fixed article subtitle fonts remain 58px English and 46px Chinese. Visual
+  pages are presentation-only, preserve frozen cue IDs/text/times, switch only
+  at word gaps, and require 900ms minimum duration. The renderer does not
+  lower the font size or weaken the page-duration gate to force a video.
+- Offline preflight of the 215-cue `ai-writing-style-full-e2e-20260804` stable
+  artifact found 212 valid plans and three intentional render blocks:
+  `S0188`, `S0202`, and `S0208`. Evidence is under
+  `E:\VideoCaptioner-e2e-runs\renderer-word-timeline-validation`.

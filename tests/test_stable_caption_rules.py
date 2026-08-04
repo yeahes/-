@@ -3549,6 +3549,19 @@ def test_caption_wrapper_scales_before_breaking_a_hyphenated_compound():
     assert not podcast_learning_video._has_discouraged_caption_break(text, lines)
 
 
+def _article_word_timing(cue):
+    words = cue.en.split()
+    duration = (cue.end - cue.start) / max(1, len(words))
+    return tuple(
+        {
+            "surface": word,
+            "start": cue.start + index * duration,
+            "end": cue.start + (index + 1) * duration,
+        }
+        for index, word in enumerate(words)
+    )
+
+
 def test_article_template_does_not_truncate_a_long_english_subtitle():
     article_image = Image.new(
         "RGB",
@@ -3562,9 +3575,11 @@ def test_article_template_does_not_truncate_a_long_english_subtitle():
         "corporations essentially bought out the American entrepreneurial spirit."
     )
     cue = podcast_learning_video.Cue(1, 0.0, 2.0, text, "中文译文。", "male")
+    cue.word_timing = _article_word_timing(cue)
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
-    page_count = podcast_learning_video.article_visual_page_count(cue)
-    en_pages = podcast_learning_video.split_article_visual_pages(text, page_count)
+    cue.article_page_plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+    page_count = len(cue.article_page_plan["pages"])
+    en_pages = [page["en"] for page in cue.article_page_plan["pages"]]
     rendered_lines = []
     expected_lines = {
         line
@@ -3620,9 +3635,11 @@ def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
         "这些大语言模型已经在悄然改变自己的句法结构。"
     )
     cue = podcast_learning_video.Cue(1, 0.0, 12.15, english, chinese, "male")
+    cue.word_timing = _article_word_timing(cue)
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
-    page_count = podcast_learning_video.article_visual_page_count(cue)
-    zh_pages = podcast_learning_video.split_chinese_visual_pages(chinese, page_count)
+    cue.article_page_plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+    page_count = len(cue.article_page_plan["pages"])
+    zh_pages = [page["zh"] for page in cue.article_page_plan["pages"]]
     rendered_lines = []
     expected_lines = set()
     for page in zh_pages:
@@ -3649,7 +3666,8 @@ def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
     with patch.object(
         podcast_learning_video, "draw_stroked_text", side_effect=capture_draw_text
     ):
-        for display_time in (1.0, 5.0, 9.0):
+        for page in cue.article_page_plan["pages"]:
+            display_time = (page["start"] + page["end"]) / 2.0
             podcast_learning_video.draw_article_frame(
                 article_image,
                 cue,
@@ -3661,6 +3679,173 @@ def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
     assert all(len(page) <= 30 for page in zh_pages)
     assert "".join(zh_pages) == chinese
     assert set(rendered_lines) == expected_lines
+
+
+def test_article_page_timeline_uses_fixed_fonts_and_word_boundaries():
+    english = (
+        "Yeah. And, you know, what is genuinely consequential about that 1.2 "
+        "million word study is that while everyone is still looking for outdated "
+        "clues like excessive em dashes, these large language models have quietly "
+        "mutated their syntax."
+    )
+    chinese = (
+        "是的。而且，你知道，那项120万词研究真正要紧的地方在于，"
+        "当所有人还在寻找过时的线索，比如大量使用的破折号时，"
+        "这些大语言模型已经在悄然改变自己的句法结构。"
+    )
+    cue = podcast_learning_video.Cue(4, 13.29, 25.44, english, chinese, "male")
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+    cue.article_page_plan = plan
+
+    assert plan["status"] == "ok"
+    assert plan["font_size"] == {"english": 58, "chinese": 46}
+    assert " ".join(page["en"] for page in plan["pages"]) == english
+    assert "".join(page["zh"] for page in plan["pages"]) == chinese
+    assert all(
+        page["end"] - page["start"] >= 0.9
+        for page in plan["pages"]
+    )
+    for previous, following in zip(plan["pages"], plan["pages"][1:]):
+        transition = previous["end"]
+        assert cue.word_timing[previous["word_end"]]["end"] <= transition
+        assert transition <= cue.word_timing[following["word_start"]]["start"]
+        assert podcast_learning_video.article_visual_page_index(cue, transition - 0.001) == previous["index"]
+        assert podcast_learning_video.article_visual_page_index(cue, transition) == following["index"]
+
+
+def test_article_renderer_blocks_paginated_cue_without_verified_word_ledger():
+    text = " ".join(f"word{index}" for index in range(24))
+    cue = podcast_learning_video.Cue(1, 0.0, 8.0, text, "这是一段需要分页的中文字幕。" * 3, "male")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "render_structural_overflow"
+    assert plan["errors"][0]["reason"] == "missing_or_mismatched_word_ledger"
+
+
+def test_article_page_plan_reports_unschedulable_word_boundary_before_total_duration():
+    cue = podcast_learning_video.Cue(
+        188,
+        0.0,
+        2.4,
+        "through reinforcement learning from human feedback.",
+        "也就是通过基于人类反馈的强化学习。",
+        "male",
+    )
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "render_structural_overflow"
+    assert plan["errors"][0]["reason"] == "no_word_boundary_with_minimum_page_duration"
+    assert "cue_duration_below_page_minimum" in plan["errors"][0]["attempted_reasons"]
+
+
+def test_article_renderer_rejects_word_ledger_text_mismatch():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        subtitle_path = root / "stable-final-original-top.srt"
+        subtitle_path.write_text(
+            "1\n00:00:00,000 --> 00:00:02,000\nOne two.\n一二。\n",
+            encoding="utf-8",
+        )
+        artifact_dir = root / "styled-subtitles-artifacts"
+        artifact_dir.mkdir()
+        timeline_path = artifact_dir / "final-cue-timeline.json"
+        timeline_path.write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "subtitle_id": "S0001",
+                            "word_start": 0,
+                            "word_end": 1,
+                            "start_ms": 0,
+                            "end_ms": 2000,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (artifact_dir / "word-ledger.json").write_text(
+            json.dumps(
+                {
+                    "words": [
+                        {"surface": "One", "start_ms": 0, "end_ms": 900},
+                        {"surface": "three", "start_ms": 900, "end_ms": 2000},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "stable-final-manifest.json").write_text(
+            json.dumps({"final_cue_timeline_path": str(timeline_path)}),
+            encoding="utf-8",
+        )
+
+        cues = podcast_learning_video.parse_srt(subtitle_path)
+
+        assert not podcast_learning_video.attach_article_word_timing(cues, subtitle_path)
+        assert cues[0].word_timing == ()
+
+
+def test_article_renderer_blocks_before_ffmpeg_for_unplanned_fixed_font_page():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        subtitle_path = root / "stable-final-original-top.srt"
+        subtitle_path.write_text(
+            "1\n00:00:00,000 --> 00:00:08,000\n"
+            + " ".join(f"word{index}" for index in range(24))
+            + "\n这是一段需要分页的中文字幕。这是一段需要分页的中文字幕。这是一段需要分页的中文字幕。\n",
+            encoding="utf-8",
+        )
+        with patch.object(podcast_learning_video.subprocess, "Popen") as popen:
+            try:
+                podcast_learning_video.render_podcast_learning_video(
+                    "unused-source.m4a",
+                    str(subtitle_path),
+                    str(root / "output.mp4"),
+                    template_style="文章单词",
+                )
+            except podcast_learning_video.RenderStructuralOverflowError as exc:
+                assert exc.code == "render_structural_overflow"
+            else:
+                raise AssertionError("unplanned fixed-font page must block synthesis")
+        assert not popen.called
+
+
+def test_article_renderer_requires_verified_word_ledger_even_for_single_page_cues():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        subtitle_path = root / "stable-final-original-top.srt"
+        subtitle_path.write_text(
+            "1\n00:00:00,000 --> 00:00:02,000\nA short cue.\n短字幕。\n",
+            encoding="utf-8",
+        )
+        with patch.object(podcast_learning_video.subprocess, "Popen") as popen:
+            try:
+                podcast_learning_video.render_podcast_learning_video(
+                    "unused-source.m4a",
+                    str(subtitle_path),
+                    str(root / "output.mp4"),
+                    template_style="文章单词",
+                )
+            except podcast_learning_video.RenderStructuralOverflowError as exc:
+                assert exc.errors == [
+                    {
+                        "cue_index": "all",
+                        "reason": "missing_or_mismatched_word_ledger",
+                    }
+                ]
+            else:
+                raise AssertionError("article synthesis must require a verified word ledger")
+        assert not popen.called
 
 
 def test_standard_chinese_subtitle_font_uses_48_then_46_before_two_lines():
@@ -8541,6 +8726,13 @@ if __name__ == "__main__":
     test_caption_wrapper_preserves_preposition_and_infinitive_phrase_edges()
     test_caption_wrapper_scales_before_breaking_a_hyphenated_compound()
     test_article_template_does_not_truncate_a_long_english_subtitle()
+    test_article_template_keeps_full_chinese_for_structural_overflow_cue()
+    test_article_page_timeline_uses_fixed_fonts_and_word_boundaries()
+    test_article_renderer_blocks_paginated_cue_without_verified_word_ledger()
+    test_article_page_plan_reports_unschedulable_word_boundary_before_total_duration()
+    test_article_renderer_rejects_word_ledger_text_mismatch()
+    test_article_renderer_blocks_before_ffmpeg_for_unplanned_fixed_font_page()
+    test_article_renderer_requires_verified_word_ledger_even_for_single_page_cues()
     test_standard_chinese_subtitle_font_uses_48_then_46_before_two_lines()
     test_article_template_scaled_geometry_stays_on_integer_pixels()
     test_article_template_tip_font_and_wrapper_support_chinese_text()
