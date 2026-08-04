@@ -491,3 +491,27 @@ Result:
   `git diff --check` passed after integrating both changes. A fresh unseen
   audio production run remains required to assess real ASR parsing and Chinese
   allocation behavior.
+
+## 2026-08-04 Relative-Clause Predicate Boundary E2E
+
+- Root cause: final pre-ID boundary validation evaluated only the left cue's
+  display fragment. A right cue that began with a finite predicate but lacked
+  a subject could therefore remain legal. The local repair-window pause gate
+  then excluded the 480 ms production boundary even though the two cues were
+  syntactically dependent.
+- Fix: final boundary evaluation now records
+  `right_orphaned_finite_predicate` from the local spaCy parse. Only that
+  target boundary may enter a direct merge across its recorded pause; the
+  merged 17-19 word cue must still satisfy the existing complete-sentence,
+  no-legal-normal-split structural-overflow proof. Other pre-ID repairs retain
+  their original pause rule.
+- Regression coverage includes the production relative-clause shape with a
+  480 ms pause. `tests/test_stable_caption_rules.py` and the unified
+  `scripts/run_regression.py` passed.
+- The isolated subtitle-stage E2E rerun at
+  `E:\VideoCaptioner-e2e-runs\ai-writing-relative-predicate-fixed-r2` passed
+  with 276 cues, no render block, no final-timeline errors, and delegated PNG
+  review at 7, 10, 15, and 18 seconds. It used a copied E2E cache/config,
+  produced no ASR, WhisperX, or video-synthesis work, and used stable-ts
+  fallback timing because no source audio was supplied to this subtitle-only
+  runner.
