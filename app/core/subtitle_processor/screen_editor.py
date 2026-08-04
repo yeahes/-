@@ -22,6 +22,7 @@ from app.core.storage.cache_manager import CacheManager
 from app.core.subtitle_processor.stable_pipeline_contracts import (
     FROZEN_PIPELINE_HASH_KEYS,
     FrozenPipelineSnapshot,
+    stable_payload_hash,
 )
 from app.core.subtitle_processor.final_cue_timeline import (
     derive_final_cue_timeline,
@@ -76,6 +77,12 @@ SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
 SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v3"
+SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v4"
+SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION = "semantic-full-translation-style-retry-v1"
+SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT_VERSION = "semantic-allocation-fragment-retry-v1"
+STABLE_CHINESE_CACHE_CONTRACT_VERSION = "stable-chinese-cache-v1"
+FROZEN_ID_WORD_SPAN_CACHE_VERSION = "frozen-id-word-span-v1"
+FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION = "fixed-id-allocation-v4"
 SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v4"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK = (
     "screen_subtitle_semantic_full_translation_style_retry_v1"
@@ -478,6 +485,7 @@ class ScreenSubtitleEditor:
         self._llm_cache_stats: Dict[str, Dict[str, int]] = {}
         self._allocation_runtime_stats: Dict[str, Any] = {}
         self._llm_cache_used: bool = False
+        self._chinese_cache_contract: Dict[str, str] = {}
         self._boundary_snapshots: List[Dict] = []
         self._boundary_snapshot_changes: List[Dict] = []
         self._boundary_snapshot_item_sets: Dict[str, List[ScreenSubtitleItem]] = {}
@@ -647,6 +655,7 @@ class ScreenSubtitleEditor:
         self._chinese_polish_log = []
         self._llm_cache_stats = {}
         self._allocation_runtime_stats = {}
+        self._chinese_cache_contract = {}
         self._final_cue_timeline = {}
         self._final_cue_timeline_seed_errors = []
         self._final_cue_timeline_path = ""
@@ -4116,6 +4125,7 @@ class ScreenSubtitleEditor:
                     subtitle_id=subtitle_id,
                 )
             )
+        self._set_chinese_cache_contract(assigned)
         return assigned
 
     def _capture_boundary_snapshot(
@@ -4705,6 +4715,9 @@ class ScreenSubtitleEditor:
             "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
             "allocation_max_concurrency": self.allocation_max_concurrency,
             "allocation_batch_size": self.allocation_batch_size,
+            "stable_chinese_cache_contract": dict(
+                getattr(self, "_chinese_cache_contract", {}) or {}
+            ),
             "llm_cache_stats": self._llm_cache_stats,
             "allocation_runtime_stats": self._allocation_runtime_stats,
             "qa_review_points_count": self._qa_review_points_count,
@@ -8047,6 +8060,9 @@ class ScreenSubtitleEditor:
                 "chinese_polish_enabled": self.enable_chinese_polish,
                 "allocation_max_concurrency": self.allocation_max_concurrency,
                 "allocation_batch_size": self.allocation_batch_size,
+                "stable_chinese_cache_contract": dict(
+                    getattr(self, "_chinese_cache_contract", {}) or {}
+                ),
                 "llm_cache_stats": self._llm_cache_stats,
                 "allocation_runtime_stats": self._allocation_runtime_stats,
                 "source_segment_count": len(source_segments),
@@ -11094,7 +11110,7 @@ class ScreenSubtitleEditor:
         task: str,
         temperature: float,
     ) -> Dict:
-        cache_key = self._cache_key(prompt, payload)
+        cache_key = self._semantic_chinese_cache_key(prompt, payload, task)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
@@ -12321,8 +12337,93 @@ class ScreenSubtitleEditor:
             return None
         return best[1], best[2]
 
+    def _set_chinese_cache_contract(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> None:
+        """Bind every stable Chinese cache entry to the frozen English timeline."""
+        frozen_items = [
+            {
+                "subtitle_id": str(item.subtitle_id or ""),
+                "english": str(item.original or ""),
+                "word_start": item.word_start,
+                "word_end": item.word_end,
+            }
+            for item in items
+        ]
+        self._chinese_cache_contract = {
+            "contract_version": STABLE_CHINESE_CACHE_CONTRACT_VERSION,
+            "full_english_text_hash": stable_payload_hash(
+                [entry["english"] for entry in frozen_items]
+            ),
+            "frozen_id_word_span_version": FROZEN_ID_WORD_SPAN_CACHE_VERSION,
+            "frozen_id_word_span_hash": stable_payload_hash(
+                [
+                    {
+                        "subtitle_id": entry["subtitle_id"],
+                        "word_start": entry["word_start"],
+                        "word_end": entry["word_end"],
+                    }
+                    for entry in frozen_items
+                ]
+            ),
+            "semantic_full_translation_prompt_version": (
+                SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION
+            ),
+            "semantic_allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
+            "fixed_id_allocation_algorithm_version": (
+                FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION
+            ),
+        }
+
     @staticmethod
-    def _cache_key(prompt: str, payload: List[Dict]) -> str:
+    def _semantic_chinese_prompt_version(cache_task: str) -> str:
+        task = str(cache_task or "")
+        if task == SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK:
+            return SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION
+        if task.startswith("screen_subtitle_semantic_full_translation"):
+            return SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION
+        if task == SEMANTIC_FRAGMENT_ALLOCATION_RETRY_CACHE_TASK:
+            return SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT_VERSION
+        if task == SEMANTIC_CHINESE_POLISH_CACHE_TASK:
+            return SEMANTIC_CHINESE_POLISH_PROMPT_VERSION
+        return SEMANTIC_ALLOCATION_PROMPT_VERSION
+
+    def _semantic_chinese_cache_key(
+        self,
+        prompt: str,
+        payload: Sequence[Dict],
+        cache_task: str,
+    ) -> str:
+        contract = dict(getattr(self, "_chinese_cache_contract", {}) or {})
+        if not contract:
+            # Direct helper use outside the frozen stable pipeline must never
+            # collide with a cache entry created from a verified timeline.
+            contract = {
+                "contract_version": STABLE_CHINESE_CACHE_CONTRACT_VERSION,
+                "full_english_text_hash": stable_payload_hash(list(payload)),
+                "frozen_id_word_span_version": "unbound",
+                "frozen_id_word_span_hash": stable_payload_hash([]),
+                "fixed_id_allocation_algorithm_version": (
+                    FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION
+                ),
+            }
+        contract["cache_task"] = str(cache_task or "")
+        contract["translation_prompt_version"] = self._semantic_chinese_prompt_version(
+            cache_task
+        )
+        return self._cache_key(
+            prompt,
+            [
+                {
+                    "stable_chinese_cache_contract": contract,
+                    "payload": list(payload),
+                }
+            ],
+        )
+
+    @staticmethod
+    def _cache_key(prompt: str, payload: Sequence[Dict]) -> str:
         raw = json.dumps({"prompt": prompt, "payload": payload}, ensure_ascii=False)
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
@@ -13275,7 +13376,7 @@ class ScreenSubtitleEditor:
         *,
         cache_task: str,
     ) -> Optional[object]:
-        cache_key = self._cache_key(prompt, payload)
+        cache_key = self._semantic_chinese_cache_key(prompt, payload, cache_task)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
@@ -13825,7 +13926,7 @@ class ScreenSubtitleEditor:
         batch_id: int,
         cache_task: str,
     ) -> Optional[AllocationBatchResult]:
-        cache_key = self._cache_key(prompt, payload_chunk)
+        cache_key = self._semantic_chinese_cache_key(prompt, payload_chunk, cache_task)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
@@ -13867,7 +13968,7 @@ class ScreenSubtitleEditor:
         *,
         cache_task: str,
     ) -> None:
-        cache_key = self._cache_key(prompt, payload_chunk)
+        cache_key = self._semantic_chinese_cache_key(prompt, payload_chunk, cache_task)
         try:
             self.cache_manager.set_llm_result(
                 cache_key,
@@ -15155,7 +15256,7 @@ class ScreenSubtitleEditor:
         *,
         cache_task: str = SEMANTIC_ALLOCATION_CACHE_TASK,
     ) -> Optional[object]:
-        cache_key = self._cache_key(prompt, payload)
+        cache_key = self._semantic_chinese_cache_key(prompt, payload, cache_task)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,
@@ -15406,7 +15507,11 @@ class ScreenSubtitleEditor:
             for group in groups
         ]
         prompt = self._compose_prompt(SEMANTIC_SUBTITLE_TRANSLATION_PROMPT)
-        cache_key = self._cache_key(prompt, payload)
+        cache_key = self._semantic_chinese_cache_key(
+            prompt,
+            payload,
+            "screen_subtitle_semantic_translation",
+        )
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             self.model,

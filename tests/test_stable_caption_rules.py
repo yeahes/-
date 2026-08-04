@@ -284,6 +284,19 @@ class _QueueCache:
         self.set_calls.append((args, kwargs))
 
 
+class _KeyedCache:
+    def __init__(self, entries):
+        self.entries = dict(entries)
+        self.get_calls = []
+
+    def get_llm_result(self, *args, **kwargs):
+        self.get_calls.append((args, kwargs))
+        return self.entries.get(args[0])
+
+    def set_llm_result(self, *args, **kwargs):
+        self.entries[args[0]] = args[1]
+
+
 def _id_items(count, translated=""):
     return [
         ScreenSubtitleItem(
@@ -299,6 +312,70 @@ def _id_items(count, translated=""):
 
 def _id_group(group_id, start_index, items):
     return {"id": group_id, "start_index": start_index, "items": items}
+
+
+def test_stable_chinese_cache_rejects_stale_frozen_boundary_context():
+    editor = _id_editor()
+    before = editor._assign_global_subtitle_ids(
+        [
+            ScreenSubtitleItem([1], "The system learns from", "", 0, 3),
+            ScreenSubtitleItem([2], "feedback over time.", "", 4, 6),
+        ]
+    )
+    payload = [
+        {
+            "id": 1,
+            "full_english": "The system learns from feedback over time.",
+            "full_translation": "系统会在长期反馈中学习。",
+            "subtitle_parts": [
+                {"subtitle_id": "S0001", "english": before[0].original},
+                {"subtitle_id": "S0002", "english": before[1].original},
+            ],
+        }
+    ]
+    prompt = "fixed-id allocation"
+    cache_task = "screen_subtitle_semantic_translation_allocation_v3"
+    before_contract = dict(editor._chinese_cache_contract)
+    old_key = editor._semantic_chinese_cache_key(prompt, payload, cache_task)
+    editor.cache_manager = _KeyedCache(
+        {
+            old_key: json.dumps(
+                {
+                    "groups": [
+                        {
+                            "id": 1,
+                            "part_translations": [
+                                {"subtitle_id": "S0001", "zh": "旧缓存。"},
+                                {"subtitle_id": "S0002", "zh": "旧缓存。"},
+                            ],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        }
+    )
+
+    after = editor._assign_global_subtitle_ids(
+        [
+            ScreenSubtitleItem([1], "The system learns from feedback", "", 0, 4),
+            ScreenSubtitleItem([2], "over time.", "", 5, 6),
+        ]
+    )
+    after_contract = dict(editor._chinese_cache_contract)
+    expected_groups = {1: _id_group(1, 0, after)}
+
+    assert before_contract["full_english_text_hash"] == after_contract["full_english_text_hash"]
+    assert before_contract["frozen_id_word_span_hash"] != after_contract["frozen_id_word_span_hash"]
+    assert old_key != editor._semantic_chinese_cache_key(prompt, payload, cache_task)
+    assert editor._load_cached_allocation_batch(
+        prompt,
+        payload,
+        expected_groups,
+        batch_id=1,
+        cache_task=cache_task,
+    ) is None
+    assert editor.cache_manager.get_calls[-1][0][0] != old_key
 
 
 def _codes(editor):
