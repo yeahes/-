@@ -5299,6 +5299,10 @@ class ScreenSubtitleEditor:
             strict_issues.append("quantifier_phrase_split")
         if self._is_numeric_unit_or_noun_split(left, right):
             strict_issues.append("numeric_unit_or_noun_split")
+        if self._is_numeric_magnitude_split(left, right):
+            strict_issues.append("numeric_magnitude_split")
+        if self._is_compound_preposition_split(left_token, right_token):
+            strict_issues.append("compound_preposition_split")
         if self._is_auxiliary_predicate_split(left_token, right_token):
             strict_issues.append("auxiliary_predicate_split")
         if self._is_determiner_head_phrase_split(left_token, right_token):
@@ -5326,6 +5330,12 @@ class ScreenSubtitleEditor:
             issues.append("quantifier_phrase_split")
         if self._is_numeric_unit_or_noun_split(left, right):
             issues.append("numeric_unit_or_noun_split")
+        if self._is_comparative_complement_split(left_token, right_token):
+            issues.append("comparative_complement_split")
+        if self._is_intensifier_particle_split(left_token, right_token):
+            issues.append("intensifier_particle_split")
+        if self._is_hyphenated_measure_noun_split(left, right):
+            issues.append("hyphenated_measure_noun_split")
         if self._is_auxiliary_predicate_split(left_token, right_token):
             issues.append("auxiliary_predicate_split")
         if self._is_subject_finite_verb_boundary(left_token, right_token):
@@ -5584,6 +5594,69 @@ class ScreenSubtitleEditor:
             if self._token_is_digits_like(previous_token) and self._token_is_digits_like(left_token):
                 return True
         return False
+
+    def _is_numeric_magnitude_split(self, left: int, right: int) -> bool:
+        """Keep a spoken number and its magnitude together across ASR timings."""
+        entries = self._active_word_entries
+        left_surface = str(entries[left].get("surface") or "")
+        if re.search(r"[.!?][\"')\]]*\s*$", left_surface):
+            return False
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        magnitude_tokens = {"hundred", "thousand", "million", "billion", "trillion"}
+        return left_token in magnitude_tokens and right_token in magnitude_tokens
+
+    @staticmethod
+    def _is_compound_preposition_split(left: str, right: str) -> bool:
+        """Detect fixed multiword prepositions without treating all starts as errors."""
+        return (left, right) in {
+            ("according", "to"),
+            ("because", "of"),
+            ("instead", "of"),
+            ("out", "of"),
+        }
+
+    @staticmethod
+    def _is_comparative_complement_split(left: str, right: str) -> bool:
+        return right in {"than", "as"} and left in {
+            "more", "less", "rather", "better", "worse", "other",
+        }
+
+    @staticmethod
+    def _is_intensifier_particle_split(left: str, right: str) -> bool:
+        return left.endswith("ly") and right in {"out", "off", "away", "up", "down"}
+
+    def _is_hyphenated_measure_noun_split(self, left: int, right: int) -> bool:
+        """Keep measured modifier phrases such as ``three long em-dashes`` intact."""
+        if left <= 0:
+            return False
+        entries = self._active_word_entries
+        previous = self._clean_boundary_token(entries[left - 1].get("token") or "")
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_surface = str(entries[right].get("surface") or "")
+        return (
+            self._token_is_numeric_like(previous)
+            and left_token in {"long", "short", "wide", "narrow", "high", "low"}
+            and "-" in right_surface
+        )
+
+    def _auditable_atomic_boundary_issues(self, left: int, right: int) -> List[str]:
+        """Retain atomic evidence when a real pause makes automatic repair unsafe."""
+        entries = self._active_word_entries
+        left_token = self._clean_boundary_token(entries[left].get("token") or "")
+        right_token = self._clean_boundary_token(entries[right].get("token") or "")
+        issues: List[str] = []
+        if self._is_numeric_magnitude_split(left, right):
+            issues.append("numeric_magnitude_split")
+        if self._is_compound_preposition_split(left_token, right_token):
+            issues.append("compound_preposition_split")
+        if self._is_comparative_complement_split(left_token, right_token):
+            issues.append("comparative_complement_split")
+        if self._is_intensifier_particle_split(left_token, right_token):
+            issues.append("intensifier_particle_split")
+        if self._is_hyphenated_measure_noun_split(left, right):
+            issues.append("hyphenated_measure_noun_split")
+        return issues
 
     @staticmethod
     def _is_auxiliary_predicate_split(left: str, right: str) -> bool:
@@ -7470,12 +7543,27 @@ class ScreenSubtitleEditor:
             (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("errors", [])
             or []
         )
-        return bool(self._translation_structure_errors or final_timeline_errors)
+        hard_boundary_errors = [
+            group
+            for group in ((getattr(self, "last_validation_summary", {}) or {}).get("errors", []) or [])
+            if group.get("code") == "hard_english_boundary"
+        ]
+        return bool(
+            self._translation_structure_errors
+            or final_timeline_errors
+            or hard_boundary_errors
+        )
 
     def blocking_validation_message(self) -> str:
-        errors = list(self._translation_structure_errors or []) + list(
+        errors = list(self._translation_structure_errors or [])
+        errors.extend(
             (getattr(self, "_final_cue_timeline", {}) or {}).get("validation", {}).get("errors", [])
             or []
+        )
+        errors.extend(
+            group
+            for group in ((getattr(self, "last_validation_summary", {}) or {}).get("errors", []) or [])
+            if group.get("code") == "hard_english_boundary"
         )
         if not errors:
             return ""
@@ -7625,12 +7713,30 @@ class ScreenSubtitleEditor:
                 }
             )
 
-        if health["syntax_boundary_audit"]:
+        hard_boundary_issues = [
+            issue
+            for issue in health["syntax_boundary_audit"]
+            if issue.get("classification") == "hard"
+        ]
+        review_boundary_issues = [
+            issue
+            for issue in health["syntax_boundary_audit"]
+            if issue.get("classification") == "review"
+        ]
+        if hard_boundary_issues:
+            errors.append(
+                {
+                    "code": "hard_english_boundary",
+                    "message": f"存在 {len(hard_boundary_issues)} 处未被预 ID 修复的高置信英文边界错误。",
+                    "items": hard_boundary_issues,
+                }
+            )
+        if review_boundary_issues:
             warnings.append(
                 {
                     "code": "syntax_boundary_audit",
-                    "message": f"存在 {len(health['syntax_boundary_audit'])} 处英文句法边界疑似坏切点。",
-                    "items": health["syntax_boundary_audit"],
+                    "message": f"存在 {len(review_boundary_issues)} 处需要人工复核的英文边界。",
+                    "items": review_boundary_issues,
                 }
             )
         if health["chinese_semantic_group_warnings"]:
@@ -7760,6 +7866,7 @@ class ScreenSubtitleEditor:
             "translation_group_cardinality_mismatch",
             "final_translation_id_mismatch",
             "final_cue_timeline_invalid",
+            "hard_english_boundary",
             "allocation_quality_unresolved",
         }
         review_codes = {
@@ -7795,6 +7902,7 @@ class ScreenSubtitleEditor:
             "translation_group_cardinality_mismatch": "Returned allocation ID set differs from the expected group ID set.",
             "final_translation_id_mismatch": "Final writeback ID set differs from frozen English subtitle IDs.",
             "final_cue_timeline_invalid": "Final cue timing does not match the frozen subtitle ID and word-ledger contract.",
+            "hard_english_boundary": "A high-confidence English boundary survived the pre-ID automatic repair stage.",
             "allocation_quality_unresolved": "A high-confidence allocation issue remained after retry or retry was rejected.",
             "reading_speed_error": "A subtitle likely needs manual shortening or timing review.",
             "suspicious_cut": "English boundary may split a phrase unnaturally.",
@@ -7988,6 +8096,10 @@ class ScreenSubtitleEditor:
                         ],
                     ),
                     ("stable-boundary-snapshots.json", self._boundary_snapshot_payload()),
+                    (
+                        "english-boundary-audit.json",
+                        self._english_boundary_audit_payload(final_segments),
+                    ),
                     (
                         "translations.json",
                         [
@@ -8510,42 +8622,155 @@ class ScreenSubtitleEditor:
     def _syntax_boundary_audit_issues(
         self, segments: Sequence[ASRDataSeg]
     ) -> List[Dict]:
-        issues: List[Dict] = []
+        return [
+            record
+            for record in self._scan_final_english_boundaries(segments)
+            if record["classification"] != "allow"
+        ]
+
+    def _english_boundary_audit_payload(
+        self,
+        segments: Sequence[ASRDataSeg],
+    ) -> Dict:
+        records = self._scan_final_english_boundaries(segments)
+        counts = {
+            classification: sum(
+                1 for record in records if record["classification"] == classification
+            )
+            for classification in ("hard", "review", "allow")
+        }
+        return {
+            "schema_version": 1,
+            "policy_version": "formal-boundary-evidence-v1",
+            "word_ledger_hash": self._word_ledger_hash(),
+            "summary": {
+                "boundary_count": len(records),
+                **counts,
+            },
+            "records": records,
+        }
+
+    def _scan_final_english_boundaries(
+        self,
+        segments: Sequence[ASRDataSeg],
+    ) -> List[Dict]:
+        """Classify every final English boundary without mutating the timeline.
+
+        The pre-ID finalizer owns automatic repair. This whole-file pass proves
+        that its remaining boundaries are either structurally sound, supported
+        by timing/speaker evidence, or explicitly queued for human review.
+        """
+        items_by_id = {
+            item.subtitle_id or f"S{index:04d}": item
+            for index, item in enumerate(getattr(self, "_last_subtitle_items", []) or [], 1)
+        }
+        records: List[Dict] = []
         for index, (previous, current) in enumerate(zip(segments, segments[1:]), 1):
             previous_text = self._normalize_text(previous.text)
             current_text = self._normalize_text(current.text)
             if not previous_text or not current_text:
                 continue
-            reasons = self._syntax_boundary_reasons(previous_text, current_text)
-            reasons = [
-                reason
-                for reason in reasons
-                if not self._boundary_has_audited_issue_exception(previous, current, reason)
-            ]
-            if not reasons:
-                continue
+            left_id = self._segment_subtitle_id(previous, index)
+            right_id = self._segment_subtitle_id(current, index + 1)
+            left_item = items_by_id.get(left_id)
+            right_item = items_by_id.get(right_id)
+            word_continuity = bool(
+                left_item
+                and right_item
+                and left_item.word_end is not None
+                and right_item.word_start is not None
+                and right_item.word_start == left_item.word_end + 1
+            )
+            speaker_change = bool(
+                word_continuity and self._items_cross_speaker(left_item, right_item)
+            )
+            pause_ms: Optional[int] = None
+            hard_issues: List[str] = []
+            soft_issues: List[str] = []
+            fallback_reasons: List[str] = []
+            if word_continuity:
+                evaluation = self._evaluate_stable_cut_boundary(
+                    left_item.word_end,
+                    right_item.word_start,
+                    source_start=left_item.word_start,
+                    source_end=right_item.word_end,
+                )
+                pause_ms = evaluation.get("pause_ms")
+                hard_issues = list(evaluation.get("hard_issues") or [])
+                soft_issues = list(dict.fromkeys(
+                    list(evaluation.get("soft_issues") or [])
+                    + self._auditable_atomic_boundary_issues(
+                        left_item.word_end,
+                        right_item.word_start,
+                    )
+                ))
+            else:
+                fallback_reasons = [
+                    reason
+                    for reason in self._syntax_boundary_reasons(previous_text, current_text)
+                    if not self._boundary_has_audited_issue_exception(previous, current, reason)
+                ]
+                soft_issues = list(fallback_reasons)
+                pause_ms = max(0, int(current.start_time) - int(previous.end_time))
+
+            sentence_terminal = self._is_unambiguous_sentence_terminal(
+                previous_text,
+                current_text,
+            )
+            has_contrary_evidence = (
+                speaker_change
+                or sentence_terminal
+                or (pause_ms is not None and pause_ms >= 450)
+                or not word_continuity
+            )
+            rule_codes = list(dict.fromkeys(hard_issues + soft_issues))
+            if hard_issues and not has_contrary_evidence:
+                classification = "hard"
+                confidence = "high"
+                confidence_score = 0.95
+                recommended_action = "pre_id_auto_repair_required"
+            elif rule_codes:
+                classification = "review"
+                confidence = "medium"
+                confidence_score = 0.62 if has_contrary_evidence else 0.72
+                recommended_action = "manual_review"
+            else:
+                classification = "allow"
+                confidence = "low"
+                confidence_score = 0.2
+                recommended_action = "keep"
+
             previous_last = self._clean_boundary_token(previous_text.split()[-1])
             current_first = self._clean_boundary_token(current_text.split()[0])
             legacy_reasons = self._bad_cut_reasons(previous_last, current_first)
-            confidence_score = min(0.95, 0.65 + 0.12 * len(reasons))
-            issues.append(
+            records.append(
                 {
-                    "index": index + 1,
-                    "left_subtitle_id": f"S{index:04d}",
-                    "right_subtitle_id": f"S{index + 1:04d}",
-                    "start": self._format_ms(previous.start_time),
-                    "end": self._format_ms(current.end_time),
-                    "reason": "; ".join(reasons),
-                    "rule_codes": reasons,
-                    "confidence": "high" if confidence_score >= 0.75 else "medium",
-                    "confidence_score": round(confidence_score, 2),
-                    "evidence": (
-                        f"left_last={previous_last}; right_first={current_first}; "
-                        f"left_tokens={self._word_tokens(previous_text)[-4:]}; "
-                        f"right_tokens={self._word_tokens(current_text)[:4]}"
-                    ),
+                    "index": index,
+                    "left_subtitle_id": left_id,
+                    "right_subtitle_id": right_id,
+                    "classification": classification,
+                    "recommended_action": recommended_action,
+                    "reason": "; ".join(rule_codes) or "boundary supported by context",
+                    "rule_codes": rule_codes,
+                    "confidence": confidence,
+                    "confidence_score": confidence_score,
+                    "evidence": {
+                        "word_continuity": word_continuity,
+                        "word_boundary": (
+                            [left_item.word_end, right_item.word_start]
+                            if word_continuity else []
+                        ),
+                        "pause_ms": pause_ms,
+                        "speaker_change": speaker_change,
+                        "sentence_terminal": sentence_terminal,
+                        "left_last": previous_last,
+                        "right_first": current_first,
+                        "fallback_text_only": bool(fallback_reasons),
+                    },
                     "duplicates_legacy_bad_cut": bool(legacy_reasons),
                     "legacy_rule_codes": legacy_reasons,
+                    "start": self._format_ms(previous.start_time),
+                    "end": self._format_ms(current.end_time),
                     "previous": previous_text,
                     "current": current_text,
                     "previous_english": previous_text,
@@ -8553,7 +8778,7 @@ class ScreenSubtitleEditor:
                     "boundary": f"{previous_text} | {current_text}",
                 }
             )
-        return issues
+        return records
 
     def _syntax_boundary_reasons(self, previous_text: str, current_text: str) -> List[str]:
         if self._is_safe_independent_boundary(previous_text, current_text):

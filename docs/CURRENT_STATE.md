@@ -577,3 +577,24 @@ Result:
   `git diff --check` passed. No ASR, LLM request, or synthesis ran.
 - Earlier references to the pre-ID visual temporal pass are retained as
   historical records and are superseded by this ownership rule.
+
+## 2026-08-04 Whole-File English Boundary Evidence Audit
+
+- Root cause: the old syntax audit emitted only selected text-pair warnings.
+  It did not prove whole-file coverage, distinguish a hard atomic split from an
+  ambiguous boundary, or use the frozen word-ledger pause and speaker evidence.
+- Fix: every final English boundary now receives `hard`, `review`, or `allow`
+  evidence in `english-boundary-audit.json`. A `hard` item has an atomic
+  structure rule and no sentence-terminal, 450ms pause, speaker-change, or
+  discontinuous-ledger counterevidence; it blocks export if it survives the
+  existing pre-ID auto-repair. `review` items enter the quality queue; `allow`
+  items are recorded only in the full audit artifact.
+- Screenshot-derived fixtures cover measured hyphenated heads, comparisons,
+  intensifier particles, compound prepositions, and numeric magnitudes. They
+  also prove that terminal `Because`, `In`, and finite-clause starts remain
+  allowed, while a long pause downgrades a comparative shape to review.
+- The scanner uses local rules, frozen word times, punctuation, and speaker
+  evidence. spaCy hints remain evidence only, never a final judge.
+- `tests\test_english_boundary_rules.py`,
+  `tests\test_stable_caption_rules.py`, `scripts\run_regression.py`, and
+  `git diff --check` passed. No ASR, LLM request, or synthesis ran.

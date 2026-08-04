@@ -83,6 +83,10 @@ match or list position.
 - The 12-word/68-character visual reading target is renderer-only. The formal
   pre-ID boundary finalizer cannot invoke visual-budget splitting; renderer
   pagination cannot create or move a subtitle boundary.
+- The final English-boundary audit scans every remaining cue transition with
+  frozen word ranges, pauses, sentence terminals, and speaker evidence. It
+  classifies only atomic, uncontradicted splits as `hard`; ambiguous boundaries
+  are `review`, while valid independent starts remain `allow`.
 - The spaCy-to-word-ledger mapper now handles split compound tokens without
   consuming later ledger words. This covers cases where spaCy tokenizes an ASR
   word such as `six-fold` or `52%` into multiple tokens.

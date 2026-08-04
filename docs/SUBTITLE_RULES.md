@@ -65,12 +65,25 @@ Blocking errors:
 - Severe continuous subtitle coverage gap.
 - Time order corruption.
 - Overlong English that violates configured hard limits.
+- A residual `hard` English boundary: an atomic structural split without
+  sentence-terminal, long-pause, speaker-change, or discontinuous-ledger
+  evidence. Pre-ID repair owns automatic resolution; final residuals block
+  export rather than silently merging fixed IDs.
 
 Warnings:
 
 - Suspicious cuts.
+- `review` English boundaries: plausible but ambiguous fragments or atomic
+  shapes contradicted by pause/speaker evidence. They are recorded for human
+  review, not auto-merged.
 - Very short display duration.
 - Small timing gaps.
+
+Allowed boundaries:
+
+- Independently readable cues supported by sentence punctuation, a pause,
+  speaker change, or local context. A cue starting with `But`, `Because`,
+  `In`, or a finite verb is not invalid by word class alone.
 
 ## Avoided Approaches
 

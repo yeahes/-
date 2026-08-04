@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "measured_hyphenated_head",
+      "words": ["People", "used", "three", "long", "em-dashes", "in", "print."],
+      "cut_after": 3,
+      "expected_classification": "hard",
+      "expected_issue": "hyphenated_measure_noun_split"
+    },
+    {
+      "id": "comparative_complement",
+      "words": ["These", "systems", "write", "far", "more", "than", "humans", "do."],
+      "cut_after": 4,
+      "expected_classification": "hard",
+      "expected_issue": "comparative_complement_split"
+    },
+    {
+      "id": "intensifier_particle",
+      "words": ["That", "old", "advice", "is", "completely", "out", "of", "date."],
+      "cut_after": 4,
+      "expected_classification": "hard",
+      "expected_issue": "intensifier_particle_split"
+    },
+    {
+      "id": "compound_preposition",
+      "words": ["According", "to", "the", "report", "sales", "rose."],
+      "cut_after": 0,
+      "expected_classification": "hard",
+      "expected_issue": "compound_preposition_split"
+    },
+    {
+      "id": "numeric_magnitude",
+      "words": ["The", "fund", "raised", "one", "hundred", "million", "dollars."],
+      "cut_after": 4,
+      "expected_classification": "hard",
+      "expected_issue": "numeric_magnitude_split"
+    },
+    {
+      "id": "long_pause_keeps_comparative_for_review",
+      "words": ["These", "systems", "write", "far", "more", "than", "humans", "do."],
+      "cut_after": 4,
+      "pause_ms": 620,
+      "expected_classification": "review",
+      "expected_issue": "comparative_complement_split"
+    },
+    {
+      "id": "subordinator_after_terminal_is_allowed",
+      "words": ["The", "market", "had", "already", "changed.", "Because", "the", "evidence", "was", "clear."],
+      "cut_after": 4,
+      "expected_classification": "allow",
+      "expected_issue": null
+    },
+    {
+      "id": "preposition_after_terminal_is_allowed",
+      "words": ["Sales", "doubled.", "In", "the", "following", "year,", "costs", "fell."],
+      "cut_after": 1,
+      "expected_classification": "allow",
+      "expected_issue": null
+    },
+    {
+      "id": "finite_clause_after_terminal_is_allowed",
+      "words": ["The", "market", "was", "volatile.", "It", "became", "much", "harder."],
+      "cut_after": 3,
+      "expected_classification": "allow",
+      "expected_issue": null
+    }
+  ]
+}

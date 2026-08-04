@@ -106,6 +106,7 @@ Outputs:
 - `allocation-unresolved.json`
 - `translation-structure-errors.json`
 - `final-cue-timeline.json`
+- `english-boundary-audit.json`
 - `run-state.json`
 
 Run-state rules:
@@ -121,6 +122,10 @@ Run-state rules:
 Validation checks:
 
 - English coverage gaps.
+- Whole-file English boundary audit: `hard` atomic splits with no contrary
+  timing/speaker evidence must be repaired before IDs; residual `hard` items
+  block export. Ambiguous `review` items are retained for human verification;
+  independently supported `allow` boundaries remain untouched.
 - Missing Chinese.
 - Overlong English.
 - Translation ID mismatch, missing ID, duplicate ID, unknown ID, or group cardinality mismatch.

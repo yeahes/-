@@ -313,12 +313,18 @@ class QASummaryBuilder:
             for group in self.validation.get(level, []) or []:
                 code = str(group.get("code") or "validation_item")
                 source_severity = severity
-                if code in {"suspicious_cut", "syntax_boundary_audit"}:
+                if code == "suspicious_cut":
                     source_severity = "INFO"
                 items = group.get("items") if isinstance(group.get("items"), list) else [group]
                 max_items = 12 if source_severity == "REVIEW" else 8
                 for entry in items[:max_items]:
                     entry_severity = source_severity
+                    if code == "syntax_boundary_audit":
+                        entry_severity = (
+                            "REVIEW"
+                            if entry.get("classification") == "review"
+                            else "INFO"
+                        )
                     if (
                         code == "chinese_semantic_group_warning"
                         and entry.get("mapping_valid") is False

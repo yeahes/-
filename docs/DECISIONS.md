@@ -59,3 +59,31 @@ It gives the LLM another chance to change subtitle structure after deterministic
 Rejected:
 
 Running a second LLM correction pass in the stable production path.
+
+## 2026-08-04: Boundary Evidence Is Graded, Not POS-Absolute
+
+Decision:
+
+Audit every final English boundary as `hard`, `review`, or `allow`. Only an
+atomic structural split with no conflicting word-timing, speaker, or sentence
+evidence is `hard`; it must have been repaired before IDs. Ambiguous evidence
+is a human review item, not an automatic merge.
+
+Reason:
+
+ASR punctuation and parses are imperfect. Treating a preposition, subordinator,
+or finite verb at a cue start as an absolute error would incorrectly merge
+independent clauses and speaker turns.
+
+Evidence and trade-off:
+
+Netflix's English timed-text guide requires source-faithful text while using
+reading-speed and line constraints; BBC subtitle guidance likewise emphasizes
+line/readability constraints. This project adopts their readability principle,
+but does not copy broadcast character limits because this is a fixed bilingual
+template with an independently tested renderer.
+
+Sources:
+
+- https://partnerhelp.netflixstudios.com/hc/en-us/articles/217350977-Timed-Text-Style-Guide-General-Requirements
+- https://www.bbc.co.uk/accessibility/forproducts/guides/subtitles/
