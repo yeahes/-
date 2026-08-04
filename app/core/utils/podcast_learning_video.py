@@ -8,6 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from openai import OpenAI
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
@@ -145,6 +146,7 @@ ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
 # Keep the existing normal hard ceiling as the renderer page ceiling. The
 # preferred 6-12 word target still guides the balanced split when possible.
 ARTICLE_VISUAL_PAGE_MAX_WORDS = 16
+ARTICLE_VISUAL_PAGE_PREFERRED_WORDS = 12
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
 )
@@ -1819,16 +1821,30 @@ def split_article_visual_pages(text: str, page_count: int) -> list[str]:
     return [" ".join(words[start:end]) for start, end in zip(boundaries, boundaries[1:])]
 
 
-def split_chinese_visual_pages(text: str, page_count: int) -> list[str]:
-    """Split Chinese at nearby punctuation, falling back to character balance."""
+def split_chinese_visual_pages(
+    text: str,
+    page_count: int,
+    page_word_counts: Sequence[int] | None = None,
+) -> list[str]:
+    """Split Chinese near punctuation with the English page proportions.
+
+    Render pages are derived from frozen English word spans.  Using those
+    spans as the Chinese target prevents a later English-heavy page from
+    receiving an unrelated, equal-sized Chinese fragment merely because both
+    pages happen to contain the same number of characters.
+    """
     compact = re.sub(r"\s+", "", str(text or ""))
     page_count = max(1, min(int(page_count or 1), len(compact) or 1))
     if page_count == 1:
         return [compact] if compact else []
+    weights = list(page_word_counts or [])
+    if len(weights) != page_count or any(int(weight) <= 0 for weight in weights):
+        weights = [1] * page_count
+    total_weight = sum(int(weight) for weight in weights)
     boundaries = [0]
     punctuation = set("，。；：！？、")
     for page in range(1, page_count):
-        target = round(len(compact) * page / page_count)
+        target = round(len(compact) * sum(int(weight) for weight in weights[:page]) / total_weight)
         minimum = boundaries[-1] + 1
         maximum = len(compact) - (page_count - page)
         candidates = [
@@ -1923,6 +1939,23 @@ def _article_fixed_chinese_lines(draw: ImageDraw.ImageDraw, text: str) -> list[s
     return lines
 
 
+def _article_preferred_readability_page_count(
+    draw: ImageDraw.ImageDraw,
+    words: list[str],
+    chinese: str,
+) -> int:
+    """Request two visual pages only for a genuinely dense fixed-font cue."""
+    english_lines = _article_fixed_english_lines(draw, " ".join(words))
+    chinese_lines = _article_fixed_chinese_lines(draw, chinese) if chinese else []
+    is_two_line_english = len(english_lines) >= 2
+    has_four_bilingual_lines = len(english_lines) + len(chinese_lines) >= 4
+    if len(words) > ARTICLE_VISUAL_PAGE_PREFERRED_WORDS and (
+        is_two_line_english or has_four_bilingual_lines
+    ):
+        return 2
+    return 1
+
+
 def _article_page_break_score(
     words: list[str],
     split: int,
@@ -1947,6 +1980,7 @@ def _article_page_break_score(
 
 def _partition_article_english_pages(
     draw: ImageDraw.ImageDraw,
+    cue: Cue,
     words: list[str],
     page_count: int,
     word_timing: tuple[dict, ...],
@@ -1972,6 +2006,21 @@ def _partition_article_english_pages(
         target_words = remaining_words / remaining_pages
         last_end = len(words) - (remaining_pages - 1)
         for end in range(start + 1, last_end + 1):
+            if len(word_timing) == len(words):
+                # Do not let punctuation alone choose a split that makes the
+                # first page too brief.  The old planner found a beautiful
+                # comma after two words, then rejected the entire two-page
+                # plan when scheduling found it lasted under 900ms, without
+                # considering the next viable semantic break.
+                completed_pages = page_count - remaining_pages + 1
+                trailing_pages = remaining_pages - 1
+                previous_end = float(word_timing[end - 1]["end"])
+                next_start = float(word_timing[end]["start"])
+                min_duration = ARTICLE_PAGE_MIN_DURATION_MS / 1000.0
+                if next_start + 1e-6 < float(cue.start) + completed_pages * min_duration:
+                    continue
+                if previous_end - 1e-6 > float(cue.end) - trailing_pages * min_duration:
+                    continue
             text = " ".join(words[start:end])
             if not _article_fixed_english_lines(draw, text):
                 continue
@@ -2039,11 +2088,23 @@ def build_article_visual_page_plan(
             "errors": [{"cue_index": cue.index, "reason": "empty_english_cue"}],
         }
     failure_reasons: set[str] = set()
-    for page_count in range(1, len(words) + 1):
-        spans = _partition_article_english_pages(draw, words, page_count, cue.word_timing)
+    preferred_page_count = _article_preferred_readability_page_count(draw, words, chinese)
+    page_counts = list(range(preferred_page_count, len(words) + 1))
+    if preferred_page_count > 1:
+        # Static one-page layout remains safe if a word-timed transition would
+        # be too brief or land inside a protected phrase.  Record the unmet
+        # readability preference instead of shrinking the font or inventing a
+        # timing boundary.
+        page_counts.append(1)
+    for page_count in page_counts:
+        spans = _partition_article_english_pages(draw, cue, words, page_count, cue.word_timing)
         if spans is None:
             continue
-        chinese_pages = split_chinese_visual_pages(chinese, page_count)
+        chinese_pages = split_chinese_visual_pages(
+            chinese,
+            page_count,
+            page_word_counts=[end - start for start, end in spans],
+        )
         if chinese and len(chinese_pages) != page_count:
             failure_reasons.add("chinese_page_cardinality_mismatch")
             continue
@@ -2105,6 +2166,16 @@ def build_article_visual_page_plan(
                 "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
             },
             "pages": pages,
+            "readability_warnings": (
+                [
+                    {
+                        "reason": "preferred_readability_page_unscheduled",
+                        "requested_page_count": preferred_page_count,
+                    }
+                ]
+                if page_count < preferred_page_count
+                else []
+            ),
         }
     reason_priority = (
         "missing_or_mismatched_word_ledger",

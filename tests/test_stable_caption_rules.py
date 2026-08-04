@@ -2346,6 +2346,11 @@ def test_final_pre_id_rebalances_leading_nonfinite_dependent_prefix():
     ).split()
     editor = _marker_editor(words, max_words=16)
     editor._prepare_syntax_cut_hints()
+    # The real comma-scoped ellipted result clause has a 380ms pause.  It is
+    # reviewable evidence, not a hard preposition/object split.
+    for entry in editor._active_word_entries[11:]:
+        entry["start_time"] += 300
+        entry["end_time"] += 300
     items = [_word_item(editor, 0, 7, 1), _word_item(editor, 8, len(words) - 1, 2)]
     word_times_before = [
         (entry["start_time"], entry["end_time"])
@@ -2365,14 +2370,21 @@ def test_final_pre_id_rebalances_leading_nonfinite_dependent_prefix():
     )
     assert editor._pre_id_boundary_repairs[0]["word_order_preserved"] is True
     assert editor._pre_id_boundary_repairs[0]["word_coverage_preserved"] is True
+    for index, item in enumerate(repaired, 1):
+        item.subtitle_id = f"S{index:04d}"
+    editor._last_subtitle_items = list(repaired)
     segments = []
     for item in repaired:
         segment = ASRDataSeg(item.original, 0, 1000, "中文")
         segment.word_start = item.word_start
         segment.word_end = item.word_end
+        segment.subtitle_id = item.subtitle_id
         segments.append(segment)
     assert editor._bad_cut_issues(segments) == []
-    assert editor._syntax_boundary_audit_issues(segments) == []
+    audit = editor._syntax_boundary_audit_issues(segments)
+    assert len(audit) == 1
+    assert audit[0]["classification"] == "review"
+    assert audit[0]["recommended_action"] == "manual_review"
     assert [
         (entry["start_time"], entry["end_time"])
         for entry in editor._active_word_entries
@@ -3734,7 +3746,7 @@ def test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile():
     assert page["end"] == cue.end
 
 
-def test_article_renderer_uses_wide_two_line_profile_without_time_pagination():
+def test_article_renderer_prefers_timed_pages_for_dense_two_line_cue():
     text = "You know, this robotic vocabulary actually connects to a very human critique from way back."
     cue = podcast_learning_video.Cue(110, 335.5, 340.62, text, "其实，这种机械化的措辞，与一种相当人性化、由来已久的批评是相通的。", "male")
     cue.subtitle_id = "S0110"
@@ -3744,15 +3756,14 @@ def test_article_renderer_uses_wide_two_line_profile_without_time_pagination():
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
 
     assert plan["status"] == "ok"
-    assert len(plan["pages"]) == 1
-    page = plan["pages"][0]
-    assert page["en_lines"] == [
-        "You know, this robotic vocabulary actually",
-        "connects to a very human critique from way back.",
-    ]
-    assert page["en_width"] == podcast_learning_video.ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH
-    assert page["start"] == cue.start
-    assert page["end"] == cue.end
+    assert len(plan["pages"]) == 2
+    assert plan["readability_warnings"] == []
+    assert " ".join(page["en"] for page in plan["pages"]) == text
+    assert "".join(page["zh"] for page in plan["pages"]) == cue.zh
+    assert all(page["end"] - page["start"] >= 0.9 for page in plan["pages"])
+    transition = plan["pages"][0]["end"]
+    assert cue.word_timing[plan["pages"][0]["word_end"]]["end"] <= transition
+    assert transition <= cue.word_timing[plan["pages"][1]["word_start"]]["start"]
 
 
 def test_article_renderer_uses_pixel_width_for_43_character_chinese_cue():
@@ -8866,7 +8877,7 @@ if __name__ == "__main__":
     test_article_template_keeps_full_chinese_for_structural_overflow_cue()
     test_article_page_timeline_uses_fixed_fonts_and_word_boundaries()
     test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile()
-    test_article_renderer_uses_wide_two_line_profile_without_time_pagination()
+    test_article_renderer_prefers_timed_pages_for_dense_two_line_cue()
     test_article_renderer_uses_pixel_width_for_43_character_chinese_cue()
     test_article_renderer_blocks_paginated_cue_without_verified_word_ledger()
     test_article_renderer_keeps_s0188_shape_as_static_two_line_page()
