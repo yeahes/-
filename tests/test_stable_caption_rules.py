@@ -6921,6 +6921,68 @@ def test_whisperx_time_only_uses_expanded_frozen_ledger_not_source_segment_count
     assert editor.alignment["applied_backend"] == "whisperx-time-only"
 
 
+def test_whisperx_time_only_uses_explicit_source_audio_from_complete_task():
+    """E2E may separate the alignment input from the sidecar-report anchor."""
+    class _Progress:
+        def emit(self, *args):
+            pass
+
+    class _TimelineEditor:
+        def __init__(self):
+            self.alignment = None
+
+        def record_final_timeline_alignment(self, **kwargs):
+            self.alignment = kwargs
+
+        def rebuild_final_cue_timeline(self, asr_data, word_ledger, *, alignment_backend):
+            assert alignment_backend == "whisperx-time-only"
+            return asr_data
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_audio = root / "source.m4a"
+        source_audio.touch()
+        source_subtitle = root / "source.srt"
+        source_subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nA stable cue.\n", encoding="utf-8")
+        report_dir = root / "e2e-reports"
+        report_dir.mkdir()
+        report_anchor = report_dir / "source-audio-report-anchor.m4a"
+        task = TaskFactory.create_subtitle_task(
+            str(source_subtitle),
+            video_path=str(report_anchor),
+            need_next_task=True,
+            source_audio_path=str(source_audio),
+        )
+
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        thread.progress = _Progress()
+        thread.tr = lambda value: value
+        thread._record_stage_duration = lambda *args: None
+        final_cues = ASRData([ASRDataSeg("A stable cue.", 1000, 1600, "稳定字幕。")])
+        final_cues.segments[0].subtitle_id = "S0001"
+        ledger = ASRData([ASRDataSeg("A", 1000, 1100), ASRDataSeg("stable", 1110, 1350)])
+        editor = _TimelineEditor()
+
+        with patch.object(SubtitleThread, "_timeline_alignment_backend", return_value="whisperx-time-only"), patch(
+            "app.thread.subtitle_thread.align_frozen_word_ledger_with_whisperx",
+            return_value=ledger,
+        ) as align:
+            rebuilt = thread._apply_whisperx_time_only_if_enabled(
+                final_cues,
+                alignment_source=final_cues,
+                word_ledger=ledger,
+                screen_editor=editor,
+            )
+
+        assert rebuilt is final_cues
+        assert task.source_audio_path == str(source_audio)
+        assert task.video_path == str(report_anchor)
+        assert thread._source_audio_report_dir() == report_dir
+        assert align.call_args.args == (str(source_audio), final_cues, ledger)
+        assert editor.alignment["applied_backend"] == "whisperx-time-only"
+
+
 def test_short_nonindependent_backchannel_attaches_to_previous_display_item():
     previous_words = "This explanation has fourteen ordinary words and ends as a complete thought clearly today".split()
     words = previous_words + ["Yeah.", "The", "next", "sentence", "continues."]

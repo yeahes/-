@@ -634,6 +634,9 @@ class SubtitleTask:
     article_context_data: Optional[dict] = None
     use_article_reference_assist: bool = False
     use_article_translation_terms: bool = False
+    # Original media used only by final word-level alignment.  ``video_path``
+    # remains the report/output anchor for backwards-compatible workflows.
+    source_audio_path: Optional[str] = None
 
 
 @dataclass

@@ -455,7 +455,14 @@ class SubtitleThread(QThread):
                 )
             return rebuilt
 
-        audio_path = getattr(self.task, "video_path", None) or ""
+        # ``video_path`` historically served both as the report-output anchor
+        # and alignment input.  Prefer the explicit source path so isolated
+        # E2E runs can keep all writes out of the original audio directory.
+        audio_path = (
+            getattr(self.task, "source_audio_path", None)
+            or getattr(self.task, "video_path", None)
+            or ""
+        )
         if not audio_path or not Path(audio_path).exists():
             return use_stable_ledger_fallback("source_audio_missing")
         try:

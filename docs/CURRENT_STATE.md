@@ -636,3 +636,22 @@ Result:
   two-line profile instead of a time page.
 - `tests\test_stable_caption_rules.py`, `scripts\run_regression.py`, and
   `git diff --check` passed. No ASR, LLM request, or full-video synthesis ran.
+
+## 2026-08-05 Explicit E2E Source Audio Contract
+
+- Root cause: the E2E subtitle task used a report-anchor `video_path` that did
+  not exist, while final WhisperX time-only alignment read that same field and
+  therefore recorded `source_audio_missing` before invoking WhisperX.
+- `SubtitleTask.source_audio_path` now owns the read-only original media used
+  by final alignment. `TaskFactory.create_subtitle_task()` defaults it to the
+  legacy `video_path` for existing production callers, while E2E supplies the
+  real `.m4a` separately and keeps report sidecars inside its run directory.
+- The task-level regression verifies that an existing source `.m4a` reaches the
+  time-only aligner without changing the report anchor. Unified regression and
+  `git diff --check` pass.
+- The ASR preflight with the production model directory reproduced the prior
+  `original-transcript.srt` byte-for-byte. The subsequent full E2E reached the
+  existing hard English boundary gate at `S0160 -> S0161` (`to | so`) before
+  final alignment, so no new `final-cue-timeline.json` or video was produced.
+  This task does not alter English boundaries, IDs, or text to bypass that
+  independent blocker.

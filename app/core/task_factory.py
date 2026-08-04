@@ -128,6 +128,7 @@ class TaskFactory:
         article_context_data: Optional[dict] = None,
         use_article_reference_assist: bool = False,
         use_article_translation_terms: bool = False,
+        source_audio_path: Optional[str] = None,
     ) -> SubtitleTask:
         """创建字幕任务"""
         output_name = (
@@ -243,6 +244,10 @@ class TaskFactory:
             article_context_data=article_context_data,
             use_article_reference_assist=use_article_reference_assist,
             use_article_translation_terms=use_article_translation_terms,
+            # Existing production callers use ``video_path`` for both roles.
+            # E2E can supply a separate read-only alignment input while keeping
+            # report sidecars in its own output directory.
+            source_audio_path=source_audio_path or video_path,
         )
 
     @staticmethod
