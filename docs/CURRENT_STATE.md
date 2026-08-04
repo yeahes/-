@@ -515,3 +515,21 @@ Result:
   produced no ASR, WhisperX, or video-synthesis work, and used stable-ts
   fallback timing because no source audio was supplied to this subtitle-only
   runner.
+
+## 2026-08-04 Article Template Structural-Overflow Rendering
+
+- Root cause: `draw_article_frame()` rendered only the first two Chinese
+  wrapped lines. A grammatically protected 37-word English cue therefore
+  retained its frozen subtitle boundary but silently lost the tail of its
+  77-character Chinese translation in the article-template video.
+- Fix: article-template rendering now reduces Chinese display scale from its
+  normal size down to a bounded minimum until the full translation fits its
+  two-line visual region. It then renders every resulting line; no renderer
+  slice may omit translated text. English text, cue boundaries, IDs, word
+  spans, timings, allocation, and manifest behavior are unchanged.
+- Regression and real-frame validation used the former S0004 shape. The PNG
+  at `E:\VideoCaptioner-e2e-runs\ai-writing-style-full-e2e-20260804\overflow-fix-frame\S0004-fixed.png`
+  contains the entire Chinese text with no English/Chinese alpha-mask overlap.
+  `tests\test_stable_caption_rules.py`, `scripts\run_regression.py`, and
+  `git diff --check` passed. No full video was rerendered for this layout-only
+  verification.
