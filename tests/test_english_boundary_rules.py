@@ -141,8 +141,52 @@ def test_residual_hard_boundary_blocks_export():
     assert editor.has_blocking_validation_errors()
 
 
+def test_parser_confirmed_metalinguistic_reference_blocks_the_word_referent_cut():
+    words = (
+        "It points out that claiming a text is AI just because it uses the word "
+        "delve is as ridiculous."
+    ).split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    cut_after = words.index("word")
+    evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+    assert "metalinguistic_reference_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_confirmed_named_term_keeps_the_full_naming_relation():
+    words = "The term known as hallucination is widely used.".split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    for left, right in (("term", "known"), ("known", "as"), ("as", "hallucination")):
+        cut_after = words.index(left)
+        evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+        assert words[cut_after + 1] == right
+        assert "metalinguistic_reference_split" in evaluation["hard_issues"]
+        assert not evaluation["legal"]
+
+
+def test_unmapped_final_boundary_is_a_contract_error_not_an_allow():
+    editor = _boundary_editor(["The", "term", "delve", "is", "quoted."])
+    segments = _boundary_audit_segments(editor, 1)
+    editor._last_subtitle_items = []
+
+    records = editor._scan_final_english_boundaries(segments)
+
+    assert len(records) == 1
+    assert records[0]["classification"] == "hard"
+    assert records[0]["recommended_action"] == "pre_id_auto_repair_required"
+    assert "unmapped_frozen_boundary" in records[0]["rule_codes"]
+
+
 if __name__ == "__main__":
     test_fixture_backed_stable_boundary_contracts()
     test_fixture_backed_whole_file_boundary_audit_contracts()
     test_residual_hard_boundary_blocks_export()
+    test_parser_confirmed_metalinguistic_reference_blocks_the_word_referent_cut()
+    test_parser_confirmed_named_term_keeps_the_full_naming_relation()
+    test_unmapped_final_boundary_is_a_contract_error_not_an_allow()
     print("English boundary rule tests passed.")

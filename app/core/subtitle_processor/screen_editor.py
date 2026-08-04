@@ -6253,10 +6253,88 @@ class ScreenSubtitleEditor:
             self._protect_object_attached_modifier_boundaries(doc, doc_to_word)
             self._protect_comma_bracketed_adverb_boundaries(doc, doc_to_word)
             self._protect_modifier_head_boundaries(doc, doc_to_word)
+            self._protect_metalinguistic_reference_boundaries(doc, doc_to_word, protected)
 
         self._syntax_protected_cuts = protected
         if protected:
             logger.info("Screen subtitle syntax cut hints: protected=%s", len(protected))
+
+    def _protect_metalinguistic_reference_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+        protected: set[tuple[int, int]],
+    ) -> None:
+        """Keep an introduced word, term, or phrase with its referent.
+
+        ASR normally omits quotation marks.  A parser can consequently analyse
+        ``the word delve`` as an object followed by an ``xcomp`` rather than
+        an apposition.  This narrow dependency shape is still a quoted-term
+        relationship, so a formal subtitle boundary cannot sit between the
+        label and the introduced expression.
+        """
+        metalinguistic_heads = {"word", "term", "phrase", "expression", "name"}
+        naming_verbs = {
+            "called", "known", "named", "termed", "labelled", "labeled", "referred",
+        }
+        introduced_deps = {"xcomp", "appos", "attr", "oprd"}
+
+        for token in doc:
+            if token.i not in doc_to_word:
+                continue
+            if self._clean_boundary_token(token.text) not in metalinguistic_heads:
+                continue
+            if not any(
+                child.dep_ == "det" and child.i in doc_to_word
+                for child in token.children
+            ):
+                continue
+
+            head_word = doc_to_word[token.i]
+            governing = token.head
+            # spaCy often reads ``uses the word delve`` as two complements of
+            # ``uses``.  Require immediate parser-confirmed siblinghood so an
+            # ordinary subject such as ``the word changes`` remains splittable.
+            for sibling in getattr(governing, "children", ()):
+                if (
+                    sibling.i == token.i + 1
+                    and sibling.i in doc_to_word
+                    and sibling.dep_ in introduced_deps
+                ):
+                    indices = [head_word, doc_to_word[sibling.i]]
+                    self._protect_internal_boundaries(indices, protected)
+                    self._record_syntax_hard_issue_for_indices(
+                        indices,
+                        "metalinguistic_reference_split",
+                    )
+
+            # ``the term known as X`` and ``the phrase called X`` form one
+            # naming relation.  Protect only a parser-attached naming clause,
+            # not every adjective or relative clause after these nouns.
+            for child in token.children:
+                if (
+                    child.i not in doc_to_word
+                    or child.dep_ not in {"acl", "relcl", "appos"}
+                    or self._clean_boundary_token(child.text) not in naming_verbs
+                ):
+                    continue
+                indices = sorted(
+                    {
+                        head_word,
+                        *(
+                            doc_to_word[item.i]
+                            for item in child.subtree
+                            if item.i in doc_to_word
+                        ),
+                    }
+                )
+                if len(indices) < 2:
+                    continue
+                self._protect_internal_boundaries(indices, protected)
+                self._record_syntax_hard_issue_for_indices(
+                    indices,
+                    "metalinguistic_reference_split",
+                )
 
     def _protect_hard_noun_phrase_boundaries(self, chunk, doc_to_word: Dict[int, int]) -> None:
         word_indices = sorted(
@@ -8726,6 +8804,11 @@ class ScreenSubtitleEditor:
                     for reason in self._syntax_boundary_reasons(previous_text, current_text)
                     if not self._boundary_has_audited_issue_exception(previous, current, reason)
                 ]
+                # Stable final subtitles must remain addressable through the
+                # frozen word ledger.  Text-only audit cannot prove that an
+                # existing cue boundary is safe, so it must never quietly
+                # convert an unmapped boundary into a low-confidence allow.
+                hard_issues = ["unmapped_frozen_boundary"]
                 soft_issues = list(fallback_reasons)
                 pause_ms = max(0, int(current.start_time) - int(previous.end_time))
 
@@ -8744,7 +8827,6 @@ class ScreenSubtitleEditor:
                 speaker_change
                 or sentence_terminal
                 or (pause_ms is not None and pause_ms >= 450)
-                or not word_continuity
                 or ellipted_nonfinite_result_clause
             )
             rule_codes = list(dict.fromkeys(hard_issues + soft_issues))
