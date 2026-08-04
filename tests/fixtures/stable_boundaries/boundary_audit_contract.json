@@ -64,6 +64,14 @@
       "cut_after": 3,
       "expected_classification": "allow",
       "expected_issue": null
+    },
+    {
+      "id": "forced_to_before_comma_result_clause_is_not_hard",
+      "words": ["Exactly.", "Plus,", "it", "doesn't", "naturally", "quote", "human", "experts", "unless", "forced", "to,", "so", "it", "doesn't", "need", "all", "those", "attributive", "commas", "and", "quotation", "marks", "either."],
+      "cut_after": 10,
+      "pause_ms": 380,
+      "expected_classification": "review",
+      "expected_issue": "preposition_object_split"
     }
   ]
 }

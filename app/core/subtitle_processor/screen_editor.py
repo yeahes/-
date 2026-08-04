@@ -8733,11 +8733,19 @@ class ScreenSubtitleEditor:
                 previous_text,
                 current_text,
             )
+            ellipted_nonfinite_result_clause = (
+                self._has_ellipted_nonfinite_result_clause_evidence(
+                    previous_text,
+                    current_text,
+                    pause_ms,
+                )
+            )
             has_contrary_evidence = (
                 speaker_change
                 or sentence_terminal
                 or (pause_ms is not None and pause_ms >= 450)
                 or not word_continuity
+                or ellipted_nonfinite_result_clause
             )
             rule_codes = list(dict.fromkeys(hard_issues + soft_issues))
             if hard_issues and not has_contrary_evidence:
@@ -8779,6 +8787,7 @@ class ScreenSubtitleEditor:
                         "pause_ms": pause_ms,
                         "speaker_change": speaker_change,
                         "sentence_terminal": sentence_terminal,
+                        "ellipted_nonfinite_result_clause": ellipted_nonfinite_result_clause,
                         "left_last": previous_last,
                         "right_first": current_first,
                         "fallback_text_only": bool(fallback_reasons),
@@ -8795,6 +8804,43 @@ class ScreenSubtitleEditor:
                 }
             )
         return records
+
+    def _has_ellipted_nonfinite_result_clause_evidence(
+        self,
+        previous_text: str,
+        current_text: str,
+        pause_ms: Optional[int],
+    ) -> bool:
+        """Recognize a comma-scoped ellipted infinitive before a full result clause.
+
+        ``unless forced to, | so it ...`` is not a stranded preposition. The
+        infinitive completes the conditional through ellipsis, while the next
+        display starts a complete result clause. Keep the existing hard rule
+        for ordinary ``to | <object>`` splits; this only supplies contrary
+        evidence to the whole-file audit, so the boundary remains reviewable
+        instead of silently being rewritten or blocking export.
+        """
+        if pause_ms is None or pause_ms < 180:
+            return False
+        previous = self._normalize_text(previous_text)
+        current_words = [
+            token.casefold()
+            for token in self._word_tokens(self._normalize_text(current_text))
+        ]
+        if not re.search(
+            r"\b(?:unless|if|when|while|once|as)(?:\s+[A-Za-z][A-Za-z'-]*){1,5}\s+to,\s*$",
+            previous,
+            flags=re.IGNORECASE,
+        ):
+            return False
+        if not current_words or current_words[0] not in {"so", "then"}:
+            return False
+        result_clause_words = current_words[1:]
+        return bool(
+            result_clause_words
+            and self._fragment_has_finite_predicate(result_clause_words)
+            and not self._looks_like_subject_without_predicate(result_clause_words)
+        )
 
     def _syntax_boundary_reasons(self, previous_text: str, current_text: str) -> List[str]:
         if self._is_safe_independent_boundary(previous_text, current_text):
