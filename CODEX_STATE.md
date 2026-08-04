@@ -1,35 +1,39 @@
-# CODEX State
-Status: Article-template long-cue visual pagination verified; awaiting main-window review.
-Last verified: 2026-08-04 18:58:38 Asia/Shanghai
+# Project State
+Status: active
+Last verified: 2026-08-04 21:18:46 Asia/Shanghai
 Branch: codex/e2e-caption-regression
-Verified HEAD: fe083a7ee93b4f798a7d9bcd87a7b01830744e16
-Working tree: clean after the documentation checkpoint.
+Verified HEAD: 036080ec82cc41a4c47fa74a8721276d1bd6b7ba
+Working tree: modified; phase-one boundary ownership change is verified.
 
 ## Current Goal
-Record the verified readable-page renderer fix without rerunning the full 11-minute production video.
+Implement the approved four-stage subtitle-boundary, cache, and renderer correction as separate commits.
 
 ## Confirmed Facts
-- The article template previously discarded Chinese wrapped lines after the second line.
-- Long structural-overflow cue S0004 now renders as three readable visual pages
-  inside its frozen 12.15-second cue envelope.
-- Offline real-cue PNG verification found no crop, full English/Chinese text
-  across pages, and zero English/Chinese alpha-mask overlap.
+- Formal stable English boundaries no longer invoke the visual word/character budget.
+- A regression injects a failing visual-budget method and proves the formal finalizer cannot call it.
+- The existing renderer pagination remains a presentation-only projection and was not changed.
+
+## Approved Decisions
+- Formal English boundaries are owned only by deterministic language and timing stages before fixed IDs.
+- The 12-word/68-character visual target is renderer-only; it may never create a cue, subtitle ID, or Chinese allocation boundary.
 
 ## Relevant Paths
-- `E:\VideoCaptioner-e2e-runs\ai-writing-style-full-e2e-20260804\visual-pagination-validation\S0004-13.5s.png`
+- `app/core/subtitle_processor/stable_english_boundaries.py`
+- `app/core/subtitle_processor/screen_editor.py`
+- `tests/test_stable_boundary_finalization.py`
 - `E:\VideoCaptioner-e2e-runs\ai-writing-style-full-e2e-20260804\visual-pagination-validation\validation-report.md`
 
 ## Last Verification
-- `runtime\python.exe -X utf8 tests\test_stable_caption_rules.py`: PASS.
+- `runtime\python.exe -X utf8 tests\test_stable_boundary_finalization.py`: PASS.
 - `runtime\python.exe -X utf8 scripts\run_regression.py`: PASS.
 - `git diff --check`: PASS.
 
 ## Next Action
-Await main-window review before any further production rendering.
+Add the whole-file English boundary scanner with hard/review/allow evidence grades.
 
 ## Do Not Regress
-- Keep structural English-overflow cue text, timing, IDs, and Chinese allocation frozen.
-- Never silently truncate wrapped subtitle text or render a long bilingual cue as one unreadable paragraph.
+- Keep fixed English text, word ranges, subtitle IDs, Chinese allocation, SRT/ASS timing, and manifest resolution unchanged by rendering.
+- Do not treat a cue beginning with a subordinator, preposition, or finite verb as automatically invalid.
 
 ## Unknowns
-- The full 11-minute video has not been rerendered after this renderer-only fix.
+- The full-file boundary scan, cache fingerprint migration, and word-timed renderer pagination remain unimplemented.

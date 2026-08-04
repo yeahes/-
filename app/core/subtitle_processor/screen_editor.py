@@ -2300,15 +2300,13 @@ class ScreenSubtitleEditor:
         self,
         items: Sequence[ScreenSubtitleItem],
     ) -> List[ScreenSubtitleItem]:
-        """Create only evidence-backed visual time boundaries before IDs freeze.
+        """Legacy offline visual-boundary diagnostic helper.
 
-        A character budget alone cannot own subtitle timing: the former visual
-        pass created fragments simply because a complete cue was long.  This
-        stage instead treats the budget as a trigger, then requires a local
-        display-unit boundary backed by syntax, punctuation, word timing, and
-        minimum on-screen duration.  It runs before global IDs and Chinese
-        allocation, so every downstream stage receives one coherent boundary
-        set rather than presentation-only text edits.
+        Stable production deliberately does not invoke this helper. Formal
+        subtitle boundaries are owned by language/timing stages only; visual
+        pagination is a renderer-only projection after subtitle IDs and
+        Chinese allocation are frozen. The helper remains available to inspect
+        historical boundary evidence without becoming a production writer.
         """
         result: List[ScreenSubtitleItem] = []
         source_items = list(items)

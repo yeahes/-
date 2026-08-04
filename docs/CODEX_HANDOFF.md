@@ -80,9 +80,9 @@ match or list position.
 - Local deterministic cutting has parser-backed protections for subject/verb,
   verb/object, verb/preposition complement, clause introducer, phrasal verb,
   noun phrase, number/unit, time-range, and fragment boundaries.
-- The pre-ID visual reading pass may choose an independently safe boundary; it
-  does not change the frozen 16-word structural contract or manufacture a
-  structural split when no safe boundary exists.
+- The 12-word/68-character visual reading target is renderer-only. The formal
+  pre-ID boundary finalizer cannot invoke visual-budget splitting; renderer
+  pagination cannot create or move a subtitle boundary.
 - The spaCy-to-word-ledger mapper now handles split compound tokens without
   consuming later ledger words. This covers cases where spaCy tokenizes an ASR
   word such as `six-fold` or `52%` into multiple tokens.

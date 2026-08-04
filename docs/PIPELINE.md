@@ -35,12 +35,10 @@ Rules:
 - Preserve source order and token coverage.
 - Prefer clause, punctuation, discourse, and phrase boundaries.
 - Avoid cutting after prepositions, articles, auxiliaries, or connectors.
-- Before IDs are assigned, cues above the 12-word/68-character soft visual
-  budget may be split only at a high-confidence temporal display boundary:
-  sentence terminal (>=120ms pause), two complete punctuated clauses (>=250ms
-  pause), or a punctuated non-finite introduction followed by a complete main
-  clause (>=250ms pause). Both sides must have at least four words and meet
-  the local display-duration floor. Otherwise renderer wrapping owns the cue.
+- The 12-word/68-character visual reading target never creates a formal cue
+  boundary. A long, grammatically complete cue remains one fixed English item
+  until renderer-only pagination projects it into readable pages. That display
+  projection cannot change fixed IDs, Chinese allocation, SRT/ASS, or timing.
 - The same pre-ID finalizer may rebalance a short, parser-confirmed non-finite
   conditional prefix from the start of one cue to the preceding incomplete
   clause. It requires continuity, one speaker, a sub-450ms pause, a complete

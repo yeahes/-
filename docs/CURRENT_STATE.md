@@ -558,3 +558,22 @@ Result:
 - `runtime\python.exe -X utf8 tests\test_stable_caption_rules.py`,
   `runtime\python.exe -X utf8 scripts\run_regression.py`, and
   `git diff --check` passed. No ASR, LLM call, or full-video synthesis was run.
+
+## 2026-08-04 Formal English Boundary Ownership
+
+- Root cause: the active pre-ID boundary stage list still invoked
+  `_apply_visual_reading_budget`. Its 12-word/68-character trigger could
+  create extra formal English cues before IDs froze, forcing Chinese allocation
+  to mirror a visual fragment.
+- Fix: removed that function from `STABLE_ENGLISH_BOUNDARY_STAGES`. The helper
+  remains an offline historical diagnostic only; production boundaries now end
+  with syntax/timing validation and long cues flow unchanged to renderer-only
+  pagination.
+- Regression injects a failing visual-budget method into the editor and proves
+  the formal finalizer cannot call it. A 14-word grammatical cue also remains
+  one pre-ID item in the finalization test.
+- `tests\test_stable_boundary_finalization.py`,
+  `tests\test_stable_caption_rules.py`, `scripts\run_regression.py`, and
+  `git diff --check` passed. No ASR, LLM request, or synthesis ran.
+- Earlier references to the pre-ID visual temporal pass are retained as
+  historical records and are superseded by this ownership rule.

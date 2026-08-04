@@ -20,7 +20,6 @@ STABLE_ENGLISH_BOUNDARY_STAGES = (
     "_merge_short_display_segments",
     "_rebalance_edge_discourse_markers",
     "_validate_and_repair_final_pre_id_boundaries",
-    "_apply_visual_reading_budget",
 )
 
 

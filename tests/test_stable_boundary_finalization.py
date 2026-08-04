@@ -22,7 +22,7 @@ def test_boundary_facade_runs_the_fixed_pre_id_order_with_snapshot_handoffs():
     assert snapshots[0][3] is None
     assert snapshots[1][3] == ["snapshot:_stable_cut_items"]
     assert snapshots[-1][3] == [
-        "snapshot:_validate_and_repair_final_pre_id_boundaries"
+        "snapshot:_rebalance_edge_discourse_markers"
     ]
 
 
@@ -35,21 +35,25 @@ def test_finalizer_runs_all_english_stages_before_ids_are_assigned():
     editor._merge_short_display_segments = lambda items: [*items, "short"]
     editor._rebalance_edge_discourse_markers = lambda items: [*items, "edge"]
     editor._validate_and_repair_final_pre_id_boundaries = lambda items: [*items, "final"]
-    editor._apply_visual_reading_budget = lambda items: [*items, "visual"]
+
+    def visual_budget_must_not_run(items):
+        raise AssertionError("visual budget must not create formal cue boundaries")
+
+    editor._apply_visual_reading_budget = visual_budget_must_not_run
     editor._boundary_snapshot_items = lambda stage: [stage]
     editor._capture_boundary_snapshot = lambda stage, items, **kwargs: snapshots.append(stage)
 
     result = editor._finalize_stable_english_boundaries(["source"])
 
-    assert result == ["stable", "markers", "short", "edge", "final", "visual"]
+    assert result == ["stable", "markers", "short", "edge", "final"]
     assert snapshots == [
         "_stable_cut_items",
         "_merge_standalone_discourse_markers",
         "_merge_short_display_segments",
         "_rebalance_edge_discourse_markers",
         "_validate_and_repair_final_pre_id_boundaries",
-        "_apply_visual_reading_budget",
     ]
+    assert "_apply_visual_reading_budget" not in STABLE_ENGLISH_BOUNDARY_STAGES
 
 
 if __name__ == "__main__":

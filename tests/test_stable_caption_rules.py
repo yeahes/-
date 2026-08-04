@@ -2747,13 +2747,16 @@ def test_boundary_snapshots_record_stage_changes_before_subtitle_ids():
 
 def test_final_stable_english_boundaries_do_not_change_for_video_layout():
     editor = _marker_editor(
-        ["This", "is", "a", "long", "but", "grammatical", "English", "subtitle", "sentence."]
+        [
+            "This", "is", "a", "deliberately", "long", "but", "grammatical",
+            "English", "subtitle", "sentence", "that", "should", "stay", "frozen.",
+        ]
     )
 
     items = editor._finalize_stable_english_boundaries([])
 
     assert " ".join(item.original for item in items) == (
-        "This is a long but grammatical English subtitle sentence."
+        "This is a deliberately long but grammatical English subtitle sentence that should stay frozen."
     )
     assert all(item.subtitle_id is None for item in items)
     assert [stage["stage"] for stage in editor._boundary_snapshots] == [
@@ -2762,7 +2765,6 @@ def test_final_stable_english_boundaries_do_not_change_for_video_layout():
         "_merge_short_display_segments",
         "_rebalance_edge_discourse_markers",
         "_validate_and_repair_final_pre_id_boundaries",
-        "_apply_visual_reading_budget",
     ]
 
 
