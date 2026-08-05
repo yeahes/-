@@ -1,5 +1,6 @@
 import json
 import tempfile
+from enum import Enum
 from pathlib import Path
 
 from app.core.subtitle_processor.stable_artifacts import (
@@ -31,6 +32,19 @@ def test_write_json_artifact_preserves_unicode_and_indentation():
             "items": [1, 2],
         }
         assert "中文字幕" in path.read_text(encoding="utf-8")
+
+
+def test_write_json_artifact_serializes_enum_configuration_values():
+    class Target(Enum):
+        CHINESE = "简体中文"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "enum.json"
+        write_json_artifact(path, {"target_language": Target.CHINESE})
+
+        assert json.loads(path.read_text(encoding="utf-8")) == {
+            "target_language": "简体中文"
+        }
 
 
 def test_write_json_artifact_set_preserves_the_given_filenames_and_payloads():
@@ -71,6 +85,7 @@ if __name__ == "__main__":
     test_stable_artifact_dir_uses_the_coverage_report_stem()
     test_stable_artifact_dir_keeps_an_ordinary_report_stem()
     test_write_json_artifact_preserves_unicode_and_indentation()
+    test_write_json_artifact_serializes_enum_configuration_values()
     test_write_json_artifact_set_preserves_the_given_filenames_and_payloads()
     test_single_and_batch_writers_use_the_same_json_serialization()
     print("stable artifact helper tests passed")

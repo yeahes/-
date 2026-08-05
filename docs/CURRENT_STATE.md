@@ -1,6 +1,46 @@
 # Current State
 
-Last updated: 2026-08-04
+Last updated: 2026-08-06
+
+## 2026-08-06 Stable Boundary and Display Planner Follow-up
+
+- A renderer-only line wrap incorrectly treated every preposition at the next
+  line start as a hard error. This rejected the valid static layout
+  `through reinforcement learning` / `from human feedback.`.
+- The break scorer now distinguishes a complete prepositional or infinitive
+  phrase at the next line/page start (soft preference penalty) from a stranded
+  lexical dependency (hard penalty). High-confidence pairs such as
+  `according | to`, `completely | out`, and `far more | than` remain
+  blocked.
+- English boundary protection now also covers parser-confirmed zero-relative
+  clause entrances and post-noun participial modifiers before ID freezing.
+- Visual page span selection is delegated to the deterministic
+  `stable_display_planner` dynamic program. It only chooses word spans inside
+  an existing cue and preserves cue IDs, English text, Chinese allocation, and
+  cue timing.
+- Focused English-boundary tests, stable-caption tests, the unified regression,
+  and `git diff --check` pass.
+
+## 2026-08-06 Real-Audio E2E Verification
+
+- Cache-first E2E used the read-only source audio
+  `C:\Users\19379\Desktop\中国AI为何更省钱？\中国AI为何更省钱？.m4a` and wrote all
+  outputs under `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260806-followup`.
+- Subtitle processing passed with 266 fixed IDs and 2,897 ledger words.
+  `final-cue-timeline.json` is `PASS`, `alignment.applied_backend` is
+  `whisperx-time-only`, `fallback_used` is false, and no `source_audio_missing`
+  occurred. English text and Chinese ID mappings stayed complete and aligned.
+- The 64.8-66.5s speech check is covered by `S0017` through 67.975s. WhisperX
+  retained stable-ledger timing locally for eight unmatched words; this was not
+  an overall backend fallback.
+- External LLM requests: 0. All translation/allocation entries were cache hits;
+  the run disabled vocabulary-card generation.
+- Video synthesis was stopped before ffmpeg by the fixed-font structural gate
+  for `S0052`, `S0176`, `S0196`, and `S0258`:
+  `render_structural_overflow / no_fixed_font_page_partition`. No
+  `final-video.mp4` or `e2e-summary.json` was produced for this run. The gate
+  remains an unresolved renderer risk and was not bypassed by changing text,
+  IDs, timing, font size, or visual pagination rules.
 
 ## Working
 

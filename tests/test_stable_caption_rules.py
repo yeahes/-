@@ -17,8 +17,18 @@ from app.core.subtitle_processor.stable_ts_alignment import (
     align_frozen_word_ledger_with_whisperx,
     _make_whisperx_word_segments,
 )
+from app.core.subtitle_processor.stable_display_planner import (
+    plan_word_page_spans,
+    spans_cover_words,
+)
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
-from app.core.entities import SynthesisConfig, SynthesisTask, SubtitleConfig, SubtitleTask
+from app.core.entities import (
+    SynthesisConfig,
+    SynthesisTask,
+    SubtitleConfig,
+    SubtitleTask,
+    TargetLanguageEnum,
+)
 from app.core.task_factory import TaskFactory
 from app.thread.subtitle_thread import SubtitleThread
 from app.thread.video_synthesis_thread import VideoSynthesisThread, resolve_podcast_template_subtitle
@@ -3822,6 +3832,25 @@ def test_caption_wrapper_preserves_preposition_and_infinitive_phrase_edges():
     assert podcast_learning_video._caption_line_break_penalty(lead_words, infinitive_start + 1) > 0
 
 
+def test_caption_wrapper_distinguishes_complete_phrase_starts_from_stranded_dependencies():
+    complete = "through reinforcement learning from human feedback.".split()
+    complete_split = complete.index("from")
+    complete_penalty = podcast_learning_video._caption_line_break_penalty(
+        complete,
+        complete_split,
+    )
+    assert 0 < complete_penalty < podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+
+    for text, left in (
+        ("according to the report", "according"),
+        ("completely out of date", "completely"),
+        ("far more than humans do", "more"),
+    ):
+        words = text.split()
+        penalty = podcast_learning_video._caption_line_break_penalty(words, words.index(left) + 1)
+        assert penalty >= podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+
+
 def test_caption_wrapper_scales_before_breaking_a_hyphenated_compound():
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     text = "Think of the AI as a stand-up comedian with no internal sense of humor."
@@ -4053,6 +4082,61 @@ def test_article_page_timeline_uses_fixed_fonts_and_word_boundaries():
         assert podcast_learning_video.article_visual_page_index(cue, transition) == following["index"]
 
 
+def test_stable_display_planner_is_deterministic_and_covers_each_word_once():
+    spans = plan_word_page_spans(
+        12,
+        2,
+        cue_start=0.0,
+        cue_end=4.0,
+        word_timing=tuple(
+            {"start": index / 3, "end": (index + 1) / 3}
+            for index in range(12)
+        ),
+        span_is_readable=lambda start, end, is_first, paginated: end - start >= 4,
+        break_score=lambda end, target: abs(end - target),
+    )
+
+    assert spans == [(0, 6), (6, 12)]
+    assert spans_cover_words(spans, 12)
+    assert plan_word_page_spans(
+        12,
+        2,
+        cue_start=0.0,
+        cue_end=4.0,
+        word_timing=tuple(
+            {"start": index / 3, "end": (index + 1) / 3}
+            for index in range(12)
+        ),
+        span_is_readable=lambda start, end, is_first, paginated: end - start >= 4,
+        break_score=lambda end, target: abs(end - target),
+    ) == spans
+
+
+def test_article_renderer_never_accepts_a_forbidden_line_break_in_a_long_cue():
+    english = (
+        "So they literally have to invent entirely new ways to solve the same math "
+        "problem out of pure survival."
+    )
+    cue = podcast_learning_video.Cue(
+        156,
+        0.0,
+        10.0,
+        english,
+        "所以，他们确实是出于纯粹的生存需求，不得不发明全新的办法来解决同一个数学问题。",
+        "male",
+    )
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    for page in plan["pages"]:
+        assert not podcast_learning_video._has_discouraged_caption_break(
+            page["en"], page["en_lines"]
+        )
+
+
 def test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile():
     text = "A practical guide to clear reasoning beyond doubt."
     cue = podcast_learning_video.Cue(202, 5.0, 8.0, text, "一条简短的中文说明。", "male")
@@ -4118,7 +4202,7 @@ def test_article_renderer_keeps_short_dangling_tail_on_one_static_page():
     ]
 
 
-def test_article_renderer_keeps_three_line_bilingual_cue_on_one_page():
+def test_article_renderer_paginates_a_three_line_bilingual_cue_at_safe_word_spans():
     text = "they feed that curated, highly structured data to a new, smaller model, the student."
     chinese = "他们把经精选、高度结构化的数据喂给更小的新模型，即学生"
     cue = podcast_learning_video.Cue(64, 224.151, 230.475, text, chinese, "male")
@@ -4129,9 +4213,15 @@ def test_article_renderer_keeps_three_line_bilingual_cue_on_one_page():
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
 
     assert plan["status"] == "ok"
-    assert len(plan["pages"]) == 1
-    assert plan["pages"][0]["en"] == text
-    assert plan["pages"][0]["zh"] == chinese
+    assert len(plan["pages"]) >= 2
+    assert " ".join(page["en"] for page in plan["pages"]) == text
+    assert "".join(page["zh"] for page in plan["pages"]) == chinese
+    assert all(
+        not podcast_learning_video._has_discouraged_caption_break(
+            page["en"], page["en_lines"]
+        )
+        for page in plan["pages"]
+    )
     assert podcast_learning_video._caption_line_break_penalty(
         "a new smaller model".split(),
         2,
@@ -7538,6 +7628,14 @@ def test_whisperx_time_only_uses_explicit_source_audio_from_complete_task():
         assert editor.alignment["applied_backend"] == "whisperx-time-only"
 
 
+def test_screen_editor_normalizes_enum_target_language_for_prompts_and_artifacts():
+    assert (
+        ScreenSubtitleEditor._normalize_target_language(TargetLanguageEnum.CHINESE_SIMPLIFIED)
+        == "简体中文"
+    )
+    assert ScreenSubtitleEditor._normalize_target_language("English") == "English"
+
+
 def test_short_nonindependent_backchannel_attaches_to_previous_display_item():
     previous_words = "This explanation has fourteen ordinary words and ends as a complete thought clearly today".split()
     words = previous_words + ["Yeah.", "The", "next", "sentence", "continues."]
@@ -9433,10 +9531,12 @@ if __name__ == "__main__":
     test_article_template_does_not_truncate_a_long_english_subtitle()
     test_article_template_keeps_full_chinese_for_structural_overflow_cue()
     test_article_page_timeline_uses_fixed_fonts_and_word_boundaries()
+    test_stable_display_planner_is_deterministic_and_covers_each_word_once()
+    test_article_renderer_never_accepts_a_forbidden_line_break_in_a_long_cue()
     test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile()
     test_article_renderer_keeps_readable_two_line_cue_on_one_static_page()
     test_article_renderer_keeps_short_dangling_tail_on_one_static_page()
-    test_article_renderer_keeps_three_line_bilingual_cue_on_one_page()
+    test_article_renderer_paginates_a_three_line_bilingual_cue_at_safe_word_spans()
     test_chinese_visual_page_never_starts_with_attached_punctuation()
     test_article_renderer_keeps_modifier_head_phrase_on_one_visual_page()
     test_article_renderer_uses_pixel_width_for_43_character_chinese_cue()
@@ -9555,6 +9655,8 @@ if __name__ == "__main__":
     test_whisperx_frozen_ledger_keeps_monotonic_candidate_updates()
     test_whisperx_time_only_falls_back_to_stable_ledger_without_changing_cues()
     test_whisperx_time_only_uses_expanded_frozen_ledger_not_source_segment_count()
+    test_whisperx_time_only_uses_explicit_source_audio_from_complete_task()
+    test_screen_editor_normalizes_enum_target_language_for_prompts_and_artifacts()
     test_short_nonindependent_backchannel_attaches_to_previous_display_item()
     test_complete_unsplittable_overflow_is_warning_not_overlong_error()
     test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned()

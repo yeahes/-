@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Tuple
 
@@ -15,9 +16,24 @@ def stable_artifact_dir(report_path: Path) -> Path:
     return report_path.with_name(f"{stem}-artifacts")
 
 
+def _json_default(value: Any) -> Any:
+    """Serialize enum-backed configuration values without weakening JSON checks."""
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def write_json_artifact(path: Path, payload: Any) -> None:
     """Write one artifact with the established UTF-8, readable JSON format."""
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            default=_json_default,
+        ),
+        encoding="utf-8",
+    )
 
 
 def write_json_artifact_set(

@@ -1,5 +1,40 @@
 # Progress Log
 
+## 2026-08-06 Boundary and Renderer Follow-up (uncommitted)
+
+- Corrected the renderer's grammar gate so a complete phrase such as
+  `from human feedback` may begin a static line/page with a soft preference
+  penalty, while lexical dependencies remain hard-blocked. Regression cases
+  cover `according | to`, `completely | out`, and `far more | than`.
+- Added parser-confirmed guards for zero-relative clause entrances and
+  post-noun participial modifiers in the pre-ID English boundary stage.
+- Extracted deterministic word-span page planning into
+  `stable_display_planner.py`; the planner is presentation-only and cannot
+  mutate frozen cue IDs, text, or timings.
+- `tests/test_english_boundary_rules.py`,
+  `tests/test_stable_caption_rules.py`, `scripts/run_regression.py`, and
+  `git diff --check` pass. Real-audio E2E and synthesis remain the next gate;
+  no external request was made by this follow-up.
+
+## 2026-08-06 Real-Audio E2E Follow-up
+
+- Replayed the same read-only `中国AI为何更省钱？.m4a` through the current
+  stable pipeline with `SubtitleTask.source_audio_path` pointing at the
+  original audio and all run output isolated under
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260806-followup`.
+- Subtitle gate passed: 266/266 fixed IDs, 2,897 ledger words, complete English
+  and Chinese mappings, final timeline `PASS`, applied backend
+  `whisperx-time-only`, no overall fallback, and no `source_audio_missing`.
+  The 64.8-66.5s interval remains covered by `S0017` through 67.975s.
+- External request count was 0 because all translation/allocation work came
+  from the isolated E2E cache. WhisperX had eight per-word stable-ledger
+  timing retentions, but did not trigger an overall fallback.
+- Synthesis did not reach ffmpeg: the renderer's fixed-font structural gate
+  rejected `S0052`, `S0176`, `S0196`, and `S0258` with
+  `render_structural_overflow / no_fixed_font_page_partition`. No video was
+  created. This was recorded as a blocking renderer risk instead of bypassed
+  by altering English, IDs, timing, font size, or visual pagination.
+
 ## Current Objective
 
 Stabilize the production subtitle path and make the project recoverable for future Codex sessions.

@@ -169,6 +169,36 @@ def test_parser_confirmed_named_term_keeps_the_full_naming_relation():
         assert not evaluation["legal"]
 
 
+def test_parser_confirmed_post_noun_participial_modifier_stays_with_its_noun():
+    words = (
+        "Now when you compare that to Alphabet talking about a 205 billion spend "
+        "for a much shorter time frame"
+    ).split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    cut_after = words.index("Alphabet")
+    evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+    assert "post_noun_participial_modifier_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_confirmed_zero_relative_clause_stays_with_its_content_noun():
+    words = (
+        "They are forcing the domestic supply chain to communicate and optimize "
+        "at a level they never would have reached if they could import the hardware"
+    ).split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    cut_after = words.index("level")
+    evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+    assert "zero_relative_clause_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
 def test_unmapped_final_boundary_is_a_contract_error_not_an_allow():
     editor = _boundary_editor(["The", "term", "delve", "is", "quoted."])
     segments = _boundary_audit_segments(editor, 1)
@@ -188,5 +218,7 @@ if __name__ == "__main__":
     test_residual_hard_boundary_blocks_export()
     test_parser_confirmed_metalinguistic_reference_blocks_the_word_referent_cut()
     test_parser_confirmed_named_term_keeps_the_full_naming_relation()
+    test_parser_confirmed_post_noun_participial_modifier_stays_with_its_noun()
+    test_parser_confirmed_zero_relative_clause_stays_with_its_content_noun()
     test_unmapped_final_boundary_is_a_contract_error_not_an_allow()
     print("English boundary rule tests passed.")

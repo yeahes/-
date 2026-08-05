@@ -15,6 +15,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFo
 
 from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
 from app.core.entities import LLMServiceEnum
+from app.core.subtitle_processor.stable_display_planner import plan_word_page_spans
 from app.core.utils.json_repair import loads as repair_json_loads
 
 
@@ -176,6 +177,38 @@ LINE_BREAK_AVOID_AFTER_WORDS = {
     "has", "had", "can", "could", "will", "would", "shall", "should", "may", "might", "must",
 }
 CAPTION_HARD_BREAK_PENALTY = 12_000
+# A complete phrase that starts on the next line/page is readable, but it is
+# still slightly less desirable than a neutral boundary.  Keep this below the
+# hard threshold so callers can distinguish a review-worthy preference from a
+# genuinely stranded dependency.
+CAPTION_COMPLETE_PHRASE_START_PENALTY = 600
+# These are high-confidence lexical dependencies: the word on the left needs
+# the function word on the right to complete the same phrase.  They are
+# general grammar relations, not sample-specific exceptions.
+CAPTION_DEPENDENT_BOUNDARY_PAIRS = frozenset(
+    {
+        ("according", "to"),
+        ("based", "on"),
+        ("because", "of"),
+        ("completely", "out"),
+        ("different", "from"),
+        ("depending", "on"),
+        ("due", "to"),
+        ("far", "more"),
+        ("instead", "of"),
+        ("kind", "of"),
+        ("lack", "of"),
+        ("less", "than"),
+        ("more", "than"),
+        ("one", "of"),
+        ("part", "of"),
+        ("prior", "to"),
+        ("rather", "than"),
+        ("related", "to"),
+        ("sort", "of"),
+        ("such", "as"),
+    }
+)
 
 # These are presentation-only guards.  A paginated page may begin with a
 # complete prepositional or infinitive phrase, but a page must not begin with
@@ -1409,8 +1442,13 @@ def _caption_line_break_penalty(words: list[str], split: int) -> int:
     penalty = 0
     if previous in LINE_BREAK_AVOID_AFTER_WORDS:
         penalty += CAPTION_HARD_BREAK_PENALTY
-    if following in LINE_BREAK_AVOID_BEFORE_WORDS:
+    if _caption_boundary_has_stranded_dependency(words, split):
         penalty += CAPTION_HARD_BREAK_PENALTY
+    elif following in LINE_BREAK_AVOID_BEFORE_WORDS:
+        if _caption_phrase_start_is_complete(words, split):
+            penalty += CAPTION_COMPLETE_PHRASE_START_PENALTY
+        else:
+            penalty += CAPTION_HARD_BREAK_PENALTY
     if _looks_like_english_modifier_boundary(words[split - 1], words[split]):
         penalty += CAPTION_HARD_BREAK_PENALTY
     if "-" in words[split - 1]:
@@ -1420,6 +1458,34 @@ def _caption_line_break_penalty(words: list[str], split: int) -> int:
     if re.search(r"[.!?]$", words[split - 1]):
         penalty -= 2_400
     return penalty
+
+
+def _caption_boundary_has_stranded_dependency(words: list[str], split: int) -> bool:
+    """Return whether a split leaves a known lexical dependency behind."""
+    if split <= 0 or split >= len(words):
+        return False
+    previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
+    following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+    return (previous, following) in CAPTION_DEPENDENT_BOUNDARY_PAIRS
+
+
+def _caption_phrase_start_is_complete(words: list[str], split: int) -> bool:
+    """Allow a complete prepositional/infinitive phrase to start a line."""
+    if split <= 0 or split >= len(words):
+        return False
+    first = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+    if first not in ARTICLE_PAGE_PHRASE_START_WORDS:
+        return False
+    if _caption_boundary_has_stranded_dependency(words, split):
+        return False
+    remaining = [re.sub(r"[^A-Za-z']", "", word).lower() for word in words[split:]]
+    if len(remaining) < 2:
+        return False
+    # A function word immediately after the preposition still leaves the
+    # phrase incomplete ("from the" / "to the").
+    if remaining[1] in LINE_BREAK_AVOID_AFTER_WORDS:
+        return False
+    return remaining[-1] not in LINE_BREAK_AVOID_AFTER_WORDS
 
 
 def _has_discouraged_caption_break(text: str, lines: list[str]) -> bool:
@@ -2088,6 +2154,7 @@ def _article_fixed_english_lines(
         and len(lines) <= 2
         and not any(text_w(draw, line, fnt) > acx(ARTICLE_SUBTITLE_EN_WIDTH) for line in lines)
         and not _has_short_caption_line(lines)
+        and not _has_discouraged_caption_break(text, lines)
     ):
         return lines
     lines = wrap_en_preserving_highlight(
@@ -2105,6 +2172,7 @@ def _article_fixed_english_lines(
             for line in lines
         )
         or _has_short_caption_line(lines)
+        or _has_discouraged_caption_break(text, lines)
     ):
         return []
     # A line break inside one static page is not a timed English boundary. If
@@ -2208,76 +2276,37 @@ def _partition_article_english_pages(
     word_timing: tuple[dict, ...],
 ) -> list[tuple[int, int]] | None:
     """Find fixed-font page spans without creating a hard phrase split."""
-    memo: dict[tuple[int, int], tuple[int, list[tuple[int, int]]] | None] = {}
-
-    def solve(start: int, remaining_pages: int):
-        key = (start, remaining_pages)
-        if key in memo:
-            return memo[key]
-        remaining_words = len(words) - start
-        if remaining_words < remaining_pages:
-            memo[key] = None
-            return None
-        if remaining_pages == 1:
-            text = " ".join(words[start:])
-            result = (
-                (0, [(start, len(words))])
-                if (
-                    _article_page_span_is_readable(
-                        words[start:],
-                        is_first_page=start == 0,
-                        paginated=page_count > 1,
-                    )
-                    and _article_fixed_english_lines(draw, text)
-                )
-                else None
-            )
-            memo[key] = result
-            return result
-
-        best: tuple[int, list[tuple[int, int]]] | None = None
-        target_words = remaining_words / remaining_pages
-        last_end = len(words) - (remaining_pages - 1)
-        for end in range(start + 1, last_end + 1):
-            if len(word_timing) == len(words):
-                # Do not let punctuation alone choose a split that makes the
-                # first page too brief.  The old planner found a beautiful
-                # comma after two words, then rejected the entire two-page
-                # plan when scheduling found it lasted under 900ms, without
-                # considering the next viable semantic break.
-                completed_pages = page_count - remaining_pages + 1
-                trailing_pages = remaining_pages - 1
-                previous_end = float(word_timing[end - 1]["end"])
-                next_start = float(word_timing[end]["start"])
-                min_duration = ARTICLE_PAGE_MIN_DURATION_MS / 1000.0
-                if next_start + 1e-6 < float(cue.start) + completed_pages * min_duration:
-                    continue
-                if previous_end - 1e-6 > float(cue.end) - trailing_pages * min_duration:
-                    continue
-            page_words = words[start:end]
-            if not _article_page_span_is_readable(
+    def span_is_readable(
+        start: int,
+        end: int,
+        is_first_page: bool,
+        paginated: bool,
+    ) -> bool:
+        page_words = words[start:end]
+        return bool(
+            _article_page_span_is_readable(
                 page_words,
-                is_first_page=start == 0,
-                paginated=page_count > 1,
-            ):
-                continue
-            text = " ".join(page_words)
-            if not _article_fixed_english_lines(draw, text):
-                continue
-            score = _article_page_break_score(words, end, start + target_words, word_timing)
-            if score >= CAPTION_HARD_BREAK_PENALTY:
-                continue
-            suffix = solve(end, remaining_pages - 1)
-            if suffix is None:
-                continue
-            candidate = (score + suffix[0], [(start, end), *suffix[1]])
-            if best is None or candidate[0] < best[0]:
-                best = candidate
-        memo[key] = best
-        return best
+                is_first_page=is_first_page,
+                paginated=paginated,
+            )
+            and _article_fixed_english_lines(draw, " ".join(page_words))
+        )
 
-    result = solve(0, page_count)
-    return result[1] if result is not None else None
+    return plan_word_page_spans(
+        len(words),
+        page_count,
+        cue_start=float(cue.start),
+        cue_end=float(cue.end),
+        word_timing=word_timing,
+        min_page_duration=ARTICLE_PAGE_MIN_DURATION_MS / 1000.0,
+        span_is_readable=span_is_readable,
+        break_score=lambda end, target: _article_page_break_score(
+            words,
+            end,
+            target,
+            word_timing,
+        ),
+    )
 
 
 def _schedule_article_page_boundaries(

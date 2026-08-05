@@ -432,6 +432,11 @@ class ScreenSubtitleEditor:
         r"^(?:对|对的|没错|是的|当然|好吧|好的|嗯|啊|哦|确实)[,，。.!！…\s]+"
     )
 
+    @staticmethod
+    def _normalize_target_language(target_language: object) -> str:
+        value = getattr(target_language, "value", target_language)
+        return str(value or "简体中文")
+
     def __init__(
         self,
         model: str,
@@ -455,7 +460,7 @@ class ScreenSubtitleEditor:
         allocation_batch_size: int = 16,
     ):
         self.model = model
-        self.target_language = target_language
+        self.target_language = self._normalize_target_language(target_language)
         self.max_cjk_chars = max_cjk_chars
         self.max_english_words = max(HARD_ENGLISH_WORD_LIMIT, int(max_english_words or HARD_ENGLISH_WORD_LIMIT))
         self.batch_num = batch_num
@@ -6287,6 +6292,8 @@ class ScreenSubtitleEditor:
             self._protect_compact_coordination_boundaries(doc, doc_to_word)
             self._protect_object_content_clause_boundaries(doc, doc_to_word)
             self._protect_content_noun_that_clause_boundaries(doc, doc_to_word)
+            self._protect_zero_relative_clause_boundaries(doc, doc_to_word)
+            self._protect_post_noun_participial_modifier_boundaries(doc, doc_to_word)
             self._protect_object_attached_modifier_boundaries(doc, doc_to_word)
             self._protect_comma_bracketed_adverb_boundaries(doc, doc_to_word)
             self._protect_modifier_head_boundaries(doc, doc_to_word)
@@ -7031,6 +7038,103 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 [noun_index, marker_index],
                 "content_noun_that_clause_split",
+            )
+
+    def _protect_zero_relative_clause_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a noun attached to a post-nominal relative clause's first word.
+
+        English often omits ``that``/``which`` in an object relative clause:
+        ``a level they never would have reached``.  The parser still exposes
+        the ``relcl`` predicate, but the existing explicit-marker guard cannot
+        see the boundary after ``level``.  Protect only the noun-to-clause
+        entrance; later boundaries inside the clause remain available.
+        """
+        explicit_markers = {"that", "which", "who", "whom", "whose", "where", "when"}
+        for predicate in doc:
+            if (
+                getattr(predicate, "dep_", "") not in {"relcl", "acl"}
+                or predicate.i not in doc_to_word
+            ):
+                continue
+            head = getattr(predicate, "head", None)
+            if (
+                head is None
+                or head.i not in doc_to_word
+                or getattr(head, "pos_", "") not in {"NOUN", "PROPN"}
+            ):
+                continue
+            head_index = doc_to_word[head.i]
+            clause_indices = sorted(
+                doc_to_word[token.i]
+                for token in predicate.subtree
+                if token.i in doc_to_word and doc_to_word[token.i] > head_index
+            )
+            if not clause_indices:
+                continue
+            clause_start = clause_indices[0]
+            if clause_start != head_index + 1:
+                continue
+            first_clause_word = self._clean_boundary_token(
+                self._active_word_entries[clause_start].get("token") or ""
+            )
+            if first_clause_word in explicit_markers:
+                continue
+            previous_surface = str(self._active_word_entries[head_index].get("surface") or "")
+            if re.search(r"[,;:.!?]\s*$", previous_surface):
+                continue
+            pause_ms = self._word_pause_ms(head_index, clause_start)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [head_index, clause_start],
+                "zero_relative_clause_split",
+            )
+
+    def _protect_post_noun_participial_modifier_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep a noun with an immediately following participial modifier.
+
+        ASR commonly produces structures such as ``Alphabet talking about ...``
+        without punctuation.  Treat the noun-to-participle entrance as one
+        semantic unit when the parser marks the participle as an attached
+        clause/modifier and the audio has no meaningful pause.
+        """
+        for modifier in doc:
+            if (
+                getattr(modifier, "pos_", "") != "VERB"
+                or getattr(modifier, "tag_", "") not in {"VBG", "VBN"}
+                or getattr(modifier, "dep_", "") not in {"acl", "advcl", "amod"}
+                or modifier.i not in doc_to_word
+            ):
+                continue
+            modifier_index = doc_to_word[modifier.i]
+            previous = next(
+                (
+                    token
+                    for token in doc
+                    if doc_to_word.get(token.i) == modifier_index - 1
+                ),
+                None,
+            )
+            if (
+                previous is None
+                or previous.i not in doc_to_word
+                or getattr(previous, "pos_", "") not in {"NOUN", "PROPN"}
+            ):
+                continue
+            previous_index = doc_to_word[previous.i]
+            previous_surface = str(self._active_word_entries[previous_index].get("surface") or "")
+            if re.search(r"[,;:.!?]\s*$", previous_surface):
+                continue
+            pause_ms = self._word_pause_ms(previous_index, modifier_index)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [previous_index, modifier_index],
+                "post_noun_participial_modifier_split",
             )
 
     def _protect_object_attached_modifier_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
