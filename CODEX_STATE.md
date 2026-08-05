@@ -1,10 +1,10 @@
 # Project State
 
 Status: in_progress
-Last verified: 2026-08-06 03:06:06 Asia/Shanghai
+Last verified: 2026-08-06 03:09:12 Asia/Shanghai
 Branch: codex/e2e-caption-regression
-Verified HEAD: 47ae5f8
-Working tree: modified boundary/renderer code and tests; no staged files
+Verified HEAD: 3c70f4b
+Working tree: clean
 
 ## Current Goal
 Complete the current-code boundary/allocation/renderer E2E regression and hand

@@ -1,6 +1,6 @@
 # Progress Log
 
-## 2026-08-06 Boundary and Renderer Follow-up (uncommitted)
+## 2026-08-06 Boundary and Renderer Follow-up (committed as 3c70f4b)
 
 - Corrected the renderer's grammar gate so a complete phrase such as
   `from human feedback` may begin a static line/page with a soft preference
