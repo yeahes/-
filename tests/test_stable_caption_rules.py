@@ -3827,6 +3827,56 @@ def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
     assert set(rendered_lines) == expected_lines
 
 
+def test_article_visual_pages_never_split_a_chinese_lexical_unit():
+    chinese = "因为这基本上就像在一片大陆那么大的信息干草堆里找一根针。"
+
+    pages = podcast_learning_video._strict_split_chinese_visual_pages(
+        chinese,
+        2,
+        page_word_counts=[6, 8],
+        strict=True,
+    )
+
+    assert pages == [
+        "因为这基本上就像在一片大陆",
+        "那么大的信息干草堆里找一根针。",
+    ]
+    assert "".join(pages) == chinese
+    assert pages[0][-1] != "大"
+    assert pages[1][0] != "陆"
+
+
+def test_article_visual_pages_fail_closed_when_no_safe_chinese_boundary_exists():
+    with patch.object(
+        podcast_learning_video,
+        "_chinese_visual_token_boundaries",
+        return_value=None,
+    ):
+        pages = podcast_learning_video._strict_split_chinese_visual_pages(
+            "甲乙丙丁戊己庚辛壬癸",
+            2,
+            page_word_counts=[1, 1],
+            strict=True,
+        )
+
+    assert pages is None
+
+
+def test_article_visual_pages_use_local_token_boundaries_without_punctuation():
+    pages = podcast_learning_video._strict_split_chinese_visual_pages(
+        "中国AI小公司不必把有限资金砸进尖端芯片无底洞跑原始数据",
+        2,
+        page_word_counts=[12, 8],
+        strict=True,
+    )
+
+    assert pages is not None
+    assert "".join(pages) == "中国AI小公司不必把有限资金砸进尖端芯片无底洞跑原始数据"
+    assert all(page for page in pages)
+    assert pages[0].endswith("尖端")
+    assert pages[1].startswith("芯片")
+
+
 def test_article_page_timeline_uses_fixed_fonts_and_word_boundaries():
     english = (
         "Yeah. And, you know, what is genuinely consequential about that 1.2 "

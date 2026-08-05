@@ -1,0 +1,4 @@
+This directory contains the required runtime subset of jieba 0.42.1.
+
+jieba is distributed under the MIT License. Copyright (c) 2013 Sun Junyi.
+The full license text is available at https://github.com/fxsjy/jieba/blob/master/LICENSE.

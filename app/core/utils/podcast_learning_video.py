@@ -176,6 +176,20 @@ LINE_BREAK_AVOID_AFTER_WORDS = {
 }
 CAPTION_HARD_BREAK_PENALTY = 12_000
 
+# A Chinese visual page may switch before a new grammatical phrase, but it
+# must not switch inside an unspaced lexical unit.  This is intentionally a
+# conservative boundary vocabulary rather than a translation or segmentation
+# authority: punctuation remains strongest, and ambiguous text is rejected by
+# the strict page planner instead of being cut by character count.
+CHINESE_VISUAL_SAFE_PREFIXES = frozenset(
+    {
+        "因为", "所以", "但是", "然而", "而且", "并且", "不过", "否则", "因此",
+        "如果", "虽然", "即使", "以及", "还有", "同时", "并非", "尽管", "除非",
+        "其中", "于是", "比如", "例如", "包括", "随着", "那么", "这样",
+        "这种", "这些", "这个", "那个", "那些", "这里", "那里", "尤其", "而是",
+    }
+)
+
 
 @dataclass
 class Cue:
@@ -1826,12 +1840,70 @@ def split_chinese_visual_pages(
     page_count: int,
     page_word_counts: Sequence[int] | None = None,
 ) -> list[str]:
-    """Split Chinese near punctuation with the English page proportions.
+    """Split Chinese near safe phrase boundaries with English proportions.
 
     Render pages are derived from frozen English word spans.  Using those
     spans as the Chinese target prevents a later English-heavy page from
     receiving an unrelated, equal-sized Chinese fragment merely because both
-    pages happen to contain the same number of characters.
+    pages happen to contain the same number of characters.  The public helper
+    retains a best-effort fallback for legacy callers; the production planner
+    uses ``_strict_split_chinese_visual_pages`` and fails closed when no safe
+    boundary exists.
+    """
+    return _strict_split_chinese_visual_pages(
+        text,
+        page_count,
+        page_word_counts,
+        strict=False,
+    ) or []
+
+
+_CHINESE_VISUAL_TOKENIZER = None
+
+
+def _chinese_visual_token_boundaries(text: str) -> set[int] | None:
+    """Return deterministic word-end offsets from the vendored jieba model."""
+    global _CHINESE_VISUAL_TOKENIZER
+    try:
+        if _CHINESE_VISUAL_TOKENIZER is None:
+            from app._vendor import jieba
+
+            jieba.setLogLevel(logging.WARNING)
+            tokenizer = jieba.Tokenizer(
+                dictionary=str(Path(jieba.__file__).with_name("dict.txt"))
+            )
+            cache_dir = CACHE_PATH / "jieba"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tokenizer.tmp_dir = str(cache_dir)
+            tokenizer.cache_file = "visual-segmentation.cache"
+            _CHINESE_VISUAL_TOKENIZER = tokenizer
+        boundaries = {0}
+        offset = 0
+        for token in _CHINESE_VISUAL_TOKENIZER.cut(text, HMM=True):
+            token = str(token)
+            offset += len(token)
+            boundaries.add(offset)
+        return boundaries if offset == len(text) else None
+    except Exception:
+        logger.exception("Chinese visual tokenizer unavailable")
+        return None
+
+
+def _strict_split_chinese_visual_pages(
+    text: str,
+    page_count: int,
+    page_word_counts: Sequence[int] | None = None,
+    *,
+    strict: bool = True,
+) -> list[str] | None:
+    """Split Chinese without cutting a Han-word or glued token.
+
+    Chinese subtitles do not carry spaces, so a renderer cannot infer every
+    lexical word with certainty from characters alone.  A strict plan accepts
+    only punctuation or a conservative phrase-start boundary.  If none is
+    available near the English-proportional target, it returns ``None`` so the
+    caller can keep one page or block the render rather than create a visibly
+    broken word such as ``大 | 陆``.
     """
     compact = re.sub(r"\s+", "", str(text or ""))
     page_count = max(1, min(int(page_count or 1), len(compact) or 1))
@@ -1843,16 +1915,54 @@ def split_chinese_visual_pages(
     total_weight = sum(int(weight) for weight in weights)
     boundaries = [0]
     punctuation = set("，。；：！？、")
+    token_boundaries = _chinese_visual_token_boundaries(compact)
     for page in range(1, page_count):
         target = round(len(compact) * sum(int(weight) for weight in weights[:page]) / total_weight)
         minimum = boundaries[-1] + 1
         maximum = len(compact) - (page_count - page)
-        candidates = [
-            value
-            for value in range(max(minimum, target - 8), min(maximum, target + 8) + 1)
-            if value > 0 and compact[value - 1] in punctuation
-        ]
-        boundaries.append(min(candidates or [target], key=lambda value: abs(value - target)))
+        nearby = range(
+            max(minimum, target - 8),
+            min(maximum, target + 8) + 1,
+        )
+
+        def is_safe(value: int) -> bool:
+            if value <= 0 or value >= len(compact):
+                return False
+            previous = compact[value - 1]
+            following = compact[value]
+            if previous in punctuation:
+                return True
+            # Never split an ASCII/number token that was kept contiguous by
+            # the translation stage (URLs, model names, percentages, etc.).
+            if previous.isascii() and following.isascii() and (
+                previous.isalnum() or following.isalnum()
+            ):
+                return False
+            if not ("\u4e00" <= previous <= "\u9fff" and "\u4e00" <= following <= "\u9fff"):
+                return True
+            if token_boundaries is not None and value in token_boundaries:
+                return True
+            prefix = compact[value:min(len(compact), value + 2)]
+            if prefix in CHINESE_VISUAL_SAFE_PREFIXES:
+                return True
+            # Do not allow an ambiguous Han/Han boundary in strict mode.
+            return not strict
+
+        candidates = [value for value in nearby if is_safe(value)]
+        if not candidates:
+            if strict:
+                return None
+            candidates = [target]
+        boundaries.append(
+            min(
+                candidates,
+                key=lambda value: (
+                    abs(value - target),
+                    0 if compact[value - 1] in punctuation else 1,
+                    -value,
+                ),
+            )
+        )
     boundaries.append(len(compact))
     return [compact[start:end] for start, end in zip(boundaries, boundaries[1:])]
 
@@ -1867,7 +1977,12 @@ def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tup
     page_count = article_visual_page_count(cue)
     page_index = article_visual_page_index(cue, display_time)
     english_pages = split_article_visual_pages(cue.en, page_count)
-    chinese_pages = split_chinese_visual_pages(cue.zh, page_count)
+    chinese_pages = _strict_split_chinese_visual_pages(cue.zh, page_count, strict=True)
+    if chinese_pages is None:
+        # Unplanned article rendering is blocked by the normal preflight.  If
+        # a legacy caller still reaches this fallback, keep the complete text
+        # together rather than reproducing a character-level split.
+        chinese_pages = [re.sub(r"\s+", "", str(cue.zh or ""))]
     return (
         english_pages[min(page_index, len(english_pages) - 1)] if english_pages else "",
         chinese_pages[min(page_index, len(chinese_pages) - 1)] if chinese_pages else "",
@@ -2100,11 +2215,15 @@ def build_article_visual_page_plan(
         spans = _partition_article_english_pages(draw, cue, words, page_count, cue.word_timing)
         if spans is None:
             continue
-        chinese_pages = split_chinese_visual_pages(
+        chinese_pages = _strict_split_chinese_visual_pages(
             chinese,
             page_count,
             page_word_counts=[end - start for start, end in spans],
+            strict=True,
         )
+        if chinese and chinese_pages is None:
+            failure_reasons.add("chinese_no_safe_visual_boundary")
+            continue
         if chinese and len(chinese_pages) != page_count:
             failure_reasons.add("chinese_page_cardinality_mismatch")
             continue
@@ -2181,6 +2300,7 @@ def build_article_visual_page_plan(
         "missing_or_mismatched_word_ledger",
         "no_word_boundary_with_minimum_page_duration",
         "cue_duration_below_page_minimum",
+        "chinese_no_safe_visual_boundary",
         "chinese_does_not_fit_fixed_font",
         "chinese_page_cardinality_mismatch",
         "no_fixed_font_page_partition",

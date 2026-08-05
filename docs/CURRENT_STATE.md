@@ -695,3 +695,26 @@ Result:
   generation exceeded its responsiveness timeout and was skipped; subtitle
   rendering still completed successfully. The QA queue retains 40 review items
   and two unresolved allocation-quality items for later human review.
+
+## 2026-08-05 Chinese Visual Page Word-Boundary Guard
+
+- Root cause: the article renderer mapped English page word proportions to raw
+  Chinese character offsets. A target inside `大陆` therefore produced the
+  visible `大 | 陆` split even though the frozen Chinese cue was complete.
+- Fix: visual-page planning now obtains deterministic Chinese word-end offsets
+  from the vendored MIT `jieba` 0.42.1 runtime subset and only switches at a
+  tokenizer boundary, punctuation, or an explicit phrase-start boundary. The
+  renderer never changes the frozen SRT, subtitle IDs, English text, Chinese
+  allocation, word ledger, or page timing.
+- If the local tokenizer cannot provide a safe boundary, the strict planner
+  fails closed with `chinese_no_safe_visual_boundary`; it does not fall back to
+  character slicing. The tokenizer cache is written below the active E2E
+  `AppData` cache, never to the production runtime.
+- Offline replay of the 273-cue `china-ai-cheaper-e2e-20260805` artifact now
+  produces 273/273 valid plans. `S0055` renders as `...一片大陆` then
+  `那么大的...`; representative PNGs are in
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260805\visual-pagination-fixed-20260805`.
+- Added regression coverage for the observed `大陆` split, punctuation-free
+  Chinese compounds, and the fail-closed path. Stable caption tests, unified
+  regression, and `git diff --check` pass. No ASR, LLM request, or video
+  synthesis was run for this renderer-only change.

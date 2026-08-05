@@ -1,10 +1,10 @@
 # Project State
 
 Status: active
-Last verified: 2026-08-05 12:04:26 Asia/Shanghai
+Last verified: 2026-08-05 15:12:18 Asia/Shanghai
 Branch: codex/e2e-caption-regression
-Verified HEAD: 32a1124
-Working tree: clean
+Verified HEAD: e6b9b99
+Working tree: modified (visual-page word-boundary fix and vendored tokenizer)
 
 ## Current Goal
 Complete the current-code E2E verification after the boundary-audit false-positive fix.
@@ -22,30 +22,21 @@ Complete the current-code E2E verification after the boundary-audit false-positi
 - Do not bypass the hard boundary by changing English text, boundaries, fixed IDs, Chinese allocation, or rendering.
 
 ## Next action
-Hand off the two current-branch commit SHAs and the verified E2E artifacts for review.
+Review the visual-page diff, stage the focused renderer/test/docs commit, and re-check the final artifact paths.
 
 ## Unknowns
 - Vocabulary-card generation timed out after 301.7 seconds and was skipped; no subtitle LLM requests were made.
 - The QA queue retains 40 review items and two unresolved allocation-quality items; final timeline integrity is nevertheless PASS.
 
-## Relevant Paths
-- `app/core/entities.py`
-- `app/core/task_factory.py`
-- `app/thread/subtitle_thread.py`
-- `tests/test_stable_caption_rules.py`
-- `E:\VideoCaptioner-e2e-runs\ai-writing-whisperx-time-only-asr-preflight-r2\subtitle\original-transcript.srt`
-- `E:\VideoCaptioner-e2e-runs\ai-writing-whisperx-time-only-e2e-20260805-r2\run-summary.json`
-
 ## Last Verification
+
+- `runtime\python.exe -X utf8 tests\test_stable_caption_rules.py`: PASS.
 - `runtime\python.exe -X utf8 scripts\run_regression.py`: PASS.
+- `prepare_article_visual_page_plans` on the 273-cue current-code artifact: PASS, 273/273 cues.
 - `git diff --check`: PASS.
-- ASR preflight SHA-256 matches `ai-writing-style-full-e2e-20260804`.
 
-## Next Action
-Commit the source-audio contract, then hand off the E2E hard-boundary blocker without another paid run.
-
-## Do Not Regress
-- Do not use `video_path` as the only time-only alignment input when an explicit source path is available.
-
-## Unknowns
-- Final `whisperx-time-only` acceptance and video synthesis are unverified because the E2E blocks before final alignment.
+## Relevant Paths
+- `app/core/utils/podcast_learning_video.py`
+- `tests/test_stable_caption_rules.py`
+- `app/_vendor/jieba/NOTICE.txt`
+- `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260805\visual-pagination-fixed-20260805`

@@ -1,0 +1,3 @@
+# Jieba's Java-only pickle models are not imported by the bundled Windows
+# runtime; keep any local staging copies out of the repository.
+*.p
