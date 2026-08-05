@@ -677,3 +677,21 @@ Result:
   synthesized 11:07.36 video. Three display-coverage warnings remain in the
   runtime log for later targeted visual review; they did not block this final
   timeline or synthesis.
+
+## 2026-08-05 Current-Code Full E2E and Chinese Compression Validation
+
+- The current-code subtitle rerun for `中国AI为何更省钱？.m4a` completed in
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260805` using cached
+  translation/allocation artifacts (zero external LLM requests).
+- Final timeline validation passed for all 273 fixed IDs. The applied backend
+  is `whisperx-time-only`, with `fallback_used=false` and no
+  `source_audio_missing` record. The 64.8-66.5s audit interval is covered by
+  S0019 through 67.975s, including its final word envelope through 67.645s.
+- Chinese post-processing now inherits terminal punctuation from the frozen
+  complete cue, permits a validated single-cue speed compression, and runs
+  after final display-duration reconciliation. These changes are covered by
+  focused regression tests.
+- Synthesis produced `final-video.mp4` (61,356,806 bytes). Vocabulary-card
+  generation exceeded its responsiveness timeout and was skipped; subtitle
+  rendering still completed successfully. The QA queue retains 40 review items
+  and two unresolved allocation-quality items for later human review.

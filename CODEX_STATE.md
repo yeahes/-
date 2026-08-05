@@ -1,10 +1,10 @@
 # Project State
 
 Status: active
-Last verified: 2026-08-05 02:11:14 Asia/Shanghai
+Last verified: 2026-08-05 12:04:26 Asia/Shanghai
 Branch: codex/e2e-caption-regression
-Verified HEAD: efe368b
-Working tree: modified (E2E boundary-audit documentation)
+Verified HEAD: 32a1124
+Working tree: clean
 
 ## Current Goal
 Complete the current-code E2E verification after the boundary-audit false-positive fix.
@@ -15,18 +15,18 @@ Complete the current-code E2E verification after the boundary-audit false-positi
 - The task-level time-only regression and unified regression pass.
 - Production-model ASR preflight reproduced the historical transcript byte-for-byte.
 - Boundary audit now classifies the comma-scoped `forced to, | so it...` case as `review`.
-- Current-code E2E completed with 210 fixed IDs, `applied_backend=whisperx-time-only`, and a synthesized video under `E:\VideoCaptioner-e2e-runs\ai-writing-current-boundary-fix-e2e-20260805`.
+- Current-code E2E completed with 273 fixed IDs, `applied_backend=whisperx-time-only`, no `source_audio_missing`, and a synthesized video under `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260805`.
 
 ## Approved Decisions
 - The original `.m4a` remains read-only; E2E report sidecars remain under `E:\VideoCaptioner-e2e-runs`.
 - Do not bypass the hard boundary by changing English text, boundaries, fixed IDs, Chinese allocation, or rendering.
 
 ## Next action
-Review the three unresolved display-coverage warnings with a targeted visual audit before treating the current E2E as production-clean.
+Hand off the two current-branch commit SHAs and the verified E2E artifacts for review.
 
 ## Unknowns
-- The renderer's vocabulary-card request count is not persisted separately from the synthesis log.
-- The three unresolved display-coverage warnings need targeted visual confirmation even though final timeline validation passed.
+- Vocabulary-card generation timed out after 301.7 seconds and was skipped; no subtitle LLM requests were made.
+- The QA queue retains 40 review items and two unresolved allocation-quality items; final timeline integrity is nevertheless PASS.
 
 ## Relevant Paths
 - `app/core/entities.py`
