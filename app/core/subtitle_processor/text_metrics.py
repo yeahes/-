@@ -16,7 +16,7 @@ def word_tokens(text: str) -> List[str]:
 
 
 def is_allowed_discourse_overflow(text: str, count: int, hard_limit: int) -> bool:
-    """Allow one complete Plus sentence above the soft display limit.
+    """Allow one complete Plus/Oh lead-in above the hard display limit.
 
     This narrow exception avoids creating a one-word subtitle just to satisfy a
     numeric limit. It is shared by generation and audit code so the same cue
@@ -25,6 +25,6 @@ def is_allowed_discourse_overflow(text: str, count: int, hard_limit: int) -> boo
     normalized = str(text or "").strip()
     return bool(
         count == hard_limit + 1
-        and re.match(r"^plus\s*,?\s+", normalized, re.IGNORECASE)
+        and re.match(r"^(?:plus|oh)\s*[,.]?\s+", normalized, re.IGNORECASE)
         and re.search(r"[.!?][\"')\]]*\s*$", normalized)
     )

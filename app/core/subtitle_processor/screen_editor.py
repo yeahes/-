@@ -1613,7 +1613,15 @@ class ScreenSubtitleEditor:
         normalized = cls._normalize_text(text)
         normalized = re.sub(r"[^a-z]+", " ", normalized.lower()).strip()
         normalized = re.sub(r"\s+", " ", normalized)
-        if normalized in {"i mean", "you know", "i guess", "well i mean", "plus"}:
+        if normalized in {
+            "oh",
+            "oh and then",
+            "i mean",
+            "you know",
+            "i guess",
+            "well i mean",
+            "plus",
+        }:
             return normalized
         return ""
 
@@ -1643,15 +1651,15 @@ class ScreenSubtitleEditor:
         combined: ScreenSubtitleItem,
         combined_words: int,
     ) -> bool:
-        """Keep a complete connector-led sense unit over one isolated marker.
+        """Keep a complete sense unit over one isolated discourse marker.
 
         The configured English value is a soft display target.  This narrow
-        exception is only for a one-word ``Plus,`` lead-in where splitting
-        would leave the connector alone and the complete unit exceeds the
-        target by exactly one word.
+        The exception is limited to a one-word ``Plus,`` or ``Oh.`` lead-in
+        where splitting would strand the marker and the complete unit exceeds
+        the target by exactly one word.
         """
         return bool(
-            self._standalone_discourse_marker(marker.original) == "plus"
+            self._standalone_discourse_marker(marker.original) in {"plus", "oh"}
             and combined_words == self.max_english_words + 1
             and re.search(r"[.!?][\"')\]]*\s*$", combined.original or "")
         )
@@ -1973,6 +1981,8 @@ class ScreenSubtitleEditor:
         next_item: Optional[ScreenSubtitleItem],
     ) -> bool:
         text = cls._normalize_text(marker.original)
+        if re.search(r"\?\s*$", text):
+            return True
         if not re.search(r"[.!?]\s*$", text):
             return False
         previous_question = bool(previous_item and re.search(r"\?\s*$", previous_item.original or ""))
@@ -5772,7 +5782,14 @@ class ScreenSubtitleEditor:
         }
         if (left, right) in protected_pairs:
             return True
-        if left.endswith("'s") or left.endswith("s'"):
+        # A possessive is only an atomic modifier when it is followed by its
+        # governed head.  A coordinator can introduce a new clause after a
+        # comma (``America's, and actually ...``); treating every possessive
+        # followed by ``and`` as a hard split would strand a valid clause
+        # boundary and block otherwise safe overlong-cue repair.
+        if (left.endswith("'s") or left.endswith("s'")) and right not in {
+            "and", "or", "but", "so", "yet", "nor",
+        }:
             return True
         return False
 
@@ -6253,6 +6270,7 @@ class ScreenSubtitleEditor:
             self._protect_coordinated_subject_boundaries(doc, doc_to_word)
             self._protect_compact_coordination_boundaries(doc, doc_to_word)
             self._protect_object_content_clause_boundaries(doc, doc_to_word)
+            self._protect_content_noun_that_clause_boundaries(doc, doc_to_word)
             self._protect_object_attached_modifier_boundaries(doc, doc_to_word)
             self._protect_comma_bracketed_adverb_boundaries(doc, doc_to_word)
             self._protect_modifier_head_boundaries(doc, doc_to_word)
@@ -6701,8 +6719,33 @@ class ScreenSubtitleEditor:
             # "sold 100 homes in three cities" may safely break after homes;
             # "fell 52% from its peak" is handled below as a one-boundary
             # qualifier attachment.
+            # ``Token.subtree`` includes coordinated material attached to the
+            # same nominal result.  For example, spaCy parses
+            # ``the size of America's, and actually a third bigger`` with
+            # ``bigger`` still attached to ``size``.  A numeric-result guard
+            # must stop at the first punctuation/coordinator boundary; it
+            # protects the result phrase, not the following clause.
+            subtree = sorted(result_token.subtree, key=lambda item: item.i)
+            coordination_start = next(
+                (
+                    item.i
+                    for item in subtree
+                    if item.i > result_token.i
+                    and (
+                        getattr(item, "dep_", "") == "cc"
+                        or (
+                            getattr(item, "pos_", "") == "PUNCT"
+                            and self._clean_boundary_token(getattr(item, "text", ""))
+                            in {",", ";", ":"}
+                        )
+                    )
+                ),
+                None,
+            )
             result_indices = []
-            for item in result_token.subtree:
+            for item in subtree:
+                if coordination_start is not None and item.i >= coordination_start:
+                    continue
                 if item.i not in doc_to_word:
                     continue
                 ancestor = item
@@ -6944,6 +6987,34 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 [previous_index, marker_index],
                 "object_content_clause_split",
+            )
+
+    def _protect_content_noun_that_clause_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
+        """Keep a content noun with its attached ``that`` clause before IDs freeze."""
+        for marker in doc:
+            if (
+                getattr(marker, "dep_", "") != "mark"
+                or self._clean_boundary_token(getattr(marker, "text", "")) != "that"
+                or marker.i not in doc_to_word
+            ):
+                continue
+            predicate = marker.head
+            noun = getattr(predicate, "head", None)
+            if (
+                noun is None
+                or predicate.i not in doc_to_word
+                or noun.i not in doc_to_word
+                or getattr(predicate, "dep_", "") not in {"acl", "relcl"}
+                or getattr(noun, "pos_", "") not in {"NOUN", "PROPN"}
+            ):
+                continue
+            noun_index = doc_to_word[noun.i]
+            marker_index = doc_to_word[marker.i]
+            if marker_index != noun_index + 1:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [noun_index, marker_index],
+                "content_noun_that_clause_split",
             )
 
     def _protect_object_attached_modifier_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
