@@ -2467,6 +2467,21 @@ def test_parser_blocks_object_attached_modifier_boundary():
     assert not evaluation["legal"]
 
 
+def test_parser_blocks_misattached_zero_relative_clause_boundary():
+    editor = _marker_editor(
+        (
+            "And it brings us to one of the most fascinating technical strategies "
+            "in the sources we're looking at today."
+        ).split()
+    )
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(14, 15)
+
+    assert "zero_relative_clause_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
 def test_parser_blocks_short_dative_object_start_boundary():
     editor = _marker_editor(
         ["the", "company", "gives", "you", "a", "completely", "different", "lens."]
@@ -3249,17 +3264,116 @@ def test_parser_mapping_keeps_numeric_result_after_hyphenated_ledger_word():
     assert not evaluation["legal"]
 
 
-def test_stable_cut_prefers_normal_limit_when_a_legal_boundary_exists():
+def test_stable_cut_balances_the_full_sentence_instead_of_leaving_a_short_tail():
     words = [
-        "One", "two", "three", "four", "five", "six", "seven", "eight",
-        "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-        "sixteen", "seventeen", "eighteen", "nineteen", "twenty.",
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        "india", "juliet", "kilo", "lima", "mike", "november", "oscar",
+        "papa", "quebec", "romeo", "sierra", "tango.",
     ]
     editor = _marker_editor(words, max_words=16)
 
     ranges = editor._stable_word_ranges_for_span((0, len(words) - 1))
 
-    assert [end - start + 1 for start, end in ranges] == [16, 4]
+    assert [end - start + 1 for start, end in ranges] == [10, 10]
+
+
+def test_stable_cut_does_not_evaluate_overflow_when_normal_partition_exists():
+    words = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        "india", "juliet", "kilo", "lima", "mike", "november", "oscar",
+        "papa", "quebec", "romeo", "sierra", "tango.",
+    ]
+    editor = _marker_editor(words, max_words=16)
+    overflow_checks = []
+
+    def record_overflow_check(start, end):
+        overflow_checks.append((start, end))
+        return True
+
+    editor._is_complete_pre_id_structural_overflow_range = record_overflow_check
+
+    ranges = editor._stable_word_ranges_for_span((0, len(words) - 1))
+
+    assert [end - start + 1 for start, end in ranges] == [10, 10]
+    assert overflow_checks == []
+
+
+def test_final_fragment_blocks_short_open_prefix_but_allows_finite_clause():
+    words = "Because in America, you have dozens of competing firms today.".split()
+    editor = _marker_editor(words, max_words=16)
+    prefix = _word_item(editor, 0, 2, 1)
+    continuation = _word_item(editor, 3, len(words) - 1, 1)
+
+    fragment = editor._evaluate_final_display_fragment(prefix, None, continuation)
+
+    assert "short_open_prefix_fragment" in fragment["hard_fragment_issues"]
+
+    finite_words = "Because the market had already changed, sales doubled.".split()
+    finite_editor = _marker_editor(finite_words, max_words=16)
+    finite_clause = _word_item(finite_editor, 0, 5, 1)
+    finite_continuation = _word_item(finite_editor, 6, len(finite_words) - 1, 1)
+
+    finite_fragment = finite_editor._evaluate_final_display_fragment(
+        finite_clause,
+        None,
+        finite_continuation,
+    )
+
+    assert "short_open_prefix_fragment" not in finite_fragment["hard_fragment_issues"]
+
+
+def test_final_pre_id_repair_keeps_short_open_prefix_with_clause_across_pause():
+    words = "Exactly. And yet, a Beijing startup won the race.".split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    continuation_start = 3
+    for entry in editor._active_word_entries[continuation_start:]:
+        entry["start_time"] += 500
+        entry["end_time"] += 500
+    prefix = _word_item(editor, 0, continuation_start - 1, 1)
+    continuation = _word_item(editor, continuation_start, len(words) - 1, 1)
+
+    fragment = editor._evaluate_final_display_fragment(prefix, None, continuation)
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(
+        [prefix, continuation]
+    )
+
+    assert editor._boundary_pause_ms(prefix, continuation) == 580
+    assert "short_open_prefix_fragment" in fragment["hard_fragment_issues"]
+    assert " ".join(item.original for item in repaired) == (
+        "Exactly. And yet, a Beijing startup won the race."
+    )
+    assert all(not item.original.endswith("And yet,") for item in repaired)
+    assert all(not item.original.endswith("a Beijing") for item in repaired)
+    assert any(
+        "And yet, a Beijing startup won the race." in item.original
+        for item in repaired
+    )
+
+
+def test_orphaned_predicate_parse_is_cached_for_the_same_frozen_span():
+    editor = _marker_editor("they spend less today.".split(), max_words=16)
+    predicate = _word_item(editor, 1, 3, 1)
+    parse_calls = []
+
+    class Root:
+        dep_ = "ROOT"
+        pos_ = "VERB"
+        tag_ = "VBP"
+        children = ()
+
+    def parse(text):
+        parse_calls.append(text)
+        return [Root()]
+
+    editor._load_syntax_nlp = lambda: parse
+
+    first = editor._orphaned_finite_predicate_issues(predicate)
+    second = editor._orphaned_finite_predicate_issues(predicate)
+
+    assert first == ["right_orphaned_finite_predicate"]
+    assert second == first
+    assert parse_calls == ["spend less today."]
 
 
 def test_final_gate_soft_flags_heuristic_short_verb_object_split():
@@ -3851,6 +3965,27 @@ def test_caption_wrapper_distinguishes_complete_phrase_starts_from_stranded_depe
         assert penalty >= podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
 
 
+def test_caption_wrapper_accepts_a_complete_article_bearing_prepositional_phrase():
+    complete = (
+        "Because it's basically trying to find a needle in a continent-sized "
+        "haystack of information."
+    ).split()
+    split = complete.index("in")
+
+    penalty = podcast_learning_video._caption_line_break_penalty(complete, split)
+
+    assert 0 < penalty < podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+    incomplete = "The value came directly from the".split()
+    incomplete_split = incomplete.index("from")
+    assert (
+        podcast_learning_video._caption_line_break_penalty(
+            incomplete,
+            incomplete_split,
+        )
+        >= podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+    )
+
+
 def test_caption_wrapper_scales_before_breaking_a_hyphenated_compound():
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     text = "Think of the AI as a stand-up comedian with no internal sense of humor."
@@ -4173,6 +4308,21 @@ def test_article_renderer_keeps_readable_two_line_cue_on_one_static_page():
     assert plan["pages"][0]["end"] == cue.end
 
 
+def test_article_fixed_layout_uses_two_word_line_only_as_a_static_fallback():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    for text in (
+        "Stuffed with the most powerful semiconductors ever created,",
+        "You're spreading the intelligence everywhere, cheaply.",
+    ):
+        lines = podcast_learning_video._article_fixed_english_lines(draw, text)
+
+        assert lines
+        assert " ".join(lines) == text
+        assert len(lines) == 2
+        assert min(len(line.split()) for line in lines) == 2
+        assert not podcast_learning_video._has_discouraged_caption_break(text, lines)
+
+
 def test_article_renderer_keeps_short_dangling_tail_on_one_static_page():
     text = "this sounds less like getting a discount on car parts and more like"
     cue = podcast_learning_video.Cue(
@@ -4202,7 +4352,7 @@ def test_article_renderer_keeps_short_dangling_tail_on_one_static_page():
     ]
 
 
-def test_article_renderer_paginates_a_three_line_bilingual_cue_at_safe_word_spans():
+def test_article_renderer_keeps_a_complete_phrase_on_a_static_bilingual_page():
     text = "they feed that curated, highly structured data to a new, smaller model, the student."
     chinese = "他们把经精选、高度结构化的数据喂给更小的新模型，即学生"
     cue = podcast_learning_video.Cue(64, 224.151, 230.475, text, chinese, "male")
@@ -4213,19 +4363,23 @@ def test_article_renderer_paginates_a_three_line_bilingual_cue_at_safe_word_span
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
 
     assert plan["status"] == "ok"
-    assert len(plan["pages"]) >= 2
-    assert " ".join(page["en"] for page in plan["pages"]) == text
-    assert "".join(page["zh"] for page in plan["pages"]) == chinese
-    assert all(
-        not podcast_learning_video._has_discouraged_caption_break(
-            page["en"], page["en_lines"]
-        )
-        for page in plan["pages"]
+    assert len(plan["pages"]) == 1
+    page = plan["pages"][0]
+    assert page["en"] == text
+    assert page["zh"] == chinese
+    assert page["en_lines"] == [
+        "they feed that curated, highly structured data",
+        "to a new, smaller model, the student.",
+    ]
+    assert not podcast_learning_video._has_discouraged_caption_break(
+        page["en"],
+        page["en_lines"],
     )
-    assert podcast_learning_video._caption_line_break_penalty(
-        "a new smaller model".split(),
-        2,
-    ) >= podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+    phrase_penalty = podcast_learning_video._caption_line_break_penalty(
+        text.split(),
+        text.split().index("to"),
+    )
+    assert 0 < phrase_penalty < podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
 
 
 def test_chinese_visual_page_never_starts_with_attached_punctuation():
@@ -9450,6 +9604,7 @@ if __name__ == "__main__":
     test_parser_blocks_compact_coordination_boundaries()
     test_parser_blocks_object_content_clause_boundary()
     test_parser_blocks_object_attached_modifier_boundary()
+    test_parser_blocks_misattached_zero_relative_clause_boundary()
     test_parser_blocks_short_dative_object_start_boundary()
     test_parser_blocks_numeric_range_boundaries()
     test_pre_id_candidate_gate_rejects_new_hard_syntax_boundary()
@@ -9495,7 +9650,11 @@ if __name__ == "__main__":
     test_parser_blocks_verb_from_its_preposition_complement()
     test_parser_blocks_verb_from_numeric_result_expression()
     test_parser_mapping_keeps_numeric_result_after_hyphenated_ledger_word()
-    test_stable_cut_prefers_normal_limit_when_a_legal_boundary_exists()
+    test_stable_cut_balances_the_full_sentence_instead_of_leaving_a_short_tail()
+    test_stable_cut_does_not_evaluate_overflow_when_normal_partition_exists()
+    test_final_fragment_blocks_short_open_prefix_but_allows_finite_clause()
+    test_final_pre_id_repair_keeps_short_open_prefix_with_clause_across_pause()
+    test_orphaned_predicate_parse_is_cached_for_the_same_frozen_span()
     test_final_gate_soft_flags_heuristic_short_verb_object_split()
     test_final_gate_blocks_auxiliary_predicate_split()
     test_final_gate_soft_flags_heuristic_catenative_verb_complement_split()
@@ -9527,6 +9686,8 @@ if __name__ == "__main__":
     test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths()
     test_caption_wrapper_never_orphans_a_leading_connector_to_balance_two_lines()
     test_caption_wrapper_preserves_preposition_and_infinitive_phrase_edges()
+    test_caption_wrapper_distinguishes_complete_phrase_starts_from_stranded_dependencies()
+    test_caption_wrapper_accepts_a_complete_article_bearing_prepositional_phrase()
     test_caption_wrapper_scales_before_breaking_a_hyphenated_compound()
     test_article_template_does_not_truncate_a_long_english_subtitle()
     test_article_template_keeps_full_chinese_for_structural_overflow_cue()
@@ -9535,8 +9696,9 @@ if __name__ == "__main__":
     test_article_renderer_never_accepts_a_forbidden_line_break_in_a_long_cue()
     test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile()
     test_article_renderer_keeps_readable_two_line_cue_on_one_static_page()
+    test_article_fixed_layout_uses_two_word_line_only_as_a_static_fallback()
     test_article_renderer_keeps_short_dangling_tail_on_one_static_page()
-    test_article_renderer_paginates_a_three_line_bilingual_cue_at_safe_word_spans()
+    test_article_renderer_keeps_a_complete_phrase_on_a_static_bilingual_page()
     test_chinese_visual_page_never_starts_with_attached_punctuation()
     test_article_renderer_keeps_modifier_head_phrase_on_one_visual_page()
     test_article_renderer_uses_pixel_width_for_43_character_chinese_cue()

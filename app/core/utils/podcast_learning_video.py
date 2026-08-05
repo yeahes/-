@@ -149,6 +149,7 @@ ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
 ARTICLE_VISUAL_PAGE_MAX_WORDS = 16
 ARTICLE_VISUAL_PAGE_PREFERRED_WORDS = 12
 ARTICLE_VISUAL_PAGE_MIN_WORDS = 4
+ARTICLE_STATIC_TWO_WORD_LINE_MAX_WORDS = ARTICLE_VISUAL_PAGE_MIN_WORDS * 2
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
 )
@@ -1481,10 +1482,9 @@ def _caption_phrase_start_is_complete(words: list[str], split: int) -> bool:
     remaining = [re.sub(r"[^A-Za-z']", "", word).lower() for word in words[split:]]
     if len(remaining) < 2:
         return False
-    # A function word immediately after the preposition still leaves the
-    # phrase incomplete ("from the" / "to the").
-    if remaining[1] in LINE_BREAK_AVOID_AFTER_WORDS:
-        return False
+    # An article may introduce the phrase's complete object (``in a large
+    # market``). Only a terminal function word leaves the visible phrase
+    # incomplete (``from the`` / ``to a``).
     return remaining[-1] not in LINE_BREAK_AVOID_AFTER_WORDS
 
 
@@ -1499,7 +1499,14 @@ def _has_discouraged_caption_break(text: str, lines: list[str]) -> bool:
     )
 
 
-def wrap_en(draw, text: str, fnt, max_width: int) -> list[str]:
+def wrap_en(
+    draw,
+    text: str,
+    fnt,
+    max_width: int,
+    *,
+    minimum_line_words: int = 3,
+) -> list[str]:
     """Choose a balanced two-line fit while retaining basic phrase units."""
     words = text.split()
     if text_w(draw, text, fnt) <= max_width:
@@ -1508,9 +1515,7 @@ def wrap_en(draw, text: str, fnt, max_width: int) -> list[str]:
     best = None
     best_score = 10**9
     for split in range(1, len(words)):
-        # This is the one intentional improvement over the previous rule:
-        # a subtitle line with one or two English words is not readable.
-        if min(split, len(words) - split) < 3:
+        if min(split, len(words) - split) < minimum_line_words:
             continue
         a, b = " ".join(words[:split]), " ".join(words[split:])
         aw, bw = text_w(draw, a, fnt), text_w(draw, b, fnt)
@@ -1557,9 +1562,23 @@ def highlight_ranges_for_lines(lines: list[str], key: str | None) -> list[tuple[
     return ranges
 
 
-def wrap_en_preserving_highlight(draw, text: str, fnt, max_width: int, key: str | None) -> list[str]:
+def wrap_en_preserving_highlight(
+    draw,
+    text: str,
+    fnt,
+    max_width: int,
+    key: str | None,
+    *,
+    minimum_line_words: int = 3,
+) -> list[str]:
     """Avoid splitting the active vocabulary expression when a two-line fit permits it."""
-    lines = wrap_en(draw, text, fnt, max_width)
+    lines = wrap_en(
+        draw,
+        text,
+        fnt,
+        max_width,
+        minimum_line_words=minimum_line_words,
+    )
     if not key or len(lines) != 2 or any(key.lower() in line.lower() for line in lines):
         return lines
 
@@ -1584,7 +1603,7 @@ def wrap_en_preserving_highlight(draw, text: str, fnt, max_width: int, key: str 
 
     best: list[str] | None = None
     best_score: int | None = None
-    for split in range(3, len(words) - 2):
+    for split in range(minimum_line_words, len(words) - minimum_line_words + 1):
         if phrase_start < split < phrase_end:
             continue
         before = " ".join(words[:split])
@@ -2148,37 +2167,41 @@ def _article_fixed_english_lines(
     # A page transition is only needed when neither fixed-font layout fits.
     if text_w(draw, text, fnt) <= acx(ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH):
         return [text]
-    lines = wrap_en_preserving_highlight(draw, text, fnt, acx(ARTICLE_SUBTITLE_EN_WIDTH), key)
-    if (
-        lines
-        and len(lines) <= 2
-        and not any(text_w(draw, line, fnt) > acx(ARTICLE_SUBTITLE_EN_WIDTH) for line in lines)
-        and not _has_short_caption_line(lines)
-        and not _has_discouraged_caption_break(text, lines)
-    ):
-        return lines
-    lines = wrap_en_preserving_highlight(
-        draw,
-        text,
-        fnt,
-        acx(ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH),
-        key,
+    minimum_word_candidates = (
+        (3, 2)
+        if len(text.split()) <= ARTICLE_STATIC_TWO_WORD_LINE_MAX_WORDS
+        else (3,)
     )
-    if (
-        not lines
-        or len(lines) > 2
-        or any(
-            text_w(draw, line, fnt) > acx(ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH)
-            for line in lines
-        )
-        or _has_short_caption_line(lines)
-        or _has_discouraged_caption_break(text, lines)
-    ):
-        return []
-    # A line break inside one static page is not a timed English boundary. If
-    # no orphan line or pixel overflow is introduced, retain the complete text
-    # on screen and reserve hard grammar penalties for page transitions.
-    return lines
+    for minimum_line_words in minimum_word_candidates:
+        for width in (ARTICLE_SUBTITLE_EN_WIDTH, ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH):
+            max_width = acx(width)
+            lines = wrap_en_preserving_highlight(
+                draw,
+                text,
+                fnt,
+                max_width,
+                key,
+                minimum_line_words=minimum_line_words,
+            )
+            if (
+                not lines
+                or len(lines) > 2
+                or any(text_w(draw, line, fnt) > max_width for line in lines)
+                or (
+                    len(lines) > 1
+                    and any(
+                        len(line.split()) < minimum_line_words
+                        for line in lines
+                    )
+                )
+                or _has_discouraged_caption_break(text, lines)
+            ):
+                continue
+            # Two-word lines are an article-template fallback only. They avoid
+            # silent font shrinking when no legal three-word layout fits; a
+            # one-word orphan and every hard lexical break remain forbidden.
+            return lines
+    return []
 
 
 def _article_fixed_chinese_lines(draw: ImageDraw.ImageDraw, text: str) -> list[str]:
