@@ -147,6 +147,7 @@ ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
 # preferred 6-12 word target still guides the balanced split when possible.
 ARTICLE_VISUAL_PAGE_MAX_WORDS = 16
 ARTICLE_VISUAL_PAGE_PREFERRED_WORDS = 12
+ARTICLE_VISUAL_PAGE_MIN_WORDS = 4
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
 )
@@ -175,6 +176,34 @@ LINE_BREAK_AVOID_AFTER_WORDS = {
     "has", "had", "can", "could", "will", "would", "shall", "should", "may", "might", "must",
 }
 CAPTION_HARD_BREAK_PENALTY = 12_000
+
+# These are presentation-only guards.  A paginated page may begin with a
+# complete prepositional or infinitive phrase, but a page must not begin with
+# a bare clause introducer or connector that needs the preceding page.
+ARTICLE_PAGE_PHRASE_START_WORDS = frozenset(
+    {
+        "about", "above", "across", "after", "against", "among", "around", "as",
+        "at", "before", "behind", "below", "beneath", "beside", "between", "beyond",
+        "by", "despite", "during", "except", "for", "from", "in", "inside", "into",
+        "like", "near", "of", "on", "onto", "over", "since", "than", "through",
+        "to", "under", "until", "with", "without",
+    }
+)
+ARTICLE_PAGE_CONTINUATION_START_WORDS = frozenset(
+    (LINE_BREAK_AVOID_BEFORE_WORDS - ARTICLE_PAGE_PHRASE_START_WORDS)
+    | {"and", "but", "nor", "or", "so", "yet"}
+)
+ENGLISH_VISUAL_MODIFIER_SUFFIXES = (
+    "able", "al", "ant", "ary", "ed", "ent", "ful", "ic", "ical", "ible",
+    "ish", "ive", "less", "ory", "ous",
+)
+ENGLISH_VISUAL_MODIFIER_WORDS = frozenset(
+    {
+        "another", "bigger", "first", "former", "higher", "last", "larger",
+        "least", "less", "lower", "more", "most", "new", "next", "old",
+        "other", "previous", "same", "smaller",
+    }
+)
 
 # A Chinese visual page may switch before a new grammatical phrase, but it
 # must not switch inside an unspaced lexical unit.  This is intentionally a
@@ -1353,6 +1382,26 @@ def _has_short_caption_line(lines: list[str]) -> bool:
     return len(lines) > 1 and any(len(line.split()) < 3 for line in lines)
 
 
+def _looks_like_english_modifier_boundary(previous: str, following: str) -> bool:
+    """Recognize a deterministic modifier-to-head visual break.
+
+    This deliberately uses morphology only.  The renderer has no parser or
+    authority to alter frozen subtitles, so an uncertain case remains on the
+    same visual page rather than risking a visible lexical split.
+    """
+    previous = re.sub(r"[^A-Za-z']", "", previous).lower()
+    following = re.sub(r"[^A-Za-z']", "", following).lower()
+    return (
+        len(previous) >= 3
+        and following.isalpha()
+        and following not in LINE_BREAK_AVOID_BEFORE_WORDS
+        and (
+            previous in ENGLISH_VISUAL_MODIFIER_WORDS
+            or previous.endswith(ENGLISH_VISUAL_MODIFIER_SUFFIXES)
+        )
+    )
+
+
 def _caption_line_break_penalty(words: list[str], split: int) -> int:
     """Score a renderer-only line break without changing cue ownership."""
     previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
@@ -1361,6 +1410,8 @@ def _caption_line_break_penalty(words: list[str], split: int) -> int:
     if previous in LINE_BREAK_AVOID_AFTER_WORDS:
         penalty += CAPTION_HARD_BREAK_PENALTY
     if following in LINE_BREAK_AVOID_BEFORE_WORDS:
+        penalty += CAPTION_HARD_BREAK_PENALTY
+    if _looks_like_english_modifier_boundary(words[split - 1], words[split]):
         penalty += CAPTION_HARD_BREAK_PENALTY
     if "-" in words[split - 1]:
         penalty += CAPTION_HARD_BREAK_PENALTY * 2
@@ -1861,8 +1912,8 @@ def split_chinese_visual_pages(
 _CHINESE_VISUAL_TOKENIZER = None
 
 
-def _chinese_visual_token_boundaries(text: str) -> set[int] | None:
-    """Return deterministic word-end offsets from the vendored jieba model."""
+def _chinese_visual_token_boundaries(text: str) -> dict[int, tuple[int, int]] | None:
+    """Return deterministic token-boundary context from the vendored jieba model."""
     global _CHINESE_VISUAL_TOKENIZER
     try:
         if _CHINESE_VISUAL_TOKENIZER is None:
@@ -1877,12 +1928,13 @@ def _chinese_visual_token_boundaries(text: str) -> set[int] | None:
             tokenizer.tmp_dir = str(cache_dir)
             tokenizer.cache_file = "visual-segmentation.cache"
             _CHINESE_VISUAL_TOKENIZER = tokenizer
-        boundaries = {0}
+        tokens = [str(token) for token in _CHINESE_VISUAL_TOKENIZER.cut(text, HMM=True)]
+        boundaries: dict[int, tuple[int, int]] = {}
         offset = 0
-        for token in _CHINESE_VISUAL_TOKENIZER.cut(text, HMM=True):
-            token = str(token)
+        for index, token in enumerate(tokens):
             offset += len(token)
-            boundaries.add(offset)
+            if index + 1 < len(tokens):
+                boundaries[offset] = (len(token), len(tokens[index + 1]))
         return boundaries if offset == len(text) else None
     except Exception:
         logger.exception("Chinese visual tokenizer unavailable")
@@ -1930,6 +1982,11 @@ def _strict_split_chinese_visual_pages(
                 return False
             previous = compact[value - 1]
             following = compact[value]
+            # A renderer page must never start with closing punctuation that
+            # belongs to the phrase on the prior page.  Prefer the boundary
+            # after that punctuation or keep the cue on a single page.
+            if following in punctuation:
+                return False
             if previous in punctuation:
                 return True
             # Never split an ASCII/number token that was kept contiguous by
@@ -1940,7 +1997,19 @@ def _strict_split_chinese_visual_pages(
                 return False
             if not ("\u4e00" <= previous <= "\u9fff" and "\u4e00" <= following <= "\u9fff"):
                 return True
-            if token_boundaries is not None and value in token_boundaries:
+            if isinstance(token_boundaries, dict):
+                token_context = token_boundaries.get(value)
+            elif isinstance(token_boundaries, set):
+                # Preserve the read-only test/legacy contract where callers
+                # provide only the set of known token-end offsets.
+                token_context = (2, 2) if value in token_boundaries else None
+            else:
+                token_context = None
+            # A tokenizer can still analyse a compound as ``轻 | 量化``.  A
+            # Han/Han page break is trustworthy only between two multi-character
+            # tokens; single-character edges require independent punctuation or
+            # an explicit discourse-prefix boundary below.
+            if token_context is not None and min(token_context) >= 2:
                 return True
             prefix = compact[value:min(len(compact), value + 2)]
             if prefix in CHINESE_VISUAL_SAFE_PREFIXES:
@@ -2062,10 +2131,16 @@ def _article_preferred_readability_page_count(
     """Request two visual pages only for a genuinely dense fixed-font cue."""
     english_lines = _article_fixed_english_lines(draw, " ".join(words))
     chinese_lines = _article_fixed_chinese_lines(draw, chinese) if chinese else []
-    is_two_line_english = len(english_lines) >= 2
+    needs_english_page_transition = bool(
+        len(words) >= ARTICLE_VISUAL_PAGE_PREFERRED_WORDS + 3
+        and len(english_lines) >= 2
+        and _has_discouraged_caption_break(" ".join(words), english_lines)
+    )
+    last_word = re.sub(r"[^A-Za-z']", "", words[-1]).lower() if words else ""
+    has_dangling_tail = last_word in LINE_BREAK_AVOID_AFTER_WORDS
     has_four_bilingual_lines = len(english_lines) + len(chinese_lines) >= 4
     if len(words) > ARTICLE_VISUAL_PAGE_PREFERRED_WORDS and (
-        is_two_line_english or has_four_bilingual_lines
+        needs_english_page_transition or has_dangling_tail or has_four_bilingual_lines
     ):
         return 2
     return 1
@@ -2081,6 +2156,11 @@ def _article_page_break_score(
     if split >= len(words):
         return int(score)
     break_penalty = _article_visual_break_penalty(words, split)
+    if _article_page_can_start_with_complete_phrase(words, split):
+        # A page transition differs from a line wrap: the phrase begins on a
+        # fresh page and remains intact there.  Remove only the generic
+        # line-start penalty; any independent hard penalty still blocks it.
+        break_penalty -= CAPTION_HARD_BREAK_PENALTY
     if break_penalty >= CAPTION_HARD_BREAK_PENALTY:
         return CAPTION_HARD_BREAK_PENALTY
     score += break_penalty
@@ -2091,6 +2171,33 @@ def _article_page_break_score(
         )
         score -= min(pause_ms, ARTICLE_PAGE_PAUSE_PREFERENCE_MS) * 4
     return int(score)
+
+
+def _article_page_can_start_with_complete_phrase(words: list[str], split: int) -> bool:
+    """Allow a full prepositional or infinitive phrase to start a new page."""
+    remaining = words[split:]
+    if len(remaining) < ARTICLE_VISUAL_PAGE_MIN_WORDS:
+        return False
+    first = re.sub(r"[^A-Za-z']", "", remaining[0]).lower()
+    return first in ARTICLE_PAGE_PHRASE_START_WORDS
+
+
+def _article_page_span_is_readable(
+    words: list[str],
+    *,
+    is_first_page: bool,
+    paginated: bool,
+) -> bool:
+    """Reject a timed page that is visibly too short or syntactically dangling."""
+    if not paginated:
+        return True
+    if len(words) < ARTICLE_VISUAL_PAGE_MIN_WORDS:
+        return False
+    first = re.sub(r"[^A-Za-z']", "", words[0]).lower()
+    last = re.sub(r"[^A-Za-z']", "", words[-1]).lower()
+    if not is_first_page and first in ARTICLE_PAGE_CONTINUATION_START_WORDS:
+        return False
+    return last not in LINE_BREAK_AVOID_AFTER_WORDS
 
 
 def _partition_article_english_pages(
@@ -2113,7 +2220,18 @@ def _partition_article_english_pages(
             return None
         if remaining_pages == 1:
             text = " ".join(words[start:])
-            result = (0, [(start, len(words))]) if _article_fixed_english_lines(draw, text) else None
+            result = (
+                (0, [(start, len(words))])
+                if (
+                    _article_page_span_is_readable(
+                        words[start:],
+                        is_first_page=start == 0,
+                        paginated=page_count > 1,
+                    )
+                    and _article_fixed_english_lines(draw, text)
+                )
+                else None
+            )
             memo[key] = result
             return result
 
@@ -2136,7 +2254,14 @@ def _partition_article_english_pages(
                     continue
                 if previous_end - 1e-6 > float(cue.end) - trailing_pages * min_duration:
                     continue
-            text = " ".join(words[start:end])
+            page_words = words[start:end]
+            if not _article_page_span_is_readable(
+                page_words,
+                is_first_page=start == 0,
+                paginated=page_count > 1,
+            ):
+                continue
+            text = " ".join(page_words)
             if not _article_fixed_english_lines(draw, text):
                 continue
             score = _article_page_break_score(words, end, start + target_words, word_timing)

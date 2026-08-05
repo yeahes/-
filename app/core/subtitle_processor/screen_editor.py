@@ -76,13 +76,23 @@ SUBTITLE_DURATION_INVALID_MS = 150
 SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
-SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v3"
+SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v4"
 SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v4"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION = "semantic-full-translation-style-retry-v1"
 SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT_VERSION = "semantic-allocation-fragment-retry-v1"
 STABLE_CHINESE_CACHE_CONTRACT_VERSION = "stable-chinese-cache-v1"
 FROZEN_ID_WORD_SPAN_CACHE_VERSION = "frozen-id-word-span-v1"
-FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION = "fixed-id-allocation-v4"
+FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION = "fixed-id-allocation-v5"
+# One release-compatible read path for whole-group translations.  These values
+# belonged only to allocation validation and never changed the source English,
+# frozen spans, or full-translation prompt.  Allocation responses themselves
+# deliberately do not use this compatibility path.
+LEGACY_FULL_TRANSLATION_CACHE_ALLOCATION_CONTRACTS = (
+    {
+        "semantic_allocation_prompt_version": "semantic-allocation-v3",
+        "fixed_id_allocation_algorithm_version": "fixed-id-allocation-v4",
+    },
+)
 SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v4"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK = (
     "screen_subtitle_semantic_full_translation_style_retry_v1"
@@ -268,7 +278,7 @@ Return pure JSON only:
 SEMANTIC_TRANSLATION_ALLOCATION_PROMPT = """
 You are assigning a completed Chinese translation back to fixed English subtitle parts.
 
-Version: semantic-allocation-v3
+Version: semantic-allocation-v4
 
 Task:
 Given a full English sense group, its completed Chinese translation, and fixed subtitle parts, write one concise Chinese subtitle for each part.
@@ -289,6 +299,8 @@ Rules:
 - Preserve facts, numbers, names, negation, contrast, conditions, modality, and speaker stance.
 - If a part is an incomplete English fragment, make the Chinese fragment natural in context.
 - When an English subject receives its predicate in a later part, keep the Chinese subject-predicate relation readable across those parts. Add a minimal pronoun or connective when needed; do not copy English modifier order.
+- When a part begins with an explicit causal, conditional, or concessive relation, keep the preceding main-clause action on its earlier subtitle_id and begin this part with the matching Chinese relation rather than a displaced main clause.
+- Do not use a subtitle_id only as a dangling Chinese syntactic scaffold. A non-final part may continue into the next ID, but it must not end on a bare preposition or other head that has no governed phrase in the same part.
 - Every subtitle_parts item includes target_zh_chars and absolute_max_zh_chars derived from its display duration. Treat target_zh_chars as a preferred reading budget, not a reason to omit meaning. If one part is too short, distribute the same completed Chinese meaning naturally across adjacent IDs in the same group.
 - For comparisons, lists, and source attributions, rebuild the Chinese sentence first. Do not leave the final subtitle part as a bare list of publications, dates, or nouns without the comparison/action that governs it.
 
@@ -344,7 +356,11 @@ subtitle part must be independently readable when its English part is complete.
 Do not end the final part with a bare modifier, possessive marker, place/name
 modifier, or connective that lacks the noun or predicate it governs.
 For a non-final English fragment, a Chinese continuation is allowed only when
-the following existing subtitle_id completes that exact phrase naturally.
+the following existing subtitle_id completes that exact phrase naturally. Do
+not leave a non-final subtitle_id as a bare preposition or syntactic scaffold;
+rewrite it as a readable connective instead. When a part begins with a causal,
+conditional, or concessive relation, keep an earlier main-clause predicate on
+its own subtitle_id and begin this part with that relation.
 
 Preserve names, numbers, negation, contrast, conditions, modality, and core
 actions. Return exactly the supplied subtitle_id set and no other IDs.
@@ -12596,11 +12612,15 @@ class ScreenSubtitleEditor:
             }
             for item in items
         ]
+        english_parts = [entry["english"] for entry in frozen_items]
+        # Content and boundaries have separate owners.  The complete English
+        # hash must survive a boundary-only repartition; the frozen-span hash
+        # below is the explicit boundary invalidation key.
+        full_english_text = " ".join(" ".join(english_parts).split())
+        self._legacy_chinese_full_english_text_hash = stable_payload_hash(english_parts)
         self._chinese_cache_contract = {
             "contract_version": STABLE_CHINESE_CACHE_CONTRACT_VERSION,
-            "full_english_text_hash": stable_payload_hash(
-                [entry["english"] for entry in frozen_items]
-            ),
+            "full_english_text_hash": stable_payload_hash([full_english_text]),
             "frozen_id_word_span_version": FROZEN_ID_WORD_SPAN_CACHE_VERSION,
             "frozen_id_word_span_hash": stable_payload_hash(
                 [
@@ -12653,6 +12673,15 @@ class ScreenSubtitleEditor:
                     FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION
                 ),
             }
+        # A whole-group translation is independent of how its final Chinese
+        # text is later allocated to frozen IDs.  Keep the frozen English
+        # boundary fingerprint and translation prompt version, but do not
+        # discard a valid full-translation cache solely because allocation
+        # validation changed.  Allocation and allocation-retry cache keys
+        # retain both fields below and therefore always invalidate correctly.
+        if str(cache_task or "").startswith("screen_subtitle_semantic_full_translation"):
+            contract.pop("semantic_allocation_prompt_version", None)
+            contract.pop("fixed_id_allocation_algorithm_version", None)
         contract["cache_task"] = str(cache_task or "")
         contract["translation_prompt_version"] = self._semantic_chinese_prompt_version(
             cache_task
@@ -12666,6 +12695,43 @@ class ScreenSubtitleEditor:
                 }
             ],
         )
+
+    def _legacy_semantic_full_translation_cache_keys(
+        self,
+        prompt: str,
+        payload: Sequence[Dict],
+        cache_task: str,
+    ) -> List[str]:
+        """Return verified pre-v5 cache keys for whole-group translations only."""
+        if not str(cache_task or "").startswith("screen_subtitle_semantic_full_translation"):
+            return []
+        contract = dict(getattr(self, "_chinese_cache_contract", {}) or {})
+        legacy_full_english_hash = str(
+            getattr(self, "_legacy_chinese_full_english_text_hash", "") or ""
+        )
+        if not contract or not legacy_full_english_hash:
+            return []
+        keys: List[str] = []
+        for legacy_allocation_contract in LEGACY_FULL_TRANSLATION_CACHE_ALLOCATION_CONTRACTS:
+            legacy_contract = dict(contract)
+            legacy_contract.update(legacy_allocation_contract)
+            legacy_contract["full_english_text_hash"] = legacy_full_english_hash
+            legacy_contract["cache_task"] = str(cache_task or "")
+            legacy_contract["translation_prompt_version"] = self._semantic_chinese_prompt_version(
+                cache_task
+            )
+            keys.append(
+                self._cache_key(
+                    prompt,
+                    [
+                        {
+                            "stable_chinese_cache_contract": legacy_contract,
+                            "payload": list(payload),
+                        }
+                    ],
+                )
+            )
+        return keys
 
     @staticmethod
     def _cache_key(prompt: str, payload: Sequence[Dict]) -> str:
@@ -13628,6 +13694,36 @@ class ScreenSubtitleEditor:
             temperature=0.2,
             task=cache_task,
         )
+        if not cache_result:
+            for legacy_cache_key in self._legacy_semantic_full_translation_cache_keys(
+                prompt,
+                payload,
+                cache_task,
+            ):
+                legacy_result = self.cache_manager.get_llm_result(
+                    legacy_cache_key,
+                    self.model,
+                    temperature=0.2,
+                    task=cache_task,
+                )
+                if not legacy_result:
+                    continue
+                try:
+                    json.loads(legacy_result)
+                except (TypeError, ValueError):
+                    continue
+                cache_result = legacy_result
+                try:
+                    self.cache_manager.set_llm_result(
+                        cache_key,
+                        cache_result,
+                        self.model,
+                        temperature=0.2,
+                        task=cache_task,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to migrate semantic full translation cache: %s", exc)
+                break
         started = time.perf_counter()
         try:
             if cache_result:
@@ -14715,6 +14811,14 @@ class ScreenSubtitleEditor:
         issue_codes.extend(issue["code"] for issue in anchor_issues)
         issues.extend(anchor_issues)
 
+        relation_issues = self._detect_cross_id_relation_scope_leakage(
+            entry,
+            allocation or {},
+        )
+        if relation_issues:
+            issue_codes.append("cross_id_semantic_leakage")
+            issues.extend(relation_issues)
+
         predicate_breaks = self._detect_cross_subtitle_predicate_breaks(
             expected_ids,
             ordered_texts,
@@ -15035,10 +15139,12 @@ class ScreenSubtitleEditor:
             return self._is_bad_chinese_fragment(text)
         if len(normalized) <= 2 and normalized not in {"好的", "没错", "对", "是的", "真的"}:
             return True
+        if offset < total - 1 and self._has_bare_chinese_syntactic_head(normalized):
+            return True
         # Allocation is allowed to create natural subtitle half-sentences inside
         # one semantic group. Hard-failing these fragments creates noisy retries.
         if offset < total - 1 and normalized.endswith(
-            ("意味着", "因为", "如果", "对于", "以及", "将", "把", "在", "的")
+            ("意味着", "因为", "如果", "以及", "将")
         ):
             return False
         if offset < total - 1 and normalized.startswith(
@@ -15048,6 +15154,14 @@ class ScreenSubtitleEditor:
         # Terminal punctuation does not make a bare modifier complete.  Check
         # the grammar after preserving permitted non-final continuations.
         return self._is_bad_chinese_fragment(text)
+
+    @staticmethod
+    def _has_bare_chinese_syntactic_head(text: str) -> bool:
+        """Return whether a non-final allocation ends before its governed phrase."""
+        compact = re.sub(r"[\s，。！？；：、,.!?;:]+$", "", text or "")
+        return bool(
+            re.search(r"(?:在|从|向|往|对|对于|把|被|给|比|由|为|于|的)$", compact)
+        )
 
     def _detect_cross_id_anchor_misplacement(
         self,
@@ -15166,6 +15280,73 @@ class ScreenSubtitleEditor:
                         ),
                     }
                 )
+        return issues
+
+    @staticmethod
+    def _leading_english_allocation_relation(english: str) -> str:
+        """Classify explicit subordinate relations that own a fixed cue boundary."""
+        normalized = re.sub(r"\s+", " ", english or "").strip().lower()
+        normalized = re.sub(r"^(?:(?:and|but|or|so)\s+)+", "", normalized)
+        if re.match(r"(?:(?:just|only|simply)\s+)?because\b|due\s+to\b", normalized):
+            return "causal"
+        if re.match(r"(?:(?:even)\s+)?though\b|although\b", normalized):
+            return "concessive"
+        if re.match(r"if\b|unless\b", normalized):
+            return "conditional"
+        return ""
+
+    @staticmethod
+    def _chinese_relation_marker_pattern(relation: str) -> str:
+        return {
+            "causal": r"(?:因为|只因|皆因|由于|缘于|鉴于)",
+            "concessive": r"(?:虽然|尽管|即使|哪怕|纵然|就算)",
+            "conditional": r"(?:如果|若|假如|除非|一旦)",
+        }.get(relation, "")
+
+    def _detect_cross_id_relation_scope_leakage(
+        self,
+        entry: Dict,
+        allocation: Dict[str, str],
+    ) -> List[Dict]:
+        """Reject a displaced main clause before an explicit subordinate relation.
+
+        The invariant is intentionally narrow: when both the authoritative
+        translation and the fixed English part expose the same strong relation,
+        the relation-owning Chinese cue cannot first contain a substantive main
+        clause. That text belongs to an earlier fixed subtitle_id.
+        """
+        parts = list(entry.get("subtitle_parts") or [])
+        full_translation = self._normalize_text(str(entry.get("full_translation") or ""))
+        issues: List[Dict] = []
+        for index, part in enumerate(parts):
+            if index == 0:
+                continue
+            subtitle_id = str(part.get("subtitle_id") or "").strip()
+            relation = self._leading_english_allocation_relation(
+                str(part.get("english") or "")
+            )
+            marker_pattern = self._chinese_relation_marker_pattern(relation)
+            if not subtitle_id or not marker_pattern or not re.search(marker_pattern, full_translation):
+                continue
+            chinese = self._normalize_text(str(allocation.get(subtitle_id, "")))
+            marker = re.search(marker_pattern, chinese)
+            if not marker:
+                continue
+            prefix = chinese[: marker.start()]
+            semantic_prefix = re.sub(r"[\s，、；：,.!?]+", "", prefix)
+            if len(re.findall(r"[\u4e00-\u9fff]", semantic_prefix)) < 5:
+                continue
+            issues.append(
+                {
+                    "code": "cross_id_semantic_leakage",
+                    "subtitle_id": subtitle_id,
+                    "reason": "subordinate_relation_preceded_by_displaced_main_clause",
+                    "relation": relation,
+                    "english": str(part.get("english") or ""),
+                    "chinese_prefix_before_relation": prefix,
+                    "chinese_relation_marker": marker.group(0),
+                }
+            )
         return issues
 
     def _allocation_anchor_presence_scan(
