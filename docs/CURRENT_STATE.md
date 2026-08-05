@@ -718,3 +718,43 @@ Result:
   Chinese compounds, and the fail-closed path. Stable caption tests, unified
   regression, and `git diff --check` pass. No ASR, LLM request, or video
   synthesis was run for this renderer-only change.
+
+## 2026-08-05 Boundary, Allocation, and Blind E2E Verification
+
+- Stable English cutting now stops numeric-result protection at punctuation or
+  coordinator boundaries, protects a content noun from an attached `that`
+  clause, and keeps a complete `Oh.` lead-in with the next 16-word unit only
+  when the one-word overflow contract is satisfied. These rules remain pre-ID
+  and local.
+- Fixed-ID Chinese allocation now invalidates allocation caches independently of
+  complete-group translation caches. Verified legacy full-translation cache keys
+  may be migrated once; allocation and retry keys still require the current
+  frozen-boundary and allocation algorithm contract. Allocation validation also
+  rejects bare Chinese syntactic heads and displaced main clauses before a
+  candidate can replace the current ID mapping.
+- Article visual pagination now keeps modifier-head English phrases together and
+  uses vendored deterministic Chinese token boundaries. It never changes frozen
+  English, Chinese, IDs, word spans, cue times, or font size; an unsafe Chinese
+  split fails closed.
+- Cached current-code E2E for `中国AI为何更省钱？.m4a` completed under
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260805-r3`. It produced 271
+  fixed IDs, 2,897 frozen words, `final-cue-timeline.json` status `PASS`,
+  `applied_backend=whisperx-time-only`, `fallback_used=false`, and no
+  `source_audio_missing`. Eight individual words retained stable timestamps as
+  unmatched-word fallbacks; this was not an overall stable-ts backend fallback.
+- ID and English text sets remained identical between `subtitle-spans.json` and
+  `translations.json`; Chinese mappings contained all 271 IDs. The 64.8-66.5s
+  interval is covered by `S0019` from 62.312s through 67.975s, including the
+  spoken words through 66.585s.
+- Synthesis completed once at
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260805-r3\final-video.mp4`:
+  62,239,995 bytes, 16:43.66, 1920x1080 H.264/AAC. Vocabulary-card
+  generation timed out after 319.1s and was skipped; subtitle rendering was
+  unaffected.
+- Subtitle LLM cache statistics recorded 21 misses: 13 full translations, one
+  style retry, four allocations, and three fragment retries. The vocabulary
+  runner does not expose a per-attempt request counter; its timed-out attempt is
+  reported separately and no credential material was recorded.
+- Unified regression passed. The final QA report has zero structural blockers,
+  three unresolved Chinese allocation-quality reviews, and ordinary timing and
+  reading warnings that remain for human review.

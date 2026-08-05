@@ -512,6 +512,48 @@ def test_stable_chinese_cache_rejects_stale_frozen_boundary_context():
     assert editor.cache_manager.get_calls[-1][0][0] != old_key
 
 
+def test_semantic_full_translation_cache_survives_allocation_algorithm_change():
+    editor = _id_editor()
+    editor._assign_global_subtitle_ids(_id_items(2))
+    prompt = "semantic full translation"
+    payload = [{"id": 1, "full_english": "English 1. English 2."}]
+    full_task = "screen_subtitle_semantic_full_translation_v4"
+    allocation_task = "screen_subtitle_semantic_translation_allocation_v3"
+
+    full_key_before = editor._semantic_chinese_cache_key(prompt, payload, full_task)
+    allocation_key_before = editor._semantic_chinese_cache_key(prompt, payload, allocation_task)
+    editor._chinese_cache_contract["fixed_id_allocation_algorithm_version"] = "changed"
+    editor._chinese_cache_contract["semantic_allocation_prompt_version"] = "changed"
+
+    assert editor._semantic_chinese_cache_key(prompt, payload, full_task) == full_key_before
+    assert editor._semantic_chinese_cache_key(prompt, payload, allocation_task) != allocation_key_before
+
+
+def test_semantic_full_translation_reads_verified_pre_v5_cache_once():
+    editor = _id_editor()
+    editor._assign_global_subtitle_ids(_id_items(2))
+    prompt = "semantic full translation"
+    payload = [{"id": 1, "full_english": "English 1. English 2."}]
+    cache_task = "screen_subtitle_semantic_full_translation_v4"
+    current_key = editor._semantic_chinese_cache_key(prompt, payload, cache_task)
+    legacy_keys = editor._legacy_semantic_full_translation_cache_keys(
+        prompt,
+        payload,
+        cache_task,
+    )
+    cached = {"groups": [{"id": 1, "translation": "完整中文。"}]}
+    editor.cache_manager = _KeyedCache({legacy_keys[0]: json.dumps(cached, ensure_ascii=False)})
+
+    result = editor._request_semantic_full_translation_chunk(
+        prompt,
+        payload,
+        cache_task=cache_task,
+    )
+
+    assert result == cached
+    assert editor.cache_manager.entries[current_key] == json.dumps(cached, ensure_ascii=False)
+
+
 def _codes(editor):
     return {issue["code"] for issue in editor._translation_structure_errors}
 
@@ -1855,8 +1897,69 @@ def test_standalone_discourse_marker_attaches_to_immediate_next_sentence():
     assert editor._discourse_marker_orphans == []
 
 
+def test_attached_oh_and_then_lead_in_merges_with_contiguous_clause():
+    editor = _marker_editor(["Oh.", "And", "then", "the", "market", "changed."])
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 5, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert [item.original for item in merged] == ["Oh. And then the market changed."]
+    assert editor._discourse_marker_orphans == []
+
+
+def test_question_oh_lead_in_remains_independent():
+    editor = _marker_editor(["Oh?", "And", "then", "what", "changed?"])
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 4, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert [item.original for item in merged] == ["Oh?", "And then what changed?"]
+    assert editor._discourse_marker_orphans
+
+
+def test_oh_and_then_lead_in_respects_long_pause():
+    editor = _marker_editor(["Oh.", "And", "then", "the", "market", "changed."])
+    editor._active_word_entries[1]["start_time"] += 600
+    editor._active_word_entries[1]["end_time"] += 600
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 5, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert [item.original for item in merged] == ["Oh.", "And then the market changed."]
+    assert editor._discourse_marker_orphans
+
+
+def test_oh_and_then_lead_in_respects_speaker_change():
+    editor = _marker_editor(["Oh.", "And", "then", "the", "market", "changed."])
+    editor._active_source_segments_by_id[1].speaker = "A"
+    editor._active_source_segments_by_id[2].speaker = "B"
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 5, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert [item.original for item in merged] == ["Oh.", "And then the market changed."]
+    assert editor._discourse_marker_orphans
+
+
 def test_plus_marker_keeps_a_complete_one_word_overflow_unit():
     words = "Plus, breaking away from corporate hubs kind of broke the social pressure to climb that traditional ladder.".split()
+    editor = _marker_editor(words, max_words=16)
+    items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, len(words) - 1, 2)]
+
+    merged = editor._merge_standalone_discourse_markers(items)
+
+    assert len(merged) == 1
+    assert merged[0].original == " ".join(words)
+    assert ScreenSubtitleEditor._word_count(merged[0].original) == 17
+    assert editor._is_allowed_plus_discourse_overflow(merged[0].original, 17, 16)
+
+
+def test_oh_marker_attaches_to_next_complete_unit_at_one_word_overflow():
+    words = [
+        "Oh.", "And", "then", "they", "feed", "that", "curated,", "highly",
+        "structured", "data", "to", "a", "new,", "smaller", "model,", "the",
+        "student.",
+    ]
     editor = _marker_editor(words, max_words=16)
     items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, len(words) - 1, 2)]
 
@@ -2448,6 +2551,27 @@ def test_final_pre_id_repair_removes_known_hard_boundary():
         for left, right in zip(repaired, repaired[1:])
     )
     assert editor._pre_id_boundary_repairs
+
+
+def test_final_pre_id_blocks_content_noun_that_clause_boundary():
+    words = ["The", "fact", "that", "the", "market", "changed", "matters."]
+    editor = _marker_editor(words, max_words=14)
+    editor._prepare_syntax_cut_hints()
+    items = [_word_item(editor, 0, 1, 1), _word_item(editor, 2, len(words) - 1, 2)]
+
+    evaluation = editor._evaluate_item_boundary(items[0], items[1])
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert "content_noun_that_clause_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in repaired)) == (
+        ScreenSubtitleEditor._word_tokens(" ".join(words))
+    )
+    assert all(
+        "content_noun_that_clause_split"
+        not in editor._evaluate_item_boundary(left, right)["hard_issues"]
+        for left, right in zip(repaired, repaired[1:])
+    )
 
 
 def test_final_pre_id_keeps_discourse_marker_with_following_sentence_after_terminal_over():
@@ -3081,6 +3205,22 @@ def test_parser_blocks_verb_from_numeric_result_expression():
     assert "numeric_result_qualifier_split" in editor._syntax_hard_cut_issues[(4, 5)]
     assert not verb_to_result["legal"]
     assert not result_to_qualifier["legal"]
+
+
+def test_numeric_result_guard_stops_before_coordinated_clause():
+    editor = _marker_editor(
+        [
+            "China's", "GDP", "is", "two-thirds", "the", "size", "of",
+            "America's,", "and", "actually", "a", "third", "bigger", "when",
+            "you", "adjust", "for", "purchasing", "power.",
+        ]
+    )
+    editor._prepare_syntax_cut_hints()
+
+    boundary = editor._evaluate_stable_cut_boundary(7, 8)
+
+    assert boundary["legal"] is True
+    assert "verb_numeric_result_split" not in boundary["hard_issues"]
 
 
 def test_parser_mapping_keeps_numeric_result_after_hyphenated_ledger_word():
@@ -3822,7 +3962,8 @@ def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
             )
 
     assert page_count == 3
-    assert all(len(page) <= 30 for page in zh_pages)
+    assert all(podcast_learning_video._article_fixed_chinese_lines(draw, page) for page in zh_pages)
+    assert all(not page.startswith(tuple("、，。；：！？")) for page in zh_pages)
     assert "".join(zh_pages) == chinese
     assert set(rendered_lines) == expected_lines
 
@@ -3930,7 +4071,7 @@ def test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile():
     assert page["end"] == cue.end
 
 
-def test_article_renderer_prefers_timed_pages_for_dense_two_line_cue():
+def test_article_renderer_keeps_readable_two_line_cue_on_one_static_page():
     text = "You know, this robotic vocabulary actually connects to a very human critique from way back."
     cue = podcast_learning_video.Cue(110, 335.5, 340.62, text, "其实，这种机械化的措辞，与一种相当人性化、由来已久的批评是相通的。", "male")
     cue.subtitle_id = "S0110"
@@ -3940,14 +4081,115 @@ def test_article_renderer_prefers_timed_pages_for_dense_two_line_cue():
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
 
     assert plan["status"] == "ok"
-    assert len(plan["pages"]) == 2
+    assert len(plan["pages"]) == 1
     assert plan["readability_warnings"] == []
+    assert plan["pages"][0]["en"] == text
+    assert plan["pages"][0]["zh"] == cue.zh
+    assert plan["pages"][0]["start"] == cue.start
+    assert plan["pages"][0]["end"] == cue.end
+
+
+def test_article_renderer_keeps_short_dangling_tail_on_one_static_page():
+    text = "this sounds less like getting a discount on car parts and more like"
+    cue = podcast_learning_video.Cue(
+        77,
+        270.722,
+        274.924,
+        text,
+        "这不太像买汽车零件时打了折，更像是",
+        "male",
+    )
+    cue.subtitle_id = "S0077"
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    assert plan["pages"][0]["en"] == text
+    assert plan["pages"][0]["start"] == cue.start
+    assert plan["pages"][0]["end"] == cue.end
+    assert plan["readability_warnings"] == [
+        {
+            "reason": "preferred_readability_page_unscheduled",
+            "requested_page_count": 2,
+        }
+    ]
+
+
+def test_article_renderer_keeps_three_line_bilingual_cue_on_one_page():
+    text = "they feed that curated, highly structured data to a new, smaller model, the student."
+    chinese = "他们把经精选、高度结构化的数据喂给更小的新模型，即学生"
+    cue = podcast_learning_video.Cue(64, 224.151, 230.475, text, chinese, "male")
+    cue.subtitle_id = "S0064"
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    assert plan["pages"][0]["en"] == text
+    assert plan["pages"][0]["zh"] == chinese
+    assert podcast_learning_video._caption_line_break_penalty(
+        "a new smaller model".split(),
+        2,
+    ) >= podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+
+
+def test_chinese_visual_page_never_starts_with_attached_punctuation():
+    chinese = "然后再造一台轻量化、空气动力学极佳的四缸发动机，"
+
+    with patch.object(
+        podcast_learning_video,
+        "_chinese_visual_token_boundaries",
+        return_value={0, 9, len(chinese)},
+    ):
+        pages = podcast_learning_video._strict_split_chinese_visual_pages(
+            chinese,
+            2,
+            page_word_counts=[5, 11],
+            strict=True,
+        )
+
+    assert pages is not None
+    assert "".join(pages) == chinese
+    assert pages[0].endswith("、")
+    assert pages[1].startswith("空气")
+
+
+def test_article_renderer_keeps_modifier_head_phrase_on_one_visual_page():
+    text = (
+        "smaller Chinese AI firms aren't throwing their limited capital into a bottomless "
+        "pit of cutting-edge chips to process raw data."
+    )
+    cue = podcast_learning_video.Cue(
+        74,
+        254.971,
+        262.176,
+        text,
+        "中国AI小公司不必把有限资金砸进尖端芯片无底洞跑原始数据",
+        "male",
+    )
+    cue.subtitle_id = "S0074"
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) >= 2
     assert " ".join(page["en"] for page in plan["pages"]) == text
     assert "".join(page["zh"] for page in plan["pages"]) == cue.zh
-    assert all(page["end"] - page["start"] >= 0.9 for page in plan["pages"])
-    transition = plan["pages"][0]["end"]
-    assert cue.word_timing[plan["pages"][0]["word_end"]]["end"] <= transition
-    assert transition <= cue.word_timing[plan["pages"][1]["word_start"]]["start"]
+    assert all(len(page["en"].split()) >= 4 for page in plan["pages"])
+    assert all(
+        not (page["en"].endswith("bottomless") and following["en"].startswith("pit"))
+        for page, following in zip(plan["pages"], plan["pages"][1:])
+    )
+    assert podcast_learning_video._caption_line_break_penalty(text.split(), 12) >= (
+        podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+    )
 
 
 def test_article_renderer_uses_pixel_width_for_43_character_chinese_cue():
@@ -6067,6 +6309,124 @@ def test_allocation_quality_retries_information_leaked_to_previous_id():
     assert any("number_allocation_mismatch" in item["issue_codes"] for item in editor._last_allocation_validation)
     assert editor._last_allocation_retry_log[-1]["success"] is True
     assert editor._translation_structure_errors == []
+
+
+def test_allocation_quality_retries_displaced_main_clause_before_causal_id():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = (
+        "engineering a lightweight engine that somehow wins the exact same race,"
+    )
+    items[1].original = "just because it is not carrying all that weight."
+    group = _id_group(1, 0, items)
+    full_translations = {
+        1: "打造一台轻量发动机，它居然能赢下同一场比赛，只因不用背负那份重量。",
+    }
+    calls = []
+
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v3"):
+        calls.append(cache_task)
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "part_translations": [
+                            {"subtitle_id": "S0001", "zh": "打造一台轻量发动机，"},
+                            {
+                                "subtitle_id": "S0002",
+                                "zh": "它居然能赢下同一场比赛，只因不用背负那份重量。",
+                            },
+                        ],
+                    }
+                ]
+            }
+        return {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [
+                        {
+                            "subtitle_id": "S0001",
+                            "zh": "打造一台轻量发动机，它居然能赢下同一场比赛，",
+                        },
+                        {"subtitle_id": "S0002", "zh": "只因不用背负那份重量。"},
+                    ],
+                }
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations([group], full_translations)
+
+    assert allocated[1] == {
+        "S0001": "打造一台轻量发动机，它居然能赢下同一场比赛，",
+        "S0002": "只因不用背负那份重量。",
+    }
+    assert calls == [
+        "screen_subtitle_semantic_translation_allocation_v3",
+        "screen_subtitle_semantic_translation_allocation_retry_v3",
+    ]
+    assert any(
+        "cross_id_semantic_leakage" in validation["issue_codes"]
+        for validation in editor._last_allocation_validation
+    )
+    assert editor._last_allocation_retry_log[-1]["success"] is True
+
+
+def test_allocation_quality_retries_orphaned_bare_preposition_prefix():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "Yeah. And that is despite the fact"
+    items[1].original = "that the economy is large."
+    group = _id_group(1, 0, items)
+    full_translations = {1: "是啊。即便如此，经济规模很大也成立。"}
+    calls = []
+
+    def request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_v3"):
+        calls.append(cache_task)
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "part_translations": [
+                            {"subtitle_id": "S0001", "zh": "是啊。这一点甚至是在"},
+                            {"subtitle_id": "S0002", "zh": "经济规模很大也成立。"},
+                        ],
+                    }
+                ]
+            }
+        return {
+            "groups": [
+                {
+                    "id": 1,
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "是啊。即便如此，"},
+                        {"subtitle_id": "S0002", "zh": "经济规模很大也成立。"},
+                    ],
+                }
+            ]
+        }
+
+    with patch.object(editor, "_request_semantic_translation_allocation", side_effect=request):
+        allocated = editor._allocate_semantic_group_translations([group], full_translations)
+
+    assert allocated[1] == {
+        "S0001": "是啊。即便如此，",
+        "S0002": "经济规模很大也成立。",
+    }
+    assert calls == [
+        "screen_subtitle_semantic_translation_allocation_v3",
+        "screen_subtitle_semantic_translation_allocation_fragment_retry_v1",
+    ]
+    assert any(
+        issue.get("subtitle_id") == "S0001"
+        and issue.get("code") == "unnatural_chinese_fragment"
+        for validation in editor._last_allocation_validation
+        for issue in validation["issues"]
+    )
+    assert editor._last_allocation_retry_log[-1]["success"] is True
 
 
 def test_allocation_quality_rejects_adjacent_core_duplication():
@@ -8886,6 +9246,9 @@ def test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
 
 
 if __name__ == "__main__":
+    test_stable_chinese_cache_rejects_stale_frozen_boundary_context()
+    test_semantic_full_translation_cache_survives_allocation_algorithm_change()
+    test_semantic_full_translation_reads_verified_pre_v5_cache_once()
     test_final_time_alignment_reapplies_display_padding_to_loaded_short_subtitle()
     test_final_time_alignment_shifts_next_when_loaded_short_has_no_gap()
     test_final_time_alignment_runs_chinese_speed_repair_without_touching_english()
@@ -8958,7 +9321,12 @@ if __name__ == "__main__":
     test_short_backchannel_merges_with_following_segment()
     test_short_sentence_bridges_small_gap_before_next_subtitle()
     test_standalone_discourse_marker_attaches_to_immediate_next_sentence()
+    test_attached_oh_and_then_lead_in_merges_with_contiguous_clause()
+    test_question_oh_lead_in_remains_independent()
+    test_oh_and_then_lead_in_respects_long_pause()
+    test_oh_and_then_lead_in_respects_speaker_change()
     test_plus_marker_keeps_a_complete_one_word_overflow_unit()
+    test_oh_marker_attaches_to_next_complete_unit_at_one_word_overflow()
     test_trailing_standalone_discourse_marker_attaches_to_previous_sentence()
     test_standalone_discourse_marker_does_not_cross_long_pause()
     test_standalone_discourse_marker_does_not_cross_speaker_change()
@@ -8989,6 +9357,7 @@ if __name__ == "__main__":
     test_pre_id_candidate_gate_rejects_new_hard_syntax_boundary()
     test_long_object_still_allows_legal_boundary()
     test_final_pre_id_repair_removes_known_hard_boundary()
+    test_final_pre_id_blocks_content_noun_that_clause_boundary()
     test_final_pre_id_keeps_discourse_marker_with_following_sentence_after_terminal_over()
     test_final_pre_id_rebalances_leading_nonfinite_dependent_prefix()
     test_final_pre_id_keeps_finite_conditional_introduction_in_its_own_cue()
@@ -9065,7 +9434,11 @@ if __name__ == "__main__":
     test_article_template_keeps_full_chinese_for_structural_overflow_cue()
     test_article_page_timeline_uses_fixed_fonts_and_word_boundaries()
     test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile()
-    test_article_renderer_prefers_timed_pages_for_dense_two_line_cue()
+    test_article_renderer_keeps_readable_two_line_cue_on_one_static_page()
+    test_article_renderer_keeps_short_dangling_tail_on_one_static_page()
+    test_article_renderer_keeps_three_line_bilingual_cue_on_one_page()
+    test_chinese_visual_page_never_starts_with_attached_punctuation()
+    test_article_renderer_keeps_modifier_head_phrase_on_one_visual_page()
     test_article_renderer_uses_pixel_width_for_43_character_chinese_cue()
     test_article_renderer_blocks_paginated_cue_without_verified_word_ledger()
     test_article_renderer_keeps_s0188_shape_as_static_two_line_page()
@@ -9120,6 +9493,8 @@ if __name__ == "__main__":
     test_full_translation_style_retry_only_retries_flagged_group_and_accepts_improvement()
     test_full_translation_style_retry_keeps_original_when_candidate_loses_number_or_negation()
     test_allocation_quality_retries_information_leaked_to_previous_id()
+    test_allocation_quality_retries_displaced_main_clause_before_causal_id()
+    test_allocation_quality_retries_orphaned_bare_preposition_prefix()
     test_allocation_quality_rejects_adjacent_core_duplication()
     test_allocation_quality_rejects_adjacent_long_common_phrase_duplication()
     test_allocation_quality_detects_negation_misplacement()
