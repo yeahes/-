@@ -40,6 +40,10 @@ from app.core.subtitle_processor.stable_artifacts import (
 from app.core.subtitle_processor.stable_english_boundaries import (
     finalize_stable_english_boundaries,
 )
+from app.core.subtitle_processor.stable_english_optimizer import (
+    plan_english_cue_ranges,
+    ranges_cover_interval,
+)
 from app.core.subtitle_processor.text_metrics import (
     HARD_ENGLISH_WORD_LIMIT,
     is_allowed_discourse_overflow,
@@ -118,6 +122,7 @@ VISUAL_TEMPORAL_TERMINAL_MIN_PAUSE_MS = 120
 VISUAL_TEMPORAL_MIN_DISPLAY_MS = 1100
 VISUAL_TEMPORAL_MIN_MS_PER_WORD = 180
 VISUAL_TEMPORAL_MIN_WORDS = 4
+LOCAL_SYNTAX_RESULT_CACHE_MAX = 8192
 
 
 SCREEN_EDITOR_PROMPT = """
@@ -485,6 +490,7 @@ class ScreenSubtitleEditor:
         self._active_source_segments_by_id: Dict[int, ASRDataSeg] = {}
         self._syntax_protected_cuts: set[tuple[int, int]] = set()
         self._syntax_hard_cut_issues: Dict[tuple[int, int], List[str]] = {}
+        self._orphaned_finite_predicate_cache: Dict[tuple, tuple[str, ...]] = {}
         self._syntax_nlp = None
         self._last_semantic_full_translations: Dict[int, str] = {}
         self._last_semantic_group_audit_contexts: Dict[str, Dict] = {}
@@ -2740,11 +2746,19 @@ class ScreenSubtitleEditor:
         item: ScreenSubtitleItem,
     ) -> List[str]:
         """Reject a repair that puts a finite predicate in a subjectless cue."""
-        nlp = self._load_syntax_nlp()
-        if not nlp:
-            return []
         text = self._normalize_text(item.original)
         if not text:
+            return []
+        cache = getattr(self, "_orphaned_finite_predicate_cache", None)
+        if cache is None:
+            cache = {}
+            self._orphaned_finite_predicate_cache = cache
+        cache_key = (item.word_start, item.word_end, text)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        nlp = self._load_syntax_nlp()
+        if not nlp:
             return []
         try:
             doc = nlp(text)
@@ -2776,9 +2790,17 @@ class ScreenSubtitleEditor:
             and re.search(r"[.!?][\"')\]]*\s*$", text)
             and not has_subject
         )
-        if (root_is_finite or root_has_finite_auxiliary) and not has_subject and not imperative:
-            return ["right_orphaned_finite_predicate"]
-        return []
+        issues = (
+            ("right_orphaned_finite_predicate",)
+            if (root_is_finite or root_has_finite_auxiliary)
+            and not has_subject
+            and not imperative
+            else ()
+        )
+        if len(cache) >= LOCAL_SYNTAX_RESULT_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        cache[cache_key] = issues
+        return list(issues)
 
     def _pre_id_continuation_display_issues(
         self,
@@ -3174,6 +3196,11 @@ class ScreenSubtitleEditor:
             result["has_independent_meaning"] = True
             return result
 
+        short_open_prefix = bool(
+            word_count <= 4
+            and not result["has_finite_predicate"]
+            and re.search(r"[,;:][\"')\]]*\s*$", text)
+        )
         can_attach_next = bool(
             next_item is not None
             and self._items_are_continuous(item, next_item)
@@ -3181,6 +3208,7 @@ class ScreenSubtitleEditor:
             and not (
                 (pause := self._boundary_pause_ms(item, next_item)) is not None
                 and pause >= 450
+                and not short_open_prefix
             )
         )
         can_attach_previous = bool(
@@ -3221,6 +3249,8 @@ class ScreenSubtitleEditor:
             issues.append("weak_subject_fragment")
         if word_count <= 4 and self._looks_like_incomplete_interrogative_fragment(words):
             issues.append("incomplete_interrogative_fragment")
+        if short_open_prefix and can_attach_next:
+            issues.append("short_open_prefix_fragment")
         if self._looks_like_negation_or_emphasis_fragment(words):
             issues.append("negation_or_emphasis_fragment")
         if (
@@ -3487,8 +3517,12 @@ class ScreenSubtitleEditor:
                 continue
             allowed_long_pause_boundary = (
                 target_boundary
-                if "right_orphaned_finite_predicate"
-                in (evaluation.get("continuation_display_issues") or [])
+                if (
+                    "right_orphaned_finite_predicate"
+                    in (evaluation.get("continuation_display_issues") or [])
+                    or "short_open_prefix_fragment"
+                    in (evaluation.get("hard_fragment_issues") or [])
+                )
                 else None
             )
             if not self._can_repair_pre_id_window(
@@ -5125,83 +5159,17 @@ class ScreenSubtitleEditor:
         self, span: tuple[int, int], target_words: Optional[int] = None
     ) -> List[tuple[int, int]]:
         # The configured value is a preferred display length, not a grammar
-        # override. Normal cues stay within 16 words; 17-20 is reserved for a
+        # override. Normal cues stay within 16 words; 17-19 is reserved for a
         # rare structural exception when a shorter cut would be ungrammatical.
         target = max(1, min(target_words or self.max_english_words, 16))
-        emergency = 20
+        emergency = 19
         start, end = span
         if end < start:
             return []
         count = end - start + 1
         if count <= target:
             return [(start, end)]
-        return self._stable_greedy_ranges(start, end, target, emergency)
-
-    @staticmethod
-    def _segment_length_score(length: int, target: int, emergency: int) -> float:
-        score = abs(length - target) * 1.2
-        if length <= 2:
-            score += 28
-        elif length <= 4:
-            score += 8
-        if length > target:
-            score += (length - target) * 2.5
-        if length > emergency:
-            score += 10_000
-        return score
-
-    def _segment_boundary_score(
-        self, left: int, right: int, source_start: int, source_end: int
-    ) -> float:
-        entries = self._active_word_entries
-        if not entries:
-            return 0.0
-        score = 0.0
-        first = self._clean_boundary_token(entries[left]["token"])
-        last = self._clean_boundary_token(entries[right]["token"])
-        prev_token = (
-            self._clean_boundary_token(entries[left - 1]["token"])
-            if left > source_start
-            else ""
-        )
-        next_token = (
-            self._clean_boundary_token(entries[right + 1]["token"])
-            if right < source_end
-            else ""
-        )
-        surface = str(entries[right].get("surface") or "")
-
-        if right < source_end:
-            gap = entries[right + 1]["start_time"] - entries[right]["end_time"]
-            if gap >= 450:
-                score -= 18
-            elif gap >= 260:
-                score -= 8
-            elif gap <= 80:
-                score += 2
-
-            if re.search(r"[.!?]\s*$", surface):
-                score -= 32
-            elif re.search(r"[,;:]\s*$", surface):
-                score -= 12
-
-            if next_token in {"but", "however", "yet", "because", "although", "though", "if", "when", "where", "while"}:
-                score -= 8
-            if last in self._dangerous_segment_end_tokens():
-                score += 32
-            if next_token in self._dangerous_segment_start_tokens():
-                score += 20
-            if self._is_bad_boundary_pair(last, next_token):
-                score += 45
-            if (right, right + 1) in self._syntax_protected_cuts:
-                score += 80
-
-        if left > source_start:
-            if first in self._dangerous_segment_start_tokens():
-                score += 14
-            if self._is_bad_boundary_pair(prev_token, first):
-                score += 36
-        return score
+        return self._stable_global_ranges(start, end, target, emergency)
 
     def _cut_boundary_score(
         self, left: int, right: int, source_start: int, source_end: int
@@ -6102,80 +6070,66 @@ class ScreenSubtitleEditor:
         }
         return (left, right) in bad_pairs or (left, "*") in bad_pairs
 
-    def _stable_greedy_ranges(
+    def _stable_global_ranges(
         self, start: int, end: int, target: int, emergency: int
     ) -> List[tuple[int, int]]:
-        ranges = []
-        cursor = start
-        while cursor <= end:
-            remaining = end - cursor + 1
-            if remaining <= target:
-                ranges.append((cursor, end))
-                break
-
-            # First search within the normal display limit. Only if every
-            # candidate is structurally illegal do we use the 17-19 exception.
-            best: Optional[int] = None
-            best_score = float("inf")
-            max_length = min(target, remaining - 1)
-            for candidate in range(cursor + 4, cursor + max_length):
-                boundary = self._evaluate_stable_cut_boundary(
-                    candidate,
-                    candidate + 1,
-                    source_start=cursor,
-                    source_end=end,
+        def edge_cost(range_start: int, range_end: int, is_final: bool) -> Optional[float]:
+            length = range_end - range_start + 1
+            if (
+                length > target
+                and not self._is_complete_pre_id_structural_overflow_range(
+                    range_start,
+                    range_end,
                 )
-                if not boundary["legal"]:
-                    continue
-                if not self._stable_greedy_candidate_display_safe(cursor, candidate, end):
-                    continue
-                length = candidate - cursor + 1
-                score = float(boundary["boundary_score"]) + abs(length - target) * 1.5
-                if score < best_score:
-                    best_score = score
-                    best = candidate
+            ):
+                return None
+            if is_final:
+                return 0.0
+            boundary = self._evaluate_stable_cut_boundary(
+                range_end,
+                range_end + 1,
+                source_start=start,
+                source_end=end,
+            )
+            if not boundary["legal"]:
+                return None
+            if not self._stable_candidate_display_safe(range_start, range_end, end):
+                return None
+            return float(boundary["boundary_score"]) + 12.0 * len(
+                boundary.get("soft_issues") or []
+            )
 
-            if best is None:
-                max_length = min(emergency, remaining - 1)
-                for candidate in range(cursor + target - 1, cursor + max_length):
-                    boundary = self._evaluate_stable_cut_boundary(
-                        candidate,
-                        candidate + 1,
-                        source_start=cursor,
-                        source_end=end,
-                    )
-                    if not boundary["legal"]:
-                        continue
-                    if not self._stable_greedy_candidate_display_safe(cursor, candidate, end):
-                        continue
-                    length = candidate - cursor + 1
-                    if (
-                        length > target
-                        and not self._is_complete_pre_id_structural_overflow_range(
-                            cursor,
-                            candidate,
-                        )
-                    ):
-                        continue
-                    score = float(boundary["boundary_score"]) + (length - target) * 12.0
-                    if score < best_score:
-                        best_score = score
-                        best = candidate
+        # Structural overflow is an exception, not another ordinary edge.
+        # Evaluate the normal-limit graph first so common sentences never pay
+        # for parser-backed 17-19 word completeness checks.  Only a sentence
+        # with no complete normal path may enter the documented exception
+        # graph.
+        ranges = plan_english_cue_ranges(
+            start,
+            end,
+            target_words=target,
+            emergency_words=target,
+            edge_cost=edge_cost,
+        )
+        if ranges is not None and ranges_cover_interval(ranges, start, end):
+            return ranges
 
-            if best is None:
-                # This method receives one terminal source-sentence span. A
-                # forced 19-word cut here can only create an incomplete cue
-                # that the final validator must later reject. Keep the
-                # remaining complete sentence frozen and let the renderer own
-                # its line wrapping; it remains an audited structural warning.
-                ranges.append((cursor, end))
-                break
-            right = best
-            ranges.append((cursor, right))
-            cursor = right + 1
-        return self._merge_tiny_stable_ranges(ranges, target, emergency)
+        ranges = plan_english_cue_ranges(
+            start,
+            end,
+            target_words=target,
+            emergency_words=emergency,
+            edge_cost=edge_cost,
+        )
+        if ranges is not None and ranges_cover_interval(ranges, start, end):
+            return ranges
 
-    def _stable_greedy_candidate_display_safe(
+        # This method receives one terminal source-sentence span. If no
+        # complete legal path exists, retain the source sentence for audited
+        # renderer pagination instead of manufacturing a fragment.
+        return [(start, end)]
+
+    def _stable_candidate_display_safe(
         self, start: int, cut: int, end: int
     ) -> bool:
         """Reject pre-ID cuts that create a non-displayable cue on either side."""
@@ -6196,7 +6150,7 @@ class ScreenSubtitleEditor:
         word_start: int,
         word_end: int,
     ) -> bool:
-        """Permit a 17-20 word exception only for a complete local cue."""
+        """Permit a 17-19 word exception only for a complete local cue."""
         text = self._text_from_word_span(word_start, word_end)
         if re.search(r"[.!?][\"')\]]*\s*$", text or ""):
             return True
@@ -6207,26 +6161,10 @@ class ScreenSubtitleEditor:
             return False
         return bool(self._visual_temporal_clause_shape(item).get("complete_main_clause"))
 
-    def _merge_tiny_stable_ranges(
-        self, ranges: List[tuple[int, int]], target: int, emergency: int
-    ) -> List[tuple[int, int]]:
-        if len(ranges) <= 1:
-            return ranges
-        result: List[tuple[int, int]] = []
-        for current in ranges:
-            length = current[1] - current[0] + 1
-            if result and length <= 2:
-                prev = result[-1]
-                merged_len = current[1] - prev[0] + 1
-                if merged_len <= emergency:
-                    result[-1] = (prev[0], current[1])
-                    continue
-            result.append(current)
-        return result
-
     def _prepare_syntax_cut_hints(self) -> None:
         self._syntax_protected_cuts = set()
         self._syntax_hard_cut_issues = {}
+        self._orphaned_finite_predicate_cache = {}
         if not self._active_word_entries:
             return
         nlp = self._load_syntax_nlp()
@@ -7046,8 +6984,12 @@ class ScreenSubtitleEditor:
         English often omits ``that``/``which`` in an object relative clause:
         ``a level they never would have reached``.  The parser still exposes
         the ``relcl`` predicate, but the existing explicit-marker guard cannot
-        see the boundary after ``level``.  Protect only the noun-to-clause
-        entrance; later boundaries inside the clause remain available.
+        see the boundary after ``level``.  The parser can also attach the
+        relative clause to an earlier noun in the same noun phrase, as in
+        ``strategies in the sources we're reviewing``.  In that case the
+        immediately preceding nominal is the reliable display anchor.  Protect
+        only the noun-to-clause entrance; later boundaries inside the clause
+        remain available.
         """
         explicit_markers = {"that", "which", "who", "whom", "whose", "where", "when"}
         for predicate in doc:
@@ -7072,21 +7014,48 @@ class ScreenSubtitleEditor:
             if not clause_indices:
                 continue
             clause_start = clause_indices[0]
-            if clause_start != head_index + 1:
+            if clause_start <= head_index:
+                continue
+            anchor_index = clause_start - 1
+            anchor_tokens = [
+                token
+                for token in doc
+                if (
+                    token.i in doc_to_word
+                    and doc_to_word[token.i] == anchor_index
+                    and getattr(token, "pos_", "") in {"NOUN", "PROPN"}
+                )
+            ]
+            if not anchor_tokens:
+                continue
+            head_subtree_indices = {
+                token.i for token in head.subtree if token.i in doc_to_word
+            }
+            if not any(token.i in head_subtree_indices for token in anchor_tokens):
+                continue
+            first_clause_tokens = [
+                token
+                for token in predicate.subtree
+                if token.i in doc_to_word and doc_to_word[token.i] == clause_start
+            ]
+            if not any(
+                getattr(token, "dep_", "") in {"nsubj", "nsubjpass", "expl"}
+                for token in first_clause_tokens
+            ):
                 continue
             first_clause_word = self._clean_boundary_token(
                 self._active_word_entries[clause_start].get("token") or ""
             )
             if first_clause_word in explicit_markers:
                 continue
-            previous_surface = str(self._active_word_entries[head_index].get("surface") or "")
+            previous_surface = str(self._active_word_entries[anchor_index].get("surface") or "")
             if re.search(r"[,;:.!?]\s*$", previous_surface):
                 continue
-            pause_ms = self._word_pause_ms(head_index, clause_start)
+            pause_ms = self._word_pause_ms(anchor_index, clause_start)
             if pause_ms is not None and pause_ms >= 450:
                 continue
             self._record_syntax_hard_issue_for_indices(
-                [head_index, clause_start],
+                [anchor_index, clause_start],
                 "zero_relative_clause_split",
             )
 
