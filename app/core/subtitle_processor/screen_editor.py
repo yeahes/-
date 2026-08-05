@@ -1419,6 +1419,8 @@ class ScreenSubtitleEditor:
         """
         if not self._is_short_backchannel_text(current.original):
             return False
+        if self._short_backchannel_belongs_to_following_clause(current, next_item):
+            return False
         if self._is_independent_discourse_answer(current, previous_item, next_item):
             return False
         timing = self._item_word_timing(current)
@@ -1429,6 +1431,38 @@ class ScreenSubtitleEditor:
         return self._word_count(
             self._join_subtitle_text(previous_item.original, current.original)
         ) <= self.max_english_words
+
+    def _short_backchannel_belongs_to_following_clause(
+        self,
+        marker: ScreenSubtitleItem,
+        next_item: Optional[ScreenSubtitleItem],
+    ) -> bool:
+        """Recognize a one-word response that introduces a coordinated clause."""
+        if next_item is None or self._word_count(marker.original) != 1:
+            return False
+        if not self._is_short_backchannel_text(marker.original):
+            return False
+        if not re.search(r"[.!?]\s*$", marker.original or ""):
+            return False
+        next_words = [word.lower() for word in self._word_tokens(next_item.original)]
+        if not next_words or next_words[0] not in {"and", "but", "so", "yet"}:
+            return False
+        if not re.search(r"[.!?][\"')\]]*\s*$", next_item.original or ""):
+            return False
+        if not self._items_are_continuous(marker, next_item):
+            return False
+        return not self._items_cross_speaker(marker, next_item)
+
+    def _can_keep_short_backchannel_following_overflow(
+        self,
+        marker: ScreenSubtitleItem,
+        next_item: ScreenSubtitleItem,
+        combined_words: int,
+    ) -> bool:
+        return bool(
+            combined_words == self.max_english_words + 1
+            and self._short_backchannel_belongs_to_following_clause(marker, next_item)
+        )
 
     def _safe_direct_short_item_merge(
         self,
@@ -1442,7 +1476,15 @@ class ScreenSubtitleEditor:
         if self._items_cross_speaker(left, right):
             return None
         merged = self._merge_subtitle_items(left, right)
-        if self._word_count(merged.original) > self.max_english_words:
+        merged_words = self._word_count(merged.original)
+        if (
+            merged_words > self.max_english_words
+            and not self._can_keep_short_backchannel_following_overflow(
+                left,
+                right,
+                merged_words,
+            )
+        ):
             return None
         return merged
 
@@ -1477,11 +1519,17 @@ class ScreenSubtitleEditor:
         if len(combined_words) > max(1, self.max_english_words):
             return bool(
                 is_short_bridge
-                and
-                self._balanced_two_item_split(
-                    current,
-                    next_item,
-                    require_left_not_marker_only=True,
+                and (
+                    self._balanced_two_item_split(
+                        current,
+                        next_item,
+                        require_left_not_marker_only=True,
+                    )
+                    or self._can_keep_short_backchannel_following_overflow(
+                        current,
+                        next_item,
+                        len(combined_words),
+                    )
                 )
             )
         return is_short_bridge
@@ -3351,7 +3399,13 @@ class ScreenSubtitleEditor:
         normalized = re.sub(r"[^a-z?\s]", " ", text.casefold())
         normalized = re.sub(r"\s+", " ", normalized).strip()
         normalized_words = normalized.rstrip("?")
-        if normalized_words in {"yes", "no", "really", "right", "exactly", "okay", "ok"} and re.search(r"[.!?]\s*$", text):
+        if (
+            re.search(r"[.!?]\s*$", text)
+            and (
+                normalized_words in {"yes", "no", "really", "yep"}
+                or self._is_short_backchannel_text(text)
+            )
+        ):
             return True
         if previous_item and self._items_cross_speaker(previous_item, item):
             return True
@@ -3658,6 +3712,14 @@ class ScreenSubtitleEditor:
         if self._items_word_range(old_items) != self._items_word_range(new_items):
             reasons.append("word_coverage_changed")
 
+        old_sentence_anchors = self._strong_sentence_anchor_pairs(old_items)
+        new_sentence_anchors = self._pre_id_boundary_pairs(new_items)
+        removed_sentence_anchors = sorted(
+            old_sentence_anchors - new_sentence_anchors
+        )
+        if removed_sentence_anchors:
+            reasons.append("strong_sentence_anchor_removed")
+
         for left, right in zip(new_items, new_items[1:]):
             if not self._items_are_continuous(left, right):
                 reasons.append("non_continuous_word_range")
@@ -3724,7 +3786,40 @@ class ScreenSubtitleEditor:
             "new_word_range": self._items_word_range(new_items),
             "old_word_count": len(self._items_word_tokens(old_items)),
             "new_word_count": len(self._items_word_tokens(new_items)),
+            "removed_sentence_anchors": [
+                list(boundary) for boundary in removed_sentence_anchors
+            ],
         }
+
+    def _strong_sentence_anchor_pairs(
+        self,
+        items: Sequence[ScreenSubtitleItem],
+    ) -> set[tuple[int, int]]:
+        """Return existing terminal boundaries that a repair must preserve."""
+        anchors: set[tuple[int, int]] = set()
+        entries = self._active_word_entries
+        for left, right in zip(items, items[1:]):
+            pair = self._pre_id_boundary_pair(left, right)
+            if pair is None:
+                continue
+            left_index, right_index = pair
+            if (
+                left_index < 0
+                or right_index >= len(entries)
+                or right_index != left_index + 1
+            ):
+                continue
+            left_surface = str(entries[left_index].get("surface") or "")
+            right_surface = str(entries[right_index].get("surface") or "")
+            if not self._is_unambiguous_sentence_terminal(
+                left_surface,
+                right_surface,
+            ):
+                continue
+            if self._short_backchannel_belongs_to_following_clause(left, right):
+                continue
+            anchors.add(pair)
+        return anchors
 
     def _is_allowed_pre_id_structural_overflow_merge(
         self,
@@ -6226,6 +6321,8 @@ class ScreenSubtitleEditor:
             self._protect_verb_numeric_result_boundaries(doc, doc_to_word)
             self._protect_numeric_range_boundaries(doc, doc_to_word)
             self._protect_subject_verb_boundaries(doc, doc_to_word)
+            self._protect_fronted_wh_clause_boundaries(doc, doc_to_word)
+            self._protect_comparative_measure_boundaries(doc, doc_to_word)
             self._protect_coordinated_subject_boundaries(doc, doc_to_word)
             self._protect_compact_coordination_boundaries(doc, doc_to_word)
             self._protect_object_content_clause_boundaries(doc, doc_to_word)
@@ -6233,6 +6330,8 @@ class ScreenSubtitleEditor:
             self._protect_zero_relative_clause_boundaries(doc, doc_to_word)
             self._protect_post_noun_participial_modifier_boundaries(doc, doc_to_word)
             self._protect_object_attached_modifier_boundaries(doc, doc_to_word)
+            self._protect_dependency_phrase_entrances(doc, doc_to_word)
+            self._protect_post_nominal_adverb_boundaries(doc, doc_to_word)
             self._protect_comma_bracketed_adverb_boundaries(doc, doc_to_word)
             self._protect_modifier_head_boundaries(doc, doc_to_word)
             self._protect_metalinguistic_reference_boundaries(doc, doc_to_word, protected)
@@ -6472,6 +6571,24 @@ class ScreenSubtitleEditor:
                 [verb_index, particle_index],
                 "verb_particle_split",
             )
+            following_prepositions = [
+                child
+                for child in verb.children
+                if (
+                    getattr(child, "dep_", "") == "prep"
+                    and child.i in doc_to_word
+                    and doc_to_word[child.i] == particle_index + 1
+                    and any(
+                        getattr(complement, "dep_", "") in {"pobj", "pcomp"}
+                        for complement in child.children
+                    )
+                )
+            ]
+            if following_prepositions:
+                self._record_syntax_hard_issue_for_indices(
+                    range(verb_index, particle_index + 2),
+                    "verb_particle_preposition_chain_split",
+                )
 
     def _protect_short_gerundial_modifier_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
         """Keep a compact unpunctuated VBG modifier with the action it completes.
@@ -6584,13 +6701,31 @@ class ScreenSubtitleEditor:
                 continue
             head_index = doc_to_word[head.i]
             prep_index = doc_to_word[token.i]
-            if prep_index != head_index + 1:
-                continue
             if not any(getattr(child, "dep_", "") in {"pobj", "pcomp"} for child in token.children):
                 continue
+            if prep_index == head_index + 1:
+                self._record_syntax_hard_issue_for_indices(
+                    [head_index, prep_index],
+                    "verb_preposition_complement_split",
+                )
+                continue
+            if prep_index <= head_index or prep_index - head_index > 3:
+                continue
+            intervening = [
+                item
+                for item in doc
+                if item.i in doc_to_word
+                and head_index < doc_to_word[item.i] < prep_index
+            ]
+            if not intervening or any(
+                getattr(item, "dep_", "") not in {"advmod", "neg", "prt"}
+                or item.head.i not in {head.i, token.i}
+                for item in intervening
+            ):
+                continue
             self._record_syntax_hard_issue_for_indices(
-                [head_index, prep_index],
-                "verb_preposition_complement_split",
+                range(head_index, prep_index + 1),
+                "predicate_complement_chain_split",
             )
 
     def _protect_verb_adverb_preposition_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
@@ -6826,13 +6961,6 @@ class ScreenSubtitleEditor:
                 continue
             if verb_index - subject_end > 4:
                 continue
-            if self._word_pause_ms(subject_end, subject_end + 1) is not None:
-                pauses = [
-                    self._word_pause_ms(index, index + 1)
-                    for index in range(subject_end, verb_index)
-                ]
-                if any(pause is not None and pause >= 450 for pause in pauses):
-                    continue
             issue = (
                 "relative_clause_subject_verb_split"
                 if getattr(head, "dep_", "") == "relcl" or getattr(token, "dep_", "") == "nsubj"
@@ -6842,6 +6970,108 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 list(range(subject_end, verb_index + 1)),
                 issue,
+            )
+
+    def _protect_fronted_wh_clause_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep a compact fronted WH phrase attached to its predicate."""
+        wh_tags = {"WDT", "WP", "WP$", "WRB"}
+        allowed_deps = {
+            "advmod", "attr", "dobj", "iobj", "obj", "oprd", "pobj", "pcomp",
+        }
+        for marker in doc:
+            if (
+                getattr(marker, "tag_", "") not in wh_tags
+                or getattr(marker, "dep_", "") not in allowed_deps
+                or marker.i not in doc_to_word
+            ):
+                continue
+            predicate = marker.head
+            if (
+                getattr(predicate, "pos_", "") not in {"VERB", "AUX"}
+                or predicate.i not in doc_to_word
+            ):
+                continue
+            marker_index = doc_to_word[marker.i]
+            predicate_index = doc_to_word[predicate.i]
+            if predicate_index <= marker_index or predicate_index - marker_index > 6:
+                continue
+            if any(
+                self._is_unambiguous_sentence_terminal(
+                    str(self._active_word_entries[index].get("surface") or ""),
+                    str(self._active_word_entries[index + 1].get("surface") or ""),
+                )
+                for index in range(marker_index, predicate_index)
+            ):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(marker_index, predicate_index + 1),
+                "fronted_wh_clause_split",
+            )
+
+    def _protect_comparative_measure_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Protect ``less/more than <measure> the <noun>`` complements."""
+        for comparative in doc:
+            if (
+                self._clean_boundary_token(getattr(comparative, "text", ""))
+                not in {"less", "more"}
+                or comparative.i not in doc_to_word
+            ):
+                continue
+            than_phrases = [
+                child
+                for child in comparative.children
+                if self._clean_boundary_token(getattr(child, "text", "")) == "than"
+            ]
+            measure_indices = [
+                doc_to_word[item.i]
+                for than_phrase in than_phrases
+                for item in than_phrase.subtree
+                if item.i in doc_to_word
+                and (
+                    getattr(item, "like_num", False)
+                    or getattr(item, "pos_", "") in {"NOUN", "NUM"}
+                )
+            ]
+            if not measure_indices:
+                continue
+            measure_end = max(measure_indices)
+            nominal_complements = [
+                candidate
+                for candidate in doc
+                if (
+                    getattr(candidate, "dep_", "")
+                    in {"appos", "attr", "dobj", "obj", "oprd"}
+                    and getattr(candidate, "pos_", "") in {"NOUN", "PROPN"}
+                    and candidate.i in doc_to_word
+                    and measure_end < doc_to_word[candidate.i] <= measure_end + 3
+                    and any(
+                        getattr(child, "dep_", "") in {"det", "poss"}
+                        and child.i in doc_to_word
+                        and doc_to_word[child.i] == measure_end + 1
+                        for child in candidate.children
+                    )
+                )
+            ]
+            if not nominal_complements:
+                continue
+            complement = min(
+                nominal_complements,
+                key=lambda child: doc_to_word[child.i],
+            )
+            complement_index = doc_to_word[complement.i]
+            if complement_index - measure_end > 3:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(measure_end, complement_index + 1),
+                "comparative_measure_phrase_split",
             )
 
     def _protect_coordinated_subject_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
@@ -7137,6 +7367,179 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 [previous_index, modifier_index],
                 "object_attached_modifier_split",
+            )
+
+    def _protect_dependency_phrase_entrances(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Protect high-confidence sentence-internal dependency entrances.
+
+        These boundaries sit immediately before a parser-attached continuation,
+        not before an independent sentence.  Keeping the check here makes the
+        global optimizer, pre-ID repair, and whole-file audit share the same
+        grammar invariant.
+        """
+        tokens_by_word: Dict[int, List] = {}
+        for token in doc:
+            if token.i in doc_to_word:
+                tokens_by_word.setdefault(doc_to_word[token.i], []).append(token)
+
+        relative_markers = {"that", "which", "who", "whom", "whose", "where", "when"}
+        object_deps = {"obj", "dobj", "iobj", "attr", "oprd"}
+
+        def has_local_complement(token) -> bool:
+            return any(
+                getattr(child, "dep_", "") in {"pobj", "pcomp"}
+                and any(item.i in doc_to_word for item in child.subtree)
+                for child in token.children
+            )
+
+        def continues_object(candidate, governing) -> bool:
+            current = candidate
+            while getattr(current, "dep_", "") == "conj":
+                current = current.head
+            return (
+                getattr(current, "dep_", "") in object_deps
+                and current.head == governing
+            )
+
+        for token in doc:
+            if token.i not in doc_to_word:
+                continue
+            right = doc_to_word[token.i]
+            if right <= 0:
+                continue
+            dep = getattr(token, "dep_", "")
+            pos = getattr(token, "pos_", "")
+            head = token.head
+            head_word = doc_to_word.get(head.i)
+
+            # Protect an adjacent adverb and its parser-confirmed head in
+            # either word order. This prevents a repair from merely moving a
+            # bad cut to the other side of an intensifier.
+            if (
+                dep == "advmod"
+                and pos == "ADV"
+                and head_word is not None
+                and abs(head_word - right) == 1
+                and getattr(head, "pos_", "") in {"VERB", "AUX", "ADJ", "ADV"}
+            ):
+                modifier_left = min(right, head_word)
+                modifier_right = max(right, head_word)
+                modifier_left_surface = str(
+                    self._active_word_entries[modifier_left].get("surface") or ""
+                )
+                modifier_right_surface = str(
+                    self._active_word_entries[modifier_right].get("surface") or ""
+                )
+                modifier_pause = self._word_pause_ms(modifier_left, modifier_right)
+                if (
+                    not self._is_unambiguous_sentence_terminal(
+                        modifier_left_surface,
+                        modifier_right_surface,
+                    )
+                    and (modifier_pause is None or modifier_pause < 450)
+                ):
+                    self._record_syntax_hard_issue_for_indices(
+                        [modifier_left, modifier_right],
+                        "dependency_phrase_entrance_split",
+                    )
+
+            left = right - 1
+            left_surface = str(self._active_word_entries[left].get("surface") or "")
+            right_surface = str(self._active_word_entries[right].get("surface") or "")
+            if self._is_unambiguous_sentence_terminal(left_surface, right_surface):
+                continue
+            pause_ms = self._word_pause_ms(left, right)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+
+            protected = False
+
+            # A nominal complement entrance such as ``the secret to how``.
+            if (
+                dep == "prep"
+                and pos == "ADP"
+                and head_word == left
+                and getattr(head, "pos_", "") in {"NOUN", "PROPN", "PRON", "ADJ"}
+                and has_local_complement(token)
+            ):
+                protected = True
+
+            # A verb-attached modifier after its final object, including a
+            # coordinated object such as ``logic and patterns without ...``.
+            if (
+                not protected
+                and dep == "prep"
+                and pos == "ADP"
+                and getattr(head, "pos_", "") in {"VERB", "AUX"}
+                and has_local_complement(token)
+                and any(continues_object(candidate, head) for candidate in tokens_by_word.get(left, []))
+            ):
+                protected = True
+
+            # Explicit relative markers belong to the following relative
+            # predicate and its antecedent noun phrase.  The marker may follow
+            # modifiers rather than the noun itself.
+            marker = self._clean_boundary_token(getattr(token, "text", ""))
+            predicate = head
+            antecedent = getattr(predicate, "head", None)
+            if (
+                not protected
+                and marker in relative_markers
+                and dep in {"nsubj", "nsubjpass", "expl", "mark", "advmod"}
+                and getattr(predicate, "dep_", "") in {"relcl", "acl"}
+                and antecedent is not None
+                and antecedent.i in doc_to_word
+            ):
+                clause_indices = sorted(
+                    doc_to_word[item.i]
+                    for item in predicate.subtree
+                    if item.i in doc_to_word
+                )
+                antecedent_word = doc_to_word[antecedent.i]
+                if clause_indices and right == clause_indices[0] and antecedent_word <= left:
+                    protected = True
+
+            if protected:
+                self._record_syntax_hard_issue_for_indices(
+                    [left, right],
+                    "dependency_phrase_entrance_split",
+                )
+
+    def _protect_post_nominal_adverb_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep an adjacent post-nominal adverb inside its noun phrase."""
+        for modifier in doc:
+            if (
+                getattr(modifier, "dep_", "") != "advmod"
+                or getattr(modifier, "pos_", "") != "ADV"
+                or modifier.i not in doc_to_word
+            ):
+                continue
+            head = modifier.head
+            if (
+                getattr(head, "pos_", "") not in {"NOUN", "PROPN", "PRON"}
+                or head.i not in doc_to_word
+            ):
+                continue
+            head_index = doc_to_word[head.i]
+            modifier_index = doc_to_word[modifier.i]
+            if modifier_index != head_index + 1:
+                continue
+            if self._is_unambiguous_sentence_terminal(
+                str(self._active_word_entries[head_index].get("surface") or ""),
+                str(self._active_word_entries[modifier_index].get("surface") or ""),
+            ):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [head_index, modifier_index],
+                "post_nominal_adverb_split",
             )
 
     def _protect_comma_bracketed_adverb_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:

@@ -2778,6 +2778,184 @@ def test_verb_directional_adverb_preposition_boundary_is_hard_when_syntax_marks_
     assert not adverb_preposition["legal"]
 
 
+def test_parser_dependency_phrase_entrances_are_hard_boundaries():
+    cases = [
+        (
+            [
+                "Yeah.", "And", "this", "is", "really", "the", "secret", "to", "how",
+                "these", "developers", "are", "optimizing", "their", "costs.",
+            ],
+            6,
+        ),
+        (
+            [
+                "The", "student", "learns", "the", "underlying", "logic", "and", "patterns",
+                "without", "needing", "the", "teacher.",
+            ],
+            7,
+        ),
+        (
+            [
+                "They", "launched", "an", "efficient", "model", "by", "investing", "heavily",
+                "in", "techniques.",
+            ],
+            6,
+        ),
+        (
+            [
+                "You", "have", "to", "build", "something", "highly", "efficient", "that",
+                "delivers", "a", "return.",
+            ],
+            6,
+        ),
+        (["They", "are", "so", "drastically", "optimizing", "costs."], 3),
+    ]
+
+    for words, cut_after in cases:
+        editor = _marker_editor(words)
+        editor._prepare_syntax_cut_hints()
+
+        evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+        assert "dependency_phrase_entrance_split" in evaluation["hard_issues"], words
+        assert not evaluation["legal"], words
+
+
+def test_dependency_phrase_entrance_guard_allows_independent_sentence_starts():
+    cases = [
+        (["We", "invested.", "To", "reduce", "costs,", "we", "automated."], 1),
+        (["They", "left.", "Without", "warning,", "markets", "fell."], 1),
+        (["We", "stopped.", "That", "was", "enough."], 1),
+    ]
+
+    for words, cut_after in cases:
+        editor = _marker_editor(words)
+        editor._prepare_syntax_cut_hints()
+
+        evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+        assert "dependency_phrase_entrance_split" not in evaluation["hard_issues"], words
+        assert evaluation["legal"], words
+
+
+def test_parser_clause_chains_block_migrated_dependency_boundaries():
+    cases = [
+        (
+            ["you", "have", "to", "ask,", "what", "exactly", "are", "you", "buying?"],
+            5,
+            "fronted_wh_clause_split",
+            80,
+        ),
+        (
+            ["that's", "less", "than", "a", "tenth", "the", "size", "of", "the", "model."],
+            4,
+            "comparative_measure_phrase_split",
+            80,
+        ),
+        (
+            (
+                "But a 30% discount doesn't explain an infrastructure budget that's "
+                "less than a tenth the size of your American competitors."
+            ).split(),
+            13,
+            "comparative_measure_phrase_split",
+            60,
+        ),
+        (
+            ["They", "end", "up", "with", "an", "advanced", "model."],
+            2,
+            "verb_particle_preposition_chain_split",
+            80,
+        ),
+        (
+            ["spend", "less", "than", "one-tenth", "of", "what", "American", "firms", "spend."],
+            5,
+            "fronted_wh_clause_split",
+            80,
+        ),
+        (
+            ["The", "budget", "suddenly", "looks", "less", "like", "an", "advantage."],
+            3,
+            "predicate_complement_chain_split",
+            560,
+        ),
+        (
+            ["We", "wonder", "about", "the", "long", "game", "here."],
+            5,
+            "post_nominal_adverb_split",
+            80,
+        ),
+        (
+            ["Will", "the", "ultimate", "winner", "of", "this", "revolution", "actually", "be", "the", "country?"],
+            6,
+            "subject_finite_verb_split",
+            520,
+        ),
+    ]
+
+    for words, cut_after, issue, pause_ms in cases:
+        editor = _marker_editor(words)
+        additional_pause = max(0, pause_ms - 80)
+        for entry in editor._active_word_entries[cut_after + 1:]:
+            entry["start_time"] += additional_pause
+            entry["end_time"] += additional_pause
+        editor._prepare_syntax_cut_hints()
+
+        evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+        assert issue in evaluation["hard_issues"], (words, evaluation)
+        assert not evaluation["legal"], words
+
+
+def test_pre_id_candidate_cannot_remove_existing_strong_sentence_anchor():
+    words = (
+        "We really have to wonder about the long game here. "
+        "Will the ultimate winner actually be the country that wins?"
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    old_items = [
+        _word_item(editor, 0, 9, 1),
+        _word_item(editor, 10, 17, 2),
+        _word_item(editor, 18, 19, 3),
+    ]
+    migrated_items = [
+        _word_item(editor, 0, 8, 1),
+        _word_item(editor, 9, 14, 2),
+        _word_item(editor, 15, 19, 3),
+    ]
+
+    gate = editor._can_apply_pre_id_repair_candidate(old_items, migrated_items)
+
+    assert gate["accepted"] is False
+    assert "strong_sentence_anchor_removed" in gate["reasons"]
+
+
+def test_migrated_dependency_guards_allow_independent_sentence_boundaries():
+    cases = [
+        (["They", "ended", "up.", "With", "care,", "they", "continued."], 2),
+        (["The", "budget", "looks.", "Less", "can", "be", "better."], 2),
+        (["We", "discussed", "the", "game.", "Here", "is", "why."], 3),
+        (["What", "changed?", "American", "firms", "responded."], 1),
+    ]
+    new_issue_codes = {
+        "comparative_measure_phrase_split",
+        "fronted_wh_clause_split",
+        "post_nominal_adverb_split",
+        "predicate_complement_chain_split",
+        "verb_particle_preposition_chain_split",
+    }
+
+    for words, cut_after in cases:
+        editor = _marker_editor(words)
+        editor._prepare_syntax_cut_hints()
+
+        evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+        assert evaluation["legal"], (words, evaluation)
+        assert not new_issue_codes.intersection(evaluation["hard_issues"]), words
+
+
 def test_short_display_merge_keeps_original_when_no_safe_boundary_exists():
     words = ["Yeah,", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"]
     editor = _marker_editor(words, max_words=4)
@@ -7811,6 +7989,53 @@ def test_short_nonindependent_backchannel_attaches_to_previous_display_item():
     )
 
 
+def test_short_backchannel_stays_with_following_coordinated_clause():
+    previous_words = ["Model", "distillation."]
+    next_words = (
+        "And this is really the secret to how these developers are so drastically "
+        "optimizing their costs."
+    ).split()
+    words = previous_words + ["Yeah."] + next_words
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    items = [
+        _word_item(editor, 0, 1, 1),
+        _word_item(editor, 2, 2, 2),
+        _word_item(editor, 3, len(words) - 1, 3),
+    ]
+
+    merged = editor._merge_short_display_items(items)
+
+    assert len(merged) == 2
+    assert merged[0].original == "Model distillation."
+    assert merged[1].original.startswith("Yeah. And this")
+    assert merged[1].original.endswith("their costs.")
+    assert ScreenSubtitleEditor._word_count(merged[1].original) == 17
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in merged)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+
+
+def test_pre_id_validation_keeps_terminal_backchannel_out_of_previous_sentence():
+    words = ["Model", "distillation.", "Yeah.", "And", "this", "works."]
+    editor = _marker_editor(words, max_words=16)
+    items = [
+        _word_item(editor, 0, 1, 1),
+        _word_item(editor, 2, 2, 2),
+        _word_item(editor, 3, 5, 3),
+    ]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [
+        "Model distillation.",
+        "Yeah. And this works.",
+    ]
+    assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in repaired)) == ScreenSubtitleEditor._word_tokens(
+        " ".join(item.original for item in items)
+    )
+
+
 def test_complete_unsplittable_overflow_is_warning_not_overlong_error():
     text = "A precise compact sentence keeps every protected grammatical relation intact through this final complete clause cleanly today."
     editor = _marker_editor(text.split(), max_words=16)
@@ -9619,6 +9844,11 @@ if __name__ == "__main__":
     test_final_pre_id_repair_does_not_cross_speaker_change()
     test_final_pre_id_rejects_noop_repartition_without_iteration_loop()
     test_verb_directional_adverb_preposition_boundary_is_hard_when_syntax_marks_it()
+    test_parser_dependency_phrase_entrances_are_hard_boundaries()
+    test_dependency_phrase_entrance_guard_allows_independent_sentence_starts()
+    test_parser_clause_chains_block_migrated_dependency_boundaries()
+    test_pre_id_candidate_cannot_remove_existing_strong_sentence_anchor()
+    test_migrated_dependency_guards_allow_independent_sentence_boundaries()
     test_short_display_merge_keeps_original_when_no_safe_boundary_exists()
     test_final_pre_id_preserves_word_order_coverage_and_timestamps()
     test_boundary_snapshot_payload_records_pre_id_repairs()
@@ -9820,6 +10050,8 @@ if __name__ == "__main__":
     test_whisperx_time_only_uses_explicit_source_audio_from_complete_task()
     test_screen_editor_normalizes_enum_target_language_for_prompts_and_artifacts()
     test_short_nonindependent_backchannel_attaches_to_previous_display_item()
+    test_short_backchannel_stays_with_following_coordinated_clause()
+    test_pre_id_validation_keeps_terminal_backchannel_out_of_previous_sentence()
     test_complete_unsplittable_overflow_is_warning_not_overlong_error()
     test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned()
     test_overlong_repair_keeps_relative_clause_with_its_main_predicate()
