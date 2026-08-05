@@ -176,6 +176,140 @@ def test_final_time_alignment_runs_chinese_speed_repair_without_touching_english
     assert repaired.segments[0].translated_text == "它来自一个平时拼写很差的人"
 
 
+def test_final_time_alignment_checks_chinese_speed_after_display_reconciliation():
+    editor = _editor()
+    asr_data = ASRData(
+        [
+            ASRDataSeg(
+                "A fixed English cue.",
+                0,
+                2000,
+                "这是一条在最终时长收紧后会超速的中文字幕",
+            )
+        ]
+    )
+    asr_data.segments[0].subtitle_id = "S0001"
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._align_segment_translation_punctuation = lambda segments: list(segments)
+    editor._report_subtitle_coverage_gaps = lambda *args, **kwargs: None
+    editor._write_stable_pipeline_artifacts = lambda **kwargs: None
+
+    def reconcile(segments, source_segments):
+        return [editor._copy_segment(segments[0], end_time=1000)]
+
+    observed = {}
+
+    def compress(segments, **kwargs):
+        observed["duration_ms"] = segments[0].end_time - segments[0].start_time
+        return list(segments)
+
+    editor._reconcile_final_display_coverage = reconcile
+    editor._compress_fast_chinese_segments = compress
+
+    repaired = editor.repair_after_final_time_alignment(
+        asr_data,
+        preserve_aligned_timing=True,
+    )
+
+    assert observed["duration_ms"] == 1000
+    assert repaired.segments[0].end_time == 1000
+    assert repaired.segments[0].text == "A fixed English cue."
+    assert repaired.segments[0].subtitle_id == "S0001"
+
+
+def test_chinese_compression_inherits_terminal_punctuation():
+    editor = _id_editor()
+    segment = ASRDataSeg(
+        "A complete sentence.",
+        0,
+        1000,
+        "这是一条较长的完整中文字幕。",
+    )
+    segment.subtitle_id = "S0001"
+
+    with patch.object(
+        editor,
+        "_request_chinese_compression",
+        return_value={"items": [{"subtitle_id": "S0001", "chinese": "这是简洁完整表达"}]},
+    ):
+        repaired = editor._compress_fast_chinese_segments([segment])
+
+    assert repaired[0].translated_text == "这是简洁完整表达。"
+
+
+def test_chinese_compression_accepts_punctuated_sentence_outside_action_whitelist():
+    editor = _id_editor()
+    segment = ASRDataSeg(
+        "We've talked a lot about how they're building it distantly.",
+        0,
+        1872,
+        "我们已经谈了很多他们是如何以迂回的方式构建它的。",
+    )
+    segment.subtitle_id = "S0001"
+    context = {
+        "group_id": 1,
+        "full_english": segment.text,
+        "full_translation": segment.translated_text,
+        "parts": [
+            {
+                "index": 0,
+                "subtitle_id": segment.subtitle_id,
+                "english": segment.text,
+                "current_chinese": segment.translated_text,
+                "duration_ms": 1872,
+            }
+        ],
+    }
+    candidate = "我们详谈了他们迂回建造的方式。"
+
+    assert not editor._is_incomplete_chinese_group(candidate)
+    assert editor._is_valid_chinese_compression(
+        candidate,
+        segment,
+        [segment],
+        0,
+        context=context,
+    )
+
+
+def test_single_cue_speed_compression_does_not_use_allocation_coverage_as_a_veto():
+    editor = _id_editor()
+    segment = ASRDataSeg(
+        "We've talked a lot about how they're building it distantly.",
+        0,
+        1872,
+        "我们已经谈了很多他们是如何以迂回的方式构建它的。",
+    )
+    segment.subtitle_id = "S0001"
+    item = ScreenSubtitleItem(
+        source_ids=[1],
+        original=segment.text,
+        translated=segment.translated_text,
+        word_start=0,
+        word_end=9,
+        subtitle_id=segment.subtitle_id,
+    )
+    editor._last_semantic_full_translations = {1: segment.translated_text}
+    groups = [{"id": 1, "start_index": 0, "items": [item]}]
+
+    with patch.object(
+        editor,
+        "_request_chinese_compression",
+        return_value={
+            "items": [{"subtitle_id": "S0001", "chinese": "我们详谈了他们迂回建造的方式"}]
+        },
+    ):
+        repaired = editor._compress_fast_chinese_segments(
+            [segment],
+            semantic_groups=groups,
+            subtitle_items=[item],
+        )
+
+    assert repaired[0].translated_text == "我们详谈了他们迂回建造的方式。"
+    assert not editor._is_severe_chinese_speed(repaired[0])
+
+
 def _words(text):
     return ScreenSubtitleEditor._word_tokens(text)
 
@@ -8764,6 +8898,10 @@ if __name__ == "__main__":
     test_caption_audit_keeps_numeric_percent_chinese_line()
     test_large_number_anchor_variants_do_not_crash()
     test_concise_group_allocation_is_not_rejected_by_coverage_only()
+    test_final_time_alignment_checks_chinese_speed_after_display_reconciliation()
+    test_chinese_compression_inherits_terminal_punctuation()
+    test_chinese_compression_accepts_punctuated_sentence_outside_action_whitelist()
+    test_single_cue_speed_compression_does_not_use_allocation_coverage_as_a_veto()
     test_short_but_severe_chinese_speed_triggers_repair()
     test_borderline_chinese_speed_does_not_trigger_render_blocker()
     test_short_subtitle_gets_minimum_display_duration_when_room_allows()

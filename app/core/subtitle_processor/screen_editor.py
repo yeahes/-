@@ -765,16 +765,19 @@ class ScreenSubtitleEditor:
         # A forced-alignment backend owns the final cue boundaries.  Chinese
         # post-processing remains allowed, but it must never move cue times.
         segments = list(before) if preserve_timing else self._repair_final_short_subtitle_timings(before)
-        segments = self._compress_fast_chinese_segments(
-            segments,
-            semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
-            subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
-        )
         segments = self._align_segment_translation_punctuation(segments)
         asr_data.segments = list(segments)
         source_map = getattr(self, "_active_source_segments_by_id", {}) or {}
         source_segments = list(source_map.values()) if isinstance(source_map, dict) else list(source_map)
         segments = self._reconcile_final_display_coverage(segments, source_segments)
+        # Display reconciliation is the last owner that may adjust cue times.
+        # Select Chinese compression only after those durations are final, or a
+        # cue can newly exceed the CPS gate after its speed was evaluated.
+        segments = self._compress_fast_chinese_segments(
+            segments,
+            semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
+            subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
+        )
         asr_data.segments = list(segments)
         self.refresh_final_cue_timeline_artifact(asr_data.segments)
         if source_segments:
@@ -10925,7 +10928,10 @@ class ScreenSubtitleEditor:
                 continue
             text = str(item.get("chinese", "")).strip()
             if text:
-                by_id[subtitle_id] = text
+                by_id[subtitle_id] = self._inherit_terminal_chinese_punctuation(
+                    segments[index].translated_text,
+                    text,
+                )
 
         group_reallocation_payload = []
         for index, seg in targets:
@@ -11080,6 +11086,7 @@ class ScreenSubtitleEditor:
                 after_segments=result,
                 semantic_groups=semantic_groups,
                 subtitle_items=subtitle_items,
+                allow_valid_single_cue_compression=True,
             )
             logger.info("局部压缩中文字幕阅读速度: %s", changed)
         return result
@@ -11091,6 +11098,7 @@ class ScreenSubtitleEditor:
         after_segments: Sequence[ASRDataSeg],
         semantic_groups: Optional[Sequence[Dict]],
         subtitle_items: Optional[Sequence[ScreenSubtitleItem]],
+        allow_valid_single_cue_compression: bool = False,
     ) -> List[ASRDataSeg]:
         if not semantic_groups or not subtitle_items:
             return list(after_segments)
@@ -11169,6 +11177,34 @@ class ScreenSubtitleEditor:
                     "candidate_comparison": candidate_comparison,
                 }
             )
+            if (
+                allow_valid_single_cue_compression
+                and count == 1
+                and speed_improved
+                and self._is_valid_chinese_compression(
+                    result[start].translated_text,
+                    before_segments[start],
+                    before_segments,
+                    start,
+                    context=self._semantic_context_for_segment_index(
+                        start,
+                        before_segments,
+                        semantic_groups=semantic_groups,
+                        subtitle_items=subtitle_items,
+                    ),
+                )
+            ):
+                # A single cue has no cross-ID allocation boundary. Its
+                # compression has already passed the stricter local speed,
+                # fragment, duplicate, and semantic-marker checks above, so
+                # a character-overlap reduction is expected rather than an
+                # information-allocation regression.
+                candidate_comparison["accepted"] = True
+                candidate_comparison["decision"] = "keep_concise_single_cue"
+                candidate_comparison.setdefault("reasons", []).append(
+                    "validated_single_cue_speed_compression"
+                )
+                continue
             if not candidate_decision["accepted"] or not speed_improved:
                 for index in range(start, end):
                     result[index] = before_segments[index]
@@ -11305,9 +11341,13 @@ class ScreenSubtitleEditor:
                         ),
                     )
                     continue
+                index = id_to_index[subtitle_id]
                 text = str(item.get("zh", item.get("chinese", ""))).strip()
                 if text:
-                    allocation[subtitle_id] = text
+                    allocation[subtitle_id] = self._inherit_terminal_chinese_punctuation(
+                        segments[index].translated_text,
+                        text,
+                    )
             if allocation:
                 result[target_id] = allocation
         return result
@@ -11526,8 +11566,9 @@ class ScreenSubtitleEditor:
 
     @staticmethod
     def _is_incomplete_chinese_group(text: str) -> bool:
-        normalized = re.sub(r"\s+", "", text or "")
-        normalized = re.sub(r"[，。！？；：、,.!?;:]+$", "", normalized)
+        compact = re.sub(r"\s+", "", text or "")
+        has_terminal_punctuation = bool(re.search(r"[。！？；：]$", compact))
+        normalized = re.sub(r"[，。！？；：、,.!?;:]+$", "", compact)
         if not normalized:
             return True
         if normalized in {
@@ -11563,6 +11604,11 @@ class ScreenSubtitleEditor:
         )
         if normalized.endswith(dangling_endings):
             return True
+        # Terminal punctuation is stronger evidence of a complete Chinese
+        # utterance than a narrow, incomplete list of verb characters. The
+        # caller has already rejected known prefix/suffix fragments.
+        if has_terminal_punctuation:
+            return False
         has_action = bool(
             re.search(
                 r"[\u60f3\u770b\u95ee\u8bf4\u8ba9\u4f7f\u6210\u4e3a\u5e26\u6765\u5f15\u53d1\u9762\u4e34\u89e3\u91ca\u601d\u8003\u77e5\u9053\u6253\u7834\u62ff\u8d70\u662f\u6709\u80fd\u4f1a\u8981\u5fc5\u987b\u5f00\u59cb\u8ba8\u8bba\u8bbe\u8ba1\u5173\u6ce8]",
@@ -16139,6 +16185,18 @@ class ScreenSubtitleEditor:
         if final == ":":
             return re.sub(r"[。！？；，、：…]+$", "：", translated)
         return re.sub(f"[{re.escape(zh_terminal)}]+$", "", translated).strip()
+
+    @staticmethod
+    def _inherit_terminal_chinese_punctuation(existing: str, candidate: str) -> str:
+        """Keep a complete fixed cue complete when an LLM omits only its final mark."""
+        existing = (existing or "").strip()
+        candidate = (candidate or "").strip()
+        if not existing or not candidate:
+            return candidate
+        existing_match = re.search(r"([。！？；：])$", existing)
+        if not existing_match or re.search(r"[。！？；：]$", candidate):
+            return candidate
+        return f"{candidate}{existing_match.group(1)}"
 
     @classmethod
     def _split_english_text(cls, text: str, max_words: int) -> List[str]:
