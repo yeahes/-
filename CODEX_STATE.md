@@ -1,60 +1,48 @@
 # Project State
 
-Status: in_progress
-Last verified: 2026-08-06 03:09:12 Asia/Shanghai
-Branch: codex/e2e-caption-regression
-Verified HEAD: 3c70f4b
-Working tree: clean
+Status: complete
+Last verified: 2026-08-06 15:06:05 Asia/Shanghai
+Branch: main
+Verified HEAD: 4f3bc8035f549d488ccf58b04e25020e561970ff
+Working tree: clean after the documentation handoff commit
 
 ## Current Goal
-Complete the current-code boundary/allocation/renderer E2E regression and hand
-off the verified artifacts, while preserving the renderer's fail-closed gate.
+Maintain the validated fixed-parent-ID display-page translation contract.
 
 ## Confirmed Facts
-- Cache-first real-audio E2E completed its subtitle stage under
-  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260806-followup` with 266
-  fixed IDs and 2,897 ledger words.
-- `final-cue-timeline.json` is `PASS`, applied backend is
-  `whisperx-time-only`, overall fallback is false, and `source_audio_missing`
-  is absent. ID, English, and Chinese mapping sets are complete.
-- The 64.8-66.5s speech interval remains covered by `S0017` through 67.975s.
-- Video synthesis was blocked before ffmpeg for four fixed-font structural
-  overflow cues (`S0052`, `S0176`, `S0196`, `S0258`); no new video exists.
+- Real-audio E2E `china-ai-cheaper-e2e-20260806-page-contract-r1` passed with 262 fixed IDs, 2,897 ledger words, 46 multipage parents, and 94 validated pages.
+- Frozen ID order, English, and word spans match `china-ai-cheaper-e2e-20260806-global-boundaries-r2` exactly.
+- Final timing is `PASS`, applied backend is `whisperx-time-only`, overall fallback is false, `source_audio_missing` is absent, and 64.8-66.5s is covered by S0017.
+- Final video exists at the E2E root, is 1003.66s / 1920x1080 H.264/AAC, and fully decodes with zero ffmpeg errors. ffprobe is unavailable.
+- Targeted visual validation passed 22/22 sampled frames, including four
+  multipage cues, all associated +/-80ms transitions, and 64.8/65.6/66.4s.
+  No sampled shrink, crop, overlap, blank, or reversed page was found.
+- Total external requests across the four page-contract attempts: 11. Synthesis used zero.
 
 ## Approved Decisions
-- The original `.m4a` remains read-only; E2E report sidecars remain under `E:\VideoCaptioner-e2e-runs`.
-- Do not bypass the hard boundary by changing English text, boundaries, fixed IDs, Chinese allocation, or rendering.
-
-## Next action
-Main window reviews the committed E2E artifacts and decides whether the four
-renderer structural-overflow cues warrant a separate renderer task.
-
-## Unknowns
-- The four renderer-blocked cues need a separate fixed-font layout decision;
-  this task intentionally did not change their text, timing, or style.
-- QA artifacts retain ordinary review/warning items even though the final cue
-  timeline structural gate passed.
-
-## Follow-up Facts
-
-- Complete phrase starts receive a soft renderer penalty; stranded lexical
-  dependencies remain hard-blocked.
-- Focused tests, `scripts/run_regression.py`, and `git diff --check` pass at the
-  current working tree.
-- External LLM request count for the real-audio follow-up was 0 because the
-  isolated E2E cache supplied every translation/allocation response.
-
-## Last Verification
-
-- `runtime\python.exe scripts\run_regression.py`: PASS.
-- Final timeline: PASS; applied backend `whisperx-time-only`; no
-  `source_audio_missing`; no overall stable-ts fallback.
-- `git diff --check`: PASS.
-- Synthesis stopped at the structural renderer gate; no MP4 metadata is
-  available for the follow-up run.
+- Preserve frozen English, parent subtitle IDs, word spans, cue timing, fixed fonts, and SRT/ASS ownership.
+- Add page IDs and page-level Chinese only after the final word timeline is frozen; invalid or missing page artifacts fail before ffmpeg.
+- Bind page artifacts to the manifest using SHA-256 and contract hash; artifact writes fail closed.
 
 ## Relevant Paths
+- `app/core/subtitle_processor/stable_display_planner.py`
+- `app/core/subtitle_processor/stable_display_page_contract.py`
 - `app/core/utils/podcast_learning_video.py`
-- `tests/test_stable_caption_rules.py`
-- `app/_vendor/jieba/NOTICE.txt`
-- `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260805\visual-pagination-fixed-20260805`
+- `app/core/subtitle_processor/screen_editor.py`
+- `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260806-page-contract-r1`
+
+## Last Verification
+- Unified regression, focused page-contract tests, E2E subtitle gate, synthesis,
+  manifest/digest checks, frozen-signature comparison, and complete ffmpeg
+  decode passed. Final unified regression is 17/17 and `git diff --check`
+  passes after documentation. Targeted visual validation is 22/22.
+
+## Next Action
+Run one unrelated blind audio before raising unseen-audio confidence above 85%.
+
+## Do Not Regress
+- No proportional Chinese fallback, font shrinking, English LLM segmentation, timing rewrite, or sample-specific rule.
+
+## Unknowns
+- Blind reliability on an unrelated unseen audio has not been measured.
+- Manual-final multipage Chinese edits do not yet have a page-aware editor.

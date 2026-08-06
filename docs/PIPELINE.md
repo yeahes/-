@@ -87,6 +87,13 @@ Rules:
 - Missing, duplicate, unknown, or synthetic final timeline IDs are ERRORs and
   block export.
 
+After the final word ledger and cue timeline pass, the article renderer may
+enumerate multipage display spans. Every span receives a deterministic child
+ID such as `S0078.P01`. Chinese for those spans is returned by exact child ID,
+validated, and aggregated back into the unchanged parent cue. Missing, stale,
+tampered, semantically invalid, or unschedulable page data blocks rendering;
+there is no proportional-character fallback.
+
 ## Stage 5: Validation and Artifacts
 
 Outputs:
@@ -106,6 +113,7 @@ Outputs:
 - `allocation-unresolved.json`
 - `translation-structure-errors.json`
 - `final-cue-timeline.json`
+- `display-page-translations.json`
 - `english-boundary-audit.json`
 - `run-state.json`
 
@@ -162,7 +170,9 @@ Rule:
 
 - If rendered subtitles are wrong, first verify the resolved subtitle path.
 - The article-template renderer must verify the stable manifest, final cue
-  timeline, and word ledger before synthesis. It plans fixed 58px English and
+  timeline, word ledger, and any required display-page translation artifact
+  before synthesis. The manifest binds the page artifact by SHA-256 and page
+  contract hash. It plans fixed 58px English and
   46px Chinese pages inside each frozen cue. It first keeps a whole cue on one
   static page using measured pixels: the normal 1455px English panel, then the
   1498px safe-width profile, with at most two English and two Chinese lines.

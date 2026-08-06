@@ -10,6 +10,8 @@ audio input
 -> semantic grouping
 -> LLM full Chinese translation
 -> LLM Chinese allocation to fixed English parts
+-> deterministic renderer page blueprint after final word timing
+-> LLM Chinese allocation to exact display-page IDs for multipage cues
 -> validation and report generation
 -> stable subtitle outputs
 -> video synthesis
@@ -47,6 +49,12 @@ audio input
   - Owns stable artifact path resolution and ordered UTF-8 JSON serialization.
   - The editor still constructs payloads because it owns the active run state
     and must preserve existing artifact schemas.
+
+- `app/core/subtitle_processor/stable_display_page_contract.py`
+  - Owns the post-timing display-page schema, deterministic page IDs, cache
+    fingerprint, response cardinality checks, and parent-Chinese aggregation.
+  - It cannot change frozen English, parent subtitle IDs, word spans, cue
+    timing, or word timestamps.
 
 - `app/core/subtitle_processor/allocation_quality.py`
   - Owns the deterministic acceptance decision for fixed-ID Chinese allocation
@@ -100,6 +108,10 @@ audio input
 - Chinese subtitle drifts against English after many lines:
   - Inspect `allocation-inputs.json`, `allocation-raw-returns.json`, `allocation-validation.json`, `translation-structure-errors.json`, then final SRT.
   - Verify every allocation response is keyed by global `subtitle_id`; do not diagnose this as a reading-speed problem first.
+
+- Chinese meaning appears on the wrong page inside one long cue:
+  - Inspect `display-page-translations.json` and its manifest digest/contract
+    hash. Do not proportionally slice the parent Chinese string.
 
 - Video output uses old subtitle:
   - Inspect `stable-final-manifest.json` and `resolve_podcast_template_subtitle`.

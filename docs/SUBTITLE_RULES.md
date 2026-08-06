@@ -15,6 +15,9 @@
 - Rendering may paginate a frozen cue for readability, but that projection
   cannot alter English text, subtitle IDs, word spans, cue times, Chinese
   allocation, SRT, or ASS output.
+- A multipage cue uses deterministic display-page IDs below the frozen parent
+  subtitle ID. Chinese page meaning must be assigned to those IDs explicitly;
+  proportional character slicing is forbidden.
 - A short comma-terminated non-finite condition at the start of a cue may move
   back to the immediately preceding clause only when local parsing confirms it
   has a clause marker but no subject or finite predicate, the following text is
@@ -69,6 +72,8 @@ Blocking errors:
   sentence-terminal, long-pause, speaker-change, or discontinuous-ledger
   evidence. Pre-ID repair owns automatic resolution; final residuals block
   export rather than silently merging fixed IDs.
+- Missing, stale, mismatched, or tampered display-page translations for a cue
+  that requires timed pagination.
 
 Warnings:
 

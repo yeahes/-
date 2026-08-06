@@ -87,3 +87,29 @@ Sources:
 
 - https://partnerhelp.netflixstudios.com/hc/en-us/articles/217350977-Timed-Text-Style-Guide-General-Requirements
 - https://www.bbc.co.uk/accessibility/forproducts/guides/subtitles/
+
+## 2026-08-06: Translate Multipage Cues By Display-Page ID
+
+Decision:
+
+Create deterministic display-page IDs only after final word timing. Translate
+each multipage span by its exact child ID, validate the complete child-ID set,
+then aggregate Chinese back into the unchanged parent subtitle.
+
+Reason:
+
+Parent-level Chinese may reorder English clauses naturally. Dividing that
+Chinese string by English word proportions can therefore place correct meaning
+on the wrong timed page even when the parent subtitle is semantically valid.
+
+Rejected:
+
+- Proportional Chinese character slicing.
+- Letting the renderer rewrite parent English, IDs, cue timing, or SRT/ASS.
+- Silently shrinking fixed fonts or accepting a stale page artifact.
+
+Trade-off:
+
+Multipage cues add one cacheable LLM allocation stage after final alignment.
+This costs latency on cache misses but gives page semantics an explicit,
+auditable owner and allows synthesis to fail before ffmpeg on contract drift.

@@ -2,6 +2,50 @@
 
 Last updated: 2026-08-06
 
+## 2026-08-06 Fixed-ID Display-Page Translation Contract
+
+- Root cause: the renderer could split one frozen English cue into timed pages
+  only after parent-level Chinese allocation had finished, then divided the
+  reordered Chinese string by English word proportions. The parent cue was
+  valid while individual pages could show meaning from a later or earlier
+  English span.
+- Multipage spans now receive deterministic IDs such as `S0078.P01` after the
+  final WhisperX word timeline is frozen. The LLM maps concise Chinese to each
+  exact page ID; validation aggregates the pages back to the unchanged parent
+  cue. English text, parent IDs, word spans, cue times, word timestamps, SRT,
+  and ASS ownership remain frozen.
+- Cache identity includes the English/page text, word spans, display timing,
+  layout profile, translation/model/prompt versions, and context hash. Artifact
+  writes are atomic and fail closed. The stable manifest binds the page
+  artifact by SHA-256 and contract hash; missing or tampered data blocks before
+  ffmpeg. The renderer has no proportional-Chinese fallback.
+- Generic display-boundary scoring additionally protects tightly spoken
+  non-finite complements and numeric compound heads. A real 400ms pause may
+  still remain eligible, so the change does not globally merge all such
+  phrases.
+- Real-audio E2E output is under
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260806-page-contract-r1`.
+  It retained the frozen 262-ID English signature, produced 46 multipage
+  parents / 94 display pages, passed the final timeline with
+  `whisperx-time-only`, had no overall fallback or `source_audio_missing`, and
+  covered 64.8-66.5s through `S0017`.
+- Synthesis produced `final-video.mp4` (46,217,829 bytes, 1003.66s,
+  1920x1080 H.264/AAC). Production `ffmpeg.exe` decoded the complete video with
+  zero errors; `ffprobe.exe` was unavailable and was not claimed as run.
+- Visual validation sampled 22/22 planned frames across `S0062`, `S0078`,
+  `S0111`, `S0252`, every associated page transition at +/-80ms, and
+  64.8/65.6/66.4s. Page English/Chinese matched the artifact, the speech
+  interval retained `S0017`, minimum English/Chinese separation was 80px, and
+  no sampled frame showed shrinking, clipping, overlap, blanking, or a reversed
+  page. This is targeted transition evidence, not a claim of manual review of
+  every frame in the full video.
+- External request accounting across four subtitle attempts is 11. The final
+  successful attempt used one page request; synthesis used zero. No credential
+  value is present in the reports.
+- Unified regression 17/17 and `git diff --check` passed after final documentation.
+  Unseen-audio confidence remains unproven until a separate blind input passes;
+  manual-final multipage Chinese overrides do not yet have a page-aware editor.
+
 ## 2026-08-06 Stable Boundary and Display Planner Follow-up
 
 - A renderer-only line wrap incorrectly treated every preposition at the next
