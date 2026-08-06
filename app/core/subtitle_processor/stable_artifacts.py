@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Tuple
@@ -24,16 +26,28 @@ def _json_default(value: Any) -> Any:
 
 
 def write_json_artifact(path: Path, payload: Any) -> None:
-    """Write one artifact with the established UTF-8, readable JSON format."""
-    path.write_text(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            indent=2,
-            default=_json_default,
-        ),
-        encoding="utf-8",
+    """Atomically write one UTF-8 JSON artifact in the established format."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
     )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(
+                payload,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                default=_json_default,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 
 def write_json_artifact_set(

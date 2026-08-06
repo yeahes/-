@@ -1378,6 +1378,42 @@ class SubtitleThread(QThread):
                     # must not write a second cue timing authority.
                     preserve_aligned_timing=True,
                 )
+                try:
+                    page_stage_started = self._begin_stage(
+                        "display_page_translation",
+                        "双语分页语义分配",
+                    )
+                    asr_data = screen_editor.apply_display_page_translations_after_final_timing(
+                        asr_data
+                    )
+                    self._complete_stage(
+                        "display_page_translation",
+                        "双语分页语义分配",
+                        page_stage_started,
+                    )
+                    self._active_stage = "screen_subtitle_edit"
+                    self._active_stage_started_at = stage_started
+                except RuntimeError as exc:
+                    validation_summary = {
+                        "status": "ERROR",
+                        "errors": [
+                            {
+                                "code": "display_page_translation_invalid",
+                                "message": str(exc),
+                            }
+                        ],
+                        "warnings": [],
+                        "info": [],
+                    }
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=validation_summary,
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                    )
+                    raise
                 final_duration_errors = screen_editor._subtitle_duration_issues(
                     asr_data.segments,
                     "ERROR",

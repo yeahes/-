@@ -44,6 +44,15 @@ from app.core.subtitle_processor.stable_english_optimizer import (
     plan_english_cue_ranges,
     ranges_cover_interval,
 )
+from app.core.subtitle_processor.stable_display_page_contract import (
+    DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION,
+    DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION,
+    build_display_page_contract,
+    page_translation_cache_key,
+    page_translation_request_payload,
+    parent_chinese_by_id,
+    validate_page_translation_response,
+)
 from app.core.subtitle_processor.text_metrics import (
     HARD_ENGLISH_WORD_LIMIT,
     is_allowed_discourse_overflow,
@@ -108,6 +117,8 @@ SEMANTIC_FRAGMENT_ALLOCATION_RETRY_CACHE_TASK = (
 )
 SEMANTIC_CHINESE_POLISH_PROMPT_VERSION = "semantic-chinese-polish-v3"
 SEMANTIC_CHINESE_POLISH_CACHE_TASK = "screen_subtitle_semantic_chinese_polish_v3"
+DISPLAY_PAGE_TRANSLATION_CACHE_TASK = "screen_subtitle_display_page_translation_v2"
+DISPLAY_PAGE_TRANSLATION_RETRY_CACHE_TASK = "screen_subtitle_display_page_translation_retry_v2"
 MAX_SELECTIVE_CHINESE_POLISH_GROUPS = 8
 # These are visual review budgets for the 1080p bilingual templates, not
 # translation or structural limits.  The existing 16-word hard contract stays
@@ -324,6 +335,37 @@ Return pure JSON only:
 }
 """
 
+DISPLAY_PAGE_TRANSLATION_PROMPT = """
+You are assigning an authoritative Simplified Chinese subtitle to fixed visual
+pages below one frozen parent subtitle ID.
+
+Version: display-page-translation-v2
+
+The English page IDs, English text, order, word ownership, and timing are
+immutable. Re-express the supplied full_translation as one concise Chinese
+subtitle per page so that each Chinese page describes the English meaning
+spoken on that same page.
+
+Rules:
+- Return exactly one object for every display_page_id and no other IDs.
+- Keep facts, names, numbers, negation, contrast, causality, modality, and
+  speaker stance from full_translation.
+- Retain its fact-bearing Chinese wording (entities, actions, quantities,
+  qualifiers, and intent words). Change only the order and minimal connective
+  wording needed to bind meaning to the matching English page.
+- Do not reveal a later English page's information on an earlier Chinese page.
+- Reorder Chinese clauses when English and natural Chinese use different order.
+- Each page must read naturally on its own; do not leave a bare preposition,
+  modifier, connective, or half of a Chinese word at a page boundary.
+- Aim for target_zh_chars and never exceed absolute_max_zh_chars. Compress
+  wording without dropping any fact-bearing meaning when a page is short.
+- Keep the concatenated Chinese concise and semantically equivalent to
+  full_translation. Do not add explanations or commentary.
+
+Return pure JSON only:
+{"pages":[{"display_page_id":"S0001.P01","zh":"第一页中文"}]}
+"""
+
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT = """
 You are revising one completed Simplified Chinese translation for a bilingual video subtitle sense group.
 
@@ -532,6 +574,11 @@ class ScreenSubtitleEditor:
         self._final_cue_timeline_path: str = ""
         self._final_word_timing_reconciliations: List[Dict[str, Any]] = []
         self._final_timeline_alignment: Dict[str, Any] = {}
+        self._display_page_translation_artifact: Dict[str, Any] = {}
+        self._display_page_translation_reviews: List[Dict[str, Any]] = []
+        self._display_page_translation_path: str = ""
+        self._display_page_translation_sha256: str = ""
+        self._display_page_external_request_count: int = 0
         self.last_validation_summary: Optional[Dict] = None
 
     def _compose_prompt(self, base_prompt: str) -> str:
@@ -688,6 +735,11 @@ class ScreenSubtitleEditor:
         self._final_cue_timeline_path = ""
         self._final_word_timing_reconciliations = []
         self._final_timeline_alignment = {}
+        self._display_page_translation_artifact = {}
+        self._display_page_translation_reviews = []
+        self._display_page_translation_path = ""
+        self._display_page_translation_sha256 = ""
+        self._display_page_external_request_count = 0
         self._active_source_segments_by_id = {
             index: seg for index, seg in enumerate(asr_data.segments, 1)
         }
@@ -818,6 +870,430 @@ class ScreenSubtitleEditor:
             final_segments=asr_data.segments,
         )
         return asr_data
+
+    def apply_display_page_translations_after_final_timing(
+        self,
+        asr_data: ASRData,
+    ) -> ASRData:
+        """Bind Chinese to final article pages without changing frozen timing."""
+        if not self.enable_stable_mode or not asr_data or not asr_data.segments:
+            return asr_data
+        from app.core.utils.podcast_learning_video import (
+            Cue,
+            RenderStructuralOverflowError,
+            apply_article_display_page_translation_artifact,
+            build_article_display_page_blueprint,
+            build_article_visual_page_plan,
+        )
+        from PIL import Image, ImageDraw
+
+        cues: List[Cue] = []
+        for index, segment in enumerate(asr_data.segments, 1):
+            subtitle_id = self._segment_subtitle_id(segment, index)
+            word_start = getattr(segment, "word_start", None)
+            word_end = getattr(segment, "word_end", None)
+            if (
+                not subtitle_id
+                or not isinstance(word_start, int)
+                or not isinstance(word_end, int)
+                or word_start < 0
+                or word_end < word_start
+                or word_end >= len(self._active_word_entries)
+            ):
+                raise RuntimeError(
+                    "display_page_translation_invalid: final cue word span is missing"
+                )
+            word_timing = tuple(
+                {
+                    "word_id": word_id,
+                    "surface": str(
+                        self._active_word_entries[word_id].get("surface")
+                        or self._active_word_entries[word_id].get("token")
+                        or ""
+                    ),
+                    "start": int(
+                        self._active_word_entries[word_id].get("start_time") or 0
+                    )
+                    / 1000.0,
+                    "end": int(
+                        self._active_word_entries[word_id].get("end_time") or 0
+                    )
+                    / 1000.0,
+                }
+                for word_id in range(word_start, word_end + 1)
+            )
+            cue = Cue(
+                index=index,
+                start=int(segment.start_time) / 1000.0,
+                end=int(segment.end_time) / 1000.0,
+                en=str(segment.text or ""),
+                zh=str(segment.translated_text or ""),
+                speaker=str(getattr(segment, "speaker", "") or "male"),
+                subtitle_id=subtitle_id,
+                word_timing=word_timing,
+            )
+            cues.append(cue)
+
+        try:
+            blueprint = build_article_display_page_blueprint(cues)
+            contract = build_display_page_contract(
+                blueprint.get("parents") or [],
+                layout_profile=blueprint.get("layout_profile") or {},
+                planner_version=str(blueprint.get("planner_version") or ""),
+            )
+        except (RenderStructuralOverflowError, ValueError) as exc:
+            self._record_display_page_translation_failure(
+                "display_page_blueprint_invalid",
+                str(exc),
+                asr_data.segments,
+            )
+            raise RuntimeError(f"display_page_translation_invalid: {exc}") from exc
+
+        parents = list(contract.get("parents") or [])
+        if parents:
+            try:
+                response, cache_hit = self._request_display_page_translations(contract)
+                artifact = validate_page_translation_response(contract, response)
+                quality_errors = self._display_page_translation_quality_errors(contract, artifact)
+                if artifact.get("status") != "PASS" or quality_errors:
+                    response, retry_cache_hit = self._request_display_page_translations(
+                        contract,
+                        retry_errors=list(artifact.get("errors") or []) + quality_errors,
+                    )
+                    cache_hit = cache_hit and retry_cache_hit
+                    artifact = validate_page_translation_response(contract, response)
+                    quality_errors = self._display_page_translation_quality_errors(contract, artifact)
+            except RuntimeError as exc:
+                self._display_page_translation_artifact = {
+                    "schema_version": 1,
+                    "status": "ERROR",
+                    "contract_hash": contract.get("contract_hash"),
+                    "planner_version": contract.get("planner_version"),
+                    "layout_profile": dict(contract.get("layout_profile") or {}),
+                    "errors": [
+                        {
+                            "code": "display_page_translation_request_failed",
+                            "message": str(exc),
+                        }
+                    ],
+                    "parents": [],
+                    "external_request_count": int(self._display_page_external_request_count),
+                }
+                self._record_display_page_translation_failure(
+                    "display_page_translation_request_failed",
+                    str(exc),
+                    asr_data.segments,
+                )
+                raise
+        else:
+            cache_hit = True
+            artifact = validate_page_translation_response(contract, {"pages": []})
+            quality_errors = []
+
+        artifact["cache"] = {
+            "hit": bool(cache_hit),
+            "task": DISPLAY_PAGE_TRANSLATION_CACHE_TASK,
+        }
+        artifact["external_request_count"] = int(self._display_page_external_request_count)
+        artifact["reviews"] = list(
+            getattr(self, "_display_page_translation_reviews", []) or []
+        )
+        artifact["review_count"] = len(artifact["reviews"])
+        if artifact.get("status") != "PASS" or quality_errors:
+            if quality_errors:
+                artifact["status"] = "ERROR"
+                artifact.setdefault("errors", []).extend(quality_errors)
+            self._display_page_translation_artifact = artifact
+            self._record_display_page_translation_failure(
+                "display_page_translation_invalid",
+                "Page translation response failed deterministic validation.",
+                asr_data.segments,
+            )
+            raise RuntimeError(
+                "display_page_translation_invalid: page response failed validation"
+            )
+
+        parent_chinese = parent_chinese_by_id(artifact)
+        before = [
+            (
+                self._segment_subtitle_id(segment, index),
+                str(segment.text or ""),
+                int(segment.start_time),
+                int(segment.end_time),
+                getattr(segment, "word_start", None),
+                getattr(segment, "word_end", None),
+            )
+            for index, segment in enumerate(asr_data.segments, 1)
+        ]
+        for cue in cues:
+            if cue.subtitle_id in parent_chinese:
+                cue.zh = parent_chinese[cue.subtitle_id]
+        if not apply_article_display_page_translation_artifact(cues, artifact):
+            self._display_page_translation_artifact = {
+                **artifact,
+                "status": "ERROR",
+                "errors": [
+                    *(artifact.get("errors") or []),
+                    {"code": "display_page_artifact_blueprint_mismatch"},
+                ],
+            }
+            self._record_display_page_translation_failure(
+                "display_page_artifact_blueprint_mismatch",
+                "Validated page translations did not match the final renderer blueprint.",
+                asr_data.segments,
+            )
+            raise RuntimeError(
+                "display_page_translation_invalid: artifact blueprint mismatch"
+            )
+
+        draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+        layout_errors: List[Dict] = []
+        for cue in cues:
+            plan = build_article_visual_page_plan(cue, draw)
+            if plan.get("status") != "ok":
+                layout_errors.extend(plan.get("errors") or [])
+        if layout_errors:
+            self._display_page_translation_artifact = {
+                **artifact,
+                "status": "ERROR",
+                "errors": [
+                    *(artifact.get("errors") or []),
+                    {
+                        "code": "display_page_fixed_font_layout_invalid",
+                        "items": layout_errors,
+                    },
+                ],
+            }
+            self._record_display_page_translation_failure(
+                "display_page_fixed_font_layout_invalid",
+                "Page Chinese does not fit the fixed renderer profile.",
+                asr_data.segments,
+            )
+            raise RuntimeError(
+                "display_page_translation_invalid: fixed-font page layout failed"
+            )
+
+        for segment, cue in zip(asr_data.segments, cues):
+            if cue.subtitle_id in parent_chinese:
+                segment.translated_text = parent_chinese[cue.subtitle_id]
+        after = [
+            (
+                self._segment_subtitle_id(segment, index),
+                str(segment.text or ""),
+                int(segment.start_time),
+                int(segment.end_time),
+                getattr(segment, "word_start", None),
+                getattr(segment, "word_end", None),
+            )
+            for index, segment in enumerate(asr_data.segments, 1)
+        ]
+        if after != before:
+            raise RuntimeError(
+                "display_page_translation_invalid: frozen parent cue changed"
+            )
+
+        self._last_subtitle_items = [
+            ScreenSubtitleItem(
+                source_ids=list(item.source_ids),
+                original=item.original,
+                translated=parent_chinese.get(str(item.subtitle_id or ""), item.translated),
+                word_start=item.word_start,
+                word_end=item.word_end,
+                subtitle_id=item.subtitle_id,
+            )
+            for item in self._last_subtitle_items
+        ]
+        self._display_page_translation_artifact = artifact
+        source_map = getattr(self, "_active_source_segments_by_id", {}) or {}
+        source_segments = list(source_map.values()) if isinstance(source_map, dict) else list(source_map)
+        self._report_subtitle_coverage_gaps(source_segments, asr_data.segments)
+        self._write_stable_pipeline_artifacts(
+            source_segments=source_segments,
+            semantic_groups=getattr(self, "_last_semantic_groups", []) or [],
+            subtitle_items=getattr(self, "_last_subtitle_items", []) or [],
+            final_segments=asr_data.segments,
+        )
+        return asr_data
+
+    def _request_display_page_translations(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        retry_errors: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> tuple[object, bool]:
+        retry = bool(retry_errors)
+        prompt = self._compose_prompt(DISPLAY_PAGE_TRANSLATION_PROMPT)
+        prompt_version = DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION
+        task = DISPLAY_PAGE_TRANSLATION_CACHE_TASK
+        if retry:
+            prompt += (
+                "\n\nThe previous response failed these deterministic checks. "
+                "Return a complete corrected response: "
+                + json.dumps(list(retry_errors or []), ensure_ascii=False)
+            )
+            prompt_version += "-retry1"
+            task = DISPLAY_PAGE_TRANSLATION_RETRY_CACHE_TASK
+        payload = page_translation_request_payload(contract)
+        cache_key = page_translation_cache_key(
+            contract,
+            model=self.model,
+            target_language=self.target_language,
+            prompt_version=prompt_version,
+            algorithm_version=DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION,
+            context_hash=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        )
+        cached = self.cache_manager.get_llm_result(
+            cache_key,
+            self.model,
+            temperature=0.2,
+            task=task,
+        )
+        if cached:
+            self._llm_cache_used = True
+            self._record_llm_cache_stat(task, True)
+            return json.loads(cached), True
+        self._record_llm_cache_stat(task, False)
+        delay_seconds = 1.0
+        last_error = ""
+        for attempt in range(1, 4):
+            try:
+                self._display_page_external_request_count += 1
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                    temperature=0.2,
+                    timeout=self.timeout,
+                )
+                data = json_repair.loads(response.choices[0].message.content)
+                self.cache_manager.set_llm_result(
+                    cache_key,
+                    json.dumps(data, ensure_ascii=False),
+                    self.model,
+                    temperature=0.2,
+                    task=task,
+                )
+                return data, False
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt >= 3 or not self._is_retryable_allocation_error(exc):
+                    break
+                time.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 2, 8.0)
+        raise RuntimeError(
+            f"display_page_translation_request_failed: {last_error}"
+        )
+
+    def _display_page_translation_quality_errors(
+        self,
+        contract: Mapping[str, Any],
+        artifact: Mapping[str, Any],
+    ) -> List[Dict]:
+        self._display_page_translation_reviews = []
+        if artifact.get("status") != "PASS":
+            return []
+        artifact_by_parent = {
+            str(parent.get("parent_subtitle_id") or ""): parent
+            for parent in artifact.get("parents") or []
+        }
+        errors: List[Dict] = []
+        for group_id, parent in enumerate(contract.get("parents") or [], 1):
+            parent_id = str(parent.get("parent_subtitle_id") or "")
+            translated_parent = artifact_by_parent.get(parent_id) or {}
+            allocation = {
+                str(page.get("display_page_id") or ""): str(page.get("zh") or "")
+                for page in translated_parent.get("pages") or []
+            }
+            entry = {
+                "id": group_id,
+                "full_english": parent.get("english"),
+                "full_translation": parent.get("source_chinese"),
+                "subtitle_parts": [
+                    {
+                        "subtitle_id": page.get("display_page_id"),
+                        "english": page.get("english"),
+                    }
+                    for page in parent.get("pages") or []
+                ],
+            }
+            validation = self._validate_group_chinese_allocation(entry, allocation)
+            if not validation.get("valid"):
+                issue_codes = list(validation.get("issue_codes") or [])
+                blocking_codes = [
+                    code
+                    for code in issue_codes
+                    if code != "unnatural_chinese_fragment"
+                ]
+                record = {
+                    "parent_subtitle_id": parent_id,
+                    "issue_codes": issue_codes,
+                    "issues": list(validation.get("issues") or []),
+                }
+                if blocking_codes:
+                    errors.append(
+                        {
+                            "code": "display_page_semantic_validation_failed",
+                            **record,
+                        }
+                    )
+                elif issue_codes:
+                    self._display_page_translation_reviews.append(
+                        {
+                            "code": "display_page_continuation_review",
+                            **record,
+                        }
+                    )
+            for page in parent.get("pages") or []:
+                page_id = str(page.get("display_page_id") or "")
+                chinese = allocation.get(page_id, "")
+                duration_ms = max(
+                    0,
+                    int(page.get("end_ms") or 0)
+                    - int(page.get("start_ms") or 0),
+                )
+                if duration_ms <= 0:
+                    continue
+                chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", chinese))
+                absolute_max = max(
+                    6,
+                    int(duration_ms / 1000.0 * CHINESE_CPS_ERROR),
+                )
+                if chinese_chars > absolute_max:
+                    errors.append(
+                        {
+                            "code": "display_page_chinese_reading_speed_exceeded",
+                            "parent_subtitle_id": parent_id,
+                            "display_page_id": page_id,
+                            "duration_ms": duration_ms,
+                            "chinese_chars": chinese_chars,
+                            "absolute_max_zh_chars": absolute_max,
+                            "cps": round(
+                                chinese_chars / max(0.001, duration_ms / 1000.0),
+                                2,
+                            ),
+                        }
+                    )
+        return errors
+
+    def _record_display_page_translation_failure(
+        self,
+        code: str,
+        message: str,
+        final_segments: Sequence[ASRDataSeg],
+    ) -> None:
+        self._translation_structure_errors.append(
+            {"code": str(code), "message": str(message)}
+        )
+        source_map = getattr(self, "_active_source_segments_by_id", {}) or {}
+        source_segments = list(source_map.values()) if isinstance(source_map, dict) else list(source_map)
+        self._write_stable_pipeline_artifacts(
+            source_segments=source_segments,
+            semantic_groups=getattr(self, "_last_semantic_groups", []) or [],
+            subtitle_items=getattr(self, "_last_subtitle_items", []) or [],
+            final_segments=final_segments,
+        )
 
     def _repair_final_short_subtitle_timings(
         self, segments: Sequence[ASRDataSeg]
@@ -4896,6 +5372,28 @@ class ScreenSubtitleEditor:
             "final_timeline_alignment": dict(
                 getattr(self, "_final_timeline_alignment", {}) or {}
             ),
+            "display_page_translation_path": str(
+                getattr(self, "_display_page_translation_path", "") or ""
+            ),
+            "display_page_translation_status": str(
+                (getattr(self, "_display_page_translation_artifact", {}) or {}).get("status")
+                or "NOT_BUILT"
+            ),
+            "display_page_translation_contract_hash": str(
+                (getattr(self, "_display_page_translation_artifact", {}) or {}).get(
+                    "contract_hash"
+                )
+                or ""
+            ),
+            "display_page_translation_sha256": str(
+                getattr(self, "_display_page_translation_sha256", "") or ""
+            ),
+            "display_page_translation_review_count": len(
+                getattr(self, "_display_page_translation_reviews", []) or []
+            ),
+            "display_page_external_request_count": int(
+                getattr(self, "_display_page_external_request_count", 0) or 0
+            ),
         }
         if self._qa_review_points_path:
             metadata["qa_review_points_srt"] = self._qa_review_points_path
@@ -8685,6 +9183,9 @@ class ScreenSubtitleEditor:
     ) -> None:
         if not self.coverage_report_path:
             return
+        self._final_cue_timeline_path = ""
+        self._display_page_translation_path = ""
+        self._display_page_translation_sha256 = ""
         try:
             report_path = Path(self.coverage_report_path)
             artifact_dir = stable_artifact_dir(report_path)
@@ -8727,10 +9228,14 @@ class ScreenSubtitleEditor:
                 "final_word_timing_reconciliation_count": len(
                     getattr(self, "_final_word_timing_reconciliations", []) or []
                 ),
+                "display_page_translation_status": str(
+                    (getattr(self, "_display_page_translation_artifact", {}) or {}).get("status")
+                    or "NOT_BUILT"
+                ),
                 "artifact_schema_version": 2,
             }
             final_timeline_path = artifact_dir / "final-cue-timeline.json"
-            self._final_cue_timeline_path = str(final_timeline_path)
+            display_page_path = artifact_dir / "display-page-translations.json"
             write_json_artifact_set(
                 artifact_dir,
                 (
@@ -8746,6 +9251,10 @@ class ScreenSubtitleEditor:
                     (
                         "final-cue-timeline.json",
                         getattr(self, "_final_cue_timeline", {}) or {},
+                    ),
+                    (
+                        "display-page-translations.json",
+                        getattr(self, "_display_page_translation_artifact", {}) or {},
                     ),
                     ("semantic-groups.json", self._semantic_groups_payload(semantic_groups)),
                     (
@@ -8794,9 +9303,18 @@ class ScreenSubtitleEditor:
                     ),
                 ),
             )
+            self._final_cue_timeline_path = str(final_timeline_path)
+            self._display_page_translation_path = str(display_page_path)
+            self._display_page_translation_sha256 = hashlib.sha256(
+                display_page_path.read_bytes()
+            ).hexdigest()
             logger.info("稳定模式中间产物已保存 / Stable artifacts saved: %s", artifact_dir)
         except Exception as e:
-            logger.warning("稳定模式中间产物保存失败 / Stable artifacts save failed: %s", str(e))
+            self._final_cue_timeline_path = ""
+            self._display_page_translation_path = ""
+            self._display_page_translation_sha256 = ""
+            logger.error("稳定模式中间产物保存失败 / Stable artifacts save failed: %s", str(e))
+            raise RuntimeError(f"stable_artifact_write_failed: {e}") from e
 
     def _boundary_snapshot_payload(self) -> Dict:
         focus_phrases = [

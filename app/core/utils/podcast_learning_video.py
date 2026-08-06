@@ -8,7 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from openai import OpenAI
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
@@ -16,6 +16,11 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFo
 from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
 from app.core.entities import LLMServiceEnum
 from app.core.subtitle_processor.stable_display_planner import plan_word_page_spans
+from app.core.subtitle_processor.stable_display_page_contract import (
+    DISPLAY_PAGE_PLANNER_VERSION,
+    DISPLAY_PAGE_SCHEMA_VERSION,
+    display_page_id,
+)
 from app.core.utils.json_repair import loads as repair_json_loads
 
 
@@ -141,6 +146,7 @@ ARTICLE_PAGE_MIN_DURATION_MS = 900
 ARTICLE_PAGE_LEAD_IN_MS = 70
 ARTICLE_PAGE_TAIL_HOLD_MS = 120
 ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
+ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS = 120
 # A long frozen cue remains one subtitle ID and one timing envelope, but the
 # article template may paginate it inside that envelope.  These are render
 # budgets, not segmentation or translation limits.
@@ -227,6 +233,9 @@ ARTICLE_PAGE_CONTINUATION_START_WORDS = frozenset(
     (LINE_BREAK_AVOID_BEFORE_WORDS - ARTICLE_PAGE_PHRASE_START_WORDS)
     | {"and", "but", "nor", "or", "so", "yet"}
 )
+ARTICLE_PAGE_OBJECT_DETERMINERS = frozenset(
+    {"a", "an", "the", "this", "that", "these", "those", "my", "your", "our", "their", "its"}
+)
 ENGLISH_VISUAL_MODIFIER_SUFFIXES = (
     "able", "al", "ant", "ary", "ed", "ent", "ful", "ic", "ical", "ible",
     "ish", "ive", "less", "ory", "ous",
@@ -237,6 +246,9 @@ ENGLISH_VISUAL_MODIFIER_WORDS = frozenset(
         "least", "less", "lower", "more", "most", "new", "next", "old",
         "other", "previous", "same", "smaller",
     }
+)
+ENGLISH_NUMERIC_MAGNITUDE_WORDS = frozenset(
+    {"hundred", "thousand", "million", "billion", "trillion"}
 )
 
 # A Chinese visual page may switch before a new grammatical phrase, but it
@@ -265,6 +277,7 @@ class Cue:
     subtitle_id: str = ""
     word_timing: tuple[dict, ...] = ()
     article_page_plan: dict | None = None
+    display_page_translations: dict[str, str] | None = None
 
 
 class RenderStructuralOverflowError(RuntimeError):
@@ -457,6 +470,7 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         cue.subtitle_id = ""
         cue.word_timing = ()
         cue.article_page_plan = None
+        cue.display_page_translations = None
 
     manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
     if not manifest_path.exists():
@@ -497,10 +511,14 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         ):
             return False
         timed_words: list[dict] = []
-        for word in words[word_start : word_end + 1]:
+        for word_id, word in enumerate(
+            words[word_start : word_end + 1],
+            start=word_start,
+        ):
             try:
                 timed_words.append(
                     {
+                        "word_id": word_id,
                         "surface": str(word["surface"]),
                         "start": int(word["start_ms"]) / 1000.0,
                         "end": int(word["end_ms"]) / 1000.0,
@@ -1436,6 +1454,55 @@ def _looks_like_english_modifier_boundary(previous: str, following: str) -> bool
     )
 
 
+def _looks_like_numeric_phrase_boundary(words: list[str], split: int) -> bool:
+    """Keep a numeric value, its magnitude, and its following head together."""
+    if split <= 0 or split >= len(words):
+        return False
+
+    def normalized(index: int) -> str:
+        return re.sub(r"[^A-Za-z0-9'.]", "", words[index]).lower()
+
+    def is_numeric_value(token: str) -> bool:
+        return bool(
+            re.fullmatch(r"\d+(?:[.,]\d+)?", token)
+            or token
+            in {
+                "zero", "one", "two", "three", "four", "five", "six",
+                "seven", "eight", "nine", "ten", "eleven", "twelve",
+                "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+                "eighteen", "nineteen", "twenty", "thirty", "forty",
+                "fifty", "sixty", "seventy", "eighty", "ninety",
+            }
+        )
+
+    previous = normalized(split - 1)
+    following = normalized(split)
+    if is_numeric_value(previous) and following in ENGLISH_NUMERIC_MAGNITUDE_WORDS:
+        return True
+    if (
+        previous in ENGLISH_NUMERIC_MAGNITUDE_WORDS
+        and split >= 2
+        and (
+            is_numeric_value(normalized(split - 2))
+            or normalized(split - 2) in ENGLISH_NUMERIC_MAGNITUDE_WORDS
+        )
+        and following.isalpha()
+    ):
+        return True
+    if (
+        split >= 3
+        and previous.isalpha()
+        and following.isalpha()
+        and normalized(split - 2) in ENGLISH_NUMERIC_MAGNITUDE_WORDS
+        and (
+            is_numeric_value(normalized(split - 3))
+            or normalized(split - 3) in ENGLISH_NUMERIC_MAGNITUDE_WORDS
+        )
+    ):
+        return True
+    return False
+
+
 def _caption_line_break_penalty(words: list[str], split: int) -> int:
     """Score a renderer-only line break without changing cue ownership."""
     previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
@@ -1451,6 +1518,8 @@ def _caption_line_break_penalty(words: list[str], split: int) -> int:
         else:
             penalty += CAPTION_HARD_BREAK_PENALTY
     if _looks_like_english_modifier_boundary(words[split - 1], words[split]):
+        penalty += CAPTION_HARD_BREAK_PENALTY
+    if _looks_like_numeric_phrase_boundary(words, split):
         penalty += CAPTION_HARD_BREAK_PENALTY
     if "-" in words[split - 1]:
         penalty += CAPTION_HARD_BREAK_PENALTY * 2
@@ -2246,12 +2315,21 @@ def _article_page_break_score(
     score = abs(split - target_words) * 240
     if split >= len(words):
         return int(score)
+    if _article_page_has_tight_nonfinite_complement(
+        words,
+        split,
+        word_timing,
+    ):
+        return CAPTION_HARD_BREAK_PENALTY
     break_penalty = _article_visual_break_penalty(words, split)
     if _article_page_can_start_with_complete_phrase(words, split):
         # A page transition differs from a line wrap: the phrase begins on a
-        # fresh page and remains intact there.  Remove only the generic
-        # line-start penalty; any independent hard penalty still blocks it.
-        break_penalty -= CAPTION_HARD_BREAK_PENALTY
+        # fresh page and remains intact there. Remove only the penalties that
+        # belong to that phrase start; independent hard penalties still block.
+        break_penalty -= CAPTION_COMPLETE_PHRASE_START_PENALTY
+        following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+        if following in ARTICLE_AVOID_LINE_START_WORDS:
+            break_penalty -= CAPTION_HARD_BREAK_PENALTY
     if break_penalty >= CAPTION_HARD_BREAK_PENALTY:
         return CAPTION_HARD_BREAK_PENALTY
     score += break_penalty
@@ -2262,6 +2340,29 @@ def _article_page_break_score(
         )
         score -= min(pause_ms, ARTICLE_PAGE_PAUSE_PREFERENCE_MS) * 4
     return int(score)
+
+
+def _article_page_has_tight_nonfinite_complement(
+    words: list[str],
+    split: int,
+    word_timing: tuple[dict, ...],
+) -> bool:
+    """Reject a page switch inside a tightly spoken non-finite verb phrase."""
+    if split <= 0 or split >= len(words) or len(word_timing) != len(words):
+        return False
+    previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
+    following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+    if (
+        not previous.endswith("ing")
+        or following
+        not in (ARTICLE_PAGE_PHRASE_START_WORDS | ARTICLE_PAGE_OBJECT_DETERMINERS)
+    ):
+        return False
+    pause_ms = max(
+        0,
+        round((word_timing[split]["start"] - word_timing[split - 1]["end"]) * 1000),
+    )
+    return pause_ms <= ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS
 
 
 def _article_page_can_start_with_complete_phrase(words: list[str], split: int) -> bool:
@@ -2367,20 +2468,19 @@ def _schedule_article_page_boundaries(
     return boundaries, ""
 
 
-def build_article_visual_page_plan(
+def _build_article_english_page_plan(
     cue: Cue,
     draw: ImageDraw.ImageDraw,
 ) -> dict:
-    """Plan presentation-only fixed-font pages for one frozen subtitle cue."""
+    """Freeze the English word pages before any Chinese page text is selected."""
     words = str(cue.en or "").split()
-    chinese = re.sub(r"\s+", "", str(cue.zh or ""))
     if not words:
         return {
             "status": "render_structural_overflow",
             "errors": [{"cue_index": cue.index, "reason": "empty_english_cue"}],
         }
     failure_reasons: set[str] = set()
-    preferred_page_count = _article_preferred_readability_page_count(draw, words, chinese)
+    preferred_page_count = _article_preferred_readability_page_count(draw, words, "")
     page_counts = list(range(preferred_page_count, len(words) + 1))
     if preferred_page_count > 1:
         # Static one-page layout remains safe if a word-timed transition would
@@ -2391,23 +2491,6 @@ def build_article_visual_page_plan(
     for page_count in page_counts:
         spans = _partition_article_english_pages(draw, cue, words, page_count, cue.word_timing)
         if spans is None:
-            continue
-        chinese_pages = _strict_split_chinese_visual_pages(
-            chinese,
-            page_count,
-            page_word_counts=[end - start for start, end in spans],
-            strict=True,
-        )
-        if chinese and chinese_pages is None:
-            failure_reasons.add("chinese_no_safe_visual_boundary")
-            continue
-        if chinese and len(chinese_pages) != page_count:
-            failure_reasons.add("chinese_page_cardinality_mismatch")
-            continue
-        if not chinese:
-            chinese_pages = [""] * page_count
-        if any(not _article_fixed_chinese_lines(draw, page) for page in chinese_pages if page):
-            failure_reasons.add("chinese_does_not_fit_fixed_font")
             continue
         english_layouts = [
             _article_fixed_english_lines(draw, " ".join(words[start:end]))
@@ -2423,10 +2506,27 @@ def build_article_visual_page_plan(
         pages = [
             {
                 "index": index,
+                "display_page_id": (
+                    display_page_id(cue.subtitle_id, index + 1)
+                    if cue.subtitle_id
+                    else ""
+                ),
+                "parent_subtitle_id": str(cue.subtitle_id or ""),
                 "en": " ".join(words[start:end]),
-                "zh": chinese_pages[index],
                 "word_start": start,
                 "word_end": end - 1,
+                "global_word_start": (
+                    int(cue.word_timing[start].get("word_id"))
+                    if len(cue.word_timing) == len(words)
+                    and cue.word_timing[start].get("word_id") is not None
+                    else None
+                ),
+                "global_word_end": (
+                    int(cue.word_timing[end - 1].get("word_id"))
+                    if len(cue.word_timing) == len(words)
+                    and cue.word_timing[end - 1].get("word_id") is not None
+                    else None
+                ),
                 "start": boundaries[index],
                 "end": boundaries[index + 1],
                 "en_lines": english_layouts[index],
@@ -2457,6 +2557,7 @@ def build_article_visual_page_plan(
         ]
         return {
             "status": "ok",
+            "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
             "font_size": {
                 "english": ARTICLE_SUBTITLE_EN_FONT_SIZE,
                 "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
@@ -2477,9 +2578,6 @@ def build_article_visual_page_plan(
         "missing_or_mismatched_word_ledger",
         "no_word_boundary_with_minimum_page_duration",
         "cue_duration_below_page_minimum",
-        "chinese_no_safe_visual_boundary",
-        "chinese_does_not_fit_fixed_font",
-        "chinese_page_cardinality_mismatch",
         "no_fixed_font_page_partition",
     )
     primary_reason = next(
@@ -2498,6 +2596,237 @@ def build_article_visual_page_plan(
     }
 
 
+def build_article_visual_page_plan(
+    cue: Cue,
+    draw: ImageDraw.ImageDraw,
+) -> dict:
+    """Plan fixed-font pages from frozen English plus validated page Chinese."""
+    plan = _build_article_english_page_plan(cue, draw)
+    if plan.get("status") != "ok":
+        return plan
+    pages = [dict(page) for page in plan.get("pages") or []]
+    chinese = re.sub(r"\s+", "", str(cue.zh or ""))
+    if len(pages) <= 1:
+        chinese_pages = [chinese]
+    else:
+        expected_page_ids = [str(page.get("display_page_id") or "") for page in pages]
+        translations = dict(cue.display_page_translations or {})
+        chinese_pages = [
+            re.sub(r"\s+", "", str(translations.get(page_id) or ""))
+            for page_id in expected_page_ids
+        ]
+        if (
+            not cue.subtitle_id
+            or not all(expected_page_ids)
+            or set(translations) != set(expected_page_ids)
+            or not all(chinese_pages)
+            or "".join(chinese_pages) != chinese
+        ):
+            return {
+                "status": "render_structural_overflow",
+                "errors": [
+                    {
+                        "cue_index": cue.index,
+                        "reason": "missing_or_invalid_display_page_translations",
+                    }
+                ],
+            }
+    if any(not _article_fixed_chinese_lines(draw, page) for page in chinese_pages if page):
+        return {
+            "status": "render_structural_overflow",
+            "errors": [
+                {
+                    "cue_index": cue.index,
+                    "reason": "chinese_does_not_fit_fixed_font",
+                }
+            ],
+        }
+    for page, chinese_page in zip(pages, chinese_pages):
+        page["zh"] = chinese_page
+    plan["pages"] = pages
+    return plan
+
+
+def article_display_page_layout_profile() -> dict:
+    return {
+        "template": "article_words",
+        "width": ARTICLE_WIDTH,
+        "height": ARTICLE_HEIGHT,
+        "english_font_size": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+        "chinese_font_size": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        "english_width": ARTICLE_SUBTITLE_EN_WIDTH,
+        "english_wide_safe_width": ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
+        "chinese_width": ARTICLE_SUBTITLE_ZH_WIDTH,
+        "max_lines": 2,
+        "minimum_page_duration_ms": ARTICLE_PAGE_MIN_DURATION_MS,
+    }
+
+
+def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
+    """Return only multi-page parents after final word timing is frozen."""
+    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    parents: list[dict] = []
+    errors: list[dict] = []
+    for cue in cues:
+        plan = _build_article_english_page_plan(cue, draw)
+        if plan.get("status") != "ok":
+            errors.extend(plan.get("errors") or [])
+            continue
+        pages = list(plan.get("pages") or [])
+        if len(pages) <= 1:
+            continue
+        if (
+            not cue.subtitle_id
+            or not pages
+            or pages[0].get("global_word_start") is None
+            or pages[-1].get("global_word_end") is None
+        ):
+            errors.append(
+                {
+                    "cue_index": cue.index,
+                    "reason": "missing_or_mismatched_word_ledger",
+                }
+            )
+            continue
+        parents.append(
+            {
+                "parent_subtitle_id": cue.subtitle_id,
+                "english": cue.en,
+                "chinese": cue.zh,
+                "word_start": int(pages[0]["global_word_start"]),
+                "word_end": int(pages[-1]["global_word_end"]),
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "word_start": int(page["global_word_start"]),
+                        "word_end": int(page["global_word_end"]),
+                        "english": page["en"],
+                        "start_ms": round(float(page["start"]) * 1000),
+                        "end_ms": round(float(page["end"]) * 1000),
+                    }
+                    for page in pages
+                ],
+            }
+        )
+    if errors:
+        raise RenderStructuralOverflowError(errors)
+    return {
+        "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
+        "layout_profile": article_display_page_layout_profile(),
+        "parents": parents,
+    }
+
+
+def apply_article_display_page_translation_artifact(
+    cues: Sequence[Cue],
+    artifact: Mapping[str, object],
+) -> bool:
+    """Attach page Chinese only after matching the final renderer blueprint."""
+    for cue in cues:
+        cue.display_page_translations = None
+    if (
+        int(artifact.get("schema_version") or 0) != DISPLAY_PAGE_SCHEMA_VERSION
+        or str(artifact.get("status") or "") != "PASS"
+        or str(artifact.get("planner_version") or "") != DISPLAY_PAGE_PLANNER_VERSION
+        or dict(artifact.get("layout_profile") or {}) != article_display_page_layout_profile()
+    ):
+        return False
+    try:
+        blueprint = build_article_display_page_blueprint(cues)
+    except RenderStructuralOverflowError:
+        return False
+    expected = {
+        str(parent["parent_subtitle_id"]): parent
+        for parent in blueprint.get("parents") or []
+    }
+    returned_parents = list(artifact.get("parents") or [])
+    returned_ids = [
+        str(parent.get("parent_subtitle_id") or "")
+        for parent in returned_parents
+        if isinstance(parent, Mapping)
+    ]
+    if len(returned_ids) != len(set(returned_ids)) or set(returned_ids) != set(expected):
+        return False
+    cues_by_id = {str(cue.subtitle_id): cue for cue in cues if cue.subtitle_id}
+    pending: list[tuple[Cue, dict[str, str]]] = []
+    for parent in returned_parents:
+        if not isinstance(parent, Mapping):
+            return False
+        parent_id = str(parent.get("parent_subtitle_id") or "")
+        cue = cues_by_id.get(parent_id)
+        expected_parent = expected.get(parent_id)
+        if cue is None or expected_parent is None:
+            return False
+        aggregate = re.sub(r"\s+", "", str(parent.get("aggregate_chinese") or ""))
+        if aggregate != re.sub(r"\s+", "", str(cue.zh or "")):
+            return False
+        expected_pages = list(expected_parent.get("pages") or [])
+        returned_pages = list(parent.get("pages") or [])
+        if len(returned_pages) != len(expected_pages):
+            return False
+        translations: dict[str, str] = {}
+        for expected_page, returned_page in zip(expected_pages, returned_pages):
+            if not isinstance(returned_page, Mapping):
+                return False
+            page_id = str(returned_page.get("display_page_id") or "")
+            chinese = re.sub(r"\s+", "", str(returned_page.get("zh") or ""))
+            try:
+                returned_word_start = int(returned_page["word_start"])
+                returned_word_end = int(returned_page["word_end"])
+                expected_word_start = int(expected_page["word_start"])
+                expected_word_end = int(expected_page["word_end"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if (
+                page_id != str(expected_page.get("display_page_id") or "")
+                or returned_word_start != expected_word_start
+                or returned_word_end != expected_word_end
+                or " ".join(str(returned_page.get("english") or "").split())
+                != " ".join(str(expected_page.get("english") or "").split())
+                or abs(int(returned_page.get("start_ms") or 0) - int(expected_page.get("start_ms") or 0)) > 5
+                or abs(int(returned_page.get("end_ms") or 0) - int(expected_page.get("end_ms") or 0)) > 5
+                or not chinese
+                or page_id in translations
+            ):
+                return False
+            translations[page_id] = chinese
+        if "".join(translations[page["display_page_id"]] for page in expected_pages) != aggregate:
+            return False
+        pending.append((cue, translations))
+    for cue, translations in pending:
+        cue.display_page_translations = translations
+    return True
+
+
+def load_article_display_page_translation_artifact(
+    cues: Sequence[Cue],
+    subtitle_path: str | Path,
+) -> bool:
+    manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if str(manifest.get("display_page_translation_status") or "") != "PASS":
+            return False
+        artifact_path = Path(str(manifest.get("display_page_translation_path") or ""))
+        if not artifact_path.is_file():
+            return False
+        expected_sha256 = str(manifest.get("display_page_translation_sha256") or "")
+        expected_contract_hash = str(
+            manifest.get("display_page_translation_contract_hash") or ""
+        )
+        if not expected_sha256 or not expected_contract_hash:
+            return False
+        if hashlib.sha256(artifact_path.read_bytes()).hexdigest() != expected_sha256:
+            return False
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        if str(artifact.get("contract_hash") or "") != expected_contract_hash:
+            return False
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Article renderer could not load display page translations: %s", exc)
+        return False
+    return apply_article_display_page_translation_artifact(cues, artifact)
+
+
 def prepare_article_visual_page_plans(cues: list[Cue], subtitle_path: str | Path) -> None:
     """Prepare every article-template page plan before starting ffmpeg."""
     if not attach_article_word_timing(cues, subtitle_path):
@@ -2506,6 +2835,15 @@ def prepare_article_visual_page_plans(cues: list[Cue], subtitle_path: str | Path
                 {
                     "cue_index": "all",
                     "reason": "missing_or_mismatched_word_ledger",
+                }
+            ]
+        )
+    if not load_article_display_page_translation_artifact(cues, subtitle_path):
+        raise RenderStructuralOverflowError(
+            [
+                {
+                    "cue_index": "all",
+                    "reason": "missing_or_invalid_display_page_translation_artifact",
                 }
             ]
         )

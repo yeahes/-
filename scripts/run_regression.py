@@ -73,6 +73,11 @@ def main() -> int:
             False,
         ),
         (
+            "stable display page translation contract",
+            ["tests/test_stable_page_translation_contract.py"],
+            False,
+        ),
+        (
             "frozen run comparison",
             ["tests/test_frozen_run_comparison.py"],
             False,
@@ -119,6 +124,7 @@ def main() -> int:
                 "tests/test_allocation_only_replay.py",
                 "tests/test_allocation_quality.py",
                 "tests/test_stable_artifacts.py",
+                "tests/test_stable_page_translation_contract.py",
                 "tests/test_frozen_run_comparison.py",
                 "tests/test_golden_subtitle_evaluation.py",
                 "tests/test_manual_final_subtitle_editor.py",

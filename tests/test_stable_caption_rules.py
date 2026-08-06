@@ -4190,6 +4190,20 @@ def _article_word_timing(cue):
     )
 
 
+def _attach_explicit_article_page_translations(cue, chinese_pages):
+    cue.subtitle_id = cue.subtitle_id or f"S{cue.index:04d}"
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    english_plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+    assert english_plan["status"] == "ok"
+    pages = list(english_plan["pages"])
+    assert len(pages) == len(chinese_pages)
+    cue.zh = "".join(chinese_pages)
+    cue.display_page_translations = {
+        page["display_page_id"]: chinese
+        for page, chinese in zip(pages, chinese_pages)
+    }
+
+
 def test_article_template_does_not_truncate_a_long_english_subtitle():
     article_image = Image.new(
         "RGB",
@@ -4204,6 +4218,7 @@ def test_article_template_does_not_truncate_a_long_english_subtitle():
     )
     cue = podcast_learning_video.Cue(1, 0.0, 2.0, text, "中文译文。", "male")
     cue.word_timing = _article_word_timing(cue)
+    _attach_explicit_article_page_translations(cue, ["中文", "译文。"])
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     cue.article_page_plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
     page_count = len(cue.article_page_plan["pages"])
@@ -4264,6 +4279,14 @@ def test_article_template_keeps_full_chinese_for_structural_overflow_cue():
     )
     cue = podcast_learning_video.Cue(1, 0.0, 12.15, english, chinese, "male")
     cue.word_timing = _article_word_timing(cue)
+    _attach_explicit_article_page_translations(
+        cue,
+        [
+            "是的。而且，你知道，那项120万词研究真正要紧的地方在于，",
+            "当所有人还在寻找过时的线索，比如大量使用的破折号时，",
+            "这些大语言模型已经在悄然改变自己的句法结构。",
+        ],
+    )
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     cue.article_page_plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
     page_count = len(cue.article_page_plan["pages"])
@@ -4374,6 +4397,14 @@ def test_article_page_timeline_uses_fixed_fonts_and_word_boundaries():
     )
     cue = podcast_learning_video.Cue(4, 13.29, 25.44, english, chinese, "male")
     cue.word_timing = _article_word_timing(cue)
+    _attach_explicit_article_page_translations(
+        cue,
+        [
+            "是的。而且，你知道，那项120万词研究真正要紧的地方在于，",
+            "当所有人还在寻找过时的线索，比如大量使用的破折号时，",
+            "这些大语言模型已经在悄然改变自己的句法结构。",
+        ],
+    )
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
 
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
@@ -4439,6 +4470,13 @@ def test_article_renderer_never_accepts_a_forbidden_line_break_in_a_long_cue():
         "male",
     )
     cue.word_timing = _article_word_timing(cue)
+    _attach_explicit_article_page_translations(
+        cue,
+        [
+            "所以，他们确实不得不发明全新的办法",
+            "来解决同一个数学问题，这纯粹是出于生存需求。",
+        ],
+    )
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
 
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
@@ -4499,6 +4537,93 @@ def test_article_fixed_layout_uses_two_word_line_only_as_a_static_fallback():
         assert len(lines) == 2
         assert min(len(line.split()) for line in lines) == 2
         assert not podcast_learning_video._has_discouraged_caption_break(text, lines)
+
+
+def test_article_fixed_layout_keeps_numeric_magnitude_and_following_head_together():
+    text = "without requiring a 500 billion data center to run it."
+    words = text.split()
+    cue = podcast_learning_video.Cue(
+        900,
+        0.0,
+        3.0,
+        text,
+        "而且不需要一个5000亿美元的数据中心来运行它。",
+        "male",
+    )
+    cue.subtitle_id = "S0900"
+    cue.word_timing = _article_word_timing(cue)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert plan["font_size"]["english"] == 58
+    assert len(plan["pages"]) == 1
+    page = plan["pages"][0]
+    assert page["en"] == text
+    assert len(page["en_lines"]) == 2
+    assert " ".join(page["en_lines"]) == text
+    boundary = (page["en_lines"][0].split()[-1], page["en_lines"][1].split()[0])
+    assert boundary not in {
+        ("500", "billion"),
+        ("billion", "data"),
+        ("data", "center"),
+    }
+    assert all(
+        podcast_learning_video._looks_like_numeric_phrase_boundary(words, split)
+        for split in (4, 5, 6)
+    )
+    assert not podcast_learning_video._has_discouraged_caption_break(
+        text,
+        page["en_lines"],
+    )
+
+
+def test_article_page_keeps_tightly_spoken_nonfinite_complement_together():
+    cases = [
+        (
+            "They kept talking about the project for several important reasons today",
+            "about",
+        ),
+        (
+            "The student learns the underlying logic and patterns without needing "
+            "the massive raw data processing capabilities of the teacher",
+            "the",
+        ),
+    ]
+
+    for text, following_word in cases:
+        words = text.split()
+        split = next(
+            index
+            for index, word in enumerate(words)
+            if index > 0
+            and word == following_word
+            and words[index - 1].lower().endswith("ing")
+        )
+
+        def timing_with_pause(pause_ms):
+            timing = []
+            cursor = 0.0
+            for index, word in enumerate(words):
+                start = cursor
+                end = start + 0.2
+                timing.append({"surface": word, "start": start, "end": end})
+                cursor = end + (pause_ms / 1000.0 if index == split - 1 else 0.04)
+            return tuple(timing)
+
+        assert podcast_learning_video._article_page_break_score(
+            words,
+            split,
+            len(words) / 2,
+            timing_with_pause(40),
+        ) == podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+        assert podcast_learning_video._article_page_break_score(
+            words,
+            split,
+            len(words) / 2,
+            timing_with_pause(400),
+        ) < podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
 
 
 def test_article_renderer_keeps_short_dangling_tail_on_one_static_page():
@@ -4596,6 +4721,13 @@ def test_article_renderer_keeps_modifier_head_phrase_on_one_visual_page():
     )
     cue.subtitle_id = "S0074"
     cue.word_timing = _article_word_timing(cue)
+    _attach_explicit_article_page_translations(
+        cue,
+        [
+            "中国AI小公司不必把有限资金砸进尖端芯片无底洞",
+            "跑原始数据",
+        ],
+    )
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
 
     plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
@@ -9927,6 +10059,8 @@ if __name__ == "__main__":
     test_article_renderer_keeps_short_58px_cue_on_wide_single_line_profile()
     test_article_renderer_keeps_readable_two_line_cue_on_one_static_page()
     test_article_fixed_layout_uses_two_word_line_only_as_a_static_fallback()
+    test_article_fixed_layout_keeps_numeric_magnitude_and_following_head_together()
+    test_article_page_keeps_tightly_spoken_nonfinite_complement_together()
     test_article_renderer_keeps_short_dangling_tail_on_one_static_page()
     test_article_renderer_keeps_a_complete_phrase_on_a_static_bilingual_page()
     test_chinese_visual_page_never_starts_with_attached_punctuation()
