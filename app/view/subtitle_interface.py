@@ -1355,6 +1355,23 @@ class SubtitleInterface(QWidget):
             max(int(self._manual_boundary_word_count_value), 1),
             maximum,
         )
+        direction = str(getattr(self, "_manual_boundary_move_direction", ""))
+        expander = getattr(
+            self.manual_final_session,
+            "expanded_manual_boundary_word_count",
+            None,
+        )
+        if direction in {"next", "previous"} and callable(expander):
+            count = int(
+                expander(
+                    left_word_start=int(context["left"]["word_start"]),
+                    left_word_end=int(context["left"]["word_end"]),
+                    right_word_start=int(context["right"]["word_start"]),
+                    right_word_end=int(context["right"]["word_end"]),
+                    requested_word_count=count,
+                    move_to_next=direction == "next",
+                )
+            )
         self._manual_boundary_word_count_value = count
         count_box = getattr(self, "manual_boundary_word_count", None)
         if count_box is not None and count_box.value() != count:
@@ -1362,7 +1379,6 @@ class SubtitleInterface(QWidget):
             count_box.setValue(count)
             count_box.blockSignals(blocked)
 
-        direction = str(getattr(self, "_manual_boundary_move_direction", ""))
         next_allowed = count <= context["move_to_next_max"]
         previous_allowed = count <= context["move_to_previous_max"]
         left_label = getattr(self, "manual_boundary_left_text_label", None)

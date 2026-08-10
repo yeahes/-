@@ -2,6 +2,39 @@
 
 Last updated: 2026-08-10
 
+## 2026-08-10 Single-Page Chinese Fit And Numeric Manual Boundaries
+
+- Root cause of the pale-red batch mark: the article page planner treated
+  parent Chinese length as a page-count signal but did not prove that a
+  selected one-page candidate fit the fixed 46px/two-line Chinese region. A
+  later frozen-artifact validator rejected `S0199`, while the failure adapter
+  knew only the 39 multipage parent IDs and therefore marked all 39 instead of
+  the one failing subtitle.
+- A one-page candidate with non-empty Chinese now enters the candidate pool
+  only after `_article_fixed_chinese_lines()` succeeds. Frozen-artifact apply
+  failures carry their exact parent subtitle ID, and failure normalization may
+  resolve that ID against every render plan rather than only multipage
+  translation parents.
+- Forced fallback ranking now treats a verb/complement split as less desirable
+  than a subject/predicate page split. The real `S0199` checkpoint therefore
+  uses `down / might` rather than `meant / to` while retaining its parent ID,
+  English, word ledger, cue timing, and word timestamps.
+- Manual parent and display-page boundary moves now expand a requested word
+  count to include the complete numeric phrase. UI preview and confirmation
+  show the expanded count before mutation. Sentence-final numbers such as
+  `2019. / Right.` remain separate and do not absorb the following sentence.
+- Read-only replay of the 199-parent `中国AI为何更省钱？` failure checkpoint
+  changes `S0199` from one page to two and narrows a simulated apply failure to
+  `S0199`; external requests remain zero. The whole-episode sequence planner
+  also changes adjacent `S0198` from four pages to three because the new
+  `S0199` first-page pressure changes the existing cross-cue cost. Its parent
+  text, ID, word coverage, and cue timing remain unchanged, but the denser
+  17/14/19-word projection remains a visual review risk.
+- Article readability, page-translation, manual-editor, and 58 publication/UI
+  tests pass. The unified regression passes all stages in 374.9 seconds;
+  `git diff --check` and production syntax compilation pass. No ASR, LLM,
+  network, FFmpeg synthesis, paid request, or production artifact write ran.
+
 ## 2026-08-10 Semantic Two-Line Vocabulary Notes
 
 - Root cause: article vocabulary-card concept notes still used the generic

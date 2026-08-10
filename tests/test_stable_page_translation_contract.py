@@ -2112,6 +2112,62 @@ def test_golden_page_translations_pass_existing_fixed_id_semantic_gate():
         }
 
 
+def test_frozen_artifact_mismatch_reports_the_exact_single_page_parent():
+    cue = podcast_learning_video.Cue(
+        199,
+        0.0,
+        3.0,
+        "A complete short sentence.",
+        "一条完整的短句。",
+        "male",
+        subtitle_id="S0199",
+        word_timing=tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * 0.7,
+                "end": index * 0.7 + 0.5,
+            }
+            for index, word in enumerate("A complete short sentence.".split())
+        ),
+    )
+    blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+    artifact = {
+        "schema_version": podcast_learning_video.DISPLAY_PAGE_SCHEMA_VERSION,
+        "status": "PASS",
+        "planner_version": blueprint["planner_version"],
+        "layout_profile": blueprint["layout_profile"],
+        "render_plans": blueprint["render_plans"],
+        "parents": [],
+    }
+    failures = []
+
+    with patch.object(
+        podcast_learning_video,
+        "_article_plan_from_frozen_artifact",
+        return_value=None,
+    ):
+        applied = podcast_learning_video.apply_article_display_page_translation_artifact(
+            [cue],
+            artifact,
+            failure_items=failures,
+        )
+
+    assert applied is False
+    assert failures == [
+        {
+            "subtitle_id": "S0199",
+            "reason": "display_page_artifact_blueprint_mismatch",
+        }
+    ]
+    assert ScreenSubtitleEditor._display_page_failure_items(
+        failures,
+        [],
+        render_plans=artifact["render_plans"],
+        fallback_reason="display_page_artifact_blueprint_mismatch",
+    ) == failures
+
+
 if __name__ == "__main__":
     test_s0078_reordered_chinese_is_bound_by_page_id()
     test_s0252_monotonic_translation_remains_page_aligned()
@@ -2149,4 +2205,5 @@ if __name__ == "__main__":
     test_loaded_manual_draft_pages_match_persisted_identity_text_timing_and_font()
     test_stable_artifact_write_failure_is_not_reported_as_success()
     test_golden_page_translations_pass_existing_fixed_id_semantic_gate()
+    test_frozen_artifact_mismatch_reports_the_exact_single_page_parent()
     print("stable page translation contract tests passed")

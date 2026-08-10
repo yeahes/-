@@ -3635,6 +3635,88 @@ def test_manual_page_soft_override_preserves_hard_page_invariants():
         raise AssertionError("a cut without a legal shared time boundary must fail")
 
 
+def test_numeric_phrase_moves_as_one_unit_in_both_directions():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        replacement = {
+            6: "740",
+            7: "billion",
+            8: "spend",
+        }
+        for word_id, surface in replacement.items():
+            session.word_ledger[word_id]["surface"] = surface
+            session.word_ledger[word_id]["normalized"] = surface.casefold()
+        session.cues[0]["original_subtitle"] = session._words_text(
+            session.word_ledger, 0, 8
+        )
+
+        session.move_suffix_to_next(0, 1)
+
+        assert session.cues[0]["word_end"] == 5
+        assert session.cues[1]["word_start"] == 6
+        assert session.cues[1]["original_subtitle"].startswith(
+            "740 billion spend"
+        )
+        assert session.history[-1]["word_count"] == 3
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        replacement = {
+            8: "740",
+            9: "billion",
+            10: "spend",
+            11: "today.",
+        }
+        for word_id, surface in replacement.items():
+            session.word_ledger[word_id]["surface"] = surface
+            session.word_ledger[word_id]["normalized"] = surface.casefold().strip(".")
+        session.cues[0].update(
+            {
+                "word_end": 7,
+                "end_time": session._word_end_time(7),
+                "original_subtitle": session._words_text(
+                    session.word_ledger, 0, 7
+                ),
+            }
+        )
+        session.cues[1].update(
+            {
+                "word_start": 8,
+                "start_time": session._word_start_time(8),
+                "original_subtitle": session._words_text(
+                    session.word_ledger, 8, 11
+                ),
+            }
+        )
+
+        session.move_prefix_to_previous(1, 1)
+
+        assert session.cues[0]["original_subtitle"].endswith(
+            "740 billion spend"
+        )
+        assert session.cues[1]["original_subtitle"] == "today."
+        assert session.history[-1]["word_count"] == 3
+
+
+def test_numeric_sentence_end_does_not_absorb_the_next_sentence():
+    words = [
+        {"surface": "in", "normalized": "in"},
+        {"surface": "2019.", "normalized": "2019"},
+        {"surface": "Right.", "normalized": "right"},
+        {"surface": "Next", "normalized": "next"},
+    ]
+
+    assert ManualFinalSubtitleSession._expanded_numeric_boundary_word_count(
+        words,
+        left_word_start=0,
+        left_word_end=1,
+        right_word_start=2,
+        right_word_end=3,
+        requested_word_count=1,
+        move_to_next=False,
+    ) == 1
+
+
 if __name__ == "__main__":
     test_manual_page_export_requires_matching_complete_boundary_evidence()
     test_legacy_package_recovers_omitted_saved_cue_boundary_across_move_and_undo()
@@ -3697,4 +3779,6 @@ if __name__ == "__main__":
     test_manual_save_upgrades_old_page_layout_without_replanning_pages()
     test_unconfirmed_manual_split_proposals_can_move_boundary_but_save_stays_blocked()
     test_manual_page_soft_override_preserves_hard_page_invariants()
+    test_numeric_phrase_moves_as_one_unit_in_both_directions()
+    test_numeric_sentence_end_does_not_absorb_the_next_sentence()
     print("Manual final subtitle editor tests passed.")

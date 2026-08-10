@@ -1,19 +1,18 @@
 # Project State
-Status: complete
-Last verified: 2026-08-10 08:14:02 Asia/Shanghai
+Status: verified, uncommitted
+Last verified: 2026-08-10 16:55:00 Asia/Shanghai
 Branch: main
-Verified HEAD: 6b6a1e9da8725c2e51dec27c9639209d529b6249
-Working tree: clean after the stable bilingual workflow checkpoint commit
+Verified HEAD: 6bb5ba8aee8d1542e0d965ee2d288c69cb2856b9
+Working tree: modified by the single-page Chinese fit, exact failure attribution, numeric manual-boundary, test, and documentation changes
 
 ## Current Goal
-Improve same-screen English line breaks and font selection without changing any frozen subtitle or page contract.
+Prevent false batch review marks and let manual numeric boundary edits move complete number phrases without changing frozen subtitle identity or timing.
 
 ## Confirmed Facts
-- Contract v19 runs only after page spans, IDs, Chinese, and timing are frozen.
-- Read-only replay checked 253 parents, 311 pages, and 311 saved page edits; every structural field had zero changes.
-- Exact renderer validation exposed three invalid retained v18 wraps at S0065.P01, S0185.P01, and S0223.P01.
-- The accepted v19 font counts are 56/54/52/50 = 297/6/5/3. Invalid legacy wraps cannot be retained merely to preserve a larger font.
-- All 15 source-package files retained their SHA-256; no production package or video was regenerated.
+- The observed pale-red batch came from one single-page Chinese fit failure at S0199 plus ID-less error fallback, not 39 independent subtitle failures.
+- S0199 now plans two pages at `down / might`; simulated apply failure attribution returns only S0199.
+- Manual numeric moves expand the selected count for complete numeric phrases in both directions; sentence-final numbers remain independent.
+- Unified regression passes all stages in 374.9 seconds. External requests and production writes are zero.
 
 ## Approved Decisions
 - Same-screen reflow has no authority over page count, page boundaries, IDs, English, Chinese, word ownership, or timing.
@@ -36,7 +35,7 @@ Improve same-screen English line breaks and font selection without changing any 
 - External requests and production writes are zero.
 
 ## Next Action
-Review the current encoded video, then decide whether unsafe 50px line wraps should trigger upstream visual replanning before page contracts are frozen.
+Run one normal application flow or resume the failed checkpoint so the new S0199 page receives fixed-ID page Chinese, then inspect S0198 and S0199 in the editor before synthesis.
 
 ## Do Not Regress
 - Never let same-screen line reflow change page count, page boundaries, parent or page IDs, English, Chinese, word spans, cue timing, or word timing.
@@ -44,5 +43,5 @@ Review the current encoded video, then decide whether unsafe 50px line wraps sho
 - Never reuse an older page-layout cache as v19.
 
 ## Unknowns
-- No fresh GUI run or video encode has validated the v19 page artifact.
-- Reliability on a completely unrelated blind audio remains unmeasured.
+- No fresh GUI run or video encode has validated the repaired checkpoint.
+- The existing sequence planner changes adjacent S0198 from four pages to a denser three-page projection when S0199 becomes two pages; visual acceptance is not yet proven.

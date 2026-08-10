@@ -2021,6 +2021,126 @@ def test_manual_page_boundary_rebuild_rejects_hard_empty_and_short_pages():
             raise AssertionError(f"unsafe page ranges must fail: {expected_reason}")
 
 
+def test_single_page_candidate_requires_parent_chinese_to_fit_fixed_layout():
+    text = (
+        "The possibility that external guardrails meant to slow them down "
+        "might actually ensure their long-term economic survival is a "
+        "fascinating paradox for you to consider."
+    )
+    words = text.split()
+    starts_ms = (
+        905932, 906052, 906653, 906813, 907233, 907734, 907894, 908014,
+        908274, 908415, 908695, 908935, 909196, 909476, 909656, 910157,
+        910577, 911138, 911238, 911318, 911859, 912319, 912419, 912540,
+        912620,
+    )
+    ends_ms = (
+        906012, 906612, 906753, 907173, 907694, 907854, 907954, 908234,
+        908375, 908655, 908835, 909176, 909456, 909616, 910097, 910537,
+        911038, 911198, 911278, 911819, 912299, 912399, 912520, 912580,
+        912880,
+    )
+    hard_issues = {
+        2525: ["determiner_head_phrase_split", "protected_syntax_cut"],
+        2526: ["content_noun_that_clause_split", "dependency_phrase_entrance_split"],
+        2527: ["determiner_head_phrase_split", "clause_introducer_split", "protected_syntax_cut"],
+        2528: ["protected_syntax_cut"],
+        2529: ["subject_finite_verb_split", "protected_syntax_cut"],
+        2530: ["verb_complement_split", "short_verb_complement_split"],
+        2531: ["preposition_object_split", "protected_syntax_cut"],
+        2532: ["short_verb_object_split", "short_verb_complement_split", "separable_verb_particle_chain_split"],
+        2533: ["separable_verb_particle_chain_split"],
+        2534: ["subject_finite_verb_split"],
+        2535: ["subject_finite_verb_split", "protected_syntax_cut"],
+        2536: ["subject_finite_verb_split", "dependency_phrase_entrance_split", "modifier_head_split", "protected_syntax_cut"],
+        2537: ["verb_complement_split", "short_verb_complement_split"],
+        2538: ["determiner_head_phrase_split", "protected_syntax_cut"],
+        2539: ["modifier_noun_head_split", "protected_syntax_cut"],
+        2540: ["protected_syntax_cut"],
+        2541: ["subject_finite_verb_split"],
+        2542: ["verb_complement_split", "short_verb_complement_split"],
+        2543: ["determiner_head_phrase_split", "protected_syntax_cut"],
+        2544: ["protected_syntax_cut"],
+        2545: [],
+        2546: ["preposition_object_split", "clause_introducer_split", "protected_syntax_cut"],
+        2547: ["subject_finite_verb_split", "protected_syntax_cut"],
+        2548: ["preposition_object_split", "subject_finite_verb_split", "protected_syntax_cut"],
+    }
+    cue = podcast_learning_video.Cue(
+        199,
+        905.892,
+        913.140,
+        text,
+        (
+            "那些旨在拖慢中国脚步的外部护栏，反而可能确保其长期的经济生存；"
+            "这种可能性本身就是一个耐人寻味的悖论，值得你好好思量。"
+        ),
+        "male",
+        subtitle_id="S0199",
+        word_timing=tuple(
+            {
+                "word_id": 2524 + index,
+                "surface": word,
+                "start": starts_ms[index] / 1000.0,
+                "end": ends_ms[index] / 1000.0,
+            }
+            for index, word in enumerate(words)
+        ),
+        display_boundary_evidence={
+            str(word_id): {
+                "hard_issues": issues,
+                "soft_issues": [],
+                "pause_ms": max(
+                    0,
+                    starts_ms[word_id - 2524]
+                    - ends_ms[word_id - 2525],
+                ),
+            }
+            for word_id, issues in hard_issues.items()
+        },
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    with patch.object(
+        podcast_learning_video,
+        "_article_fixed_chinese_lines",
+        return_value=[],
+    ):
+        plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) > 1
+    assert " ".join(page["en"] for page in plan["pages"]) == cue.en
+    assert plan["pages"][1]["en"].startswith("might actually")
+    assert "verb_complement_split" not in set(
+        plan["pages"][1]["boundary_before"].get("issue_codes") or []
+    )
+
+
+def test_forced_verb_complement_split_ranks_below_subject_predicate_fallback():
+    verb_complement = {
+        "classification": "review",
+        "confidence": "high",
+        "forced_display_continuation": True,
+        "issue_codes": ["verb_complement_split", "short_verb_complement_split"],
+    }
+    subject_predicate = {
+        "classification": "review",
+        "confidence": "high",
+        "forced_display_continuation": True,
+        "forced_subject_predicate": True,
+        "issue_codes": ["subject_finite_verb_split"],
+    }
+
+    assert podcast_learning_video._article_page_boundary_risk(
+        verb_complement,
+        0,
+    ) > podcast_learning_video._article_page_boundary_risk(
+        subject_predicate,
+        0,
+    )
+
+
 if __name__ == "__main__":
     test_display_planning_does_not_mutate_frozen_cue_identity_text_or_timing()
     test_visual_planning_reuses_the_complete_frozen_page_projection()
@@ -2056,4 +2176,6 @@ if __name__ == "__main__":
     test_manual_page_boundary_rebuild_preserves_parent_and_rederives_pages()
     test_manual_multipage_rebuild_assigns_font_from_each_final_page()
     test_manual_page_boundary_rebuild_rejects_hard_empty_and_short_pages()
+    test_single_page_candidate_requires_parent_chinese_to_fit_fixed_layout()
+    test_forced_verb_complement_split_ranks_below_subject_predicate_fallback()
     print("article display readability contract tests passed")

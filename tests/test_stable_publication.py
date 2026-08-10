@@ -2399,6 +2399,32 @@ class StablePublicationTests(unittest.TestCase):
         self.assertNotIn(">delta epsilon</span>", right_html)
         self.assertEqual(moves, [], "changing direction must stay non-mutating")
 
+    def test_manual_boundary_preview_highlights_the_expanded_numeric_phrase(self):
+        app, interface, moves = self._manual_boundary_interaction_fixture()
+        interface.manual_final_session.expanded_manual_boundary_word_count = (
+            lambda **kwargs: 2
+            if kwargs["move_to_next"] and kwargs["requested_word_count"] == 1
+            else kwargs["requested_word_count"]
+        )
+        self._select_manual_boundary_row(app, interface, 0)
+        self._manual_boundary_button(
+            interface,
+            0,
+            "调整与下一屏边界",
+        ).click()
+        app.processEvents()
+
+        self._manual_boundary_button(interface, 0, "移到下一屏").click()
+        app.processEvents()
+
+        self.assertEqual(interface.manual_boundary_word_count.value(), 2)
+        self.assertIn(
+            ">beta gamma</span>",
+            self._manual_boundary_rich_text(interface, 0),
+        )
+        self._manual_boundary_button(interface, 0, "确认移动 2 个词")
+        self.assertEqual(moves, [])
+
     def test_dirty_parent_page_refresh_dispatches_save_then_reuses_frozen_blueprint(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             session = self._manual_page_boundary_session(Path(temp_dir))

@@ -3541,6 +3541,14 @@ def _article_page_boundary_risk(decision: Mapping, cost: int | float) -> int:
             risk = max(risk, 4)
         if "atomic_of_complement_split" in issue_codes:
             risk = max(risk, 5)
+        if (
+            decision.get("forced_display_continuation")
+            and issue_codes
+            & {"short_verb_complement_split", "verb_complement_split"}
+        ):
+            # A forced page may separate a complete predicate from its subject
+            # before it splits a verb from the complement that completes it.
+            risk = max(risk, 6)
     if float(cost) >= DISPLAY_PAGE_HIGH_RISK_COST:
         risk = max(risk, 1)
     if decision.get("forced_display_continuation"):
@@ -4391,6 +4399,13 @@ def _build_article_english_page_plan(
                 failure_reasons.update(
                     attempt_diagnostics or {"no_complete_legal_page_partition"}
                 )
+                continue
+            if (
+                page_count == 1
+                and str(cue.zh or "").strip()
+                and not _article_fixed_chinese_lines(draw, str(cue.zh))
+            ):
+                failure_reasons.add("chinese_does_not_fit_fixed_font")
                 continue
             page_layouts = [
                 _article_planning_final_page_layout(draw, cue, words, start, end)
@@ -5737,6 +5752,8 @@ def _article_plan_from_frozen_artifact(
 def apply_article_display_page_translation_artifact(
     cues: Sequence[Cue],
     artifact: Mapping[str, object],
+    *,
+    failure_items: list[dict[str, str]] | None = None,
 ) -> bool:
     """Validate and attach the frozen page plans selected after final timing."""
     for cue in cues:
@@ -5821,6 +5838,13 @@ def apply_article_display_page_translation_artifact(
             draw,
         )
         if plan is None:
+            if failure_items is not None:
+                failure_items.append(
+                    {
+                        "subtitle_id": parent_id,
+                        "reason": "display_page_artifact_blueprint_mismatch",
+                    }
+                )
             return False
         pending_plans.append((cue, plan, translations))
     for cue, plan, translations in pending_plans:

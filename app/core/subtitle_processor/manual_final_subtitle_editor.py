@@ -127,6 +127,108 @@ class ManualFinalSubtitleSession:
     source_media_path: Path | None = None
     import_notice: str = ""
 
+    @staticmethod
+    def _expanded_numeric_boundary_word_count(
+        word_ledger: Sequence[Mapping[str, Any]],
+        *,
+        left_word_start: int,
+        left_word_end: int,
+        right_word_start: int,
+        right_word_end: int,
+        requested_word_count: int,
+        move_to_next: bool,
+    ) -> int:
+        """Expand a manual move until it no longer splits a numeric phrase."""
+        requested = max(int(requested_word_count), 1)
+        left_start = int(left_word_start)
+        left_end = int(left_word_end)
+        right_start = int(right_word_start)
+        right_end = int(right_word_end)
+        if left_end + 1 != right_start:
+            return requested
+
+        surfaces = [
+            str(word.get("surface", word.get("token", "")) or "")
+            for word in word_ledger
+        ]
+
+        def boundary_splits_numeric_phrase(boundary: int) -> bool:
+            if boundary <= 0 or boundary >= len(surfaces):
+                return False
+            previous_surface = surfaces[boundary - 1]
+            if re.search(r"[.!?][\"')\]]*\s*$", previous_surface):
+                return False
+            from app.core.utils.podcast_learning_video import (
+                _looks_like_numeric_phrase_boundary,
+            )
+
+            if _looks_like_numeric_phrase_boundary(surfaces, boundary):
+                return True
+
+            def normalized(value: str) -> str:
+                return re.sub(r"[^A-Za-z0-9'.]", "", value).lower()
+
+            previous = normalized(previous_surface)
+            following = normalized(surfaces[boundary])
+            numeric_words = {
+                "zero", "one", "two", "three", "four", "five", "six",
+                "seven", "eight", "nine", "ten", "eleven", "twelve",
+                "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+                "eighteen", "nineteen", "twenty", "thirty", "forty",
+                "fifty", "sixty", "seventy", "eighty", "ninety",
+                "hundred", "thousand", "million", "billion", "trillion",
+            }
+            previous_is_numeric = bool(
+                re.fullmatch(r"\d+(?:[.,]\d+)?", previous)
+                or previous in numeric_words
+            )
+            following_is_head = bool(
+                following
+                and following.isalpha()
+                and following
+                not in {
+                    "and", "but", "for", "in", "of", "on", "or", "to", "with",
+                }
+            )
+            return previous_is_numeric and following_is_head
+
+        if move_to_next:
+            source_count = left_end - left_start + 1
+            count = min(requested, source_count)
+            boundary = left_end - count + 1
+            while boundary > left_start and boundary_splits_numeric_phrase(boundary):
+                count += 1
+                boundary -= 1
+            return count
+
+        source_count = right_end - right_start + 1
+        count = min(requested, source_count)
+        boundary = right_start + count
+        while boundary <= right_end and boundary_splits_numeric_phrase(boundary):
+            count += 1
+            boundary += 1
+        return count
+
+    def expanded_manual_boundary_word_count(
+        self,
+        *,
+        left_word_start: int,
+        left_word_end: int,
+        right_word_start: int,
+        right_word_end: int,
+        requested_word_count: int,
+        move_to_next: bool,
+    ) -> int:
+        return self._expanded_numeric_boundary_word_count(
+            self.word_ledger,
+            left_word_start=left_word_start,
+            left_word_end=left_word_end,
+            right_word_start=right_word_start,
+            right_word_end=right_word_end,
+            requested_word_count=requested_word_count,
+            move_to_next=move_to_next,
+        )
+
     @classmethod
     def load_for_subtitle(
         cls,
@@ -1390,6 +1492,14 @@ class ManualFinalSubtitleSession:
         )
         self._ensure_unmodified_english(left)
         self._ensure_unmodified_english(right)
+        word_count = self.expanded_manual_boundary_word_count(
+            left_word_start=int(left["word_start"]),
+            left_word_end=int(left["word_end"]),
+            right_word_start=int(right["word_start"]),
+            right_word_end=int(right["word_end"]),
+            requested_word_count=word_count,
+            move_to_next=True,
+        )
         boundary = int(left["word_end"]) - int(word_count) + 1
         if boundary <= int(left["word_start"]):
             raise ManualFinalSubtitleEditError("不能把一条字幕的全部英文词移动到下一条。")
@@ -1445,6 +1555,14 @@ class ManualFinalSubtitleSession:
         )
         self._ensure_unmodified_english(left)
         self._ensure_unmodified_english(right)
+        word_count = self.expanded_manual_boundary_word_count(
+            left_word_start=int(left["word_start"]),
+            left_word_end=int(left["word_end"]),
+            right_word_start=int(right["word_start"]),
+            right_word_end=int(right["word_end"]),
+            requested_word_count=word_count,
+            move_to_next=False,
+        )
         boundary = int(right["word_start"]) + int(word_count)
         if boundary > int(right["word_end"]):
             raise ManualFinalSubtitleEditError("不能把一条字幕的全部英文词移动到上一条。")
@@ -2206,6 +2324,14 @@ class ManualFinalSubtitleSession:
         ]
         left_count = ranges[page_index][1] - ranges[page_index][0] + 1
         right_count = ranges[page_index + 1][1] - ranges[page_index + 1][0] + 1
+        word_count = self.expanded_manual_boundary_word_count(
+            left_word_start=ranges[page_index][0],
+            left_word_end=ranges[page_index][1],
+            right_word_start=ranges[page_index + 1][0],
+            right_word_end=ranges[page_index + 1][1],
+            requested_word_count=word_count,
+            move_to_next=move_to_next,
+        )
         if move_to_next:
             if word_count >= left_count:
                 raise ManualFinalSubtitleEditError("不能把上一屏的全部英文词移走。")

@@ -1172,33 +1172,39 @@ class ScreenSubtitleEditor:
         for cue in cues:
             if cue.subtitle_id in parent_chinese:
                 cue.zh = parent_chinese[cue.subtitle_id]
-        if not apply_article_display_page_translation_artifact(cues, artifact):
+        apply_failure_items: List[Dict[str, str]] = []
+        if not apply_article_display_page_translation_artifact(
+            cues,
+            artifact,
+            failure_items=apply_failure_items,
+        ):
             self._display_page_translation_artifact = {
                 **artifact,
                 "status": "ERROR",
                 "errors": [
                     *(artifact.get("errors") or []),
-                    {"code": "display_page_artifact_blueprint_mismatch"},
+                    {
+                        "code": "display_page_artifact_blueprint_mismatch",
+                        "items": apply_failure_items,
+                    },
                 ],
             }
+            failure_items = self._display_page_failure_items(
+                apply_failure_items,
+                parents,
+                render_plans=contract.get("render_plans") or [],
+                fallback_reason="display_page_artifact_blueprint_mismatch",
+            )
             self._record_display_page_translation_failure(
                 "display_page_artifact_blueprint_mismatch",
                 "Validated page translations did not match the final renderer blueprint.",
                 asr_data.segments,
-                items=self._display_page_failure_items(
-                    [],
-                    parents,
-                    fallback_reason="display_page_artifact_blueprint_mismatch",
-                ),
+                items=failure_items,
             )
             wrapped = RuntimeError(
                 "display_page_translation_invalid: artifact blueprint mismatch"
             )
-            wrapped.display_page_errors = self._display_page_failure_items(
-                [],
-                parents,
-                fallback_reason="display_page_artifact_blueprint_mismatch",
-            )
+            wrapped.display_page_errors = failure_items
             raise wrapped
 
         draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
@@ -1506,6 +1512,7 @@ class ScreenSubtitleEditor:
         errors: Sequence[Mapping[str, Any]],
         parents: Sequence[Mapping[str, Any]],
         *,
+        render_plans: Sequence[Mapping[str, Any]] = (),
         fallback_reason: str,
     ) -> List[Dict[str, Any]]:
         page_parent_ids: Dict[str, str] = {}
@@ -1535,6 +1542,15 @@ class ScreenSubtitleEditor:
         normalized: List[Dict[str, Any]] = []
         seen = set()
         known_parent_ids = set(parent_ids)
+        known_parent_ids.update(
+            str(plan.get("parent_subtitle_id") or "")
+            for plan in render_plans
+            if isinstance(plan, Mapping)
+            and re.fullmatch(
+                r"S\d{4,}",
+                str(plan.get("parent_subtitle_id") or ""),
+            )
+        )
         for error in flattened:
             page_ids = [str(error.get("display_page_id") or "")]
             direct_subtitle_ids = [
