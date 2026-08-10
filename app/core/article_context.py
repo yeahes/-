@@ -19,6 +19,7 @@ from app.core.utils.logger import setup_logger
 logger = setup_logger("article_context")
 
 ARTICLE_CONTEXT_SCHEMA_VERSION = 2
+ARTICLE_ASR_CORRECTION_POLICY_VERSION = "article-asr-correction-v2"
 ARTICLE_RAW_RESPONSE_KEY = "_raw_response"
 ARTICLE_ANALYSIS_META_KEY = "_analysis_meta"
 ARTICLE_ENTITY_KEYS = (
@@ -94,6 +95,11 @@ def clean_article_text(text: str, max_chars: int = 20000) -> str:
     return text.strip()[:max_chars]
 
 
+def article_text_hash(text: str) -> str:
+    cleaned = clean_article_text(text)
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest() if cleaned else ""
+
+
 def empty_article_context() -> Dict[str, Any]:
     return {
         "schema_version": ARTICLE_CONTEXT_SCHEMA_VERSION,
@@ -161,7 +167,7 @@ def analyze_article_text(
     if not cleaned:
         return empty_article_context()
     cache = cache_manager or CacheManager(str(CACHE_PATH))
-    cache_key = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+    cache_key = article_text_hash(cleaned)
     cache_result = cache.get_llm_result(
         cache_key,
         llm_config.model,
@@ -538,13 +544,35 @@ def _correct_word_timestamp_segments(
                 candidate["category"] = term["source"].get("category", "")
                 candidate["source_key"] = term["source"].get("source_key", "")
                 candidate["evidence"] = term["source"].get("evidence", {})
+                existing_span = _existing_canonical_span_near_candidate(
+                    segments,
+                    index,
+                    index + window_size,
+                    str(term.get("canonical") or ""),
+                )
+                if existing_span:
+                    candidate["existing_canonical_span"] = existing_span
                 candidate["candidate_id"] = f"article-correction-{candidate_seq:06d}"
                 candidate_seq += 1
-                candidate["context_match"] = False
+                context_evidence = _person_description_context_support(
+                    segments,
+                    index,
+                    index + window_size,
+                    candidate,
+                )
+                candidate["context_match"] = bool(context_evidence.get("matched"))
+                candidate["context_evidence"] = context_evidence
+                if candidate["context_match"]:
+                    candidate["matched_conditions"].append(
+                        "article_person_context_match"
+                    )
                 candidate["asr_confidence_low"] = None
                 if _is_self_replacement_candidate(candidate):
                     continue
-                if candidate["final_confidence"] >= review_confidence:
+                if (
+                    candidate["final_confidence"] >= review_confidence
+                    or _context_supported_person_candidate(candidate)
+                ):
                     if candidate.get("matched_variant_is_alias"):
                         alias_collision = _find_ambiguous_alias_canonical_collision(candidate, terms)
                         if alias_collision:
@@ -672,6 +700,58 @@ def _candidate_ranges_overlap(left: Dict[str, Any], right: Dict[str, Any]) -> bo
     right_start = int(right.get("start_word_index", 0))
     right_end = int(right.get("end_word_index", 0))
     return left_start < right_end and right_start < left_end
+
+
+def _existing_canonical_span_near_candidate(
+    segments: Sequence[ASRDataSeg],
+    candidate_start: int,
+    candidate_end: int,
+    canonical: str,
+) -> Dict[str, Any]:
+    """Find an already-correct entity span touching a fuzzy candidate.
+
+    A fuzzy window may include one neighbouring discourse word or title even
+    though the complete canonical entity is already present inside or beside
+    that window. Replacing the fuzzy window would delete source words. The
+    glossary window-size contract differs by at most one token, so inspecting
+    one segment on either side is sufficient and keeps this guard local.
+    """
+    canonical_tokens = _normalized_entity_tokens(_word_tokens(canonical))
+    candidate_tokens = _normalized_entity_tokens(
+        _word_tokens(
+            _join_asr_words(
+                segment.text
+                for segment in segments[candidate_start:candidate_end]
+            )
+        )
+    )
+    if not canonical_tokens or len(candidate_tokens) < len(canonical_tokens):
+        return {}
+    context_start = max(0, int(candidate_start) - 1)
+    context_end = min(len(segments), int(candidate_end) + 1)
+    for span_start in range(context_start, context_end):
+        for span_end in range(span_start + 1, context_end + 1):
+            if span_start >= candidate_end or span_end <= candidate_start:
+                continue
+            if (span_start, span_end) == (candidate_start, candidate_end):
+                continue
+            span_tokens = _normalized_entity_tokens(
+                _word_tokens(
+                    _join_asr_words(
+                        segment.text for segment in segments[span_start:span_end]
+                    )
+                )
+            )
+            if span_tokens == canonical_tokens:
+                return {
+                    "start_word_index": span_start,
+                    "end_word_index": span_end,
+                    "original_words": [
+                        str(segment.text or "")
+                        for segment in segments[span_start:span_end]
+                    ],
+                }
+    return {}
 
 
 def _apply_article_correction_candidates(
@@ -864,6 +944,7 @@ def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, 
         "awards",
         "media_outlets",
         "platforms",
+        "technical_terms",
     }
     allowed_categories = {
         "analyst",
@@ -917,6 +998,8 @@ def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, 
         category = str(term.get("category", "") or "").strip().casefold()
         if source_key and source_key not in asr_source_keys:
             continue
+        if source_key == "technical_terms" and not _technical_term_is_asr_eligible(term):
+            continue
         if not source_key and category and category not in allowed_categories:
             continue
         variants = [canonical]
@@ -942,6 +1025,36 @@ def _glossary_match_terms(glossary: Sequence[Dict[str, Any]]) -> List[Dict[str, 
             }
         )
     return terms
+
+
+def _technical_term_is_asr_eligible(term: Dict[str, Any]) -> bool:
+    """Admit only article-defined, distinctive domain terms to ASR correction."""
+    canonical = str(term.get("canonical_name", "") or "").strip()
+    canonical_tokens = _word_tokens(canonical)
+    evidence = term.get("evidence") or {}
+    supported_aliases = [
+        str(alias or "").strip()
+        for alias in term.get("aliases") or []
+        if str(alias or "").strip()
+    ]
+    if (
+        term.get("canonical_in_article") is not True
+        or not isinstance(evidence, dict)
+        or not evidence.get("evidence_sentence")
+        or not canonical_tokens
+    ):
+        return False
+    normalized = [_normalize_entity_gate_token(token) for token in canonical_tokens]
+    if any(
+        token in _COMMON_LOWERCASE_WORD_PROTECTION
+        or token in _ENTITY_BLOCKING_FUNCTION_WORDS
+        for token in normalized
+    ):
+        return False
+    distinctive_surface = bool(
+        re.search(r"[A-Z].*[A-Z]|[a-z][A-Z]|\d|[-.]", canonical)
+    )
+    return bool(supported_aliases or distinctive_surface)
 
 
 def _has_boundary_filler(window: Sequence[ASRDataSeg]) -> bool:
@@ -982,7 +1095,12 @@ def _has_boundary_filler(window: Sequence[ASRDataSeg]) -> bool:
 def _window_crosses_sentence_boundary(window: Sequence[ASRDataSeg]) -> bool:
     if len(window) <= 1:
         return False
-    return any(re.search(r"[.!?]+$", str(seg.text or "").strip()) for seg in window[:-1])
+    return any(
+        re.search(r"[.!?]+$", str(seg.text or "").strip())
+        and _normalize_entity_gate_token(str(seg.text or ""))
+        not in _ARTICLE_PERSON_TITLES
+        for seg in window[:-1]
+    )
 
 
 def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dict[str, Any]:
@@ -1014,7 +1132,10 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
             best_phonetic = phonetic_similarity
     final_confidence = max(best_string, best_phonetic * 0.98)
     conditions = ["candidate_in_article_glossary"]
-    if best_variant and original_norm == _compact_text(best_variant):
+    if (
+        best_variant
+        and _entity_phrase_key(original_text) == _entity_phrase_key(best_variant)
+    ):
         conditions.append("exact_alias_match")
     if best_string >= 0.78:
         conditions.append("spelling_similarity")
@@ -1024,7 +1145,7 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
     canonical_tokens = _word_tokens(canonical)
     entity_gate = _entity_phrase_gate(original_text, canonical)
     matched_variant_is_alias = bool(best_variant) and (
-        _compact_text(best_variant) != _compact_text(canonical)
+        _entity_phrase_key(best_variant) != _entity_phrase_key(canonical)
     )
     matched_alias_evidence = (
         _matched_alias_evidence(term["source"], best_variant)
@@ -1059,8 +1180,154 @@ def _score_correction_candidate(original_text: str, term: Dict[str, Any]) -> Dic
             "category": term["source"].get("category", ""),
             "source_key": term["source"].get("source_key", ""),
             "aliases": term["source"].get("aliases", []),
+            "canonical_in_article": term["source"].get("canonical_in_article"),
+            "evidence": dict(term["source"].get("evidence") or {}),
         },
     }
+
+
+_ARTICLE_PERSON_TITLES = frozenset(
+    {"mr", "mrs", "ms", "miss", "dr", "doctor", "prof", "professor"}
+)
+_ARTICLE_PERSON_CONTEXT_STOP_WORDS = frozenset(
+    {
+        "about",
+        "after",
+        "again",
+        "also",
+        "because",
+        "before",
+        "being",
+        "case",
+        "could",
+        "exactly",
+        "from",
+        "have",
+        "into",
+        "like",
+        "more",
+        "other",
+        "said",
+        "that",
+        "their",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "when",
+        "where",
+        "which",
+        "while",
+        "with",
+        "would",
+    }
+)
+
+
+def _person_description_context_support(
+    segments: Sequence[ASRDataSeg],
+    start_index: int,
+    end_index: int,
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Require nearby article-description overlap before relaxing a person name."""
+    if not _candidate_is_person_name(candidate):
+        return {"matched": False, "reason": "not_person_entity"}
+    evidence = candidate.get("evidence") or {}
+    evidence_sentence = str(evidence.get("evidence_sentence") or "").strip()
+    if not evidence_sentence:
+        return {"matched": False, "reason": "missing_person_article_evidence"}
+
+    original_tokens = _word_tokens(str(candidate.get("original_text") or ""))
+    canonical_tokens = _word_tokens(str(candidate.get("candidate_text") or ""))
+    if len(original_tokens) < 2 or len(original_tokens) != len(canonical_tokens):
+        return {"matched": False, "reason": "person_name_shape_mismatch"}
+    original_normalized = [_normalize_entity_gate_token(token) for token in original_tokens]
+    canonical_normalized = [_normalize_entity_gate_token(token) for token in canonical_tokens]
+    original_title = original_normalized[0] if original_normalized[0] in _ARTICLE_PERSON_TITLES else ""
+    canonical_title = canonical_normalized[0] if canonical_normalized[0] in _ARTICLE_PERSON_TITLES else ""
+    if not canonical_title or original_title != canonical_title:
+        return {"matched": False, "reason": "person_title_mismatch"}
+
+    original_surname = original_normalized[-1]
+    canonical_surname = canonical_normalized[-1]
+    surname_similarity = _entity_token_similarity(original_surname, canonical_surname)
+    if (
+        not original_surname
+        or not canonical_surname
+        or original_surname[0] != canonical_surname[0]
+        or surname_similarity < 0.5
+        or float(candidate.get("final_confidence") or 0.0) < 0.6
+    ):
+        return {"matched": False, "reason": "person_surname_similarity_too_low"}
+
+    context_start = max(0, start_index - 24)
+    context_end = min(len(segments), end_index + 24)
+    nearby_text = _join_asr_words(
+        segment.text for segment in segments[context_start:context_end]
+    )
+    excluded = set(canonical_normalized) | set(original_normalized) | _ARTICLE_PERSON_TITLES
+    article_terms = _person_context_terms(evidence_sentence, excluded)
+    nearby_terms = _person_context_terms(nearby_text, excluded)
+    overlap = sorted(article_terms & nearby_terms)
+    distinctive_overlap = [
+        token for token in overlap if token.isdigit() or len(token) >= 6
+    ]
+    matched = len(overlap) >= 2 and bool(distinctive_overlap)
+    return {
+        "matched": matched,
+        "reason": (
+            "article_person_description_overlap"
+            if matched
+            else "insufficient_nearby_person_description_overlap"
+        ),
+        "surname_similarity": round(surname_similarity, 4),
+        "overlap_terms": overlap,
+        "context_word_range": [context_start, context_end],
+    }
+
+
+def _person_context_terms(text: str, excluded: set[str]) -> set[str]:
+    terms = set()
+    for token in _word_tokens(text):
+        normalized = _normalize_entity_gate_token(token)
+        if (
+            not normalized
+            or normalized in excluded
+            or normalized in _ARTICLE_PERSON_CONTEXT_STOP_WORDS
+            or normalized in _ENTITY_BLOCKING_FUNCTION_WORDS
+            or (len(normalized) < 4 and not normalized.isdigit())
+        ):
+            continue
+        terms.add(normalized)
+    return terms
+
+
+def _article_defined_technical_term_candidate(candidate: Dict[str, Any]) -> bool:
+    source = candidate.get("source_glossary") or {}
+    if str(source.get("source_key", "") or "").casefold() != "technical_terms":
+        return False
+    if not _technical_term_is_asr_eligible(source):
+        return False
+    original_tokens = _word_tokens(str(candidate.get("original_text", "") or ""))
+    canonical_tokens = _word_tokens(str(candidate.get("candidate_text", "") or ""))
+    if len(original_tokens) != 1 or len(canonical_tokens) != 1:
+        return False
+    original = _normalize_entity_gate_token(original_tokens[0])
+    canonical = _normalize_entity_gate_token(canonical_tokens[0])
+    if (
+        len(original) < 4
+        or len(canonical) < 4
+        or original[:1] != canonical[:1]
+        or original in _COMMON_LOWERCASE_WORD_PROTECTION
+        or canonical in _COMMON_LOWERCASE_WORD_PROTECTION
+    ):
+        return False
+    return (
+        float(candidate.get("phonetic_similarity") or 0) >= 0.88
+        and float(candidate.get("string_similarity") or 0) >= 0.5
+    )
 
 
 def _matched_alias_evidence(source: Dict[str, Any], matched_variant: str) -> Dict[str, Any]:
@@ -1216,11 +1483,16 @@ def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -
     near_threshold_person_edge = _near_threshold_person_edge_candidate(
         candidate, high_confidence
     )
-    if candidate["final_confidence"] < high_confidence and not near_threshold_person_edge:
+    context_supported_person = _context_supported_person_candidate(candidate)
+    if (
+        candidate["final_confidence"] < high_confidence
+        and not near_threshold_person_edge
+        and not context_supported_person
+    ):
         return False
     if _article_scope_rejection_reason(candidate):
         return False
-    if near_threshold_person_edge:
+    if near_threshold_person_edge or context_supported_person:
         return True
     return len(candidate.get("matched_conditions") or []) >= 2
 
@@ -1228,8 +1500,10 @@ def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -
 def _not_applied_reason(candidate: Dict[str, Any], high_confidence: float) -> str:
     if _is_self_replacement_candidate(candidate):
         return "self_replacement_skipped"
-    if candidate["final_confidence"] < high_confidence and not _near_threshold_person_edge_candidate(
-        candidate, high_confidence
+    if (
+        candidate["final_confidence"] < high_confidence
+        and not _near_threshold_person_edge_candidate(candidate, high_confidence)
+        and not _context_supported_person_candidate(candidate)
     ):
         return "below_high_confidence_threshold"
     scope_reason = _article_scope_rejection_reason(candidate)
@@ -1259,14 +1533,25 @@ def _article_scope_rejection_reason(candidate: Dict[str, Any]) -> str:
     if "exact_alias_match" in (candidate.get("matched_conditions") or []):
         return "" if _exact_alias_can_auto_apply(candidate) else "alias_would_degrade_canonical_match"
 
-    conservative_reason = _conservative_person_name_rejection_reason(candidate)
+    conservative_reason = (
+        ""
+        if _context_supported_person_candidate(candidate)
+        else _conservative_person_name_rejection_reason(candidate)
+    )
     if conservative_reason:
         return conservative_reason
 
-    if not candidate.get("entity_gate_passed"):
-        if _candidate_tokens_fully_align_to_canonical(original_tokens, corrected_tokens):
-            return ""
+    if _article_defined_technical_term_candidate(candidate):
+        return ""
+
+    if (
+        not candidate.get("entity_gate_passed")
+        and not _context_supported_person_candidate(candidate)
+    ):
         return str(candidate.get("entity_gate_reason") or "ordinary_text_not_article_proper_noun_scope")
+
+    if candidate.get("existing_canonical_span"):
+        return "canonical_entity_already_present_nearby"
 
     if len(original_tokens) == 1 and len(corrected_tokens) == 1:
         if not _single_token_candidate_stays_in_scope(original_tokens[0], corrected_tokens[0], candidate):
@@ -1333,6 +1618,10 @@ def _candidate_tokens_fully_align_to_canonical(
                 "".join(source[source_index : source_index + 2]),
                 canonical[canonical_index],
             ) >= 0.8
+            and _source_tokens_contribute_to_canonical(
+                source[source_index : source_index + 2],
+                canonical[canonical_index],
+            )
         ):
             source_index += 2
             canonical_index += 1
@@ -1349,6 +1638,25 @@ def _candidate_tokens_fully_align_to_canonical(
             continue
         return False
     return source_index == len(source) and canonical_index == len(canonical)
+
+
+def _source_tokens_contribute_to_canonical(
+    source_tokens: Sequence[str], canonical_token: str
+) -> bool:
+    source_text = "".join(source_tokens)
+    if not source_text or not canonical_token:
+        return False
+    matched = [False] * len(source_text)
+    for block in SequenceMatcher(None, source_text, canonical_token).get_matching_blocks():
+        for index in range(block.a, block.a + block.size):
+            matched[index] = True
+    offset = 0
+    for token in source_tokens:
+        token_end = offset + len(token)
+        if not any(matched[offset:token_end]):
+            return False
+        offset = token_end
+    return True
 
 
 def _entity_token_similarity(left: str, right: str) -> float:
@@ -1397,6 +1705,14 @@ def _candidate_is_person_name(candidate: Dict[str, Any]) -> bool:
         "poet",
         "writer",
     }
+
+
+def _context_supported_person_candidate(candidate: Dict[str, Any]) -> bool:
+    return bool(
+        _candidate_is_person_name(candidate)
+        and candidate.get("context_match")
+        and float(candidate.get("final_confidence") or 0.0) >= 0.6
+    )
 
 
 def _near_threshold_person_edge_candidate(
@@ -1503,7 +1819,7 @@ def _entity_initials(tokens: Sequence[str]) -> str:
 def _exact_alias_can_auto_apply(candidate: Dict[str, Any]) -> bool:
     original = str(candidate.get("original_text", "") or "")
     corrected = str(candidate.get("candidate_text", "") or "")
-    return _compact_text(original) == _compact_text(corrected)
+    return _entity_phrase_key(original) == _entity_phrase_key(corrected)
 
 
 def _entity_phrase_gate(original_text: str, canonical: str) -> Dict[str, Any]:
@@ -1511,6 +1827,9 @@ def _entity_phrase_gate(original_text: str, canonical: str) -> Dict[str, Any]:
     canonical_tokens = _word_tokens(canonical)
     if not original_tokens or not canonical_tokens:
         return _entity_gate_result(False, "empty_candidate")
+
+    if _candidate_tokens_fully_align_to_canonical(original_tokens, canonical_tokens):
+        return _entity_gate_result(True, "complete_source_window_maps_to_entity")
 
     if len(canonical_tokens) > len(original_tokens) + 1:
         return _entity_gate_result(False, "candidate_would_expand_short_phrase")
@@ -1722,6 +2041,7 @@ _ENTITY_BLOCKING_FUNCTION_WORDS = {
     "will",
     "with",
     "would",
+    "yes",
     "yeah",
     "yet",
     "you",
@@ -1741,6 +2061,11 @@ def _word_tokens(text: str) -> List[str]:
 
 def _compact_text(text: str) -> str:
     return "".join(token.casefold() for token in _word_tokens(text))
+
+
+def _entity_phrase_key(text: str) -> str:
+    """Compare entity phrases without treating terminal punctuation as content."""
+    return "".join(_normalized_entity_tokens(_word_tokens(text)))
 
 
 def _phonetic_key(text: str) -> str:

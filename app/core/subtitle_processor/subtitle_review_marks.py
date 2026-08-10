@@ -38,18 +38,28 @@ def load_subtitle_review_marks(
     """Load marker candidates without mutating subtitle or audit artifacts."""
     directory = Path(artifact_dir)
     validation = _read_json(directory / "validation-report.json", {})
-    structure_errors = _read_json(directory / "translation-structure-errors.json", [])
+    structure_errors = _read_json(
+        directory / "translation-structure-errors.json",
+        [],
+        strict=True,
+    )
     marks: List[SubtitleReviewMark] = []
 
     for error in _as_list(structure_errors):
+        code = str(error.get("code") or "translation_structure_error")
+        is_visual_page = code.startswith("display_page_")
         _append_marks(
             marks,
             _subtitle_ids(error),
             severity="BLOCKER",
-            category="structure",
-            target="both",
-            code=str(error.get("code") or "translation_structure_error"),
-            reason="中文返回结构与冻结 subtitle_id 不一致。",
+            category="visual_page" if is_visual_page else "structure",
+            target="english" if is_visual_page else "both",
+            code=code,
+            reason=(
+                str(error.get("message") or "自动视觉分页失败，需要人工处理。")
+                if is_visual_page
+                else "中文返回结构与冻结 subtitle_id 不一致。"
+            ),
         )
 
     for group in _as_list(validation.get("errors") if isinstance(validation, Mapping) else []):
@@ -66,7 +76,13 @@ def load_subtitle_review_marks(
             )
 
     marks.extend(_final_timeline_fallback_marks(directory))
-    marks.extend(_high_precision_english_cut_marks(directory))
+    boundary_marks, has_boundary_audit = _english_boundary_audit_marks(directory)
+    marks.extend(boundary_marks)
+    if not has_boundary_audit:
+        marks.extend(_high_precision_english_cut_marks(directory))
+    marks.extend(_high_confidence_chinese_marks(validation))
+    marks.extend(_allocation_unresolved_marks(directory))
+    marks.extend(_visual_page_review_marks(directory))
 
     return _group_marks(marks)
 
@@ -74,6 +90,15 @@ def load_subtitle_review_marks(
 def syntax_review_parser_available() -> bool:
     """Return whether the local spaCy dependency parser is available."""
     return _load_syntax_nlp() is not None
+
+
+def review_marks_require_syntax_parser(artifact_dir: str | Path) -> bool:
+    """Legacy runs need parser fallback only when no boundary audit exists."""
+    payload = _read_json(Path(artifact_dir) / "english-boundary-audit.json", {})
+    return not (
+        isinstance(payload, Mapping)
+        and isinstance(payload.get("records"), list)
+    )
 
 
 def review_marks_to_payload(
@@ -113,12 +138,14 @@ def review_marks_from_payload(payload: Any) -> Dict[str, List[SubtitleReviewMark
     return _group_marks(mark for marks in restored.values() for mark in marks)
 
 
-def _read_json(path: Path, default: Any) -> Any:
+def _read_json(path: Path, default: Any, *, strict: bool = False) -> Any:
     if not path.exists():
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        if strict:
+            raise ValueError(f"无法读取复查证据：{path}") from exc
         return default
 
 
@@ -134,7 +161,12 @@ def _group_entries(group: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
 
 
 def _subtitle_ids(payload: Mapping[str, Any]) -> List[str]:
-    values: List[Any] = [payload.get("subtitle_id")]
+    display_page_id = str(payload.get("display_page_id") or "")
+    values: List[Any] = [
+        payload.get("subtitle_id"),
+        payload.get("parent_subtitle_id"),
+        display_page_id.partition(".")[0] if display_page_id else "",
+    ]
     for key in (
         "subtitle_ids",
         "expected_subtitle_ids",
@@ -186,15 +218,17 @@ def _append_marks(
 
 
 def _final_timeline_fallback_marks(directory: Path) -> List[SubtitleReviewMark]:
-    """Mark only final cues whose time still contains a stable-ts fallback word.
+    """Mark only cues whose first or last word retained fallback timing.
 
     This is provenance from the final time artifact, not a heuristic about
     subtitle duration.  It therefore remains useful in the editor without
     turning routine short or fast cues into noisy review markers.
     """
     timeline = _read_json(directory / "final-cue-timeline.json", {})
+    ledger_payload = _read_json(directory / "word-ledger.json", {})
+    ledger = ledger_payload.get("words") if isinstance(ledger_payload, Mapping) else []
     records = timeline.get("records") if isinstance(timeline, Mapping) else []
-    if not isinstance(records, list):
+    if not isinstance(records, list) or not isinstance(ledger, list):
         return []
 
     marks: List[SubtitleReviewMark] = []
@@ -202,15 +236,19 @@ def _final_timeline_fallback_marks(directory: Path) -> List[SubtitleReviewMark]:
         if not isinstance(record, Mapping):
             continue
         subtitle_id = str(record.get("subtitle_id") or "")
-        sources = record.get("word_alignment_sources")
-        if not _SUBTITLE_ID_RE.fullmatch(subtitle_id) or not isinstance(sources, list):
+        try:
+            word_start = int(record.get("word_start"))
+            word_end = int(record.get("word_end"))
+            edge_words = (ledger[word_start], ledger[word_end])
+        except (IndexError, TypeError, ValueError):
             continue
-        fallback_sources = [
-            str(source)
-            for source in sources
-            if str(source).startswith("stable-ts-fallback")
-        ]
-        if not fallback_sources:
+        if not _SUBTITLE_ID_RE.fullmatch(subtitle_id):
+            continue
+        if not any(
+            str(word.get("alignment_source") or "").startswith("stable-ts-fallback")
+            for word in edge_words
+            if isinstance(word, Mapping)
+        ):
             continue
         _append_marks(
             marks,
@@ -221,6 +259,175 @@ def _final_timeline_fallback_marks(directory: Path) -> List[SubtitleReviewMark]:
             code="timeline_alignment_fallback",
             reason="最终时间轴含 stable-ts 回退词；建议试听本条字幕的首尾。",
         )
+    return marks
+
+
+def _english_boundary_audit_marks(
+    directory: Path,
+) -> tuple[List[SubtitleReviewMark], bool]:
+    payload = _read_json(directory / "english-boundary-audit.json", {})
+    records = payload.get("records") if isinstance(payload, Mapping) else None
+    if not isinstance(records, list):
+        return [], False
+    marks: List[SubtitleReviewMark] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        classification = str(record.get("classification") or "")
+        confidence = str(record.get("confidence") or "")
+        if classification not in {"hard", "review"}:
+            continue
+        if classification == "review" and confidence != "high":
+            continue
+        right_id = str(record.get("right_subtitle_id") or "")
+        left_id = str(record.get("left_subtitle_id") or "")
+        target_id = right_id if _SUBTITLE_ID_RE.fullmatch(right_id) else left_id
+        if not _SUBTITLE_ID_RE.fullmatch(target_id):
+            continue
+        boundary = str(record.get("boundary") or "").strip()
+        reason = str(record.get("reason") or "英文边界需要人工复核").strip()
+        if boundary:
+            reason = f"{reason}：{boundary}"
+        _append_marks(
+            marks,
+            [target_id],
+            severity="BLOCKER" if classification == "hard" else "REVIEW",
+            category="english_cut",
+            target="english",
+            code="english_boundary_audit",
+            reason=reason,
+        )
+    return marks, True
+
+
+def _high_confidence_chinese_marks(validation: Any) -> List[SubtitleReviewMark]:
+    if not isinstance(validation, Mapping):
+        return []
+    severe_codes = {
+        "entity_loss",
+        "missing_predicate",
+        "negation_loss",
+        "number_mismatch",
+        "semantic_loss",
+    }
+    marks: List[SubtitleReviewMark] = []
+    for group in _as_list(validation.get("warnings")):
+        if not isinstance(group, Mapping) or group.get("code") != "chinese_semantic_group_warning":
+            continue
+        for entry in _group_entries(group):
+            if not bool(entry.get("mapping_valid")):
+                continue
+            try:
+                confidence_score = float(entry.get("confidence_score") or 0.0)
+            except (TypeError, ValueError):
+                confidence_score = 0.0
+            issue_codes = {str(code) for code in _as_list(entry.get("rule_codes"))}
+            subtitle_ids = _subtitle_ids(entry)
+            if confidence_score < 0.85 or not issue_codes.intersection(severe_codes) or not subtitle_ids:
+                continue
+            _append_marks(
+                marks,
+                [subtitle_ids[0]],
+                severity="REVIEW",
+                category="chinese_allocation",
+                target="chinese",
+                code="high_confidence_chinese_semantic_issue",
+                reason=_reason(entry, group),
+            )
+    return marks
+
+
+def _allocation_unresolved_marks(directory: Path) -> List[SubtitleReviewMark]:
+    unresolved = _read_json(directory / "allocation-unresolved.json", [])
+    high_value_codes = {
+        "entity_allocation_mismatch",
+        "missing_predicate",
+        "negation_allocation_mismatch",
+        "number_allocation_mismatch",
+        "semantic_loss",
+        "unnatural_chinese_fragment",
+    }
+    marks: List[SubtitleReviewMark] = []
+    for entry in _as_list(unresolved):
+        if not isinstance(entry, Mapping):
+            continue
+        issue_codes = {str(code) for code in _as_list(entry.get("issue_codes"))}
+        allocation = entry.get("allocation")
+        subtitle_ids = _subtitle_ids(entry)
+        if isinstance(allocation, Mapping):
+            subtitle_ids = _normalise_ids([*subtitle_ids, *allocation.keys()])
+        if not subtitle_ids or not issue_codes.intersection(high_value_codes):
+            continue
+        _append_marks(
+            marks,
+            [subtitle_ids[0]],
+            severity="REVIEW",
+            category="chinese_allocation",
+            target="chinese",
+            code="allocation_unresolved",
+            reason=str(entry.get("reason") or ", ".join(sorted(issue_codes))),
+        )
+    return marks
+
+
+def _visual_page_review_marks(directory: Path) -> List[SubtitleReviewMark]:
+    artifact = _read_json(directory / "display-page-translations.json", {})
+    plans = artifact.get("render_plans") if isinstance(artifact, Mapping) else None
+    if not isinstance(plans, list):
+        return []
+    high_value_codes = {
+        "compound_noun_split",
+        "modifier_head_split",
+        "object_attached_modifier_split",
+        "post_noun_participial_modifier_split",
+        "relative_clause_subject_verb_split",
+        "subject_finite_verb_split",
+        "subject_predicate_split",
+        "verb_complement_split",
+        "verb_preposition_complement_split",
+        "zero_relative_clause_split",
+    }
+    relative_starts = {"that", "which", "who", "whom", "whose"}
+    marks: List[SubtitleReviewMark] = []
+    for plan in plans:
+        if not isinstance(plan, Mapping):
+            continue
+        subtitle_id = str(plan.get("parent_subtitle_id") or "")
+        pages = plan.get("pages")
+        if not _SUBTITLE_ID_RE.fullmatch(subtitle_id) or not isinstance(pages, list):
+            continue
+        for page_index, page in enumerate(pages[1:], 1):
+            if not isinstance(page, Mapping):
+                continue
+            decision = page.get("boundary_before")
+            if not isinstance(decision, Mapping) or decision.get("classification") != "review":
+                continue
+            issue_codes = {str(code) for code in _as_list(decision.get("issue_codes"))}
+            current_words = str(page.get("english") or "").split()
+            previous_words = str(pages[page_index - 1].get("english") or "").split()
+            starts_relative = bool(
+                current_words
+                and re.sub(r"[^A-Za-z']", "", current_words[0]).lower() in relative_starts
+                and "dependency_phrase_entrance_split" in issue_codes
+            )
+            if not issue_codes.intersection(high_value_codes) and not starts_relative:
+                continue
+            boundary = " | ".join(
+                [
+                    previous_words[-1] if previous_words else "",
+                    current_words[0] if current_words else "",
+                ]
+            ).strip(" |")
+            _append_marks(
+                marks,
+                [subtitle_id],
+                severity="REVIEW",
+                category="visual_page",
+                target="both",
+                code="high_confidence_visual_page_boundary",
+                reason=f"视觉分页可能切开紧密语法单元：{boundary}。",
+            )
+            break
     return marks
 
 

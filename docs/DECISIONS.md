@@ -113,3 +113,49 @@ Trade-off:
 Multipage cues add one cacheable LLM allocation stage after final alignment.
 This costs latency on cache misses but gives page semantics an explicit,
 auditable owner and allows synthesis to fail before ffmpeg on contract drift.
+
+## 2026-08-09: Manual Structural Edits Preserve Frozen Parents And Source Media
+
+Decision:
+
+Manual page-count changes are display projections of one frozen parent cue.
+Tail deletion is a reversible suffix decision that materializes a separate,
+manifest-owned audio derivative on save.
+
+Reason:
+
+Changing a parent cue to solve a display problem would invalidate fixed IDs,
+Chinese ownership, and final timing. Cutting text or time evenly would ignore
+syntax, pauses, word ownership, and minimum page duration. Overwriting the
+source audio would make undo and package provenance unreliable.
+
+Selected design:
+
+- Reuse the production syntax/timing planner for requested 2/3/4-page layouts.
+- Keep parent ID, English, word span, and parent time frozen; require explicit
+  Chinese for every newly created display page.
+- Choose a suffix cut between retained and removed word envelopes, then use
+  FFmpeg `atrim` followed by `asetpts` to create a zero-based AAC derivative.
+- Bind source hash, decision hash, removed IDs, derived path, and derived hash
+  in the manual package. Undo restores subtitle, ledger, media, and evidence
+  ownership together.
+
+Rejected:
+
+- Splitting or renumbering the frozen parent cue for a visual-only problem.
+- Character-count, word-count, or equal-duration page slicing.
+- Truncating the source `.m4a` in place.
+- Deferring the cut only to renderer runtime without a portable derived media
+  artifact and manifest authority.
+
+Trade-off:
+
+The first save after a new cut performs one local audio encode, proportional to
+source duration. Identical decisions reuse the derivative. Formal publication
+remains blocked until new page Chinese is complete, and the first tail-trim
+release is limited to static podcast-template synthesis.
+
+Sources:
+
+- https://ffmpeg.org/ffmpeg-filters.html#atrim
+- https://doc.qt.io/qt-6/qundo.html

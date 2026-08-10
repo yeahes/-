@@ -2,27 +2,40 @@ import datetime
 import copy
 import json
 import os
+import shutil
 import time
+import uuid
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Mapping
 
 from PyQt5.QtCore import QSettings, QThread, pyqtSignal
 
 from app.common.config import cfg
 from app.core.bk_asr.asr_data import ASRData
 from app.core.entities import SubtitleConfig, SubtitleTask, TranslatorServiceEnum
+from app.core.output_paths import media_result_dir
 from app.core.article_context import (
+    ARTICLE_ANALYSIS_META_KEY,
+    ARTICLE_ASR_CORRECTION_POLICY_VERSION,
     ArticleLLMConfig,
     analyze_article_text,
     apply_article_asr_corrections,
+    article_text_hash,
     build_article_glossary,
     build_translation_context_prompt,
     clean_article_text,
     empty_article_context,
+    enrich_article_context_with_evidence,
     normalize_article_context,
     save_article_artifacts,
 )
 from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
+from app.core.subtitle_processor.stable_artifacts import (
+    file_sha256,
+    stable_artifact_dir,
+    write_json_artifact,
+    write_text_artifact,
+)
 from app.core.subtitle_processor.stable_run_state import (
     ResumePlan,
     StableRunStateStore,
@@ -71,6 +84,7 @@ class SubtitleThread(QThread):
     def __init__(self, task: SubtitleTask):
         super().__init__()
         self.task: SubtitleTask = task
+        self.attempt_id = uuid.uuid4().hex
         self.subtitle_length = 0
         self.finished_subtitle_length = 0
         self.custom_prompt_text = ""
@@ -261,6 +275,15 @@ class SubtitleThread(QThread):
     def _load_resume_asr_correction(self, output_dir: Path) -> ASRData | None:
         if not self._resume_plan.can_reuse("article_asr_correction"):
             return None
+        details = self._resume_stage_details("article_asr_correction")
+        if (
+            str(details.get("policy_version") or "")
+            != ARTICLE_ASR_CORRECTION_POLICY_VERSION
+        ):
+            logger.info(
+                "Resume ASR correction policy changed; recalculating article entities"
+            )
+            return None
         try:
             payload = json.loads((output_dir / "asr_corrected.json").read_text(encoding="utf-8"))
             return ASRData.from_json(payload)
@@ -399,6 +422,30 @@ class SubtitleThread(QThread):
         return metadata
 
     @staticmethod
+    def _require_valid_final_timeline_before_display_pages(
+        screen_editor: ScreenSubtitleEditor,
+    ) -> None:
+        validation = dict(
+            (getattr(screen_editor, "_final_cue_timeline", {}) or {}).get(
+                "validation", {}
+            )
+            or {}
+        )
+        errors = list(validation.get("errors") or [])
+        if validation.get("status") != "PASS" or errors:
+            codes = sorted(
+                {
+                    str(error.get("code") or "final_cue_timeline_invalid")
+                    for error in errors
+                    if isinstance(error, dict)
+                }
+            )
+            details = ", ".join(codes) if codes else "validation_missing"
+            raise RuntimeError(
+                "final_cue_timeline_invalid_before_display_pages: " + details
+            )
+
+    @staticmethod
     def _timeline_alignment_backend() -> str:
         try:
             return os.getenv(
@@ -486,12 +533,17 @@ class SubtitleThread(QThread):
                 or len(aligned_word_ledger.segments) != len(word_ledger.segments)
             ):
                 return use_stable_ledger_fallback("incomplete_frozen_word_ledger")
+            local_timing_fallbacks = []
+            local_timing_fallbacks.extend(
+                getattr(aligned_word_ledger, "whisperx_expansion_fallbacks", []) or []
+            )
+            local_timing_fallbacks.extend(
+                getattr(aligned_word_ledger, "whisperx_monotonicity_fallbacks", []) or []
+            )
             screen_editor.record_final_timeline_alignment(
                 requested_backend="whisperx-time-only",
                 applied_backend="whisperx-time-only",
-                local_timing_fallbacks=list(
-                    getattr(aligned_word_ledger, "whisperx_monotonicity_fallbacks", []) or []
-                ),
+                local_timing_fallbacks=local_timing_fallbacks,
             )
             rebuilt = screen_editor.rebuild_final_cue_timeline(
                 asr_data,
@@ -575,6 +627,15 @@ class SubtitleThread(QThread):
         context = normalize_article_context(
             getattr(self.task, "article_context_data", None)
         )
+        context_hash = str(
+            (context.get(ARTICLE_ANALYSIS_META_KEY) or {}).get("prompt_hash") or ""
+        )
+        expected_hash = article_text_hash(article_text)
+        if self._has_article_context(context) and context_hash != expected_hash:
+            logger.warning(
+                "Discarding stale article context: analysis hash does not match current text"
+            )
+            context = empty_article_context()
         if not self._has_article_context(context):
             llm_config = self._article_llm_config(subtitle_config)
             if llm_config is not None:
@@ -588,6 +649,7 @@ class SubtitleThread(QThread):
                     logger.warning("Article context analysis failed, fallback to empty context: %s", exc)
                     context = empty_article_context()
 
+        context = enrich_article_context_with_evidence(context, article_text)
         try:
             save_article_artifacts(output_dir, article_text, context)
         except Exception as exc:
@@ -637,7 +699,198 @@ class SubtitleThread(QThread):
             )
             lines.extend(line for line in body if line)
             lines.append("")
-        save_path.write_text("\n".join(lines), encoding="utf-8-sig")
+        write_text_artifact(
+            save_path,
+            "\n".join(lines),
+            encoding="utf-8-sig",
+        )
+
+    @staticmethod
+    def _stable_run_id() -> str:
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S.%f")
+        return f"{timestamp}-{uuid.uuid4().hex[:8]}"
+
+    @staticmethod
+    def _snapshot_stable_validation_artifacts(
+        coverage_report_path: str | None,
+        run_dir: Path,
+    ) -> tuple[str | None, Path | None, Path | None]:
+        if not coverage_report_path:
+            return None, None, None
+        report_source = Path(coverage_report_path)
+        if not report_source.is_file():
+            return coverage_report_path, None, None
+
+        report_target = run_dir / report_source.name
+        shutil.copy2(report_source, report_target)
+        artifact_source = stable_artifact_dir(report_source)
+        if not artifact_source.is_dir():
+            return str(report_target), None, None
+        artifact_target = run_dir / artifact_source.name
+        shutil.copytree(artifact_source, artifact_target)
+        return str(report_target), artifact_source, artifact_target
+
+    @staticmethod
+    def _rebase_stable_manifest_artifact_paths(
+        manifest_meta: dict,
+        artifact_source: Path | None,
+        artifact_target: Path | None,
+    ) -> dict:
+        metadata = copy.deepcopy(manifest_meta)
+        if artifact_source is None or artifact_target is None:
+            return metadata
+        for key in (
+            "final_cue_timeline_path",
+            "display_page_translation_path",
+            "display_boundary_evidence_path",
+            "qa_review_points_srt",
+            "qa_review_points_json",
+        ):
+            value = str(metadata.get(key) or "")
+            if not value:
+                continue
+            source_path = Path(value)
+            try:
+                relative = source_path.resolve().relative_to(artifact_source.resolve())
+            except (OSError, ValueError):
+                continue
+            metadata[key] = str(artifact_target / relative)
+        return metadata
+
+    def _write_stable_failure_record(
+        self,
+        output_dir: Path,
+        *,
+        coverage_report_path: str | None,
+        validation_summary: dict | None,
+        manifest_meta: dict | None,
+        editable_checkpoint_manifest_path: Path | None = None,
+    ) -> None:
+        failure = {
+            "schema_version": 1,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "attempt_id": self._stable_attempt_id(),
+            "source_subtitle": self.task.subtitle_path,
+            "output_path": str(self.task.output_path or ""),
+            "coverage_report": coverage_report_path,
+            "validation_status": "failed",
+            "render_blocked": True,
+            "validation_error_codes": [
+                str(issue.get("code"))
+                for issue in (validation_summary or {}).get("errors", [])
+                if issue.get("code")
+            ],
+            "validation_summary": validation_summary or {},
+        }
+        if manifest_meta:
+            failure.update(manifest_meta)
+        if editable_checkpoint_manifest_path is not None:
+            failure["editable_checkpoint_manifest_path"] = str(
+                editable_checkpoint_manifest_path
+            )
+        write_json_artifact(output_dir / "stable-last-failure.json", failure)
+
+    @staticmethod
+    def _display_failure_is_editable(validation_summary: dict | None) -> bool:
+        return any(
+            str(issue.get("code") or "") == "display_page_translation_invalid"
+            for issue in (validation_summary or {}).get("errors", [])
+            if isinstance(issue, dict)
+        )
+
+    def _stable_attempt_id(self) -> str:
+        attempt_id = str(self.__dict__.get("attempt_id", "") or "").strip()
+        if not attempt_id:
+            attempt_id = uuid.uuid4().hex
+            self.__dict__["attempt_id"] = attempt_id
+        return attempt_id
+
+    def _write_stable_editable_checkpoint(
+        self,
+        output_dir: Path,
+        asr_data: ASRData,
+        subtitle_config: SubtitleConfig,
+        *,
+        coverage_report_path: str | None,
+        validation_summary: dict | None,
+        manifest_meta: dict | None,
+    ) -> Path:
+        """Snapshot complete failed subtitles for editing without publishing them."""
+        run_id = self._stable_run_id()
+        run_dir = output_dir / "stable-checkpoints" / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        stable_paths = {
+            "original_top_srt": run_dir / "stable-final-original-top.srt",
+            "translation_top_srt": run_dir / "stable-final-translation-top.srt",
+            "only_original_srt": run_dir / "stable-final-only-original.srt",
+            "only_translation_srt": run_dir / "stable-final-only-translation.srt",
+        }
+        try:
+            for mode, path in stable_paths.items():
+                self._write_stable_srt(asr_data, path, mode.removesuffix("_srt"))
+            (
+                published_coverage_report,
+                artifact_source,
+                artifact_target,
+            ) = self._snapshot_stable_validation_artifacts(
+                coverage_report_path,
+                run_dir,
+            )
+            if artifact_target is None or not all(
+                (artifact_target / name).is_file()
+                for name in ("subtitle-spans.json", "word-ledger.json")
+            ):
+                raise RuntimeError(
+                    "editable_checkpoint_missing_frozen_word_artifacts"
+                )
+            published_meta = self._rebase_stable_manifest_artifact_paths(
+                manifest_meta or {},
+                artifact_source,
+                artifact_target,
+            )
+            error_codes = [
+                str(issue.get("code"))
+                for issue in (validation_summary or {}).get("errors", [])
+                if issue.get("code")
+            ]
+            source_media_path = ""
+            for candidate in (
+                getattr(self.task, "source_audio_path", None),
+                getattr(self.task, "video_path", None),
+            ):
+                if candidate and Path(candidate).is_file():
+                    source_media_path = str(Path(candidate).resolve())
+                    break
+            manifest = {
+                "schema_version": 2,
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "attempt_id": self._stable_attempt_id(),
+                "stable_run_id": run_id,
+                "stable_run_dir": str(run_dir),
+                "editable_checkpoint": True,
+                "source_subtitle": self.task.subtitle_path,
+                "output_path": str(self.task.output_path or ""),
+                "coverage_report": published_coverage_report,
+                "validation_status": "failed",
+                "render_blocked": True,
+                "validation_error_codes": error_codes,
+                "validation_summary": validation_summary or {},
+                "layout": subtitle_config.subtitle_layout,
+                "stable_mode": subtitle_config.screen_subtitle_stable_mode,
+                "subtitle_count": len(asr_data.segments),
+                "paths": {key: str(path) for key, path in stable_paths.items()},
+                "paths_sha256": {
+                    key: file_sha256(path) for key, path in stable_paths.items()
+                },
+                "source_media_path": source_media_path,
+            }
+            manifest.update(published_meta)
+            manifest_path = run_dir / "stable-final-manifest.json"
+            write_json_artifact(manifest_path, manifest)
+            return manifest_path
+        except Exception:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
 
     def _save_stable_subtitle_outputs(
         self,
@@ -660,76 +913,163 @@ class SubtitleThread(QThread):
         output_dir = output_path.parent
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        stable_paths = {
-            "original_top_srt": output_dir / "stable-final-original-top.srt",
-            "translation_top_srt": output_dir / "stable-final-translation-top.srt",
-            "only_original_srt": output_dir / "stable-final-only-original.srt",
-            "only_translation_srt": output_dir / "stable-final-only-translation.srt",
-        }
-        self._write_stable_srt(asr_data, stable_paths["original_top_srt"], "original_top")
-        self._write_stable_srt(
-            asr_data, stable_paths["translation_top_srt"], "translation_top"
-        )
-        self._write_stable_srt(
-            asr_data, stable_paths["only_original_srt"], "only_original"
-        )
-        self._write_stable_srt(
-            asr_data, stable_paths["only_translation_srt"], "only_translation"
-        )
-
         if validation_summary and validation_summary.get("status") == "ERROR":
             validation_status = "failed"
         render_blocked = validation_status == "failed"
-        if not render_blocked:
+        if render_blocked:
+            editable_checkpoint_manifest_path = None
+            if self._display_failure_is_editable(validation_summary):
+                try:
+                    editable_checkpoint_manifest_path = (
+                        self._write_stable_editable_checkpoint(
+                            output_dir,
+                            asr_data,
+                            subtitle_config,
+                            coverage_report_path=coverage_report_path,
+                            validation_summary=validation_summary,
+                            manifest_meta=manifest_meta,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Stable editable checkpoint save failed: %s", exc
+                    )
+            self._write_stable_failure_record(
+                output_dir,
+                coverage_report_path=coverage_report_path,
+                validation_summary=validation_summary,
+                manifest_meta=manifest_meta,
+                editable_checkpoint_manifest_path=editable_checkpoint_manifest_path,
+            )
+            logger.warning(
+                "Stable subtitle publication blocked; previous success preserved; "
+                "editable_checkpoint=%s failure=%s",
+                editable_checkpoint_manifest_path or "unavailable",
+                output_dir / "stable-last-failure.json",
+            )
+            return
+
+        run_id = self._stable_run_id()
+        run_dir = output_dir / "stable-runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        stable_paths = {
+            "original_top_srt": run_dir / "stable-final-original-top.srt",
+            "translation_top_srt": run_dir / "stable-final-translation-top.srt",
+            "only_original_srt": run_dir / "stable-final-only-original.srt",
+            "only_translation_srt": run_dir / "stable-final-only-translation.srt",
+        }
+        published = False
+        try:
+            self._write_stable_srt(
+                asr_data, stable_paths["original_top_srt"], "original_top"
+            )
+            self._write_stable_srt(
+                asr_data, stable_paths["translation_top_srt"], "translation_top"
+            )
+            self._write_stable_srt(
+                asr_data, stable_paths["only_original_srt"], "only_original"
+            )
+            self._write_stable_srt(
+                asr_data, stable_paths["only_translation_srt"], "only_translation"
+            )
+            (
+                published_coverage_report,
+                artifact_source,
+                artifact_target,
+            ) = self._snapshot_stable_validation_artifacts(
+                coverage_report_path,
+                run_dir,
+            )
+            published_meta = self._rebase_stable_manifest_artifact_paths(
+                manifest_meta or {},
+                artifact_source,
+                artifact_target,
+            )
+            manifest = {
+                "schema_version": 2,
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "stable_run_id": run_id,
+                "stable_run_dir": str(run_dir),
+                "source_subtitle": self.task.subtitle_path,
+                "output_path": str(output_path),
+                "coverage_report": published_coverage_report,
+                "validation_status": "passed",
+                "render_blocked": False,
+                "validation_error_codes": [],
+                "validation_summary": validation_summary or {},
+                "layout": subtitle_config.subtitle_layout,
+                "stable_mode": subtitle_config.screen_subtitle_stable_mode,
+                "subtitle_count": len(asr_data.segments),
+                "paths": {key: str(path) for key, path in stable_paths.items()},
+                "paths_sha256": {
+                    key: file_sha256(path)
+                    for key, path in stable_paths.items()
+                },
+            }
+            manifest.update(published_meta)
+            run_manifest_path = run_dir / "stable-final-manifest.json"
+            manifest_path = output_dir / "stable-final-manifest.json"
+            write_json_artifact(run_manifest_path, manifest)
+            write_json_artifact(manifest_path, manifest)
+            published = True
+        except Exception:
+            if not published:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+
+        # These are compatibility/convenience exports. The immutable run and
+        # root manifest above are already the source of truth.
+        for key, run_path in stable_paths.items():
+            compatibility_path = output_dir / run_path.name
+            try:
+                write_text_artifact(
+                    compatibility_path,
+                    run_path.read_text(encoding="utf-8-sig"),
+                    encoding="utf-8-sig",
+                )
+            except Exception as exc:
+                logger.warning("Stable compatibility export failed (%s): %s", key, exc)
+
+        try:
             if output_path.suffix.lower() == ".ass":
-                asr_data.to_ass(
-                    save_path=str(output_path),
+                output_text = asr_data.to_ass(
                     style_str=subtitle_config.subtitle_style,
                     layout=subtitle_config.subtitle_layout,
                 )
             elif output_path.suffix.lower() == ".srt":
-                asr_data.to_srt(
-                    save_path=str(output_path),
-                    layout=subtitle_config.subtitle_layout,
-                )
+                output_text = asr_data.to_srt(layout=subtitle_config.subtitle_layout)
+            else:
+                output_text = ""
+            if output_text:
+                write_text_artifact(output_path, output_text)
+        except Exception as exc:
+            logger.warning("Stable compatibility output failed: %s", exc)
 
-        manifest = {
-            "schema_version": 1,
-            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "source_subtitle": self.task.subtitle_path,
-            "output_path": str(output_path),
-            "coverage_report": coverage_report_path,
-            "validation_status": validation_status,
-            "render_blocked": render_blocked,
-            "validation_error_codes": [
-                str(issue.get("code"))
-                for issue in (validation_summary or {}).get("errors", [])
-                if issue.get("code")
-            ],
-            "validation_summary": validation_summary or {},
-            "layout": subtitle_config.subtitle_layout,
-            "stable_mode": subtitle_config.screen_subtitle_stable_mode,
-            "subtitle_count": len(asr_data.segments),
-            "paths": {key: str(path) for key, path in stable_paths.items()},
-        }
-        if manifest_meta:
-            manifest.update(manifest_meta)
         source_subtitle_paths = self._write_source_audio_subtitle_exports(asr_data)
+        if source_subtitle_paths:
+            source_subtitle_paths.update(
+                self._write_source_audio_display_page_exports(
+                    run_manifest_path,
+                    source_subtitle_paths,
+                )
+            )
         if source_subtitle_paths:
             manifest["source_subtitle_dir"] = str(self._source_audio_report_dir())
             manifest["source_subtitle_paths"] = source_subtitle_paths
+            manifest["source_subtitle_paths_sha256"] = {
+                key: file_sha256(Path(value))
+                for key, value in source_subtitle_paths.items()
+                if value and Path(value).is_file()
+            }
         qa_review_paths = self._write_source_audio_qc_queue(coverage_report_path)
         if qa_review_paths:
             manifest["qa_review_queue"] = qa_review_paths
         summary_paths = self._write_stable_result_summary(manifest)
         if summary_paths:
             manifest["result_summary_paths"] = summary_paths
-        manifest_path = output_dir / "stable-final-manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.info("Stable subtitle manifest saved: %s", manifest_path)
+        write_json_artifact(run_manifest_path, manifest)
+        write_json_artifact(manifest_path, manifest)
+        logger.info("Stable subtitle manifest published: %s", manifest_path)
 
     def _write_source_audio_qc_queue(self, coverage_report_path: str | None) -> dict:
         """Create one concise, time-addressable review SRT beside the source audio."""
@@ -768,7 +1108,11 @@ class SubtitleThread(QThread):
         paths = {"source_summary_txt": str(source_dir / "字幕处理结果摘要.txt")}
         for path_text in paths.values():
             try:
-                Path(path_text).write_text(summary, encoding="utf-8-sig")
+                write_text_artifact(
+                    Path(path_text),
+                    summary,
+                    encoding="utf-8-sig",
+                )
             except Exception as exc:
                 logger.warning("Writing stable result summary failed: %s", exc)
         return paths
@@ -910,8 +1254,19 @@ class SubtitleThread(QThread):
         source_dir = self._source_audio_report_dir()
         if source_dir is None:
             return {}
+        source_path = Path(
+            str(
+                getattr(self.task, "source_audio_path", None)
+                or getattr(self.task, "video_path", None)
+                or ""
+            )
+        )
+        source_stem = source_path.stem or "双语字幕"
         return {
             "bilingual_original_top_srt": str(source_dir / "双语字幕.srt"),
+            "named_bilingual_original_top_srt": str(
+                source_dir / f"{source_stem}-原文在上双语字幕.srt"
+            ),
             "only_translation_srt": str(source_dir / "中文字幕.srt"),
             "only_original_srt": str(source_dir / "英文字幕.srt"),
         }
@@ -924,6 +1279,11 @@ class SubtitleThread(QThread):
             self._write_stable_srt(
                 asr_data,
                 Path(paths["bilingual_original_top_srt"]),
+                "original_top",
+            )
+            self._write_stable_srt(
+                asr_data,
+                Path(paths["named_bilingual_original_top_srt"]),
                 "original_top",
             )
             self._write_stable_srt(
@@ -942,14 +1302,65 @@ class SubtitleThread(QThread):
             return {}
         return paths
 
+    def _write_source_audio_display_page_exports(
+        self,
+        manifest_path: Path,
+        source_subtitle_paths: Mapping[str, str],
+    ) -> dict:
+        source_path = Path(
+            str(
+                getattr(self.task, "source_audio_path", None)
+                or getattr(self.task, "video_path", None)
+                or ""
+            )
+        )
+        source_dir = self._source_audio_report_dir()
+        if source_dir is None:
+            return {}
+        source_dir.mkdir(parents=True, exist_ok=True)
+        source_stem = source_path.stem or "双语字幕"
+        parent_path = str(
+            source_subtitle_paths.get("named_bilingual_original_top_srt")
+            or source_subtitle_paths.get("bilingual_original_top_srt")
+            or ""
+        )
+        try:
+            from app.core.subtitle_processor.manual_final_subtitle_editor import (
+                ManualFinalSubtitleSession,
+            )
+
+            session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+            exported = session.export_display_page_subtitles(
+                source_dir / f"{source_stem}-实际分页双语字幕.srt",
+                source_dir / f"{source_stem}-实际分页映射.json",
+                source_parent_subtitle_path=parent_path or None,
+            )
+        except Exception as exc:
+            logger.warning("Source audio display-page export failed: %s", exc)
+            return {}
+        return {
+            "display_page_bilingual_srt": exported["srt"],
+            "display_page_map": exported["map"],
+        }
+
     def _source_audio_report_dir(self) -> Path | None:
-        source_path = getattr(self.task, "video_path", None) or ""
-        if not source_path:
+        source_media_text = (
+            getattr(self.task, "source_audio_path", None)
+            or getattr(self.task, "video_path", None)
+            or ""
+        )
+        output_anchor_text = (
+            getattr(self.task, "video_path", None) or source_media_text
+        )
+        if not source_media_text or not output_anchor_text:
             return None
-        source_dir = Path(source_path).parent
-        if not source_dir.exists():
+        output_anchor = Path(output_anchor_text)
+        if not output_anchor.parent.exists():
             return None
-        return source_dir
+        return media_result_dir(
+            source_media_text,
+            output_anchor=output_anchor,
+        )
 
     def _setup_api_config(self) -> SubtitleConfig:
         """设置API配置，返回SubtitleConfig"""
@@ -1088,6 +1499,7 @@ class SubtitleThread(QThread):
                         "resumed": article_correction_resumed,
                         "correction_ran": article_correction_ran,
                         "correction_applied": article_correction_applied,
+                        "policy_version": ARTICLE_ASR_CORRECTION_POLICY_VERSION,
                     },
                 )
             else:
@@ -1379,6 +1791,42 @@ class SubtitleThread(QThread):
                     preserve_aligned_timing=True,
                 )
                 try:
+                    self._require_valid_final_timeline_before_display_pages(
+                        screen_editor
+                    )
+                except RuntimeError as exc:
+                    validation_summary = {
+                        "status": "ERROR",
+                        "errors": [
+                            {
+                                "code": "final_cue_timeline_invalid",
+                                "message": str(exc),
+                                "items": list(
+                                    (
+                                        getattr(
+                                            screen_editor,
+                                            "_final_cue_timeline",
+                                            {},
+                                        )
+                                        or {}
+                                    ).get("validation", {}).get("errors", [])
+                                    or []
+                                ),
+                            }
+                        ],
+                        "warnings": [],
+                        "info": [],
+                    }
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=validation_summary,
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                    )
+                    raise
+                try:
                     page_stage_started = self._begin_stage(
                         "display_page_translation",
                         "双语分页语义分配",
@@ -1394,14 +1842,18 @@ class SubtitleThread(QThread):
                     self._active_stage = "screen_subtitle_edit"
                     self._active_stage_started_at = stage_started
                 except RuntimeError as exc:
+                    display_page_errors = list(
+                        getattr(exc, "display_page_errors", []) or []
+                    )
+                    issue = {
+                        "code": "display_page_translation_invalid",
+                        "message": str(exc),
+                    }
+                    if display_page_errors:
+                        issue["items"] = display_page_errors
                     validation_summary = {
                         "status": "ERROR",
-                        "errors": [
-                            {
-                                "code": "display_page_translation_invalid",
-                                "message": str(exc),
-                            }
-                        ],
+                        "errors": [issue],
                         "warnings": [],
                         "info": [],
                     }
@@ -1486,11 +1938,12 @@ class SubtitleThread(QThread):
 
             # 6. 保存字幕
             stage_started = self._begin_stage("final_subtitle_save", "写入稳定终稿")
-            asr_data.save(
-                save_path=self.task.output_path,
-                ass_style=subtitle_config.subtitle_style,
-                layout=subtitle_config.subtitle_layout,
-            )
+            if not subtitle_config.need_screen_subtitle_edit:
+                asr_data.save(
+                    save_path=self.task.output_path,
+                    ass_style=subtitle_config.subtitle_style,
+                    layout=subtitle_config.subtitle_layout,
+                )
             self._save_stage_json(article_output_dir, "final_subtitles.json", asr_data)
             self._save_stable_subtitle_outputs(
                 asr_data,
@@ -1518,11 +1971,16 @@ class SubtitleThread(QThread):
 
             # 7. 文件移动与清理
             if self.task.need_next_task and self.task.video_path:
-                # 保存srt/ass文件到视频目录（对于全流程任务）
-                save_srt_path = (
-                    Path(self.task.video_path).parent
-                    / f"{Path(self.task.video_path).stem}.srt"
+                # 保留兼容 SRT，但与其他用户可见产物放在同一结果目录。
+                source_media = (
+                    getattr(self.task, "source_audio_path", None)
+                    or self.task.video_path
                 )
+                result_dir = self._source_audio_report_dir()
+                if result_dir is None:
+                    result_dir = media_result_dir(source_media)
+                result_dir.mkdir(parents=True, exist_ok=True)
+                save_srt_path = result_dir / f"{Path(source_media).stem}.srt"
                 asr_data.to_srt(
                     save_path=str(save_srt_path), layout=subtitle_config.subtitle_layout
                 )

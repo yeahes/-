@@ -214,8 +214,78 @@ def test_review_queue_does_not_create_timing_review_for_full_whisperx_alignment(
         assert not [item for item in queue_payload["items"] if item["code"] == "timeline_alignment_fallback"]
 
 
+def test_review_queue_keeps_all_actionable_items_by_default():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir) / "sample-artifacts"
+        artifact_dir.mkdir()
+        subtitle_spans = []
+        translations = []
+        warning_items = []
+        for index in range(1, 16):
+            subtitle_id = f"S{index:04d}"
+            subtitle_spans.append(
+                {
+                    "subtitle_id": subtitle_id,
+                    "original": f"Review line {index}.",
+                    "translated": f"复核字幕{index}。",
+                }
+            )
+            translations.append(
+                {
+                    "subtitle_id": subtitle_id,
+                    "start_ms": index * 1000,
+                    "end_ms": index * 1000 + 800,
+                    "text": f"Review line {index}.",
+                    "translated_text": f"复核字幕{index}。",
+                }
+            )
+            warning_items.append(
+                {
+                    "subtitle_id": subtitle_id,
+                    "reason": "subtitle is too short",
+                }
+            )
+        _write_json(artifact_dir / "run-manifest.json", {"subtitle_count": 15})
+        _write_json(artifact_dir / "subtitle-spans.json", subtitle_spans)
+        _write_json(artifact_dir / "translations.json", translations)
+        _write_json(artifact_dir / "translation-structure-errors.json", [])
+        _write_json(artifact_dir / "allocation-unresolved.json", [])
+        _write_json(artifact_dir / "allocation-retry-log.json", [])
+        _write_json(
+            artifact_dir / "validation-report.json",
+            {
+                "errors": [],
+                "warnings": [
+                    {
+                        "code": "subtitle_duration_short_warning",
+                        "items": warning_items,
+                    }
+                ],
+            },
+        )
+
+        result = write_qa_review_artifacts(artifact_dir)
+        queue_payload = json.loads(Path(result["qa_review_queue_json"]).read_text(encoding="utf-8"))
+
+        assert result["queue_item_count"] == 15
+        assert result["omitted_review_count"] == 0
+        assert result["review_limit"] == 0
+        assert len(queue_payload["items"]) == 15
+        assert queue_payload["items"][-1]["subtitle_ids"] == ["S0015"]
+
+        limited_result = write_qa_review_artifacts(artifact_dir, review_limit=12)
+        limited_payload = json.loads(
+            Path(limited_result["qa_review_queue_json"]).read_text(encoding="utf-8")
+        )
+        assert limited_result["queue_item_count"] == 12
+        assert limited_result["omitted_review_count"] == 3
+        assert limited_result["review_limit"] == 12
+        assert len(limited_payload["items"]) == 12
+
+
 if __name__ == "__main__":
     test_review_queue_uses_final_times_and_excludes_invalid_audit_mapping()
     test_review_queue_marks_only_cues_with_final_timeline_fallback_words()
     test_review_queue_does_not_create_timing_review_for_full_whisperx_alignment()
+    test_review_queue_keeps_all_actionable_items_by_default()
     print("qa review queue tests passed")

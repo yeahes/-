@@ -316,8 +316,7 @@ class QASummaryBuilder:
                 if code == "suspicious_cut":
                     source_severity = "INFO"
                 items = group.get("items") if isinstance(group.get("items"), list) else [group]
-                max_items = 12 if source_severity == "REVIEW" else 8
-                for entry in items[:max_items]:
+                for entry in items:
                     entry_severity = source_severity
                     if code == "syntax_boundary_audit":
                         entry_severity = (
@@ -593,10 +592,14 @@ def _ms_to_srt_timestamp(ms: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
 
-def _review_queue_items(summary: dict, review_limit: int = 12) -> tuple[list[dict], int]:
-    """Keep the playable queue focused while preserving all findings in JSON."""
+def _review_queue_items(
+    summary: dict,
+    review_limit: int | None = None,
+) -> tuple[list[dict], int]:
+    """Keep every distinct blocker and actionable review in the playable queue."""
     selected: list[dict] = []
     review_count = 0
+    normalized_limit = None if review_limit is None else max(0, int(review_limit))
     seen: set[tuple[str, tuple[str, ...]]] = set()
     for item in summary.get("items") or []:
         severity = str(item.get("severity") or "")
@@ -608,10 +611,14 @@ def _review_queue_items(summary: dict, review_limit: int = 12) -> tuple[list[dic
         seen.add(key)
         if severity == "REVIEW":
             review_count += 1
-            if review_count > review_limit:
+            if normalized_limit is not None and review_count > normalized_limit:
                 continue
         selected.append(item)
-    omitted = max(0, review_count - review_limit)
+    omitted = (
+        max(0, review_count - normalized_limit)
+        if normalized_limit is not None
+        else 0
+    )
     return selected, omitted
 
 
@@ -629,7 +636,10 @@ def _review_item_time_range(item: dict) -> tuple[int, int] | None:
     return (start_ms, max(start_ms + 1, end_ms))
 
 
-def _review_queue_srt(summary: dict, review_limit: int = 12) -> tuple[str, dict]:
+def _review_queue_srt(
+    summary: dict,
+    review_limit: int | None = None,
+) -> tuple[str, dict]:
     items, omitted = _review_queue_items(summary, review_limit=review_limit)
     blocks: list[str] = []
     written_items: list[dict] = []
@@ -664,7 +674,7 @@ def _review_queue_srt(summary: dict, review_limit: int = 12) -> tuple[str, dict]
     return "\n\n".join(blocks) + ("\n" if blocks else ""), {
         "queue_item_count": len(written_items),
         "omitted_review_count": omitted,
-        "review_limit": review_limit,
+        "review_limit": 0 if review_limit is None else max(0, int(review_limit)),
         "subtitle_ids": [
             subtitle_id
             for item in written_items
@@ -676,9 +686,9 @@ def _review_queue_srt(summary: dict, review_limit: int = 12) -> tuple[str, dict]
 def write_qa_review_artifacts(
     artifact_dir: Path,
     source_audio_dir: Path | None = None,
-    review_limit: int = 12,
+    review_limit: int | None = None,
 ) -> dict:
-    """Write reproducible machine artifacts and one playable human-review SRT."""
+    """Write reproducible machine artifacts and a complete human-review SRT."""
     builder = QASummaryBuilder(artifact_dir)
     summary = builder.build()
     json_path = artifact_dir / "qa-summary.json"

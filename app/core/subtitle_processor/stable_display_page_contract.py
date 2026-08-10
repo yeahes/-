@@ -7,11 +7,15 @@ import json
 import re
 from typing import Any, Mapping, Sequence
 
+from app.core.subtitle_processor.chinese_token_boundaries import (
+    chinese_token_boundaries,
+)
 
-DISPLAY_PAGE_SCHEMA_VERSION = 1
-DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v1"
+
+DISPLAY_PAGE_SCHEMA_VERSION = 2
+DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v19"
 DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v2"
-DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v2"
+DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v4"
 
 
 class DisplayPageContractError(ValueError):
@@ -51,6 +55,156 @@ def display_page_id(parent_subtitle_id: str, page_index: int) -> str:
             page_index=page_index,
         )
     return f"{parent}.P{int(page_index):02d}"
+
+
+def _normalize_page_boundary(boundary: object) -> dict[str, Any]:
+    value = dict(boundary) if isinstance(boundary, Mapping) else {}
+    classification = str(value.get("classification") or "allow")
+    confidence = str(value.get("confidence") or "low")
+    if classification not in {"allow", "review", "hard"}:
+        raise DisplayPageContractError(
+            "display_page_boundary_classification_invalid",
+            "A frozen page boundary has an invalid classification.",
+            classification=classification,
+        )
+    if confidence not in {"low", "medium", "high"}:
+        raise DisplayPageContractError(
+            "display_page_boundary_confidence_invalid",
+            "A frozen page boundary has an invalid confidence.",
+            confidence=confidence,
+        )
+    result: dict[str, Any] = {
+        "classification": classification,
+        "confidence": confidence,
+        "issue_codes": sorted(
+            {str(code) for code in value.get("issue_codes") or [] if str(code)}
+        ),
+    }
+    for key in ("pause_ms", "boundary_score"):
+        if value.get(key) is not None:
+            result[key] = value[key]
+    if value.get("protected_syntax") is not None:
+        result["protected_syntax"] = bool(value.get("protected_syntax"))
+    return result
+
+
+def _normalize_render_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    parent_id = str(plan.get("parent_subtitle_id") or "").strip()
+    english = " ".join(str(plan.get("english") or "").split())
+    chinese = re.sub(r"\s+", "", str(plan.get("chinese") or ""))
+    try:
+        word_start = int(plan["word_start"])
+        word_end = int(plan["word_end"])
+        english_font_size = int(plan["english_font_size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DisplayPageContractError(
+            "display_render_plan_invalid",
+            "A frozen render plan is missing its word span or font size.",
+            parent_subtitle_id=parent_id,
+        ) from exc
+    if (
+        not parent_id
+        or not english
+        or word_start < 0
+        or word_end < word_start
+        or english_font_size <= 0
+    ):
+        raise DisplayPageContractError(
+            "display_render_plan_invalid",
+            "A frozen render plan has invalid identity, text, span, or typography.",
+            parent_subtitle_id=parent_id,
+        )
+
+    raw_pages = list(plan.get("pages") or [])
+    if not raw_pages:
+        raise DisplayPageContractError(
+            "display_render_plan_page_missing",
+            "Every frozen cue requires at least one render page.",
+            parent_subtitle_id=parent_id,
+        )
+    pages: list[dict[str, Any]] = []
+    cursor = word_start
+    for page_index, page in enumerate(raw_pages, 1):
+        page_id = str(page.get("display_page_id") or "").strip()
+        expected_page_id = display_page_id(parent_id, page_index)
+        try:
+            page_word_start = int(page["word_start"])
+            page_word_end = int(page["word_end"])
+            start_ms = int(page["start_ms"])
+            end_ms = int(page["end_ms"])
+            page_font_size = int(page["english_font_size"])
+            english_width = int(page["english_width"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DisplayPageContractError(
+                "display_render_page_invalid",
+                "A frozen render page is missing its span, timing, or typography.",
+                display_page_id=page_id or expected_page_id,
+            ) from exc
+        page_english = " ".join(str(page.get("english") or "").split())
+        english_lines = [
+            " ".join(str(line or "").split())
+            for line in page.get("english_lines") or []
+            if str(line or "").strip()
+        ]
+        if (
+            page_id != expected_page_id
+            or page_word_start != cursor
+            or page_word_end < page_word_start
+            or not page_english
+            or not english_lines
+            or " ".join(english_lines).split() != page_english.split()
+            or start_ms < 0
+            or end_ms <= start_ms
+            or page_font_size <= 0
+            or english_width <= 0
+        ):
+            raise DisplayPageContractError(
+                "display_render_page_invalid",
+                "A frozen render page violates identity, coverage, timing, or layout.",
+                display_page_id=page_id or expected_page_id,
+            )
+        pages.append(
+            {
+                "display_page_id": page_id,
+                "page_index": page_index,
+                "word_start": page_word_start,
+                "word_end": page_word_end,
+                "english": page_english,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "english_lines": english_lines,
+                "english_font_size": page_font_size,
+                "english_width": english_width,
+                "boundary_before": _normalize_page_boundary(
+                    page.get("boundary_before")
+                ),
+            }
+        )
+        cursor = page_word_end + 1
+    if cursor - 1 != word_end or " ".join(
+        page["english"] for page in pages
+    ).split() != english.split():
+        raise DisplayPageContractError(
+            "display_render_plan_coverage_invalid",
+            "Frozen render pages must reconstruct the parent word span and English.",
+            parent_subtitle_id=parent_id,
+        )
+    if min(page["english_font_size"] for page in pages) != english_font_size:
+        raise DisplayPageContractError(
+            "display_render_plan_font_summary_invalid",
+            "The parent font size must equal the smallest final-page font size.",
+            parent_subtitle_id=parent_id,
+        )
+    return {
+        "parent_subtitle_id": parent_id,
+        "english": english,
+        "chinese": chinese,
+        "word_start": word_start,
+        "word_end": word_end,
+        "english_font_size": english_font_size,
+        "font_fallback": dict(plan.get("font_fallback") or {"used": False}),
+        "pages": pages,
+    }
 
 
 def _normalize_parent(parent: Mapping[str, Any]) -> dict[str, Any]:
@@ -165,6 +319,7 @@ def build_display_page_contract(
     *,
     layout_profile: Mapping[str, Any],
     planner_version: str = DISPLAY_PAGE_PLANNER_VERSION,
+    render_plans: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     normalized = [_normalize_parent(parent) for parent in parents]
     parent_ids = [parent["parent_subtitle_id"] for parent in normalized]
@@ -173,11 +328,24 @@ def build_display_page_contract(
             "display_page_parent_id_duplicate",
             "A parent subtitle ID may appear only once in the page contract.",
         )
+    normalized_render_plans = [_normalize_render_plan(plan) for plan in render_plans]
+    render_plan_ids = [plan["parent_subtitle_id"] for plan in normalized_render_plans]
+    if len(render_plan_ids) != len(set(render_plan_ids)):
+        raise DisplayPageContractError(
+            "display_render_plan_parent_id_duplicate",
+            "A frozen subtitle ID may own only one render plan.",
+        )
+    if normalized_render_plans and not set(parent_ids).issubset(set(render_plan_ids)):
+        raise DisplayPageContractError(
+            "display_render_plan_parent_missing",
+            "Every translated multi-page parent requires a frozen render plan.",
+        )
     contract = {
         "schema_version": DISPLAY_PAGE_SCHEMA_VERSION,
         "planner_version": str(planner_version),
         "layout_profile": dict(layout_profile),
         "parents": normalized,
+        "render_plans": normalized_render_plans,
     }
     contract["contract_hash"] = _canonical_hash(contract)
     return contract
@@ -226,6 +394,9 @@ def page_translation_cache_key(
             "target_language": str(target_language),
             "context_hash": str(context_hash),
             "parents": semantic_parents,
+            "render_plan_hash": _canonical_hash(
+                contract.get("render_plans") or []
+            ),
         }
     )
 
@@ -356,12 +527,18 @@ def validate_page_translation_response(
             "schema_version": DISPLAY_PAGE_SCHEMA_VERSION,
             "status": "ERROR",
             "contract_hash": contract.get("contract_hash"),
+            "planner_version": contract.get("planner_version"),
+            "layout_profile": dict(contract.get("layout_profile") or {}),
+            "render_plans": [
+                dict(plan) for plan in contract.get("render_plans") or []
+            ],
             "errors": errors,
             "parents": [],
         }
 
     validated_parents: list[dict[str, Any]] = []
     for parent in contract.get("parents") or []:
+        parent_error_count = len(errors)
         pages = [
             {
                 **dict(page),
@@ -370,24 +547,62 @@ def validate_page_translation_response(
             for page in parent.get("pages") or []
         ]
         aggregate_chinese = "".join(page["zh"] for page in pages)
-        validated_parents.append(
-            {
-                "parent_subtitle_id": parent.get("parent_subtitle_id"),
-                "parent_english_hash": _text_hash(parent.get("english")),
-                "source_parent_chinese_hash": _text_hash(parent.get("source_chinese")),
-                "render_parent_chinese_hash": _text_hash(aggregate_chinese),
-                "word_start": parent.get("word_start"),
-                "word_end": parent.get("word_end"),
-                "aggregate_chinese": aggregate_chinese,
-                "pages": pages,
-            }
-        )
+        token_boundaries = chinese_token_boundaries(aggregate_chinese)
+        if token_boundaries is None:
+            errors.append(
+                {
+                    "code": "page_translation_chinese_tokenizer_unavailable",
+                    "parent_subtitle_id": parent.get("parent_subtitle_id"),
+                }
+            )
+        else:
+            offset = 0
+            for page in pages[:-1]:
+                offset += len(page["zh"])
+                if offset not in token_boundaries:
+                    errors.append(
+                        {
+                            "code": "page_translation_chinese_token_split",
+                            "parent_subtitle_id": parent.get("parent_subtitle_id"),
+                            "display_page_id": page.get("display_page_id"),
+                            "boundary_offset": offset,
+                        }
+                    )
+        if len(errors) == parent_error_count:
+            validated_parents.append(
+                {
+                    "parent_subtitle_id": parent.get("parent_subtitle_id"),
+                    "parent_english_hash": _text_hash(parent.get("english")),
+                    "source_parent_chinese_hash": _text_hash(parent.get("source_chinese")),
+                    "render_parent_chinese_hash": _text_hash(aggregate_chinese),
+                    "word_start": parent.get("word_start"),
+                    "word_end": parent.get("word_end"),
+                    "aggregate_chinese": aggregate_chinese,
+                    "pages": pages,
+                }
+            )
+    if errors:
+        return {
+            "schema_version": DISPLAY_PAGE_SCHEMA_VERSION,
+            "status": "ERROR",
+            "contract_hash": contract.get("contract_hash"),
+            "planner_version": contract.get("planner_version"),
+            "layout_profile": dict(contract.get("layout_profile") or {}),
+            "render_plans": [
+                dict(plan) for plan in contract.get("render_plans") or []
+            ],
+            "errors": errors,
+            "parents": validated_parents,
+        }
     return {
         "schema_version": DISPLAY_PAGE_SCHEMA_VERSION,
         "status": "PASS",
         "contract_hash": contract.get("contract_hash"),
         "planner_version": contract.get("planner_version"),
         "layout_profile": dict(contract.get("layout_profile") or {}),
+        "render_plans": [
+            dict(plan) for plan in contract.get("render_plans") or []
+        ],
         "errors": [],
         "parents": validated_parents,
     }

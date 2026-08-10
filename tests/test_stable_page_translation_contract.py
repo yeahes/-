@@ -3,6 +3,7 @@ import hashlib
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
@@ -48,6 +49,7 @@ def _timed_cue(case):
     duration = cue.end - cue.start
     cue.word_timing = tuple(
         {
+            "word_id": int(case["word_start"]) + index,
             "surface": word,
             "start": cue.start + duration * index / len(words),
             "end": cue.start + duration * (index + 1) / len(words),
@@ -142,12 +144,58 @@ def _word_entries_for_segments(segments):
         for index, word in enumerate(words):
             entries.append(
                 {
+                    "token": ScreenSubtitleEditor._word_tokens(word)[0],
                     "surface": word,
                     "start_time": segment.start_time + duration * index // len(words),
                     "end_time": segment.start_time + duration * (index + 1) // len(words),
                 }
             )
     return entries
+
+
+def _syntax_backed_page_cue(text, subtitle_id="S0001", *, seconds_per_word=0.32):
+    words = text.split()
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.max_english_words = 16
+    editor._active_word_entries = [
+        {
+            "token": ScreenSubtitleEditor._word_tokens(word)[0],
+            "surface": word,
+            "start_time": round(index * seconds_per_word * 1000),
+            "end_time": round((index * seconds_per_word + 0.24) * 1000),
+            "alignment_source": "fixture",
+        }
+        for index, word in enumerate(words)
+    ]
+    editor._active_source_word_spans = {1: (0, len(words) - 1)}
+    editor._syntax_protected_cuts = set()
+    editor._syntax_hard_cut_issues = {}
+    editor._syntax_soft_cut_issues = {}
+    editor._orphaned_finite_predicate_cache = {}
+    editor._syntax_nlp = None
+    editor._prepare_syntax_cut_hints()
+    cue = podcast_learning_video.Cue(
+        int(subtitle_id[1:]),
+        0.0,
+        len(words) * seconds_per_word,
+        text,
+        "测试字幕。",
+        "male",
+        subtitle_id=subtitle_id,
+        word_timing=tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * seconds_per_word,
+                "end": index * seconds_per_word + 0.24,
+            }
+            for index, word in enumerate(words)
+        ),
+        display_boundary_evidence=editor._display_boundary_evidence_for_span(
+            0, len(words) - 1
+        ),
+    )
+    return editor, cue
 
 
 def _assert_preflight_fails_before_ffmpeg(cues, subtitle_path):
@@ -166,6 +214,165 @@ def _assert_preflight_fails_before_ffmpeg(cues, subtitle_path):
         else:
             raise AssertionError("invalid page artifact must fail renderer preflight")
     assert not popen.called
+
+
+def _srt_timestamp_from_ms(value):
+    milliseconds = int(value)
+    hours, milliseconds = divmod(milliseconds, 3_600_000)
+    minutes, milliseconds = divmod(milliseconds, 60_000)
+    seconds, milliseconds = divmod(milliseconds, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def _write_persisted_manual_draft_package(root, case):
+    subtitle_path = root / "manual-final.srt"
+    artifact_dir = root / "manual-final-artifacts"
+    artifact_dir.mkdir()
+    timeline_path = artifact_dir / "final-cue-timeline.json"
+    ledger_path = artifact_dir / "word-ledger.json"
+    draft_artifact_path = artifact_dir / "manual-draft-page-plan.json"
+    manifest_path = root / "stable-final-manifest.json"
+    start_ms = round(float(case["start"]) * 1000)
+    end_ms = round(float(case["end"]) * 1000)
+    words = case["english"].split()
+    chinese = str(case["parent_chinese"])
+    subtitle_path.write_text(
+        "1\n"
+        f"{_srt_timestamp_from_ms(start_ms)} --> {_srt_timestamp_from_ms(end_ms)}\n"
+        f"{case['english']}\n{chinese}\n",
+        encoding="utf-8",
+    )
+    timeline_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "subtitle_id": case["subtitle_id"],
+                        "word_start": 0,
+                        "word_end": len(words) - 1,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "original": case["english"],
+                        "translated": chinese,
+                    }
+                ],
+                "validation": {"status": "PASS", "errors": []},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    duration = end_ms - start_ms
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {
+                        "surface": word,
+                        "start_ms": start_ms + duration * index // len(words),
+                        "end_ms": start_ms + duration * (index + 1) // len(words),
+                    }
+                    for index, word in enumerate(words)
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "schema_version": 2,
+        "render_blocked": True,
+        "validation_error_codes": ["manual_page_translation_required"],
+        "paths": {"original_top_srt": str(subtitle_path)},
+        "paths_sha256": {
+            "original_top_srt": hashlib.sha256(
+                subtitle_path.read_bytes()
+            ).hexdigest()
+        },
+        "final_cue_timeline_path": str(timeline_path),
+        "final_cue_timeline_sha256": hashlib.sha256(
+            timeline_path.read_bytes()
+        ).hexdigest(),
+        "word_ledger_path": str(ledger_path),
+        "word_ledger_sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    source_cues = podcast_learning_video.parse_srt(subtitle_path)
+    assert podcast_learning_video.attach_article_word_timing(
+        source_cues,
+        subtitle_path,
+    )
+    blueprint = podcast_learning_video.build_article_display_page_blueprint(
+        source_cues
+    )
+    frozen_render_plans = blueprint["render_plans"]
+    frozen_plan = frozen_render_plans[0]
+    manual_draft_chinese_pages = (
+        "我是说，如果你能把一种能力很强、",
+        "优化程度很高的人工智能，融入经济的每个领域，包括制造业、农业、",
+        "本地服务业，而且不需要一个5000亿美元的数据中心来运行它。",
+    )
+    assert len(frozen_plan["pages"]) == len(manual_draft_chinese_pages)
+    assert "".join(manual_draft_chinese_pages) == chinese
+    semantic_page_translations = {
+        page["display_page_id"]: {
+            "parent_subtitle_id": frozen_plan["parent_subtitle_id"],
+            "word_start": page["word_start"],
+            "word_end": page["word_end"],
+            "english": page["english"],
+            "chinese": page_chinese,
+        }
+        for page, page_chinese in zip(
+            frozen_plan["pages"],
+            manual_draft_chinese_pages,
+        )
+    }
+    draft_artifact = (
+        podcast_learning_video.build_article_manual_draft_page_artifact(
+            source_cues,
+            frozen_render_plans=frozen_render_plans,
+            semantic_page_translations=semantic_page_translations,
+        )
+    )
+    assert draft_artifact["status"] == "REVIEW"
+    draft_artifact_path.write_text(
+        json.dumps(draft_artifact, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    draft_artifact_sha256 = hashlib.sha256(
+        draft_artifact_path.read_bytes()
+    ).hexdigest()
+    manifest.update(
+        {
+            "manual_draft_page_plan_path": str(draft_artifact_path),
+            "manual_draft_page_plan_sha256": draft_artifact_sha256,
+            "manual_final_override": {
+                "schema_version": 2,
+                "subtitle_path": str(subtitle_path),
+                "subtitle_sha256": hashlib.sha256(
+                    subtitle_path.read_bytes()
+                ).hexdigest(),
+                "artifact_dir": str(artifact_dir),
+                "manual_draft_page_plan_path": str(draft_artifact_path),
+                "manual_draft_page_plan_sha256": draft_artifact_sha256,
+            },
+        }
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return {
+        "subtitle_path": subtitle_path,
+        "manifest_path": manifest_path,
+        "draft_artifact_path": draft_artifact_path,
+        "draft_artifact": draft_artifact,
+    }
 
 
 def test_s0078_reordered_chinese_is_bound_by_page_id():
@@ -268,6 +475,112 @@ def test_page_translation_rejects_missing_duplicate_and_unknown_page_ids():
             raise AssertionError("invalid page rows must not partially update parents")
 
 
+def test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages():
+    parents = [
+        {
+            "parent_subtitle_id": "S0001",
+            "english": "A valid parent",
+            "chinese": "甲乙",
+            "word_start": 0,
+            "word_end": 2,
+            "pages": [
+                {
+                    "display_page_id": "S0001.P01",
+                    "word_start": 0,
+                    "word_end": 0,
+                    "english": "A",
+                },
+                {
+                    "display_page_id": "S0001.P02",
+                    "word_start": 1,
+                    "word_end": 2,
+                    "english": "valid parent",
+                },
+            ],
+        },
+        {
+            "parent_subtitle_id": "S0002",
+            "english": "Students return",
+            "chinese": "留学生",
+            "word_start": 3,
+            "word_end": 4,
+            "pages": [
+                {
+                    "display_page_id": "S0002.P01",
+                    "word_start": 3,
+                    "word_end": 3,
+                    "english": "Students",
+                },
+                {
+                    "display_page_id": "S0002.P02",
+                    "word_start": 4,
+                    "word_end": 4,
+                    "english": "return",
+                },
+            ],
+        },
+    ]
+    render_plans = [
+        {
+            "parent_subtitle_id": parent["parent_subtitle_id"],
+            "english": parent["english"],
+            "chinese": parent["chinese"],
+            "word_start": parent["word_start"],
+            "word_end": parent["word_end"],
+            "english_font_size": 56,
+            "pages": [
+                {
+                    **dict(page),
+                    "start_ms": int(page["word_start"]) * 1000,
+                    "end_ms": (int(page["word_end"]) + 1) * 1000,
+                    "english_lines": [str(page["english"])],
+                    "english_font_size": 56,
+                    "english_width": 100,
+                }
+                for page in parent["pages"]
+            ],
+        }
+        for parent in parents
+    ]
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        render_plans=render_plans,
+    )
+    response = {
+        "pages": [
+            {"display_page_id": "S0001.P01", "zh": "甲"},
+            {"display_page_id": "S0001.P02", "zh": "乙"},
+            {"display_page_id": "S0002.P01", "zh": "留"},
+            {"display_page_id": "S0002.P02", "zh": "学生"},
+        ]
+    }
+
+    def boundaries(text):
+        return {1, 2} if text == "甲乙" else {3}
+
+    with patch(
+        "app.core.subtitle_processor.stable_display_page_contract.chinese_token_boundaries",
+        side_effect=boundaries,
+    ):
+        artifact = validate_page_translation_response(contract, response)
+
+    assert artifact["status"] == "ERROR"
+    assert artifact["render_plans"] == contract["render_plans"]
+    assert [parent["parent_subtitle_id"] for parent in artifact["parents"]] == [
+        "S0001"
+    ]
+    assert artifact["parents"][0]["aggregate_chinese"] == "甲乙"
+    assert artifact["errors"] == [
+        {
+            "code": "page_translation_chinese_token_split",
+            "parent_subtitle_id": "S0002",
+            "display_page_id": "S0002.P01",
+            "boundary_offset": 1,
+        }
+    ]
+
+
 def test_page_translation_cache_key_invalidates_semantic_page_contract_changes():
     case = _cases()["s0078_reordered_chinese"]
     contract = _contract(case)
@@ -299,6 +612,524 @@ def test_page_translation_cache_key_invalidates_semantic_page_contract_changes()
         page["start_ms"] = 100
         page["end_ms"] = 200
     assert key(contract) != key(changed_timing)
+
+    changed_planner = copy.deepcopy(contract)
+    changed_planner["planner_version"] = "article-fixed-font-pages-next"
+    assert key(contract) != key(changed_planner)
+
+
+def test_page_contract_and_cache_identity_include_frozen_font_and_boundary_evidence():
+    case = _cases()["s0078_reordered_chinese"]
+    cue = _timed_cue(case)
+    cue.display_boundary_evidence = {
+        str(case["pages"][1]["word_start"]): {
+            "hard_issues": [],
+            "soft_issues": ["dependency_phrase_entrance_split"],
+            "boundary_score": 12.0,
+            "pause_ms": 120,
+        }
+    }
+    blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+
+    def build(render_plans):
+        return build_display_page_contract(
+            blueprint["parents"],
+            layout_profile=blueprint["layout_profile"],
+            planner_version=blueprint["planner_version"],
+            render_plans=render_plans,
+        )
+
+    def key(contract):
+        return page_translation_cache_key(
+            contract,
+            model="test-model",
+            target_language="简体中文",
+            prompt_version="display-page-translation-v2",
+            algorithm_version="fixed-parent-page-allocation-v3",
+        )
+
+    baseline = build(blueprint["render_plans"])
+    changed_font_plans = copy.deepcopy(blueprint["render_plans"])
+    changed_font_plans[0]["english_font_size"] = 54
+    changed_font_plans[0]["font_fallback"] = {
+        "used": True,
+        "from": 56,
+        "to": 54,
+        "reason": "test",
+    }
+    for page in changed_font_plans[0]["pages"]:
+        page["english_font_size"] = 54
+    changed_boundary_plans = copy.deepcopy(blueprint["render_plans"])
+    changed_boundary_plans[0]["pages"][1]["boundary_before"] = {
+        "classification": "hard",
+        "confidence": "high",
+        "issue_codes": ["test_atomic_boundary"],
+    }
+
+    changed_font = build(changed_font_plans)
+    changed_boundary = build(changed_boundary_plans)
+
+    assert baseline["contract_hash"] != changed_font["contract_hash"]
+    assert baseline["contract_hash"] != changed_boundary["contract_hash"]
+    assert key(baseline) != key(changed_font)
+    assert key(baseline) != key(changed_boundary)
+
+
+def test_article_english_font_fallback_has_a_strict_50px_floor():
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_FALLBACK_SIZES == (
+        56,
+        54,
+        52,
+        50,
+    )
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES == ()
+    assert (
+        podcast_learning_video.ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
+        == podcast_learning_video.ARTICLE_SUBTITLE_EN_FALLBACK_SIZES
+    )
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE == 50
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_MIN_SIZE == 50
+
+
+def test_screenshot_page_boundaries_consume_frozen_boundary_evidence():
+    cases = [
+        (
+            "They're diverting those funds toward getting better results from accessible, some to much older hardware.",
+            "results",
+            "from",
+        ),
+        (
+            "like write text or play chess, but can reason through completely novel problems across any discipline.",
+            "reason",
+            "through",
+        ),
+        (
+            "But I'm looking at these sources, and they're arguing that being cut off from the most sophisticated chip-making gear is actually forcing these companies to become better engineers.",
+            "they're",
+            "arguing",
+        ),
+        (
+            "And achieving that level of universal, human-like reasoning across every domain requires an almost infinite amount of computing power.",
+            "every",
+            "domain",
+        ),
+        (
+            "You can't spend billions building an AGI model and expect to charge them a massive premium to use it.",
+            "expect",
+            "to",
+        ),
+        (
+            "You have to build something highly efficient that delivers an immediate, undeniable, and cheap return on investment.",
+            "immediate,",
+            "undeniable,",
+        ),
+        (
+            "We've actually seen reports in these sources that highly demanded AI services from Zipu AI,",
+            "reports",
+            "in",
+        ),
+        (
+            "Because the global market, which initially rewarded America's tech giants with higher share prices for these aggressive AI spending plans, they're suddenly looking across the Pacific.",
+            "share",
+            "prices",
+        ),
+        (
+            "relying on far less computing power, and completely avoiding these massive capital sinkholes.",
+            "and",
+            "completely",
+        ),
+        (
+            "I mean, Chinese tech titans are projected to invest less than a tenth of that amount in data centers by 2026.",
+            "invest",
+            "less",
+        ),
+    ]
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    for case_index, (text, left_word, right_word) in enumerate(cases, 1):
+        words = text.split()
+        split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == left_word and words[index] == right_word
+        )
+        cue = podcast_learning_video.Cue(
+            case_index,
+            0.0,
+            max(4.0, len(words) * 0.35),
+            text,
+            "测试字幕。",
+            "male",
+            subtitle_id=f"S{case_index:04d}",
+        )
+        cue.word_timing = tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * 0.3,
+                "end": index * 0.3 + 0.22,
+            }
+            for index, word in enumerate(words)
+        )
+        cue.display_boundary_evidence = {
+            str(split): {
+                "hard_issues": ["test_atomic_boundary"],
+                "soft_issues": [],
+                "boundary_score": 0.0,
+                "pause_ms": 80,
+            }
+        }
+
+        plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+        assert plan["status"] == "ok", text
+        assert split not in {page["word_start"] for page in plan["pages"][1:]}, text
+
+
+def test_real_syntax_evidence_steers_results_from_without_injected_fixture_issue():
+    text = (
+        "They're diverting those funds toward getting better results from "
+        "accessible, some to much older hardware."
+    )
+    editor, cue = _syntax_backed_page_cue(text, "S0066")
+    words = text.split()
+    split = words.index("from")
+    evaluation = editor._evaluate_stable_cut_boundary(split - 1, split)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert "dependency_phrase_entrance_split" in evaluation["soft_issues"]
+    assert plan["status"] == "ok"
+    assert split not in {page["word_start"] for page in plan["pages"][1:]}
+    assert words.index("some") in {
+        page["word_start"] for page in plan["pages"][1:]
+    }
+
+
+def test_medium_review_page_boundary_can_beat_static_font_reduction_on_quality():
+    text = (
+        "We've actually seen reports in these sources that highly demanded AI "
+        "services from Zipu AI,"
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0221")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 2
+    assert plan["font_size"]["english"] == 56
+    assert plan["font_fallback"] == {"used": False}
+    assert plan["pages"][1]["boundary_before"]["classification"] == "review"
+    assert plan["pages"][1]["boundary_before"]["confidence"] == "medium"
+    assert " ".join(page["en"] for page in plan["pages"]) == text
+
+
+def test_unsupported_tight_page_transition_loses_to_same_font_static_layout():
+    text = (
+        "Just to make the older machines do something they were never "
+        "designed to do."
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0150")
+    words = text.split()
+    split = words.index("they")
+    decision = podcast_learning_video._article_display_boundary_decision(cue, split)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert decision["classification"] == "review"
+    assert decision["confidence"] == "low"
+    assert "unsupported_tight_page_transition" in decision["issue_codes"]
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    assert plan["font_size"]["english"] == 56
+
+
+def test_complete_phrase_page_starts_remain_eligible_without_a_pause():
+    cases = (
+        (
+            "So they literally have to invent entirely new ways to solve the same "
+            "math problem out of pure survival.",
+            "ways",
+            "to",
+        ),
+        (
+            "smaller Chinese AI firms aren't throwing their limited capital into a "
+            "bottomless pit of cutting-edge chips to process raw data.",
+            "capital",
+            "into",
+        ),
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    for case_index, (text, page_left, page_start) in enumerate(cases, 1):
+        words = text.split()
+        split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == page_left and words[index] == page_start
+        )
+        cue = podcast_learning_video.Cue(
+            case_index,
+            0.0,
+            10.0,
+            text,
+            "测试字幕。",
+            "male",
+            subtitle_id=f"S{case_index:04d}",
+            word_timing=tuple(
+                {
+                    "word_id": index,
+                    "surface": word,
+                    "start": index * 0.4,
+                    "end": index * 0.4 + 0.4,
+                }
+                for index, word in enumerate(words)
+            ),
+        )
+
+        plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+        assert plan["status"] == "ok", text
+        assert plan["font_size"]["english"] == 56, text
+        assert podcast_learning_video._article_page_break_score(
+            cue,
+            words,
+            split,
+            len(words) / 2,
+            cue.word_timing,
+        ) is not None, text
+
+
+def test_atomic_of_and_dangling_coordinator_page_boundaries_are_hard():
+    cases = (
+        ("They underwrite half of a large data center.", "half", "of"),
+        ("They reviewed the sources and they reached a conclusion.", "and", "they"),
+    )
+
+    for case_index, (text, left_word, right_word) in enumerate(cases, 1):
+        _, cue = _syntax_backed_page_cue(text, f"S{case_index:04d}")
+        words = text.split()
+        split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == left_word and words[index] == right_word
+        )
+
+        decision = podcast_learning_video._article_display_boundary_decision(
+            cue,
+            split,
+        )
+
+        assert decision["classification"] == "hard", text
+        assert decision["confidence"] == "high", text
+
+
+def test_strong_pause_makes_clause_level_hard_page_boundary_reviewable():
+    text = (
+        "But I'm looking at these sources, and they're arguing that being cut "
+        "off from the most sophisticated chip-making gear is actually forcing "
+        "these companies to become better engineers."
+    )
+    editor, cue = _syntax_backed_page_cue(text, "S0120")
+    words = text.split()
+    cursor = 0.0
+    timings = []
+    for index, word in enumerate(words):
+        if word == "being":
+            cursor += 0.9
+        elif word == "is":
+            cursor += 0.8
+        start = cursor
+        end = start + 0.24
+        timings.append(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": start,
+                "end": end,
+            }
+        )
+        cursor = end + 0.04
+    cue.word_timing = tuple(timings)
+    cue.end = timings[-1]["end"] + 0.12
+    cue.display_boundary_evidence = editor._display_boundary_evidence_for_span(
+        0, len(words) - 1
+    )
+    for split in range(1, len(words)):
+        evidence = cue.display_boundary_evidence.get(str(split))
+        if evidence is not None:
+            evidence["pause_ms"] = round(
+                (timings[split]["start"] - timings[split - 1]["end"]) * 1000
+            )
+
+    split = words.index("is")
+    decision = podcast_learning_video._article_display_boundary_decision(cue, split)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert "subject_finite_verb_split" in decision["issue_codes"]
+    assert decision["classification"] == "review"
+    assert decision["confidence"] == "high"
+    assert decision["pause_ms"] >= 600
+    assert plan["status"] == "ok"
+    page_starts = {page["word_start"] for page in plan["pages"][1:]}
+    assert words.index("and") in page_starts
+    assert split in page_starts
+
+
+def test_low_confidence_tight_transition_does_not_force_major_font_reduction():
+    text = (
+        "They're tasked with producing advanced chips domestically to replace "
+        "the ones they can no longer import."
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0126")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert plan["font_size"]["english"] == 56
+
+
+def test_page_context_prefers_whole_attached_phrases_over_atomic_inner_cuts():
+    cases = (
+        (
+            "and then engineering a lightweight, highly aerodynamic four-cylinder "
+            "engine that somehow wins the exact same race,",
+            "somehow",
+            "wins",
+        ),
+        (
+            "They're forcing the domestic supply chain to communicate and optimize "
+            "at a level they never would have reached if they could just easily "
+            "import the hardware.",
+            "they",
+            "never",
+        ),
+        (
+            "Because in America, you have dozens of incredibly well-funded firms "
+            "locked in this expensive, almost existential race to develop AGI, "
+            "artificial general intelligence.",
+            "locked",
+            "in",
+        ),
+        (
+            "I mean, if you can integrate a highly capable, highly optimized AI "
+            "into every facet of your economy, manufacturing, agriculture, local "
+            "services, without requiring a 500 billion data center to run it.",
+            "facet",
+            "of",
+        ),
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    for case_index, (text, bad_left, bad_right) in enumerate(cases, 1):
+        _, cue = _syntax_backed_page_cue(
+            text,
+            f"S{case_index:04d}",
+            seconds_per_word=0.4,
+        )
+        words = text.split()
+        bad_split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == bad_left and words[index] == bad_right
+        )
+
+        plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+        assert plan["status"] == "ok", text
+        assert bad_split not in {
+            page["word_start"] for page in plan["pages"][1:]
+        }, text
+
+
+def test_structural_exception_can_use_actual_pixel_fit_above_sixteen_words():
+    text = (
+        "But the truly wild part of that leak is that NVIDIA's stock didn't "
+        "soar on the news."
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0002")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert len(text.split()) == 17
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    assert plan["font_size"]["english"] == 56
+
+
+def test_no_partition_failure_reports_deterministic_attempt_reasons():
+    text = "Supercalifragilisticexpialidocious Pneumonoultramicroscopicsilicovolcanoconiosis"
+    _, cue = _syntax_backed_page_cue(text, "S0999", seconds_per_word=0.2)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert plan["status"] == "render_structural_overflow"
+    assert plan["errors"][0]["attempted_reasons"]
+    assert "fixed_font_span_unreadable" in plan["errors"][0]["attempted_reasons"]
+
+
+def test_invalid_page_translation_cache_is_replaced_only_after_validation():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    invalid_cached = {
+        "pages": [
+            {
+                "display_page_id": display_page_id(case["subtitle_id"], 1),
+                "zh": case["pages"][0]["chinese"],
+            }
+        ]
+    }
+    valid_fresh = _response(case)
+
+    class Cache:
+        def __init__(self):
+            self.writes = []
+
+        def get_llm_result(self, *args, **kwargs):
+            return json.dumps(invalid_cached, ensure_ascii=False)
+
+        def set_llm_result(self, *args, **kwargs):
+            self.writes.append(json.loads(args[1]))
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.article_context_prompt = ""
+    editor.model = "test-model"
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(valid_fresh, ensure_ascii=False)
+                            )
+                        )
+                    ]
+                )
+            )
+        )
+    )
+
+    result, cache_hit = editor._request_display_page_translations(contract)
+
+    assert result == valid_fresh
+    assert cache_hit is False
+    assert editor.cache_manager.writes == [valid_fresh]
+    assert editor._display_page_external_request_count == 1
 
 
 def test_page_translation_rejects_page_level_chinese_speed_overflow():
@@ -390,13 +1221,51 @@ def test_renderer_uses_valid_page_mapping_without_proportional_fallback():
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     for case in _cases().values():
         cue = _timed_cue(case)
-        contract = _contract(case)
+        blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+        assert blueprint["parents"], case["case_id"]
+        frozen_plan = blueprint["render_plans"][0]
+        frozen_parent = blueprint["parents"][0]
+        page_count = len(frozen_parent["pages"])
+        chinese = case["parent_chinese"]
+        page_word_counts = [
+            int(page["word_end"]) - int(page["word_start"]) + 1
+            for page in frozen_parent["pages"]
+        ]
+        expected_chinese = (
+            podcast_learning_video._strict_split_chinese_visual_pages(
+                chinese,
+                page_count,
+                page_word_counts,
+                strict=True,
+            )
+        )
+        assert expected_chinese is not None
+        assert len(expected_chinese) == page_count
+        contract = build_display_page_contract(
+            [frozen_parent],
+            layout_profile=blueprint["layout_profile"],
+            planner_version=blueprint["planner_version"],
+            render_plans=blueprint["render_plans"],
+        )
         artifact = validate_page_translation_response(
             contract,
-            _response(case, reverse=True),
+            {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "zh": zh,
+                    }
+                    for page, zh in reversed(
+                        list(zip(frozen_parent["pages"], expected_chinese))
+                    )
+                ]
+            },
         )
         cue.zh = parent_chinese_by_id(artifact)[case["subtitle_id"]]
-        cue.display_page_translations = _page_translations(artifact)
+        assert podcast_learning_video.apply_article_display_page_translation_artifact(
+            [cue],
+            artifact,
+        )
 
         with patch.object(
             podcast_learning_video,
@@ -406,11 +1275,15 @@ def test_renderer_uses_valid_page_mapping_without_proportional_fallback():
             plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
 
         assert plan["status"] == "ok"
-        assert plan["font_size"] == {"english": 58, "chinese": 46}
-        _assert_exact_page_identity(plan, case)
-        assert [page["zh"] for page in plan["pages"]] == [
-            page["chinese"] for page in case["pages"]
+        assert plan["font_size"] == {
+            "english": int(frozen_plan["english_font_size"]),
+            "chinese": 46,
+        }
+        assert [page["display_page_id"] for page in plan["pages"]] == [
+            page["display_page_id"] for page in frozen_plan["pages"]
         ]
+        assert " ".join(page["en"] for page in plan["pages"]) == case["english"]
+        assert [page["zh"] for page in plan["pages"]] == expected_chinese
 
 
 def test_renderer_fails_closed_when_paginated_page_mapping_is_missing():
@@ -585,6 +1458,100 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
     ]
 
 
+def test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id():
+    text = (
+        "the ultimate consequence of this AI-enabled independence is a massive "
+        "redistribution of where economic value actually flows."
+    )
+    segment = ASRDataSeg(text, 1000, 8600, "这是完整中文。")
+    segment.subtitle_id = "S0201"
+    segment.word_start = 0
+    segment.word_end = len(text.split()) - 1
+    asr_data = ASRData([segment])
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.enable_stable_mode = True
+    editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
+    editor._active_source_segments_by_id = {}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._translation_structure_errors = []
+    editor._display_page_translation_artifact = {}
+    editor._display_page_translation_path = ""
+    editor._display_page_external_request_count = 0
+    editor.coverage_report_path = None
+    editor._display_boundary_evidence_for_span = lambda *args, **kwargs: {}
+    before = (segment.text, segment.translated_text, segment.start_time, segment.end_time)
+
+    overflow = podcast_learning_video.RenderStructuralOverflowError(
+        [{"cue_index": 1, "reason": "hard_page_boundary"}]
+    )
+    with patch(
+        "app.core.utils.podcast_learning_video.build_article_display_page_blueprint",
+        side_effect=overflow,
+    ):
+        try:
+            editor.apply_display_page_translations_after_final_timing(asr_data)
+        except RuntimeError as exc:
+            assert "display_page_translation_invalid" in str(exc)
+        else:
+            raise AssertionError("visual overflow must remain render-blocking")
+
+    issue = editor._translation_structure_errors[-1]
+    assert issue["code"] == "display_page_blueprint_invalid"
+    assert issue["subtitle_ids"] == ["S0201"]
+    assert issue["items"] == [
+        {
+            "subtitle_id": "S0201",
+            "cue_index": 1,
+            "reason": "hard_page_boundary",
+        }
+    ]
+    assert (segment.text, segment.translated_text, segment.start_time, segment.end_time) == before
+
+
+def test_screen_editor_normalizes_page_errors_to_frozen_parent_ids():
+    parents = [
+        {
+            "parent_subtitle_id": "S0201",
+            "pages": [
+                {"display_page_id": "S0201.P01"},
+                {"display_page_id": "S0201.P02"},
+            ],
+        },
+        {
+            "parent_subtitle_id": "S0202",
+            "pages": [{"display_page_id": "S0202.P01"}],
+        },
+    ]
+    items = ScreenSubtitleEditor._display_page_failure_items(
+        [
+            {
+                "code": "page_translation_chinese_token_split",
+                "display_page_id": "S0201.P02",
+            },
+            {
+                "code": "missing_display_page_ids",
+                "ids": ["S0202.P01"],
+            },
+        ],
+        parents,
+        fallback_reason="display_page_translation_invalid",
+    )
+
+    assert items == [
+        {
+            "subtitle_id": "S0201",
+            "display_page_id": "S0201.P02",
+            "reason": "page_translation_chinese_token_split",
+        },
+        {
+            "subtitle_id": "S0202",
+            "display_page_id": "S0202.P01",
+            "reason": "missing_display_page_ids",
+        },
+    ]
+
+
 def test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_tampered():
     case = _cases()["s0078_reordered_chinese"]
     aggregate_chinese = "".join(page["chinese"] for page in case["pages"])
@@ -642,8 +1609,15 @@ def test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_
         )
         page_artifact_path = artifact_dir / "display-page-translations.json"
         manifest_path = root / "stable-final-manifest.json"
+        stable_sha256 = hashlib.sha256(subtitle_path.read_bytes()).hexdigest()
         manifest_path.write_text(
-            json.dumps({"final_cue_timeline_path": str(timeline_path)}),
+            json.dumps(
+                {
+                    "paths": {"original_top_srt": str(subtitle_path)},
+                    "paths_sha256": {"original_top_srt": stable_sha256},
+                    "final_cue_timeline_path": str(timeline_path),
+                }
+            ),
             encoding="utf-8",
         )
         source_cues = podcast_learning_video.parse_srt(subtitle_path)
@@ -653,6 +1627,7 @@ def test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_
             blueprint["parents"],
             layout_profile=blueprint["layout_profile"],
             planner_version=blueprint["planner_version"],
+            render_plans=blueprint["render_plans"],
         )
         expected_pages = list(contract["parents"][0]["pages"])
         artifact = validate_page_translation_response(
@@ -675,6 +1650,8 @@ def test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_
         manifest_path.write_text(
             json.dumps(
                 {
+                    "paths": {"original_top_srt": str(subtitle_path)},
+                    "paths_sha256": {"original_top_srt": stable_sha256},
                     "final_cue_timeline_path": str(timeline_path),
                     "display_page_translation_path": str(page_artifact_path),
                     "display_page_translation_status": "PASS",
@@ -688,13 +1665,20 @@ def test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_
         )
 
         valid_cues = podcast_learning_video.parse_srt(subtitle_path)
-        podcast_learning_video.prepare_article_visual_page_plans(valid_cues, subtitle_path)
+        with patch.object(
+            podcast_learning_video,
+            "_build_article_english_page_plan",
+            side_effect=AssertionError("renderer must consume the frozen plan"),
+        ):
+            podcast_learning_video.prepare_article_visual_page_plans(
+                valid_cues,
+                subtitle_path,
+            )
         assert valid_cues[0].subtitle_id == case["subtitle_id"]
         assert valid_cues[0].article_page_plan["status"] == "ok"
         assert [page["zh"] for page in valid_cues[0].article_page_plan["pages"]] == [
             page["chinese"] for page in case["pages"]
         ]
-
         page_artifact_path.unlink()
         _assert_preflight_fails_before_ffmpeg(
             podcast_learning_video.parse_srt(subtitle_path),
@@ -727,6 +1711,325 @@ def test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_
             podcast_learning_video.parse_srt(subtitle_path),
             subtitle_path,
         )
+
+
+def test_parse_srt_preserves_numeric_only_bilingual_line_order():
+    cases = (
+        ("90%?\n90%？", "90%?", "90%？"),
+        ("90%？\n90%?", "90%?", "90%？"),
+    )
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        for index, (payload, expected_english, expected_chinese) in enumerate(
+            cases,
+            1,
+        ):
+            subtitle_path = root / f"numeric-{index}.srt"
+            subtitle_path.write_text(
+                f"1\n00:00:00,000 --> 00:00:01,000\n{payload}\n",
+                encoding="utf-8",
+            )
+
+            cue = podcast_learning_video.parse_srt(subtitle_path)[0]
+
+            assert cue.en == expected_english
+            assert cue.zh == expected_chinese
+
+
+def test_attach_article_word_timing_restores_hash_bound_boundary_evidence():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        subtitle_path = root / "stable-final-original-top.srt"
+        timeline_path = root / "final-cue-timeline.json"
+        ledger_path = root / "word-ledger.json"
+        evidence_path = root / "display-boundary-evidence.json"
+        manifest_path = root / "stable-final-manifest.json"
+        english = "Models improve through feedback."
+        chinese = "模型通过反馈改进。"
+        subtitle_path.write_text(
+            f"1\n00:00:00,000 --> 00:00:04,000\n{english}\n{chinese}\n",
+            encoding="utf-8",
+        )
+        timeline_path.write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "subtitle_id": "S0001",
+                            "word_start": 0,
+                            "word_end": 3,
+                            "start_ms": 0,
+                            "end_ms": 4000,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        ledger_path.write_text(
+            json.dumps(
+                {
+                    "words": [
+                        {"surface": word, "start_ms": index * 1000, "end_ms": (index + 1) * 1000}
+                        for index, word in enumerate(english.split())
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        boundaries = {
+            "1": {"hard_issues": ["subject_predicate_split"], "soft_issues": [], "pause_ms": 0},
+            "2": {"hard_issues": ["verb_preposition_complement_split"], "soft_issues": [], "pause_ms": 0},
+            "3": {"hard_issues": [], "soft_issues": [], "pause_ms": 420},
+        }
+        evidence_path.write_text(
+            json.dumps({"boundaries": boundaries}),
+            encoding="utf-8",
+        )
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "paths": {"original_top_srt": str(subtitle_path)},
+                    "paths_sha256": {
+                        "original_top_srt": hashlib.sha256(
+                            subtitle_path.read_bytes()
+                        ).hexdigest()
+                    },
+                    "final_cue_timeline_path": str(timeline_path),
+                    "final_cue_timeline_sha256": hashlib.sha256(
+                        timeline_path.read_bytes()
+                    ).hexdigest(),
+                    "word_ledger_path": str(ledger_path),
+                    "word_ledger_sha256": hashlib.sha256(
+                        ledger_path.read_bytes()
+                    ).hexdigest(),
+                    "display_boundary_evidence_path": str(evidence_path),
+                    "display_boundary_evidence_sha256": hashlib.sha256(
+                        evidence_path.read_bytes()
+                    ).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cues = podcast_learning_video.parse_srt(subtitle_path)
+        assert podcast_learning_video.attach_article_word_timing(cues, subtitle_path)
+        assert cues[0].display_boundary_evidence == boundaries
+
+        evidence_path.write_text(
+            json.dumps({"boundaries": {**boundaries, "2": {}}}),
+            encoding="utf-8",
+        )
+        tampered = podcast_learning_video.parse_srt(subtitle_path)
+        assert not podcast_learning_video.attach_article_word_timing(
+            tampered,
+            subtitle_path,
+        )
+        assert tampered[0].display_boundary_evidence is None
+
+
+def test_manual_draft_page_artifact_is_loaded_only_from_manifest_hash_binding():
+    case = _cases()["s0252_monotonic_chinese"]
+    with tempfile.TemporaryDirectory() as raw:
+        package = _write_persisted_manual_draft_package(Path(raw), case)
+        manifest = json.loads(
+            package["manifest_path"].read_text(encoding="utf-8")
+        )
+        override = manifest["manual_final_override"]
+        assert manifest["manual_draft_page_plan_path"] == override[
+            "manual_draft_page_plan_path"
+        ]
+        assert manifest["manual_draft_page_plan_sha256"] == override[
+            "manual_draft_page_plan_sha256"
+        ]
+        assert override["artifact_dir"] == str(
+            package["draft_artifact_path"].parent
+        )
+        assert package["draft_artifact"]["status"] == "REVIEW"
+        assert all(
+            "chinese" in page and "zh" not in page
+            for plan in package["draft_artifact"]["render_plans"]
+            for page in plan["pages"]
+        )
+        cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+        assert podcast_learning_video.attach_article_word_timing(
+            cues,
+            package["subtitle_path"],
+        )
+
+        assert podcast_learning_video.load_article_manual_draft_page_artifact(
+            cues,
+            package["subtitle_path"],
+        )
+        assert cues[0].article_page_plan["status"] == "ok"
+
+        unbound_manifest = copy.deepcopy(manifest)
+        unbound_manifest.pop("manual_draft_page_plan_sha256")
+        package["manifest_path"].write_text(
+            json.dumps(unbound_manifest, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        unbound_cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+        assert podcast_learning_video.attach_article_word_timing(
+            unbound_cues,
+            package["subtitle_path"],
+        )
+        assert not podcast_learning_video.load_article_manual_draft_page_artifact(
+            unbound_cues,
+            package["subtitle_path"],
+        )
+
+        mismatched_override = copy.deepcopy(manifest)
+        mismatched_override["manual_final_override"][
+            "manual_draft_page_plan_sha256"
+        ] = "0" * 64
+        package["manifest_path"].write_text(
+            json.dumps(mismatched_override, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        mismatched_cues = podcast_learning_video.parse_srt(
+            package["subtitle_path"]
+        )
+        assert podcast_learning_video.attach_article_word_timing(
+            mismatched_cues,
+            package["subtitle_path"],
+        )
+        assert not podcast_learning_video.load_article_manual_draft_page_artifact(
+            mismatched_cues,
+            package["subtitle_path"],
+        )
+
+        wrong_owner = copy.deepcopy(manifest)
+        wrong_owner["manual_final_override"]["artifact_dir"] = str(
+            package["subtitle_path"].parent
+        )
+        package["manifest_path"].write_text(
+            json.dumps(wrong_owner, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        wrong_owner_cues = podcast_learning_video.parse_srt(
+            package["subtitle_path"]
+        )
+        assert podcast_learning_video.attach_article_word_timing(
+            wrong_owner_cues,
+            package["subtitle_path"],
+        )
+        assert not podcast_learning_video.load_article_manual_draft_page_artifact(
+            wrong_owner_cues,
+            package["subtitle_path"],
+        )
+
+
+def test_manual_draft_preflight_consumes_frozen_artifact_without_replanning():
+    case = _cases()["s0252_monotonic_chinese"]
+    with tempfile.TemporaryDirectory() as raw:
+        package = _write_persisted_manual_draft_package(Path(raw), case)
+        cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+
+        with (
+            patch.object(
+                podcast_learning_video,
+                "_build_article_english_page_plan",
+                side_effect=AssertionError("frozen manual draft must not replan"),
+            ) as strict_planner,
+            patch.object(
+                podcast_learning_video,
+                "build_article_manual_draft_page_plan",
+                side_effect=AssertionError("frozen manual draft must not fallback"),
+            ) as fallback_planner,
+        ):
+            podcast_learning_video.prepare_article_visual_page_plans(
+                cues,
+                package["subtitle_path"],
+                allow_manual_draft=True,
+            )
+
+        strict_planner.assert_not_called()
+        fallback_planner.assert_not_called()
+        assert cues[0].article_page_plan["status"] == "ok"
+
+
+def test_manual_draft_preflight_rejects_missing_or_tampered_artifact_before_ffmpeg():
+    case = _cases()["s0252_monotonic_chinese"]
+    for mutation in ("missing", "tampered"):
+        with tempfile.TemporaryDirectory() as raw:
+            package = _write_persisted_manual_draft_package(Path(raw), case)
+            if mutation == "missing":
+                package["draft_artifact_path"].unlink()
+            else:
+                package["draft_artifact_path"].write_bytes(
+                    package["draft_artifact_path"].read_bytes() + b"\n"
+                )
+            cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+
+            with (
+                patch.object(
+                    podcast_learning_video,
+                    "_build_article_english_page_plan",
+                    side_effect=AssertionError("invalid persisted draft must not replan"),
+                ) as strict_planner,
+                patch.object(
+                    podcast_learning_video,
+                    "build_article_manual_draft_page_plan",
+                    side_effect=AssertionError("invalid persisted draft must not fallback"),
+                ) as fallback_planner,
+                patch.object(podcast_learning_video.subprocess, "Popen") as popen,
+            ):
+                try:
+                    podcast_learning_video.prepare_article_visual_page_plans(
+                        cues,
+                        package["subtitle_path"],
+                        allow_manual_draft=True,
+                    )
+                except podcast_learning_video.RenderStructuralOverflowError as exc:
+                    assert any(
+                        error.get("reason")
+                        == "missing_or_invalid_manual_draft_page_artifact"
+                        for error in exc.errors
+                    )
+                else:
+                    raise AssertionError(
+                        "missing or tampered manual draft artifact must fail preflight"
+                    )
+
+            strict_planner.assert_not_called()
+            fallback_planner.assert_not_called()
+            assert not popen.called
+
+
+def test_loaded_manual_draft_pages_match_persisted_identity_text_timing_and_font():
+    case = _cases()["s0252_monotonic_chinese"]
+    with tempfile.TemporaryDirectory() as raw:
+        package = _write_persisted_manual_draft_package(Path(raw), case)
+        cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+
+        podcast_learning_video.prepare_article_visual_page_plans(
+            cues,
+            package["subtitle_path"],
+            allow_manual_draft=True,
+        )
+
+        frozen_plan = package["draft_artifact"]["render_plans"][0]
+        loaded_plan = cues[0].article_page_plan
+        assert loaded_plan["source"] == "frozen_manual_draft_page_artifact"
+        assert loaded_plan["font_size"]["english"] == frozen_plan[
+            "english_font_size"
+        ]
+        assert len(loaded_plan["pages"]) == len(frozen_plan["pages"])
+        for loaded, frozen in zip(loaded_plan["pages"], frozen_plan["pages"]):
+            assert loaded["display_page_id"] == frozen["display_page_id"]
+            assert loaded["parent_subtitle_id"] == frozen_plan[
+                "parent_subtitle_id"
+            ]
+            assert loaded["en"] == frozen["english"]
+            assert loaded["zh"] == frozen["chinese"]
+            assert loaded["global_word_start"] == frozen["word_start"]
+            assert loaded["global_word_end"] == frozen["word_end"]
+            assert round(loaded["start"] * 1000) == frozen["start_ms"]
+            assert round(loaded["end"] * 1000) == frozen["end_ms"]
+            assert loaded["english_font_size"] == frozen["english_font_size"]
+            assert loaded["en_lines"] == frozen["english_lines"]
+            assert loaded["en_width"] == frozen["english_width"]
 
 
 def test_stable_artifact_write_failure_is_not_reported_as_success():
@@ -813,14 +2116,37 @@ if __name__ == "__main__":
     test_s0078_reordered_chinese_is_bound_by_page_id()
     test_s0252_monotonic_translation_remains_page_aligned()
     test_page_translation_rejects_missing_duplicate_and_unknown_page_ids()
+    test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages()
     test_page_translation_cache_key_invalidates_semantic_page_contract_changes()
+    test_page_contract_and_cache_identity_include_frozen_font_and_boundary_evidence()
+    test_article_english_font_fallback_has_a_strict_50px_floor()
+    test_screenshot_page_boundaries_consume_frozen_boundary_evidence()
+    test_real_syntax_evidence_steers_results_from_without_injected_fixture_issue()
+    test_medium_review_page_boundary_can_beat_static_font_reduction_on_quality()
+    test_unsupported_tight_page_transition_loses_to_same_font_static_layout()
+    test_complete_phrase_page_starts_remain_eligible_without_a_pause()
+    test_atomic_of_and_dangling_coordinator_page_boundaries_are_hard()
+    test_strong_pause_makes_clause_level_hard_page_boundary_reviewable()
+    test_low_confidence_tight_transition_does_not_force_major_font_reduction()
+    test_page_context_prefers_whole_attached_phrases_over_atomic_inner_cuts()
+    test_structural_exception_can_use_actual_pixel_fit_above_sixteen_words()
+    test_no_partition_failure_reports_deterministic_attempt_reasons()
+    test_invalid_page_translation_cache_is_replaced_only_after_validation()
     test_page_translation_rejects_page_level_chinese_speed_overflow()
     test_page_level_continuation_fragment_is_review_not_blocker()
     test_renderer_uses_valid_page_mapping_without_proportional_fallback()
     test_renderer_fails_closed_when_paginated_page_mapping_is_missing()
     test_page_translation_updates_parent_chinese_without_srt_structure_drift()
     test_screen_editor_applies_mocked_page_response_after_final_timing_only()
+    test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id()
+    test_screen_editor_normalizes_page_errors_to_frozen_parent_ids()
     test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_tampered()
+    test_parse_srt_preserves_numeric_only_bilingual_line_order()
+    test_attach_article_word_timing_restores_hash_bound_boundary_evidence()
+    test_manual_draft_page_artifact_is_loaded_only_from_manifest_hash_binding()
+    test_manual_draft_preflight_consumes_frozen_artifact_without_replanning()
+    test_manual_draft_preflight_rejects_missing_or_tampered_artifact_before_ffmpeg()
+    test_loaded_manual_draft_pages_match_persisted_identity_text_timing_and_font()
     test_stable_artifact_write_failure_is_not_reported_as_success()
     test_golden_page_translations_pass_existing_fixed_id_semantic_gate()
     print("stable page translation contract tests passed")

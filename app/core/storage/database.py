@@ -26,7 +26,10 @@ class DatabaseManager:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             self._engine = create_engine(
                 self.db_url,
-                connect_args={"check_same_thread": False},
+                connect_args={
+                    "check_same_thread": False,
+                    "timeout": 30.0,
+                },
                 pool_pre_ping=True,
                 pool_size=5,
                 max_overflow=10,

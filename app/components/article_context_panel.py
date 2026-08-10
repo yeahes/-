@@ -154,9 +154,15 @@ class ArticleContextPanel(QFrame):
         )
 
     def get_state(self):
+        current_text = self.text_edit.toPlainText().strip()
+        analysis_is_current = current_text == self.article_source_text.strip()
         return {
-            "article_source_text": self.article_source_text.strip(),
-            "article_context_data": self.article_context_data,
+            "article_source_text": current_text,
+            "article_context_data": (
+                self.article_context_data
+                if analysis_is_current
+                else empty_article_context()
+            ),
             "use_article_reference_assist": self.asr_switch.isChecked(),
             "use_article_translation_terms": self.translation_switch.isChecked(),
         }
@@ -197,6 +203,13 @@ class ArticleContextPanel(QFrame):
         self.article_analysis_thread.start()
 
     def _on_analysis_finished(self, context: dict, paths: dict):
+        if self.text_edit.toPlainText().strip() != self.article_source_text.strip():
+            self.article_context_data = empty_article_context()
+            self.analyze_button.setEnabled(True)
+            self.clear_button.setEnabled(True)
+            self.status_label.setText(self.tr("原文已修改，需要重新分析"))
+            self.summary_label.setText(self.tr("分析结果已失效"))
+            return
         self.article_context_data = context
         self.analyze_button.setEnabled(True)
         self.clear_button.setEnabled(True)

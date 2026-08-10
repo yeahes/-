@@ -10,6 +10,8 @@ from app.core.subtitle_processor.stable_run_state import (
     build_stable_run_fingerprint,
     format_stage_progress,
 )
+from app.core.article_context import ARTICLE_ASR_CORRECTION_POLICY_VERSION
+from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.thread.subtitle_thread import SubtitleThread
 
 
@@ -195,9 +197,48 @@ def test_progress_text_is_human_readable_and_signal_payload_remains_two_values()
     assert "预计剩余 00:30" in thread.progress.events[-1][1]
 
 
+def test_resume_recomputes_only_stale_article_asr_correction_policy():
+    class _ResumePlan:
+        @staticmethod
+        def can_reuse(stage):
+            return stage in {"article_context", "article_asr_correction"}
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "article_context.json").write_text(
+            '{"title":"Reference"}',
+            encoding="utf-8",
+        )
+        corrected = ASRData([ASRDataSeg("Ms Hao", 100, 500)])
+        (root / "asr_corrected.json").write_text(
+            json.dumps(corrected.to_json(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread._resume_plan = _ResumePlan()
+        thread._resume_stage_records = {
+            "article_context": {"details": {}},
+            "article_asr_correction": {
+                "details": {"policy_version": "article-asr-correction-v1"}
+            },
+        }
+
+        assert thread._load_resume_article_context(root)["title"] == "Reference"
+        assert thread._load_resume_asr_correction(root) is None
+
+        thread._resume_stage_records["article_asr_correction"]["details"][
+            "policy_version"
+        ] = ARTICLE_ASR_CORRECTION_POLICY_VERSION
+        resumed = thread._load_resume_asr_correction(root)
+
+        assert resumed is not None
+        assert [segment.text for segment in resumed.segments] == ["Ms Hao"]
+
+
 if __name__ == "__main__":
     test_matching_input_contract_reuses_only_verified_safe_stages()
     test_contract_changes_reject_resume_for_article_model_prompt_and_alignment()
     test_tampered_or_missing_artifact_is_not_reused_and_state_stays_valid_json()
     test_progress_text_is_human_readable_and_signal_payload_remains_two_values()
+    test_resume_recomputes_only_stale_article_asr_correction_policy()
     print("stable run state tests passed")

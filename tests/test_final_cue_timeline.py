@@ -172,6 +172,41 @@ def test_artifact_rejects_final_cue_that_ends_before_its_word_envelope():
     assert "final_timeline_word_envelope_uncovered" in codes
 
 
+def test_artifact_rejects_ledger_words_outside_the_first_and_last_cue():
+    words = _words((1000, 1200), (1210, 1400), (1410, 1600), (1610, 1800))
+    artifact = final_cue_timeline_artifact(
+        [
+            {
+                "subtitle_id": "S0001",
+                "word_start": 1,
+                "word_end": 2,
+                "word_envelope_start_ms": 1210,
+                "word_envelope_end_ms": 1600,
+                "start_ms": 1200,
+                "end_ms": 1610,
+            }
+        ],
+        words,
+        expected_subtitle_ids=["S0001"],
+    )
+
+    coverage_errors = [
+        item
+        for item in artifact["validation"]["errors"]
+        if item["code"] == "final_timeline_word_coverage_incomplete"
+    ]
+    assert artifact["validation"]["status"] == "ERROR"
+    assert coverage_errors == [
+        {
+            "code": "final_timeline_word_coverage_incomplete",
+            "missing_word_ids": [0, 3],
+            "duplicate_word_ids": [],
+            "expected_word_range": [0, 3],
+            "covered_word_range": [1, 2],
+        }
+    ]
+
+
 def test_artifact_rejects_cues_reordered_from_frozen_subtitle_ids():
     words = _words((1000, 1200), (1210, 1400), (1410, 1600), (1610, 1800))
     artifact = final_cue_timeline_artifact(

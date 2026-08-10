@@ -46,7 +46,7 @@ class MainWindow(FluentWindow):
         self.versionThread = QThread()
         self.versionManager.moveToThread(self.versionThread)
         self.versionThread.started.connect(self.versionManager.performCheck)
-        self.versionThread.start()
+        self._start_version_check_if_enabled()
 
         # 初始化导航界面
         self.initNavigation()
@@ -56,6 +56,10 @@ class MainWindow(FluentWindow):
         import atexit
 
         atexit.register(self.stop)
+
+    def _start_version_check_if_enabled(self):
+        if bool(cfg.checkUpdateAtStartUp.value):
+            self.versionThread.start()
 
     def initNavigation(self):
         """初始化导航栏"""
@@ -141,7 +145,7 @@ class MainWindow(FluentWindow):
         if w.exec():
             QDesktopServices.openUrl(QUrl(download_url))
         if force_update:
-            QApplication.quit()
+            self.close()
 
     def onAnnouncement(self, content):
         """显示公告"""
@@ -156,6 +160,33 @@ class MainWindow(FluentWindow):
             self.splashScreen.resize(self.size())
 
     def closeEvent(self, event):
+        subtitle_interface = getattr(
+            getattr(self, "homeInterface", None),
+            "subtitle_optimization_interface",
+            None,
+        )
+        if (
+            subtitle_interface is not None
+            and subtitle_interface.manual_final_save_in_progress()
+        ):
+            w = MessageBox(
+                self.tr("正在保存人工终稿"),
+                self.tr("完整分页检查仍在后台运行，保存完成前不能关闭程序。"),
+                self,
+            )
+            w.yesButton.setText(self.tr("继续等待"))
+            w.cancelButton.hide()
+            w.exec()
+            event.ignore()
+            return
+        can_close = getattr(
+            subtitle_interface,
+            "can_close_with_manual_edits",
+            None,
+        )
+        if callable(can_close) and not can_close():
+            event.ignore()
+            return
         # 关闭所有子界面
         # self.homeInterface.close()
         # self.batchProcessInterface.close()

@@ -18,6 +18,7 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    TextEdit,
     ToolTipFilter,
     ToolTipPosition,
 )
@@ -31,7 +32,14 @@ from app.core.entities import (
     SynthesisTask,
 )
 from app.core.task_factory import TaskFactory
-from app.thread.video_synthesis_thread import VideoSynthesisThread
+from app.thread.video_synthesis_thread import (
+    VideoSynthesisThread,
+    resolve_synthesis_package_inputs,
+)
+from app.core.subtitle_processor.manual_final_subtitle_editor import (
+    ManualFinalSubtitleEditError,
+    ManualFinalSubtitleSession,
+)
 
 
 current_dir = Path(__file__).parent.parent
@@ -46,6 +54,7 @@ class VideoSynthesisInterface(QWidget):
         self.setObjectName("VideoSynthesisInterface")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAcceptDrops(True)  # 启用拖放功能
+        self._manual_draft_mode = False
         self.setup_ui()
         self.setup_style()
         self.set_value()
@@ -87,9 +96,11 @@ class VideoSynthesisInterface(QWidget):
         # 字幕文件选择
         self.subtitle_layout = QHBoxLayout()
         self.subtitle_layout.setSpacing(15)
-        self.subtitle_label = BodyLabel(self.tr("字幕文件"), self)
+        self.subtitle_label = BodyLabel(self.tr("字幕/稳定字幕包"), self)
         self.subtitle_input = LineEdit(self)
-        self.subtitle_input.setPlaceholderText(self.tr("选择或者拖拽字幕文件"))
+        self.subtitle_input.setPlaceholderText(
+            self.tr("选择字幕文件或 stable-final-manifest.json")
+        )
         self.subtitle_input.setAcceptDrops(True)  # 启用拖放
         self.subtitle_button = PushButton(self.tr("浏览"))
         self.subtitle_layout.addWidget(self.subtitle_label)
@@ -100,9 +111,9 @@ class VideoSynthesisInterface(QWidget):
         # 视频文件选择
         self.video_layout = QHBoxLayout()
         self.video_layout.setSpacing(15)
-        self.video_label = BodyLabel(self.tr("视频文件"), self)
+        self.video_label = BodyLabel(self.tr("音频/视频文件"), self)
         self.video_input = LineEdit(self)
-        self.video_input.setPlaceholderText(self.tr("选择或者拖拽视频文件"))
+        self.video_input.setPlaceholderText(self.tr("选择或者拖拽原音频/视频文件"))
         self.video_input.setAcceptDrops(True)  # 启用拖放
         self.video_button = PushButton(self.tr("浏览"))
         self.video_layout.addWidget(self.video_label)
@@ -122,12 +133,17 @@ class VideoSynthesisInterface(QWidget):
         self.podcast_title_layout = QHBoxLayout()
         self.podcast_title_layout.setSpacing(15)
         self.podcast_title_label = BodyLabel(self.tr("模板标题"), self)
-        self.podcast_title_input = LineEdit(self)
-        self.podcast_title_input.setPlaceholderText(
-            self.tr("视频标题；文章模板会自动缩小并保持在三行内")
-        )
+        self.podcast_title_input = TextEdit(self)
+        self.podcast_title_input.setAcceptRichText(False)
+        self.podcast_title_input.setTabChangesFocus(True)
+        self.podcast_title_input.setFixedHeight(76)
+        self.podcast_title_input.setPlaceholderText(self.tr("视频标题"))
         self.podcast_title_layout.addWidget(self.podcast_title_label)
         self.podcast_title_layout.addWidget(self.podcast_title_input)
+        self.podcast_title_layout.setAlignment(
+            self.podcast_title_label,
+            Qt.AlignVCenter,
+        )
         self.config_layout.addLayout(self.podcast_title_layout)
 
         self.podcast_background_layout = QHBoxLayout()
@@ -218,6 +234,17 @@ class VideoSynthesisInterface(QWidget):
             self.tr("合成前让大模型根据字幕选择单词卡；会增加一次Token消耗")
         )
         self.command_bar.addAction(self.ai_vocab_action)
+
+        self.english_only_action = Action(
+            FIF.LANGUAGE,
+            self.tr("仅英文字幕"),
+            triggered=self.on_english_only_changed,
+            checkable=True,
+        )
+        self.english_only_action.setToolTip(
+            self.tr("隐藏视频字幕中的中文；单词卡中文释义保留")
+        )
+        self.command_bar.addAction(self.english_only_action)
 
         self.command_bar.addSeparator()
 
@@ -319,9 +346,10 @@ class VideoSynthesisInterface(QWidget):
     def setup_signals(self):
         # 文件选择相关信号
         self.subtitle_button.clicked.connect(self.choose_subtitle_file)
+        self.subtitle_input.textEdited.connect(self._clear_manual_draft_mode)
         self.video_button.clicked.connect(self.choose_video_file)
         self.podcast_style_combo.currentTextChanged.connect(self.save_podcast_style)
-        self.podcast_title_input.editingFinished.connect(self.save_podcast_title)
+        self.podcast_title_input.textChanged.connect(self.save_podcast_title)
         self.podcast_background_button.clicked.connect(self.choose_podcast_background)
         self.podcast_background_input.editingFinished.connect(
             self.save_podcast_background
@@ -345,8 +373,11 @@ class VideoSynthesisInterface(QWidget):
             cfg.podcast_learning_template.value
         )
         self.ai_vocab_action.setChecked(cfg.podcast_template_ai_vocab.value)
+        self.english_only_action.setChecked(
+            cfg.podcast_template_english_only.value
+        )
         self.podcast_style_combo.setCurrentText(cfg.podcast_template_style.value)
-        self.podcast_title_input.setText(cfg.podcast_template_title.value)
+        self.podcast_title_input.setPlainText(cfg.podcast_template_title.value)
         self.podcast_background_input.setText(cfg.podcast_template_background.value)
         self.podcast_cover_input.setText(cfg.podcast_template_cover.value)
         self.update_podcast_template_fields()
@@ -365,6 +396,7 @@ class VideoSynthesisInterface(QWidget):
         enabled = self.podcast_learning_template_action.isChecked()
         is_article = self.podcast_style_combo.currentText() == self.tr("文章单词")
         self.ai_vocab_action.setVisible(enabled)
+        self.english_only_action.setVisible(enabled)
         self.set_layout_visible(self.podcast_style_layout, enabled)
         self.set_layout_visible(self.podcast_title_layout, enabled)
         self.set_layout_visible(self.podcast_background_layout, enabled and not is_article)
@@ -398,8 +430,21 @@ class VideoSynthesisInterface(QWidget):
             self.need_video_action.setChecked(True)
         self.update_podcast_template_fields()
 
+    def on_english_only_changed(self, checked: bool):
+        cfg.set(cfg.podcast_template_english_only, checked)
+        self.english_only_action.setChecked(checked)
+        if checked:
+            cfg.set(cfg.podcast_learning_template, True)
+            self.podcast_learning_template_action.setChecked(True)
+            cfg.set(cfg.need_video, True)
+            self.need_video_action.setChecked(True)
+        self.update_podcast_template_fields()
+
     def save_podcast_title(self):
-        cfg.set(cfg.podcast_template_title, self.podcast_title_input.text().strip())
+        cfg.set(
+            cfg.podcast_template_title,
+            self.podcast_title_input.toPlainText().strip(),
+        )
 
     def save_podcast_style(self):
         cfg.set(cfg.podcast_template_style, self.podcast_style_combo.currentText())
@@ -441,13 +486,16 @@ class VideoSynthesisInterface(QWidget):
         subtitle_formats = " ".join(
             f"*.{fmt.value}" for fmt in SupportedSubtitleFormats
         )
-        filter_str = f"{self.tr('字幕文件')} ({subtitle_formats})"
+        filter_str = (
+            f"{self.tr('字幕或稳定字幕包')} "
+            f"({subtitle_formats} stable-final-manifest.json)"
+        )
 
         file_path, _ = QFileDialog.getOpenFileName(
             self, self.tr("选择字幕文件"), "", filter_str
         )
         if file_path:
-            self.subtitle_input.setText(file_path)
+            self.set_inputs("", file_path)
 
     def choose_video_file(self):
         # 构建文件过滤器
@@ -476,16 +524,122 @@ class VideoSynthesisInterface(QWidget):
         if not subtitle_file or not video_file:
             InfoBar.error(
                 self.tr("错误"),
-                self.tr("请选择字幕文件和视频文件"),
+                self.tr("请选择字幕/稳定字幕包和原音频/视频文件"),
                 duration=3000,
                 position=InfoBarPosition.TOP,
                 parent=self,
             )
             return None
-        return TaskFactory.create_synthesis_task(video_file, subtitle_file)
+        if not Path(subtitle_file).is_file() or not Path(video_file).is_file():
+            InfoBar.error(
+                self.tr("错误"),
+                self.tr("所选字幕包或媒体文件不存在。"),
+                duration=3000,
+                position=InfoBarPosition.TOP,
+                parent=self,
+            )
+            return None
+        return TaskFactory.create_synthesis_task(
+            video_file,
+            subtitle_file,
+            manual_draft_mode=self._manual_draft_mode,
+        )
+
+    def set_inputs(
+        self,
+        media_path: str,
+        subtitle_or_manifest_path: str,
+        *,
+        manual_draft_mode: bool = False,
+    ) -> None:
+        selected = Path(subtitle_or_manifest_path) if subtitle_or_manifest_path else None
+        if selected is not None:
+            if selected.suffix.lower() == ".srt" and not manual_draft_mode:
+                try:
+                    linked_manifest = ManualFinalSubtitleSession.find_manifest_for_subtitle(
+                        selected,
+                        work_dir=cfg.work_dir.value,
+                    )
+                except ManualFinalSubtitleEditError as exc:
+                    InfoBar.error(
+                        self.tr("字幕包关联失败"),
+                        str(exc),
+                        duration=5000,
+                        parent=self,
+                    )
+                    return
+                if linked_manifest is not None:
+                    try:
+                        linked_media, _ = resolve_synthesis_package_inputs(
+                            linked_manifest,
+                            media_path,
+                        )
+                    except RuntimeError:
+                        try:
+                            linked_media, _ = resolve_synthesis_package_inputs(
+                                linked_manifest,
+                                media_path,
+                                allow_manual_draft=True,
+                            )
+                        except RuntimeError as exc:
+                            InfoBar.error(
+                                self.tr("人工字幕包无效"),
+                                str(exc),
+                                duration=5000,
+                                parent=self,
+                            )
+                            return
+                        manual_draft_mode = True
+                        InfoBar.warning(
+                            self.tr("已进入人工草稿合成"),
+                            self.tr(
+                                "已找回该字幕的完整词级账本；输出将使用“【人工草稿】”前缀。"
+                            ),
+                            duration=5000,
+                            parent=self,
+                        )
+                    media_path = linked_media or media_path
+                    subtitle_or_manifest_path = str(linked_manifest)
+                    selected = linked_manifest
+            if manual_draft_mode and selected.name != "stable-final-manifest.json":
+                InfoBar.error(
+                    self.tr("人工草稿包无效"),
+                    self.tr("合成草稿必须从保存过的人工终稿清单进入。"),
+                    duration=4000,
+                    parent=self,
+                )
+                return
+            if selected.name == "stable-final-manifest.json":
+                try:
+                    media_path, subtitle_or_manifest_path = (
+                        resolve_synthesis_package_inputs(
+                            selected,
+                            media_path,
+                            allow_manual_draft=manual_draft_mode,
+                        )
+                    )
+                except RuntimeError as exc:
+                    InfoBar.error(
+                        self.tr("稳定字幕包无效"),
+                        str(exc),
+                        duration=4000,
+                        parent=self,
+                    )
+                    return
+                selected = Path(subtitle_or_manifest_path)
+            self._manual_draft_mode = bool(manual_draft_mode)
+            self.subtitle_input.setText(str(selected))
+        if media_path:
+            self.video_input.setText(str(media_path))
+
+    def _clear_manual_draft_mode(self, *_args) -> None:
+        self._manual_draft_mode = False
 
     def set_task(self, task: SynthesisTask):
         self.task = task
+        self._manual_draft_mode = bool(
+            getattr(task.synthesis_config, "manual_draft_mode", False)
+        )
         self.update_info()
 
     def update_info(self):
@@ -579,8 +733,10 @@ class VideoSynthesisInterface(QWidget):
             file_ext = os.path.splitext(file_path)[1][1:].lower()
 
             # 检查文件格式是否支持
-            if file_ext in {fmt.value for fmt in SupportedSubtitleFormats}:
-                self.subtitle_input.setText(file_path)
+            if file_ext in {fmt.value for fmt in SupportedSubtitleFormats} or (
+                Path(file_path).name == "stable-final-manifest.json"
+            ):
+                self.set_inputs("", file_path)
                 InfoBar.success(
                     self.tr("导入成功"),
                     self.tr("字幕文件已放入输入框"),

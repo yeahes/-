@@ -42,7 +42,7 @@ class FasterWhisperASR(BaseASR):
         max_comma_cent: int = 50,
         prompt: str = None,
     ):
-        super().__init__(audio_path, use_cache)
+        super().__init__(audio_path, use_cache, need_word_time_stamp)
 
         # 基本参数
         self.model_path = whisper_model
@@ -189,8 +189,57 @@ class FasterWhisperASR(BaseASR):
 
         return cmd
 
+    @staticmethod
+    def _repair_quantized_zero_duration_segments(
+        segments: list[ASRDataSeg],
+    ) -> list[ASRDataSeg]:
+        """Repair only sub-millisecond words collapsed by SRT serialization."""
+        repair_count = 0
+        for index, segment in enumerate(segments):
+            start = int(segment.start_time)
+            end = int(segment.end_time)
+            if end != start:
+                continue
+
+            repaired_start = start
+            if index > 0:
+                repaired_start = max(
+                    repaired_start,
+                    int(segments[index - 1].end_time),
+                )
+            next_distinct_start = next(
+                (
+                    int(candidate.start_time)
+                    for candidate in segments[index + 1 :]
+                    if int(candidate.start_time) > start
+                ),
+                None,
+            )
+            repaired_end = repaired_start + 1
+            if (
+                next_distinct_start is not None
+                and repaired_end > next_distinct_start
+            ):
+                raise RuntimeError(
+                    "Faster Whisper zero-duration timing cannot be repaired "
+                    f"without crossing the next word at segment {index}"
+                )
+            segment.start_time = repaired_start
+            segment.end_time = repaired_end
+            segment.timing_repair = "millisecond_quantization_zero_width"
+            repair_count += 1
+
+        if repair_count:
+            logger.warning(
+                "Repaired %s zero-duration Faster Whisper word timestamp(s) "
+                "after millisecond SRT quantization",
+                repair_count,
+            )
+        return segments
+
     def _make_segments(self, resp_data: str) -> list[ASRDataSeg]:
         asr_data = ASRData.from_srt(resp_data)
+        self._repair_quantized_zero_duration_segments(asr_data.segments)
         # 过滤掉纯音乐标记
         filtered_segments = []
         for seg in asr_data.segments:
@@ -237,30 +286,42 @@ class FasterWhisperASR(BaseASR):
             error_msg = ""
 
             # 实时打印日志和错误输出
-            while self.process.poll() is None:
+            while True:
                 output = self.process.stdout.readline()
                 output = output.strip()
-                if output:
-                    # 解析进度百分比
-                    if match := re.search(r"(\d+)%", output):
-                        progress = int(match.group(1))
-                        if progress == 100:
-                            is_finish = True
-                        mapped_progress = int(5 + (progress * 0.9))
-                        callback(mapped_progress, f"{mapped_progress} %")
-                    if "Subtitles are written to" in output:
+                if not output:
+                    if self.process.poll() is not None:
+                        break
+                    continue
+                # 解析进度百分比
+                if match := re.search(r"(\d+)%", output):
+                    progress = int(match.group(1))
+                    if progress == 100:
                         is_finish = True
-                        callback(100, "识别完成")
-                    if "error" in output:
-                        error_msg += output
-                        logger.error(output)
-                    else:
-                        logger.info(output)
+                    mapped_progress = int(5 + (progress * 0.9))
+                    callback(mapped_progress, f"{mapped_progress} %")
+                if "Subtitles are written to" in output:
+                    is_finish = True
+                    callback(100, "识别完成")
+                if "error" in output:
+                    error_msg += output
+                    logger.error(output)
+                else:
+                    logger.info(output)
 
             # 获取所有输出和错误信息
             self.process.communicate()
 
             logger.info("Faster Whisper 返回值: %s", self.process.returncode)
+            if self.process.returncode != 0:
+                logger.error(
+                    "Faster Whisper exited with return code %s: %s",
+                    self.process.returncode,
+                    error_msg,
+                )
+                raise RuntimeError(
+                    f"Faster Whisper return code {self.process.returncode}: {error_msg}"
+                )
             if not is_finish:
                 logger.error("Faster Whisper 错误: %s", error_msg)
                 raise RuntimeError(error_msg)

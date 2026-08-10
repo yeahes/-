@@ -10,8 +10,8 @@ if str(ROOT) not in sys.path:
 
 from app.core.subtitle_processor.subtitle_review_marks import (
     SubtitleReviewMark,
-    _load_syntax_nlp,
     load_subtitle_review_marks,
+    review_marks_require_syntax_parser,
     review_marks_from_payload,
     review_marks_to_payload,
 )
@@ -57,9 +57,9 @@ def test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only():
                             {
                                 "subtitle_ids": ["S0004", "S0005"],
                                 "mapping_valid": True,
-                                "confidence_score": 0.72,
-                                "reason": "group_allocation_information_omission",
-                                "rule_codes": ["group_allocation_information_omission"],
+                                "confidence_score": 0.9,
+                                "reason": "semantic_loss",
+                                "rule_codes": ["semantic_loss"],
                             },
                             {
                                 "subtitle_ids": ["S0009"],
@@ -96,6 +96,60 @@ def test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only():
             ],
         )
         _write_json(
+            artifact_dir / "english-boundary-audit.json",
+            {
+                "records": [
+                    {
+                        "left_subtitle_id": "S0002",
+                        "right_subtitle_id": "S0003",
+                        "classification": "review",
+                        "confidence": "high",
+                        "reason": "subject_finite_verb_split",
+                        "boundary": "analysis | confirms",
+                    }
+                ]
+            },
+        )
+        _write_json(
+            artifact_dir / "display-page-translations.json",
+            {
+                "status": "PASS",
+                "render_plans": [
+                    {
+                        "parent_subtitle_id": "S0010",
+                        "pages": [
+                            {"english": "investors"},
+                            {
+                                "english": "blanching at the news",
+                                "boundary_before": {
+                                    "classification": "review",
+                                    "confidence": "medium",
+                                    "issue_codes": [
+                                        "post_noun_participial_modifier_split"
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        "parent_subtitle_id": "S0011",
+                        "pages": [
+                            {"english": "being cut off from advanced gear"},
+                            {
+                                "english": "is forcing better engineering",
+                                "boundary_before": {
+                                    "classification": "review",
+                                    "confidence": "high",
+                                    "pause_ms": 800,
+                                    "issue_codes": ["subject_predicate_split"],
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+        _write_json(
             artifact_dir / "subtitle-spans.json",
             [
                 {
@@ -127,26 +181,92 @@ def test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only():
         marks = load_subtitle_review_marks(artifact_dir)
 
         assert ("BLOCKER", "structure", "both", "translation_id_missing") in _marks_for(marks, "S0001")
-        if _load_syntax_nlp() is not None:
-            assert (
-                "REVIEW",
-                "english_cut",
-                "english",
-                "verified_cross_boundary_dependency",
-            ) in _marks_for(marks, "S0002")
-            assert (
-                "REVIEW",
-                "english_cut",
-                "english",
-                "verified_cross_boundary_dependency",
-            ) in _marks_for(marks, "S0003")
+        assert (
+            "REVIEW",
+            "english_cut",
+            "english",
+            "english_boundary_audit",
+        ) in _marks_for(marks, "S0003")
+        assert (
+            "REVIEW",
+            "chinese_allocation",
+            "chinese",
+            "high_confidence_chinese_semantic_issue",
+        ) in _marks_for(marks, "S0004")
+        assert (
+            "REVIEW",
+            "chinese_allocation",
+            "chinese",
+            "allocation_unresolved",
+        ) in _marks_for(marks, "S0007")
+        assert (
+            "REVIEW",
+            "visual_page",
+            "both",
+            "high_confidence_visual_page_boundary",
+        ) in _marks_for(marks, "S0010")
+        assert (
+            "REVIEW",
+            "visual_page",
+            "both",
+            "high_confidence_visual_page_boundary",
+        ) in _marks_for(marks, "S0011")
+        assert review_marks_require_syntax_parser(artifact_dir) is False
+        assert "S0002" not in marks
         assert "S0006" not in marks
         assert "S0099" not in marks
         assert "S0009" not in marks
-        assert "S0004" not in marks
         assert "S0005" not in marks
-        assert "S0007" not in marks
         assert "S0008" not in marks
+
+
+def test_display_page_blueprint_failure_marks_exact_frozen_subtitle_id():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        _write_json(
+            artifact_dir / "translation-structure-errors.json",
+            [
+                {
+                    "code": "display_page_blueprint_invalid",
+                    "message": "render_structural_overflow: hard_page_boundary",
+                    "parent_subtitle_id": "S0201",
+                    "display_page_id": "S0201.P01",
+                    "items": [
+                        {
+                            "subtitle_id": "S0201",
+                            "cue_index": 201,
+                            "reason": "hard_page_boundary",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        marks = load_subtitle_review_marks(artifact_dir)
+
+        assert set(marks) == {"S0201"}
+        assert (
+            "BLOCKER",
+            "visual_page",
+            "english",
+            "display_page_blueprint_invalid",
+        ) in _marks_for(marks, "S0201")
+
+
+def test_corrupt_structure_error_artifact_is_not_silently_treated_as_no_marks():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        (artifact_dir / "translation-structure-errors.json").write_text(
+            "{not-json",
+            encoding="utf-8",
+        )
+
+        try:
+            load_subtitle_review_marks(artifact_dir)
+        except ValueError as exc:
+            assert "translation-structure-errors.json" in str(exc)
+        else:
+            raise AssertionError("corrupt blocker evidence must fail closed")
 
 
 def test_table_marks_only_the_relevant_english_or_chinese_column():
@@ -195,15 +315,26 @@ def test_review_marks_include_final_timeline_fallback_for_matching_subtitle_id()
                 "records": [
                     {
                         "subtitle_id": "S0001",
-                        "word_alignment_sources": ["whisperx"],
+                        "word_start": 0,
+                        "word_end": 2,
                     },
                     {
                         "subtitle_id": "S0002",
-                        "word_alignment_sources": [
-                            "stable-ts-fallback+final-ledger-boundary-reconciled",
-                            "whisperx",
-                        ],
+                        "word_start": 3,
+                        "word_end": 4,
                     },
+                ]
+            },
+        )
+        _write_json(
+            artifact_dir / "word-ledger.json",
+            {
+                "words": [
+                    {"alignment_source": "whisperx"},
+                    {"alignment_source": "stable-ts-fallback"},
+                    {"alignment_source": "whisperx"},
+                    {"alignment_source": "whisperx"},
+                    {"alignment_source": "stable-ts-fallback"},
                 ]
             },
         )
@@ -283,6 +414,8 @@ def test_manual_english_boundary_edit_marks_only_its_chinese_cell():
 
 if __name__ == "__main__":
     test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only()
+    test_display_page_blueprint_failure_marks_exact_frozen_subtitle_id()
+    test_corrupt_structure_error_artifact_is_not_silently_treated_as_no_marks()
     test_table_marks_only_the_relevant_english_or_chinese_column()
     test_review_marks_include_final_timeline_fallback_for_matching_subtitle_id()
     test_table_model_reset_reloads_imported_bilingual_rows()

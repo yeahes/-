@@ -307,6 +307,9 @@ class Config(QConfig):
     podcast_template_ai_vocab = ConfigItem(
         "Video", "PodcastTemplateAiVocab", False, BoolValidator()
     )
+    podcast_template_english_only = ConfigItem(
+        "Video", "PodcastTemplateEnglishOnly", False, BoolValidator()
+    )
     podcast_template_style = OptionsConfigItem(
         "Video",
         "PodcastTemplateStyle",

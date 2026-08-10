@@ -581,6 +581,7 @@ class SynthesisConfig:
     podcast_learning_template: bool = False
     podcast_template_style: str = "暗色播客"
     podcast_template_ai_vocab: bool = False
+    podcast_template_english_only: bool = False
     podcast_template_title: str = ""
     podcast_template_background: str = ""
     podcast_template_cover: str = ""
@@ -588,6 +589,7 @@ class SynthesisConfig:
     subtitle_render_mode: str = "ASS样式"
     subtitle_layout: str = "译文在上"
     rounded_style: dict = field(default_factory=dict)
+    manual_draft_mode: bool = False
 
 
 @dataclass
@@ -608,6 +610,11 @@ class TranscribeTask:
     need_next_task: bool = False
 
     transcribe_config: Optional[TranscribeConfig] = None
+    source_audio_path: Optional[str] = None
+    article_reference_text: str = ""
+    article_context_data: Optional[dict] = None
+    use_article_reference_assist: bool = False
+    use_article_translation_terms: bool = False
 
 
 @dataclass
@@ -628,6 +635,8 @@ class SubtitleTask:
 
     # 是否需要执行下一个任务（视频合成）
     need_next_task: bool = True
+    # 交互式完整流程先停在字幕编辑器，由用户明确发起合成。
+    require_manual_review_before_synthesis: bool = False
 
     subtitle_config: Optional[SubtitleConfig] = None
     article_reference_text: str = ""
@@ -676,6 +685,11 @@ class TranscriptAndSubtitleTask:
 
     transcribe_config: Optional[TranscribeConfig] = None
     subtitle_config: Optional[SubtitleConfig] = None
+    source_audio_path: Optional[str] = None
+    article_reference_text: str = ""
+    article_context_data: Optional[dict] = None
+    use_article_reference_assist: bool = False
+    use_article_translation_terms: bool = False
 
 
 @dataclass
@@ -694,6 +708,11 @@ class FullProcessTask:
     transcribe_config: Optional[TranscribeConfig] = None
     subtitle_config: Optional[SubtitleConfig] = None
     synthesis_config: Optional[SynthesisConfig] = None
+    source_audio_path: Optional[str] = None
+    article_reference_text: str = ""
+    article_context_data: Optional[dict] = None
+    use_article_reference_assist: bool = False
+    use_article_translation_terms: bool = False
 
 
 class BatchTaskType(Enum):

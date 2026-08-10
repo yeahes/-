@@ -1,6 +1,611 @@
 # Current State
 
-Last updated: 2026-08-06
+Last updated: 2026-08-10
+
+## 2026-08-10 Semantic Two-Line Vocabulary Notes
+
+- Root cause: article vocabulary-card concept notes still used the generic
+  mixed-text wrapper, which treated Chinese as individual characters. Its
+  short-tail rebalance ran only when one line had at most three Chinese
+  characters, so `市场变 / 化而消失` remained eligible.
+- Concept notes now use a dedicated display-only wrapper. Candidate breaks come
+  from the vendored Chinese tokenizer, reject attached punctuation and weak
+  line starts, and prefer the boundary after a short explanatory lead-in such
+  as `本句用数学隐喻说明`. Notes remain limited to two lines; short notes remain
+  on one line.
+- The reported note now renders as `本句用数学隐喻说明 / 留学回报的旧有优势已随市场变化而消失。`
+  at the existing 26-unit font. No note text, prompt version, cache schema,
+  selection, timing, subtitle, manifest, or synthesis contract changed.
+- Focused renderer tests pass. A read-only scan of 70 unique cached concept
+  notes reports zero third lines, truncation, width overflow, non-token breaks,
+  or rejected line starts. The 1920x1080 checked sample is
+  `tests/caption_audit/out/article-vocab-semantic-wrap-20260810.png`.
+- The unified regression completed 23/25 stages. Its two failures reproduce
+  outside this change: one stale English line-layout expectation in stable
+  caption smoke tests and one existing 56px expectation in the display-page
+  translation contract. Both are outside vocabulary-card rendering.
+
+## 2026-08-10 Multiline Podcast Title Input
+
+- The synthesis page's `模板标题` field is now a two-line plain-text editor.
+  Enter inserts a real newline; the field no longer requires users to encode a
+  line break inside a one-line control.
+- The UI persists the exact plain text, including internal newlines, to
+  `PodcastTemplateTitle`. `TaskFactory` freezes that same value in
+  `SynthesisConfig.podcast_template_title`, and the renderer's existing title
+  wrapper treats each explicit line as a fixed boundary.
+- No additional config field, cache key, output-name rule, subtitle field, or
+  rendering contract was added. Automatic lexical title wrapping remains the
+  fallback when the user enters a single line.
+- The focused UI/task snapshot test and complete video-synthesis safety script
+  pass. The unified regression passes all 25 stages in 412 seconds. A rendered
+  1280x720 synthesis-page sample is at
+  `tests/caption_audit/out/synthesis-multiline-title-input-20260810.png`.
+
+## 2026-08-10 Article Card Page Timing And Title Wrapping
+
+- Root cause of early cards: article cues may be divided into several final
+  display pages, while the vocabulary scheduler used only the parent cue start.
+  A phrase on page two or three therefore appeared while an earlier page was
+  still visible.
+- Article-template scheduling now resolves each exact source phrase against the
+  final frozen page plan and starts the card at the page that contains it. A
+  phrase split across pages or without one unique page is omitted. The dark
+  podcast template retains parent-cue timing.
+- Root cause of the broken title was the generic width-first character wrapper.
+  The title panel now uses the vendored deterministic Chinese tokenizer plus
+  punctuation boundaries, selects a balanced legal break, and preserves an
+  explicit newline. `中国年轻人为何不爱留学了？` renders as
+  `中国年轻人为何 / 不爱留学了？`.
+- Chinese opening titles use the bundled `ChillYunmoGothicHeavy.otf`, one step
+  heavier than the previous Bold face. Font sizing and the three-line panel
+  safety limit remain unchanged.
+- No vocabulary prompt, cache schema, card selection, ASR, subtitle boundary,
+  translation, fixed ID, cue timeline, SRT/ASS, manifest, or synthesis-entry
+  contract changed.
+- Focused timing and title tests pass; `tests/test_stable_caption_rules.py`
+  passes in 96.3 seconds; the unified regression passes all 25 stages in 395.1
+  seconds. Visual evidence is in
+  `tests/caption_audit/out/article-vocab-page-alignment-after-20260810.png` and
+  `tests/caption_audit/out/study-abroad-title-wrap-heavy-20260810.png`.
+
+## 2026-08-09 Recoverable Display-Page Translation Failure
+
+- Root cause: article-assisted fuzzy correction could select a window such as
+  `Like, Peking University` or `President Donald` even when the complete
+  canonical entity already existed inside or immediately beside that window.
+  Replacing the whole window deleted the discourse word or title.
+- A local source-span guard now rejects only non-expanding fuzzy candidates
+  that overlap an already complete canonical span. Legitimate spelling and
+  phonetic corrections, including three cached `Higee/Higgies -> haigui`
+  replacements, retain their existing thresholds and time envelopes.
+- Root cause of the editor fallback: one invalid page-Chinese token boundary
+  returned an `ERROR` artifact with empty `parents` and no `render_plans`.
+  The existing editable-checkpoint path therefore had only parent subtitles to
+  show even though deterministic English pagination had succeeded.
+- Error artifacts now retain every frozen render plan and every independently
+  valid page-Chinese parent. Invalid parents contribute no authoritative page
+  Chinese; their real English pages remain visible, blank, and explicitly
+  marked for manual review. Formal publication and synthesis remain blocked.
+- The real 19:54 study-abroad checkpoint was replayed read-only: 262 frozen
+  parents produce 303 actual pages across 36 multipage parents. `S0001` exposes
+  all three English pages with blank Chinese and review markers. Article replay
+  preserves `Like, Peking University` and `President Donald Trump` while still
+  correcting all three `haigui` variants. No network, ASR, LLM, FFmpeg, or
+  source-artifact write occurred.
+- Article correction passes 30/30, the complete page-translation contract and
+  manual-final editor scripts pass, and production-file syntax compilation
+  passes. Unified regression completes all 25 stages in 342.9 seconds and
+  `git diff --check` exits zero with line-ending notices only.
+
+## 2026-08-09 Cached Article Evidence Handoff
+
+- Root cause: article analysis returned a normalized in-memory context, while
+  `save_article_artifacts()` enriched only a separate copy with
+  `canonical_in_article`, source evidence, and supported aliases. The saved
+  `article_context.json` therefore looked correct, but ASR correction and the
+  translation glossary still received the unenriched object. In the observed
+  run, article correction executed without resume, produced 299 review
+  candidates, applied zero replacements, and left `Higee` in the word ledger.
+- `SubtitleThread._resolve_article_context()` now enriches the resolved context
+  before it is saved or passed downstream. This applies equally to fresh LLM
+  analysis, analysis-cache hits, and matching context supplied by the UI. It
+  does not invalidate or delete the article cache.
+- The contract is category-generic: article-evidenced people, companies,
+  organisations, places, works, brands, and eligible domain terms share the
+  same evidence-bearing object for English ASR correction and Chinese
+  terminology prompting. Existing high-confidence, article-scope, and grammar
+  gates remain unchanged; this is not a sample-specific replacement rule.
+- The cross-stage regression corrects cached `Li Yang Wenfing` to
+  `Liang Wenfeng` and `Higee` to `haigui`, preserves their source time
+  envelopes, and verifies `Liang Wenfeng -> 梁文锋` plus `haigui -> 海归` in the
+  translation context. Task-context tests pass 6/6 and article-correction tests
+  pass 29/29. The unified regression passes all 25 stages in 362.3 seconds.
+  No network, ASR model, LLM, real FFmpeg encoding, or paid request ran.
+
+## 2026-08-09 Complete Vocabulary Plan Render Gate
+
+- Root cause: resumable v2 progress correctly distinguished complete and
+  incomplete request chunks, but `load_or_generate_vocab_plan()` still returned
+  legacy plus partial candidates after the 240-second global budget or a failed
+  batch. The renderer then treated that partial plan as final and started
+  FFmpeg; a production episode therefore encoded with only `5/9` chunks.
+- Smart vocabulary rendering now requires every current chunk to complete before
+  the plan is returned. The global 240-second early-stop budget is removed;
+  requests remain sequential with a 90-second per-attempt timeout, no SDK
+  retry, and two explicit attempts. Successful empty arrays remain valid
+  completed chunks and do not force ordinary words into the episode.
+- A failed chunk, incomplete cache without a configured model, or unexpected
+  generation error raises `VocabularyPlanIncompleteError`. All completed chunks
+  are atomically retained, the next attempt requests only missing chunks, and
+  no legacy or partial plan can authorize FFmpeg. A complete zero-card result
+  remains renderable.
+- All 29 focused vocabulary/cache/display tests and syntax compilation pass;
+  six of those tests directly cover completion, resume, and the render gate.
+  The full 25-stage regression ran for 365.6 seconds: all stages except `stable
+  caption smoke tests` passed, and the vocabulary smoke plus video-synthesis
+  safety stages passed. Its sole failure was the unrelated
+  `test_whisperx_time_only_uses_explicit_source_audio_from_complete_task` order-
+  dependent assertion; that test passed immediately in isolation.
+- A fresh 1920x1080 real-data frame was generated from `中国AI为何更省钱？` and
+  visually checked for clipping, overlap, blank regions, card highlight, and
+  bilingual subtitle placement:
+  `tests/caption_audit/out/vocab-complete-gate-sample-20260809.png`. No external
+  model, ASR, FFmpeg, or paid request ran for this change.
+
+## 2026-08-09 Manual Page Review Acknowledgement
+
+- Root cause: recovered page Chinese and REVIEW page boundaries were shown as
+  warnings, but the editor had no durable user acknowledgement for the exact
+  page identity. A translation-blocked checkpoint also discarded its frozen
+  page geometry during save and could silently replan a three-page cue as four
+  pages.
+- Editing non-empty page Chinese now confirms that exact page Chinese. Moving a
+  page boundary confirms the newly chosen boundary. The actual-page context
+  menu also exposes `confirm current Chinese`, `confirm current page boundary`,
+  and `confirm all non-blocking reviews`.
+- Chinese and boundary acknowledgements are stored with page ID, parent ID,
+  English word range, and frozen English. A changed word range or rebuilt page
+  identity invalidates the old acknowledgement. HARD structure errors cannot
+  be acknowledged away.
+- Unconfirmed page Chinese and REVIEW boundaries remain formal-publication
+  warnings, not structural corruption. A hash-bound manual draft may still be
+  synthesized when its fixed IDs, English, word ledger, timeline, page plan,
+  and media ownership are valid.
+- Saving a strict manual checkpoint now reuses its hash-bound PASS, REVIEW, or
+  translation-blocked frozen page plan. Chinese review state no longer grants
+  the automatic planner authority to replace the saved page count or ranges.
+- Real isolated replay of the current study-abroad package changed 79 Chinese
+  and 20 boundary reviews with zero HARD items to 0/0/0 after explicit bulk
+  acknowledgement. Formal publication then passed with all 261 fixed cue
+  identities/times and all 2,862 ledger words unchanged. Evidence is under
+  `E:\VideoCaptioner-e2e-runs\manual-review-confirmation-postcheck-20260809`;
+  the desktop source package and audio hashes remained unchanged.
+- Focused confirmation tests pass 6/6, the manual editor passes 50/50, stable
+  publication passes 51/51, video-synthesis safety passes, and the unified
+  regression passes all 25/25 stages (653 test items) in 403.562 seconds.
+  `git diff --check` passes. No network, ASR, LLM, or real video synthesis ran.
+
+## 2026-08-09 Manual Editor Command Surface Audit
+
+- Root cause: loading a manual-final session exposed its editing actions without
+  hiding the ordinary reprocessing controls. Generic table export, subtitle
+  layout/translation settings, and `Start` therefore competed with the
+  authoritative manual-final save and could send the user into the wrong flow.
+- Manual-final mode now presents one command set: next review, parent/actual-page
+  view or refresh, manual-final save, undo, and the mutually exclusive formal or
+  draft synthesis action. `File` retains only import and open-current-package.
+  Ordinary save, layout, translation, language, compatibility correction,
+  prompt, settings, and start return when no stable manual session is available.
+- Removed the unreachable detached boundary panel, the duplicate command-bar
+  boundary action, the old dialog-based right-click word moves, the never-shown
+  quality-report action, and the disabled single-row merge command. The inline
+  highlighted word-count/confirm workflow remains the only boundary UI.
+- `Open manual-final folder` now resolves a loaded manifest or manual subtitle
+  even when the user imported the SRT directly and no `SubtitleTask` exists.
+- This changes only editor command visibility and file navigation. Frozen
+  English, Chinese ownership, subtitle IDs, word timing, page planning,
+  publication gates, and synthesis authority are unchanged.
+- Stable-publication/UI tests pass 46/46, the manual-final editor script passes
+  45/45, video-synthesis safety passes, and the unified regression completes
+  all 25/25 stages with no `Regression failed` entry. `git diff --check` passes.
+  A separate hidden-widget probe timed out and is not counted as visual
+  acceptance; no network, ASR, LLM, FFmpeg, synthesis, or paid request ran for
+  this audit.
+
+## 2026-08-09 Manual Editor State Ownership Audit
+
+- Root cause: the editor mixed the live table draft, pending display-page edits,
+  and the last published manual package. An active Qt delegate could be rebuilt
+  before committing its Chinese text, page edits were partly cleared without
+  their boundary overrides, and stale artifact review rows remained active
+  after the user changed the corresponding subtitle.
+- The editor now has one in-memory mutable session fingerprint. Chinese edits,
+  repeated two/three/four-page splits, and page-boundary moves update only that
+  session. They do not invoke `save_to_source_folder`; the user performs one
+  explicit background save after finishing the batch of edits.
+- Split, boundary, save, ordinary export, import-discard, and close checks first
+  commit the active table delegate. Parent rows are written back by fixed cue
+  ID plus frozen word range and time, never by an unchecked row number.
+- Display-page edits and boundary overrides invalidate and undo atomically.
+  Parent Chinese edits are undoable without deleting an otherwise current page
+  plan. Incomplete page Chinese may be saved as a blocked checkpoint, but it
+  cannot authorize formal synthesis.
+- Manual package override schema 3 binds the edit artifact SHA-256. Reload also
+  cross-checks the embedded ledger against the package word ledger before the
+  session becomes editable.
+- Review navigation now combines unchanged artifact evidence with current
+  manual state. Editing one subtitle filters only that subtitle's stale marks;
+  manual Chinese review, REVIEW page boundaries, and unavailable pages remain
+  visible in table colors, tooltips, and `next review`. A late asynchronous
+  artifact result cannot restore invalidated IDs or replace an unsaved status.
+- The real desktop study-abroad package was replayed read-only: 303/303 English
+  pages were visible, including 20 REVIEW boundaries. Filling one page Chinese
+  and splitting a second parent retained the first edit and made zero save
+  calls. All 11 source-package size, mtime, and SHA-256 records were unchanged.
+- Manual-final editor tests pass 36/36, stable-publication UI tests pass 43/43,
+  video-synthesis safety passes 24/24, and the unified regression passes
+  678/678 plus its syntax step in 335.161 seconds. `git diff --check` passes.
+- Windows QPA plus `WA_DontShowOnScreen` constructed and processed the real
+  editor widget successfully. Strict offscreen QPA remained blocked at
+  `QApplication` initialization, and the bounded widget-grab attempt produced
+  no screenshot; no visual screenshot acceptance is claimed. No network, ASR,
+  LLM, FFmpeg, synthesis, or paid request ran.
+
+## 2026-08-09 Manual Boundary Evidence Recovery
+
+- Root cause: manual-final save validated only boundaries inside the current
+  parent cues, then wrote that filtered subset back as the package evidence.
+  A later parent-boundary move or full undo could turn a previously omitted
+  cue edge into an internal page candidate and fail with
+  `manual_page_boundary_evidence_required`.
+- Manual packages now retain every adjacent boundary in the authoritative word
+  ledger. Older filtered packages recover only boundaries proven by current or
+  historical frozen cue edges; recovered edges remain REVIEW evidence. A
+  missing arbitrary internal boundary still fails closed.
+- Parent rows expose the existing two/three/four-page commands even while their
+  old page plan is stale. Selecting one queues exactly one background refresh
+  and applies the requested split once the matching saved package reloads.
+  Display-page boundary moves remain immediate and require no refresh.
+- The real desktop `中国年轻人为何不爱留学了？` package was verified read-only:
+  undoing all history restored 2,861/2,861 boundary records, including recovered
+  word ID 210, and the package tree hashes did not change. A temporary-copy
+  save/reload retained 2,861/2,861 records.
+- Focused manual-final and pending-split regressions pass. Unified regression
+  passes 603 tests across 24 suites plus one syntax step in 332.064 seconds;
+  `git diff --check` and production-file syntax checks pass. No network, ASR,
+  LLM, synthesis, or paid request ran.
+
+## 2026-08-09 Stable Word-Count Preview and Review UI
+
+- Root cause: the inline word-count `valueChanged` signal rebuilt both index
+  widgets. Increasing or decreasing the count therefore destroyed the active
+  SpinBox and appeared to cancel boundary editing.
+- Count changes now update the existing English highlights, direction capacity,
+  and `confirm move N words` text in place. The same SpinBox and both row widgets
+  remain active; no subtitle data changes before explicit confirmation.
+- The redundant `quality report` toolbar action is hidden. Coverage artifacts,
+  deterministic publication gates, table colors, tooltips, and `next review`
+  navigation remain available and unchanged.
+- Stable publication tests pass 24/24. Qt DPR 1.0/1.25/1.5 validation passes
+  411/411 checks across 18 reviewed PNGs; repeated `1 -> 2 -> 3 -> 2` count
+  changes retain widget identity with no clipping, overlap, or stale controls.
+- Unified regression passes 595 tests across 24 suites plus one syntax check
+  with zero failures in 337.197 seconds. `git diff --check` passes with only
+  line-ending notices. No network, ASR, LLM, synthesis, or paid request ran.
+
+## 2026-08-09 Manual Page Intermediate State
+
+- Root cause: page-boundary editing treated grammar risk, the 900ms reading
+  policy, missing page Chinese, and structural corruption as one failure. A
+  newly split page therefore could not be adjusted until Chinese was filled,
+  and every renderer rejection appeared as the same generic error.
+- Explicit manual page movement now permits grammar-risk and sub-900ms choices
+  as REVIEW evidence. Automatic planning keeps the strict behavior. Empty
+  pages, non-contiguous word ownership, ID drift, an illegal word-time boundary,
+  and fixed-font overflow remain hard failures.
+- Page Chinese may remain empty while the user continues to adjust boundaries.
+  The affected page Chinese is cleared whenever its English word ownership
+  changes. Formal publication still fails with
+  `manual_page_translation_required` until all page Chinese is complete.
+- Repeated boundary moves use the currently confirmed page ranges as their
+  baseline, including a manual 2/3/4-page split. A blocked save retains the
+  hash-bound English page plan, so reopening the checkpoint keeps those pages.
+- The selected row exposes upper and lower boundary entries. Direction changes
+  reset the count to one word, count changes update the highlight, and only the
+  confirmation action mutates the session. A compact legend identifies English,
+  Chinese, timing, visual-page, and blocker review colors.
+- Parent-boundary edits expose an enabled `refresh actual pages` action. It runs
+  the existing page preflight and checkpoint save in the background; subsequent
+  unchanged saves reuse the frozen result.
+- Manual-final editor tests pass 25/25 and stable publication tests pass 23/23.
+  Unified regression passes 594 tests across 24 suites plus one syntax check
+  with zero failures in 335.056 seconds; `git diff --check` passes with only
+  line-ending notices.
+- The first intermediate-state UI run exposed stale Qt index widgets covering
+  rows after a parent-model refresh. The editor now keeps direct widget
+  references and hides them synchronously before detaching and deleting them.
+- Final qwindows evidence under
+  `E:\VideoCaptioner-e2e-runs\manual-page-intermediate-editor-20260809`
+  passes 510/510 checks across DPR 1.0, 1.25, and 1.5. All 18 PNGs were
+  reviewed; stale controls, clipping, and overlap are zero. No network, ASR,
+  LLM, video synthesis, or paid request ran.
+
+## 2026-08-08 Parent-Boundary Inspector and Stale-Page Safety
+
+- Root cause: parent-boundary editing reused the compact four-column subtitle
+  table and hid word movement behind a row context menu plus numeric dialog.
+  The user could not see both complete neighboring cues while deciding which
+  word owned the boundary.
+- Parent mode now uses a vertical splitter with an inline boundary inspector.
+  Selecting a parent row shows the complete English and Chinese for the cue on
+  each side of the boundary, their IDs and times, highlights the candidate head
+  and tail words, and exposes a bounded word-count stepper with direct left and
+  right movement commands. The existing word-ledger-backed movement methods
+  remain the only mutation owner.
+- Undo is permanently visible inside the inspector. Every move and merge keeps
+  the existing session history; boundary undo restores the prior cues while
+  still requiring another save before synthesis. Page-Chinese undo remains in
+  page view and does not incorrectly jump to a parent boundary.
+- Any parent boundary, merge, or parent-row text change invalidates the old
+  whole-episode display plan. The editor immediately returns to parent mode,
+  labels actual pages as waiting for refresh, and disables formal and draft
+  synthesis. Saving the manual final runs the existing background page
+  preflight; only the reloaded saved package can expose the new actual pages
+  and synthesis actions.
+- This is an editor-state and interaction change only. It does not alter frozen
+  subtitle IDs, ledger words or times, English segmentation, Chinese allocation,
+  page-planning rules, font rules, or rendering.
+- Focused publication/editor tests pass 13/13. The page-translation contract
+  passes 35/35. Unified regression passes 25/25 in 310.535 seconds and
+  `git diff --check` passes. A 1400x850 qwindows render of the real inspector is
+  under `E:\VideoCaptioner-e2e-runs\manual-boundary-inspector-20260808` and has
+  no clipped or overlapping text or controls. The runtime has no Qt offscreen
+  plugin, so the visual smoke used the production qwindows platform with a
+  hidden window.
+
+## 2026-08-08 Article Page Contract v16 and Frozen-Plan Authority
+
+- Root cause: the whole-episode sequence planner produced a validated frozen
+  page plan, but the renderer later invoked the per-cue planner again. The
+  replacement spans and font could no longer match the page-ID-bound Chinese,
+  which caused `missing_or_invalid_display_page_translations` even though the
+  complete page artifact was valid.
+- `article-fixed-font-pages-v16` makes every validated `frozen_*` plan
+  renderer-authoritative. Rendering, editor preview, and manual-final save
+  consume the same page IDs, word spans, times, line layout, and font; no
+  downstream per-cue replanning is allowed.
+- The whole-episode planner compares feasible cue-local plans while penalizing
+  adjacent dense pages. It retains the 56/54/52/50px English sequence, allows
+  three English lines only at 50px after two-line plans fail, and treats
+  medium-risk boundaries as scored review evidence instead of an absolute
+  rejection. Frozen parent IDs, English, word ownership, and cue timing do not
+  change.
+- Page Chinese is reusable only when ordered page text reconstructs the
+  current parent Chinese exactly. An older artifact whose English page
+  identity still matches cannot be reused after parent-level Chinese polish.
+  Manual-final recovery exposes valid pages from a blocked artifact and marks
+  failed parents for review; it never proportionally slices Chinese.
+- A zero-network replay of the existing `中国年轻人为何不爱留学了？`
+  checkpoint published a PASS package under
+  `E:\VideoCaptioner-e2e-runs\study-abroad-page-contract-v16-final-r1-20260808`:
+  261 frozen parents, 2,862 ledger words, 303 display pages, and 37 multipage
+  parents. Page counts are 224x1, 33x2, 3x3, and 1x4; font counts are
+  56px=277, 54px=1, 52px=7, and 50px=18. Eight 50px pages use the controlled
+  three-line fallback. `render_blocked=false` and the display artifact is
+  `PASS`.
+- Offline validation reused 907 existing PNGs: 303 page midpoints and 604
+  before/after transition frames. Parent coverage is 261/261, page and
+  transition errors are zero, and no blank, crop, bilingual overlap, or
+  page-induced flash was found. Fifteen sub-900ms items are inherited
+  single-page source cues and remain warnings rather than pagination errors.
+- Seven parents (`S0118`, `S0158`, `S0196`, `S0214`, `S0238`, `S0240`, and
+  `S0247`) retain low-confidence Chinese page semantics because natural
+  Chinese word order crosses an English page boundary. Their page text is
+  token-safe and aggregates exactly, but editor review is still recommended.
+- Stable caption smoke tests pass 377/377. Unified regression passes 25/25 in
+  313.799 seconds. The replay and validation made zero ASR, LLM, FFmpeg,
+  synthesis, or paid external requests; no complete video was generated.
+
+## 2026-08-08 Flat Actual-Page Editing and Source Exports
+
+- Root cause: the editor kept one parent cue per row and repeated only a page
+  count in a separate `actual pages` column. That column did not expose the
+  final page text or timing where users already edit subtitles, so it consumed
+  table width without making the rendered sequence directly editable.
+- When a complete frozen page artifact exists, the default editor model is now
+  flat: one visible table row is one real rendered page. The table remains the
+  original four columns (start, end, English, Chinese); the repeated page-count
+  column has been removed. Each row still carries its hidden deterministic page
+  ID, parent subtitle ID, continuous word range, page time, and selected font
+  size.
+- Page English is read-only because it is derived from the frozen word range.
+  Page Chinese is directly editable. `查看父字幕` retains the original
+  word-ledger-backed view for formal English boundary work.
+- Saving from page view validates page identity, parent ownership, word ranges,
+  and times. A no-op save or Chinese-only page edit reuses the same hash-bound
+  page artifact and does not invoke the planner again. Any page drift blocks
+  publication instead of silently changing the previewed pagination.
+- Stable publication and manual-final save write
+  `<media-stem>-实际分页双语字幕.srt` and
+  `<media-stem>-实际分页映射.json` beside the original source audio. The map
+  preserves the parent/page relationship, so importing an authoritative page
+  SRT can recover the frozen package rather than treating pages as new fixed
+  subtitle IDs.
+- Focused manual-editor and publication tests pass. Unified regression passes
+  25/25 in 494.303 seconds, and the final documentation-only
+  `git diff --check` passes. No ASR, LLM, FFmpeg, video synthesis, or paid
+  external request ran for this change.
+
+## 2026-08-07 Article Correction Span Ownership and Complete QA Queue
+
+- Root cause: fuzzy multi-token entity matching could collapse two ASR tokens
+  into one glossary token even when one source token contributed no matched
+  character. The real `.S., Japan, -> Japan,` candidate therefore consumed the
+  `S.` portion of `U.S.` despite a failed entity/grammar gate.
+- Every source token in a collapsed entity window must now contribute to the
+  canonical match. Lossless forms such as `A Drift -> Adrift` remain eligible,
+  but a failed entity gate can no longer be bypassed by downstream similarity.
+- The human QA SRT/JSON queue now retains every distinct `BLOCKER` and `REVIEW`
+  item produced by the existing classifier. The former default total cap of 12
+  is removed; `INFO` evidence remains outside the playable queue and duplicate
+  code/ID entries remain collapsed.
+- A read-only rebuild of the v10 artifacts finds 51 timed `REVIEW` items and
+  zero omitted items. The existing on-disk queue still contains the old 12/22
+  metadata because validation deliberately did not overwrite that E2E run.
+- English segmentation, word limits, fixed subtitle IDs, Chinese allocation,
+  display pagination, timing, and rendering are unchanged. Focused article
+  correction and QA queue scripts, unified regression, and `git diff --check`
+  pass. The real v10 deletion candidate is rejected as
+  `candidate_would_delete_non_entity_token`.
+
+## 2026-08-07 Article Page Contract v10 and Frozen-Contract E2E
+
+- Root cause: eight real 203-cue checkpoint items had no strict 50px-or-larger
+  page partition because every otherwise feasible transition carried a
+  cue-level syntax warning. Blocking all of them made the full result unusable;
+  weakening those warnings globally would have permitted unrelated bad cuts.
+- `article-fixed-font-pages-v10` still exhausts strict 56/54/52/50px layouts
+  first, then permits only a complete visible continuation phrase/clause as a
+  high-risk reviewed fallback. It supports up to four pages, preserves atomic
+  lexical protections and the 900ms minimum, and never changes the frozen
+  parent ID, English, word range, cue time, or word ledger.
+- The selected fallback risk now survives dynamic-program reconstruction.
+  Layout/score memoization reduced the eight hardest fixture plans from about
+  142 seconds to 71.631 seconds. All 203 frozen render plans and the complete
+  global display-boundary evidence are published and SHA-bound for manual save.
+- Manual-final export now writes both `人工终稿分页双语字幕.srt` and its exact
+  page map. Invalid page Chinese saves a render-blocked checkpoint instead of
+  crashing or silently slicing Chinese characters.
+- Fresh E2E output is under
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-page-contract-v10-e2e-20260807-r1`.
+  It has 203 fixed parent IDs, 2,548 words, 252 display pages, 49 transitions,
+  38 multipage parents, a 50px minimum font, and a 1,051ms minimum timed page.
+  Final timing is `PASS` under `whisperx-time-only`, with no missing source
+  audio or overall backend fallback. The run made 15 external requests: 14
+  full/fixed-ID translation requests and one page-translation request.
+- The prior 16:36 checkpoint is not a valid byte-for-byte source-ledger
+  baseline: despite sharing the input SRT, it omitted or rewrote four source
+  words around `of/an/by/of American`, causing cascading word-index drift. The
+  current run retains those source words and passes its frozen ID-addressable
+  contracts; the E2E runner's old-checkpoint equality assertion was therefore
+  rejected rather than weakened.
+- Independent export validation passed 252/252 SRT/map pages, all 2,548 word
+  IDs, page continuity/envelopes, Chinese token boundaries, artifact hashes,
+  and 47 rendered midpoint/transition frames with zero blank, crop, or bilingual
+  overlap failures. Nine reviewed English page boundaries and one non-blocking
+  S0202 Chinese continuation remain explicit review items.
+- Focused page/manual suites, unified regression, and `git diff --check` pass.
+  The comparison SRT and validation report are below `editor-comparison/` in
+  the E2E directory. No video was synthesized for v10.
+
+## 2026-08-07 Non-Blocking Manual-Final Save
+
+- Root cause: `save_manual_final_output()` called the complete deterministic
+  article page preflight synchronously on the Qt GUI thread. A real 203-cue
+  blocked checkpoint spent 188.384 seconds in page-blueprint construction,
+  so Windows correctly reported the application as not responding even though
+  the package eventually saved.
+- Saving now snapshots the complete manual session and runs package generation
+  on a background worker. The subtitle table, save, undo, and synthesis actions
+  are disabled until that exact snapshot completes; completion returns to the
+  GUI through a Qt signal. Duplicate save clicks cannot start a second writer,
+  concurrent session saves are serialized, and the main window refuses to exit
+  until the active package publication finishes.
+- English, Chinese, fixed IDs, word ownership, timing, page planning, render
+  gates, and package schemas are unchanged. A blocked package remains blocked.
+- Focused publication regression passes. Delegated real-checkpoint profiling
+  completed normally in 188.806 seconds with zero network, ASR, LLM, or FFmpeg
+  calls and no production-source modification. The remaining performance cost
+  is 690,471 font-width measurements; the fix restores responsiveness but does
+  not claim faster planning.
+- Evidence is under
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-manual-save-profile-20260807-r2`.
+
+## 2026-08-07 Article Page Contract v9 and Cache-First Subtitle E2E
+
+- Root cause: candidate plans were ranked by visual cost before structural
+  confidence. A medium/high-risk page turn at 56px could therefore beat a
+  readable 50px static page, while treating every uncertain boundary as hard
+  would over-shrink ordinary long cues.
+- The planner now compares all feasible 56/54/52/50px and one-to-three-page
+  plans with categorical priority: high-confidence structural risk, then
+  medium-confidence review risk, then measured readability/visual cost, then
+  low-confidence hints and font/page tie-breakers. Hard lexical dependencies
+  remain ineligible. Frozen English, parent IDs, word ownership, cue timing,
+  parent Chinese, SRT, and ASS are unchanged.
+- The page contract is `article-fixed-font-pages-v9`. Only page planning and
+  page-translation caches are invalidated; unchanged ASR artifacts, complete
+  translations, and fixed-ID Chinese allocation retain independent cache
+  identities.
+- Offline replay planned 259/259 `China AI Why Cheaper?` cues and 207/207
+  `How to Identify AI Writing Style` cues with zero structural failures and
+  zero external requests. The runs changed 302 -> 299 / 43 -> 40 pages and
+  transitions for the first sample, and 236 -> 232 / 29 -> 25 for the second.
+- Delegated representative validation rendered 10 China and four AI-writing
+  v9 page/transition frames. Word loss/duplication, hard boundaries, crop,
+  bilingual overlap, font below 50px, page below 900ms, and transition
+  failures were all zero. One offline China page used token-safe preview
+  Chinese and was layout evidence only, not a production translation claim.
+- Cache-first subtitle E2E reused the verified ASR SRT for the same source
+  audio and reran current English boundaries, fixed-ID writeback, local
+  WhisperX, page planning, and publication. It completed with 207 cues and
+  1,993 ledger words; final timing is `PASS` under
+  `whisperx-time-only`, with no `source_audio_missing` or overall backend
+  fallback. Three local expansion/compression protections remain recorded.
+- All 12 full-translation batches, two normal allocation batches, and three
+  fragment retries were cache hits. Page contract v9 required one external
+  page-translation request, which is now cached. The published artifact is
+  `PASS`, contains 233 pages / 26 transitions, and has one non-blocking
+  `unnatural_chinese_fragment` review at S0082.
+- Evidence is under
+  `E:\VideoCaptioner-e2e-runs\ai-writing-style-page-contract-v9-e2e-20260807-r1`.
+  Pre-synthesis production-artifact validation passed for all 207 IDs, 1,993
+  words, 233 pages, and 26 transitions. Seventeen representative page and
+  transition frames had zero crop, overlap, blank, font-floor, content, or
+  transition failures.
+- Final synthesis consumed the hash-bound stable manifest and the original
+  source audio directly, with unrelated AI vocabulary cards disabled. It made
+  zero external requests and produced `final-video.mp4` (30,157,031 bytes) in
+  about 6 minutes 49 seconds.
+- The actual MP4 fully decoded 16,684 frames over 667.341497 seconds with zero
+  decode errors, duplicate frames, or dropped frames. Validation extracted
+  291 unique frames covering all 233 page midpoints, both sides of all 26
+  transitions, the 64.8/65.6/66.5-second timing probes, and S0082. Crop,
+  bilingual overlap, blank subtitle, wrong-page/content, transition,
+  word-envelope, and alignment-probe failures were all zero. The report is at
+  `video-validation-v9\video-validation-report.json` below the run directory.
+- S0082 remains a non-blocking language-quality review: its page transition is
+  mechanically correct, but P01 closes Chinese with a full stop while the
+  English continues after a comma, and P02 is understandable but slightly
+  stiff. This was reported rather than hidden by another automatic rewrite.
+
+## 2026-08-06 WhisperX Expansion-Sensitive Timing Acceptance Gate
+
+- Root cause: compact written tokens such as numerals, currency values, years,
+  and acronyms can represent several spoken words. WhisperX documents that
+  numeral/currency forms may be absent from the alignment-model dictionary.
+  A matched compact token could therefore receive only a fraction of its
+  spoken duration and pull later matched words forward until the next reliable
+  acoustic anchor.
+- Final `whisperx-time-only` mapping now rejects only a local update run when
+  an expansion-sensitive token is severely compressed relative to the frozen
+  stable-ts ledger. The run keeps baseline word times until WhisperX drift
+  returns to the pre-trigger anchor. The recovery word and every unrelated
+  WhisperX update remain unchanged; the local search is bounded to 24 words.
+- Each rejected run is recorded as
+  `whisperx_expansion_compression_fallback` with trigger word ID, affected word
+  IDs, baseline range, and rejected WhisperX range. This is a local word-time
+  fallback under `applied_backend=whisperx-time-only`, not an overall backend
+  fallback.
+- The gate is disabled for the experimental full-WhisperX path, so it cannot
+  alter pre-ID English segmentation. English text/order, frozen subtitle IDs,
+  word ownership, Chinese allocation, visual pagination, and render style are
+  unchanged.
+- Regression uses the exact production drift shape: `53` through `2028` retain
+  their frozen `412.600-417.020s` span, while recovered `Now` keeps its
+  WhisperX `417.580-417.720s` timing. Unified regression and
+  `git diff --check` pass; no ASR/LLM request or video synthesis was run.
 
 ## 2026-08-06 Fixed-ID Display-Page Translation Contract
 
@@ -114,9 +719,12 @@ Last updated: 2026-08-06
 - Podcast template can resolve subtitles from `stable-final-manifest.json`.
 - Article-template smart vocabulary cards are selected per local English semantic
   group, then globally filtered by model-provided learning priority. The target
-  density is about 1.25 cards per minute, capped at 22; low-priority candidates
-  and duplicate words are not rendered. A card starts with the subtitle that
-  contains its word, not at the start of the earlier semantic group.
+  density is about one card per minute, capped at 22; low-priority candidates
+  and duplicate words are not rendered. Eligible candidates are first selected
+  across equal timeline strata, then any remaining budget is filled by priority
+  and distance. Empty strata do not admit basic words merely to meet the target.
+  A card starts with the subtitle that contains its word, not at the start of the
+  earlier semantic group.
 - Smart vocabulary cards preserve the selected expression exactly as it appears
   in its triggering subtitle. The regular card shows only that expression and
   one compact Chinese contextual gloss. A concept card may add one short
@@ -124,9 +732,8 @@ Last updated: 2026-08-06
   concept; the plan caps such expanded cards at three per episode.
 - Vocabulary cards omit phonetics, part-of-speech labels, exam labels, English
   dictionary definitions, and `IN CONTEXT` blocks. A new card uses the full
-  learning panel for eight seconds, then becomes a compact expression-and-gloss
-  review state until a newer card replaces it. The last review state remains in
-  place for the rest of the rendered video.
+  learning panel from its triggering subtitle until a newer card replaces it.
+  The last full card remains in place for the rest of the rendered video.
 - Before the first vocabulary card, the article template keeps the right panel
   occupied with the episode title rather than a vocabulary preview. It requires
   no vocabulary-model output and fades out before the first card fades in over
@@ -138,9 +745,9 @@ Last updated: 2026-08-06
 - Regression smoke tests exist in `tests/test_stable_caption_rules.py`.
 - Generated subtitle audits exist in `tests/audit_stable_outputs.py`.
 - A single regression entry exists: `runtime\python.exe scripts\run_regression.py`.
-- Stable runs now write a concise, time-addressable `字幕质检队列.srt` beside the
-  source audio. It is built from the current coverage report's sibling artifact
-  directory, contains only `BLOCKER` and capped `REVIEW` items, and preserves
+- Stable runs now write a time-addressable `字幕质检队列.srt` beside the source
+  audio. It is built from the current coverage report's sibling artifact
+  directory, contains every distinct `BLOCKER` and `REVIEW` item, and preserves
   the affected final subtitle timings. Semantic audit items whose
   `mapping_valid` is false are retained as `INFO`, not added to the human queue.
 - Stable subtitle processing writes `run-state.json` to the subtitle output
@@ -842,3 +1449,725 @@ Result:
 - Unified regression passed. The final QA report has zero structural blockers,
   three unresolved Chinese allocation-quality reviews, and ordinary timing and
   reading warnings that remain for human review.
+
+## 2026-08-06 Readability and Manual-Final Checkpoint
+
+- Article English now defaults to 56px. The renderer treats 16 words as a soft
+  page budget, so a pixel-fitting, grammatically safer page is not rejected
+  merely for exceeding a word count. When no safe 56px layout exists, the
+  controlled 54/52/50px fallback sequence is available and its use is
+  recorded in the render plan.
+- Manual review marks now come from existing stable audit artifacts and retain
+  only actionable high-confidence English, Chinese, timing-edge, and visual
+  boundary issues. The editor does not rerun a second parser when a completed
+  English boundary audit already exists.
+- Saving from the editor creates a separate `人工终稿字幕包/` with a bilingual
+  SRT, exact word ledger, final cue timeline, page translations, edit history,
+  source-media path, and SHA-256 manifest. The original stable package remains
+  unchanged.
+- A verified package can be selected or dragged into the synthesis page. The
+  source audio is filled automatically when its recorded path still exists;
+  synthesis then consumes the package directly without rerunning ASR,
+  translation, or visual planning. A package with unresolved page-level Chinese
+  ownership is saved as an editable checkpoint but remains render-blocked.
+- Focused manual-package and synthesis-safety regressions pass. No external
+  ASR/LLM request or video synthesis has been run.
+- The page planner contract is now `article-fixed-font-pages-v7`. Verified
+  clause-level pauses of at least 600ms may convert a subject/predicate or
+  `that` + `-ing` visual boundary from hard failure to high-confidence review;
+  lexical dependencies remain hard. The real 28-word `S0120` regression now
+  plans successfully without changing its frozen parent cue or shrinking below
+  the configured fallback sequence.
+- Offline replay of the 262-cue `中国AI为何更省钱？` stable artifact now plans
+  262/262 cues with zero structural failures. The English font distribution is
+  56px=247, 54px=2, 52px=8, and 50px=5; the renderer never selects 48px or
+  46px. Nineteen pages exceed the 16-word soft budget because a shorter
+  partition would be worse. All 10 previously known bad visual cuts are absent.
+- `S0120` uses three 56px pages at its real comma/coordinator boundary and
+  800ms `gear | is` pause. Its parent ID, 28 English words, Chinese mapping,
+  cue time, and word ledger remain unchanged.
+- The v6 audit under `...page-contract-r10-offline-audit` is superseded because
+  it still allowed 48px and 46px. The final v7 audit and 29 representative
+  frames are under
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260806-page-contract-r11-offline-audit`.
+  All frames are 1920x1080 and nonblank, with zero crop, bilingual overlap,
+  page-time mismatch, or transition failure. Every paginated page lasts at
+  least 1351ms.
+- Four high-risk and twelve medium-risk semantic page boundaries remain review
+  candidates in the editor; they are not structural failures and are not
+  hidden by font shrinking. Stable caption tests, unified regression, and
+  `git diff --check` pass. This offline validation made zero network, ASR, LLM,
+  FFmpeg, or paid external requests.
+
+## 2026-08-07 Article Page Contract v8 and Fresh E2E
+
+- The article planner contract is now `article-fixed-font-pages-v8`. It uses a
+  1260px comfortable English line width and retains 1455/1498px only as
+  controlled fit profiles. Page selection balances measured pixels, spoken
+  duration, word load, and short-page cost while preserving the 56/54/52/50px
+  font floor and the frozen cue contract.
+- Renderer page boundaries consume the pre-ID syntax evidence by confidence.
+  Atomic lexical dependencies remain hard; clause-level review evidence is a
+  cost, not an unconditional merge or split. Parser-supported `-ing/-ed`
+  complements are hard only when their measured pause is at most 200ms. The
+  regression distinguishes a 40/160ms attachment from a 400ms audible pause.
+- Page-level Chinese validation shares the vendored tokenizer boundary ledger.
+  A response that cuts a Chinese token such as `software` between display
+  pages fails with `page_translation_chinese_token_split`; the renderer never
+  repairs it with raw character slicing.
+- A fresh run of `China AI Why Cheaper?` produced 259 fixed cues and 2,897
+  ledger words. Relative to the older 262-cue artifact, only seven formal word
+  boundaries changed (five removed and two added); the apparent later ID drift
+  is cascading renumbering. The new boundaries remove fragment cuts such as
+  `center | might` and `U.S. | right now`.
+- The fresh final timeline is `PASS` with
+  `applied_backend=whisperx-time-only`, no `source_audio_missing`, and no
+  overall backend fallback. Ten expansion-sensitive local timing protections
+  remain recorded separately. IDs, English, Chinese ownership, and word spans
+  agree across subtitle spans, translations, and the final timeline.
+- The published page artifact contains 259 frozen render plans, 302 pages, 40
+  multi-page parents, and 43 transitions. Full frozen-artifact validation
+  rendered 388 frames (302 page midpoints plus 86 transition frames): missing
+  or duplicate words, hard selected boundaries, Chinese token splits, crop,
+  panel overflow, bilingual overlap, page-time mismatch, and transition
+  failures are all zero. The minimum paginated page is 1080ms and the minimum
+  English font is 50px.
+- The fresh subtitle run made 22 external requests: 14 full translations,
+  seven fixed-ID allocation/review requests, and one page translation request.
+  The older cache missed because the improved formal boundaries changed the
+  semantic payload contract. No ASR API request or vocabulary-card request ran.
+- Final video synthesis ran once and wrote
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260807-page-contract-v8-r1\final-video.mp4`
+  (45,540,482 bytes). The actual MP4 validation report is stored beside the
+  run under `video-validation/`.
+- Actual MP4 validation extracted and checked 391/391 frames: 302 page
+  midpoints, 86 before/after transition frames, and 64.8/65.6/66.5-second
+  anchors. All 43 transitions match the frozen page artifact; blank subtitle,
+  crop, bilingual overlap, frozen-pixel mismatch, and transition failure counts
+  are zero. The validation made zero network, ASR, or LLM requests.
+- An offline audit that reconstructs syntax evidence instead of loading the
+  published artifact computes 303 pages and 44 transitions. This reconstructed
+  result is not used by synthesis; the hash-bound 302-page artifact is the
+  renderer authority. The audit-input mismatch remains a tooling follow-up.
+
+## 2026-08-08 Manual Draft and Actual Page Preview
+
+- The manual-final editor now exposes each saved frozen render plan as an
+  `actual pages` column with page count, English font size, exact bilingual
+  page text, and page start/end times. Editing English or Chinese clears the
+  stale row preview until the package is saved and replanned.
+- Saving a package now chooses between two commands. A formally valid package
+  keeps `go to video synthesis`; a package blocked only by one of the three
+  page-quality reasons exposes an explicit `synthesize draft` confirmation.
+- Draft authorization is carried by `SynthesisConfig.manual_draft_mode`; it is
+  cleared when the user imports or edits a different subtitle path. The draft
+  output uses the isolated `【人工草稿】` prefix and cannot overwrite a formal
+  article or learning-template video.
+- The draft path keeps the normal fail-closed checks for package ownership,
+  SRT SHA-256, final timeline and word-ledger SHA-256, fixed subtitle IDs,
+  contiguous word ownership, English text, and cue-time agreement. Only page
+  overflow or missing/invalid page-level Chinese may use a token-safe,
+  REVIEW-labelled best-effort page plan.
+- Draft mode is restricted to the `文章单词` renderer. Other templates cannot
+  consume the page-only authorization.
+- Read-only replay of the frozen v10 artifact exposes actual pages for 203/203
+  editor rows and all 252 pages; `S0202` exposes its four pages and no ID is
+  missing. The preview uses the page artifact's authoritative
+  `aggregate_chinese`, not a stale Chinese copy in an older render-plan field.
+- Focused manual-editor, synthesis-safety, and publication tests pass. Unified
+  regression passes in 223.132 seconds, and `git diff --check` passes with only
+  existing line-ending notices. No network, ASR, LLM, FFmpeg, or paid external
+  request was made for this change.
+
+## 2026-08-08 Discoverable Subtitle Package Link
+
+- Root cause: the user-facing bilingual SRT copied beside the source audio was
+  detached from its manual package. Importing it into the editor disabled the
+  draft action, while importing it into the article synthesis page reached the
+  renderer without a manifest and failed with
+  `missing_or_mismatched_word_ledger`.
+- Manual-final save now writes `<media-stem>-原文在上双语字幕.srt` and records
+  it in the package manifest. If that source-folder SRT is saved directly, the
+  portable package uses the collision-safe sibling name
+  `<media-stem>-人工终稿字幕包/`. Stable success publication writes the same
+  media-named SRT while retaining the three compatibility subtitle files.
+- Editor and synthesis imports recover a manifest only through exact path or
+  full-file SHA-256 equality. Exact source-path ownership outranks hash-only
+  matches; for a renamed byte copy, a saved manual package outranks an earlier
+  blocked checkpoint. Renderer word-ledger and timeline hashes remain mandatory.
+- A linked package blocked only by an allowed page-quality reason enters the
+  existing isolated manual-draft route. Formal rendering stays blocked, and an
+  unrelated standalone SRT cannot inherit another package's timing ledger.
+
+## 2026-08-08 Persisted Manual Draft Page Authority
+
+- Root cause: editor review-mark updates emitted only background/tooltip roles,
+  but the editor treated every `dataChanged` signal across text columns as a
+  real subtitle edit. The saved package path was cleared and both synthesis
+  actions became disabled. Only `EditRole` text changes now invalidate the
+  saved package.
+- A page-blocked manual save now writes a separate
+  `manual-draft-page-plan.json`. Both the manifest and manual override bind its
+  owned path and SHA-256. Every page records its fixed ID, English, explicit
+  Chinese, word range, time range, font layout, and boundary evidence.
+- The editor preview and manual-draft renderer consume that exact persisted
+  artifact. Missing, tampered, or cross-package artifacts fail before ffmpeg;
+  synthesis no longer calls a page planner or divides Chinese at render time.
+- Reloaded manual sessions now use their package-owned artifact directory and
+  publish `translations.json`, while older packages without that complete
+  owned set retain the source-artifact fallback until they are saved again.
+- Read-only replay of the current 203-cue desktop package preserved all 203
+  frozen plans and 252 pages, with a 50px minimum English font and explicit
+  non-empty Chinese on every page. No desktop artifact was changed.
+- Manual-final, page-contract, publication, synthesis-safety, and unified
+  regressions pass. Unified regression completed in 284.672 seconds;
+  `git diff --check` passes with line-ending notices only. No ASR, LLM,
+  FFmpeg, video render, or paid external request ran.
+
+## 2026-08-08 V10-Only Boundary and Page-Count Rebalance
+
+- The sole behavioral baseline for this iteration is
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-page-contract-v10-e2e-20260807-r1`.
+  Later 6-7 and 12-13 examples were excluded from rule design and acceptance.
+- Formal pre-ID English now rebalances high-confidence dependent tails and a
+  short misplaced adjunct before IDs freeze. A complete terminal parallel
+  prepositional continuation such as `for anyone ...` remains eligible, while
+  short or unfinished preposition-led fragments remain blocked.
+- Article planning chooses the page count from measured English pixels, the
+  16-word soft load, Chinese load, and cue duration before selecting a cut.
+  Cut rewards cannot create an extra page. Low-confidence page turns may keep
+  56px instead of forcing the deepest 50px fallback; a valid 54/52px static
+  layout still wins, and medium/high-risk turns never win on font size.
+- V10 regressions cover the reviewed formal boundaries, approved 37-38 and
+  57-58 boundaries, approved 20-21 pagination, and the 174-176 reduction from
+  three visual pages to two parent pages (`S0148=1`, `S0149=1`).
+- Final offline v10 replay plans 203/203 frozen parents and 250 pages. Font
+  counts are 56px=181, 54px=9, 52px=6, and 50px=7. The shortest page within a
+  multipage parent is 1015ms; pages below 900ms, hard page boundaries, hard
+  line breaks, and English coverage mismatches are all zero.
+- Twenty-one parents changed relative to the v10 page artifact and therefore
+  require fresh page-level Chinese translation before formal synthesis.
+  `S0169` remains an explicit REVIEW because `talks | to` uses the
+  forced-complete-continuation fallback when no strict partition exists.
+- Unified regression passes 24/24 in 256.214 seconds and `git diff --check`
+  passes. The final reports are under
+  `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-v10-page-rebalance-offline-audit-final`.
+  External requests and FFmpeg runs are zero; no video was synthesized.
+
+## 2026-08-08 Inline Manual Page-Boundary Editing
+
+- The editor no longer uses a detached bottom boundary panel. Selecting a row
+  embeds the complete neighboring English and the relevant controls directly
+  in the two English cells. The movable words are highlighted; the word count,
+  bidirectional move, and undo controls stay beside the affected rows.
+- A boundary between two pages of the same parent is presentation-only. The
+  session stores absolute subsequent-page start `word_id` values in
+  `display_page_boundary_overrides`; parent IDs, English, word ownership, and
+  parent timing remain frozen. Layout, page timing, lines, and boundary evidence
+  are re-derived for that parent before save.
+- A boundary between different parents still uses the formal word-ledger cue
+  transfer. It invalidates all old page edits and requires a new whole-episode
+  page plan; the editor never presents the old pages as current.
+- Manual-final save runs in the background, changes the action text to
+  `正在保存终稿...`, shows an indeterminate progress bar plus stage text, and
+  restores the table and action when complete. An unchanged parent view now
+  reuses the hash-bound frozen blueprint instead of invoking the planner.
+- Focused publication tests pass 16/16 and the article display readability
+  contract passes. Qt visual validation covers same-parent, cross-parent,
+  long-English, save-busy, and save-restored states at DPR 1.0/1.25/1.5 and
+  419px, 509px, and 569px English widths. All twelve screenshots pass with no
+  crop, overlap, or legacy panel. Evidence:
+  `E:\VideoCaptioner-e2e-runs\manual-row-boundary-editor-20260808-dpi-r2`.
+- Manual-final editor and video-synthesis safety tests pass. Unified regression
+  passes 25/25 in 327.980 seconds; `git diff --check` passes with existing
+  line-ending notices only. No external request or video synthesis ran.
+
+## 2026-08-09 Article Terms and Manual Structural Editing
+
+- Article-assisted ASR correction no longer excludes every `technical_terms`
+  item. Only article-evidenced, distinctive or aliased domain terms can enter
+  fuzzy matching, and automatic replacement additionally requires high
+  spelling and phonetic similarity. A real cached replay corrected three
+  phonetic variants of `haigui` without changing word times; source ASR and
+  glossary files were not modified.
+- Row selection is now separate from boundary editing. A selected row exposes
+  one explicit boundary entry; direction selection highlights only the source
+  words, and confirmation is the sole mutating action. Cancel and undo remain
+  non-mutating/restorative.
+- Users can rebuild one frozen parent's display projection as two, three, or
+  four pages. The shared article planner enforces syntax, pauses, word timing,
+  fixed 56/54/52/50px fonts, continuous word ownership, and a 900ms page floor.
+  The parent cue stays frozen. New page Chinese is blank and blocks formal
+  publication until explicitly reviewed.
+- Parent view now supports previewing and deleting a subtitle suffix. Save
+  creates a non-destructive AAC derivative and binds it through
+  `tail-trim.json` plus manifest hashes. The retained ledger/timeline is a fixed
+  prefix, the source audio hash stays unchanged, and identical decisions reuse
+  the existing derivative. The first release limits these packages to the
+  static podcast-template synthesis path.
+- The first UI capture exposed a separate rendering defect: the embedded entry
+  widget was transparent, so the table delegate painted a second English copy
+  below it. Entry and direction widgets now paint an opaque theme background.
+  The old captures remain labelled FAIL rather than being silently replaced.
+- Focused suites pass: article correction 29/29, stable publication 20/20,
+  manual-final editor 23/23, and video-synthesis safety 24/24. Unified
+  regression passes 589 tests across 24 suites plus one syntax check with zero
+  failures in 338.622 seconds. `git diff --check` passes with only existing
+  line-ending notices.
+- Final qwindows evidence under
+  `E:\VideoCaptioner-e2e-runs\manual-structural-editor-20260809-final-ui`
+  passes 195/195 checks across DPR 1.0, 1.25, and 1.5. Twelve fixed PNGs were
+  opened and reviewed; no duplicate English, clipping, overlap, overflow, or
+  menu truncation remains.
+- A real two-second FFmpeg fixture produced a 1003ms derivative for a 1000ms
+  cut, preserved the source SHA-256, and reused the derivative on a second
+  save. No network, ASR, LLM, paid request, fresh arbitrary-audio E2E, or full
+  video synthesis ran.
+
+## 2026-08-09 Manual Review Page Proposal
+
+- Root cause: the manual `split into N pages` action reused the automatic page
+  filter end to end. A boundary already classified as REVIEW could still be
+  discarded by automatic continuation guards, leaving an editable long cue
+  with the misleading result that no safe page plan existed.
+- The strict automatic result remains first and unchanged. Only an explicit
+  manual split may fall back to the lowest-risk REVIEW boundary. HARD syntax
+  cuts, page timing below 900ms, non-contiguous word ownership, and fixed-font
+  overflow remain blocking.
+- The 17-word study-abroad cue now proposes `ability | to fit...` as two editable
+  pages while preserving fixed parent ID `S0114`, English, word span, cue time,
+  and word timing. Page Chinese remains empty until reviewed.
+- Focused and full manual-editor tests pass. The current desktop package was
+  checked read-only: S0114 becomes word ranges `1129..1137 | 1138..1145`, all
+  frozen parent fields remain unchanged, and all 11 package files retain their
+  size, mtime, and SHA-256. Unified regression passes 24 suites plus one syntax
+  step in 338.772 seconds; `git diff --check` passes.
+
+## 2026-08-09 Stale Actual-Page Import Recovery
+
+- Root cause: saving a newer manual final correctly revoked the previous page
+  artifact in the manifest, but the old source-folder actual-page SRT and map
+  remained discoverable. Re-importing that file therefore appeared to lose its
+  stable package even though the user's save sequence was valid.
+- Import now verifies the stale page against its adjacent mapping, follows the
+  recorded parent subtitle, and opens the latest matching manual manifest. It
+  does not adopt any obsolete page content and explicitly asks the user to
+  refresh actual pages.
+- The focused stale-import regression passes 1/1 and the full manual-final
+  editor suite passes 30/30. A read-only replay of the real desktop file opens
+  the latest 261-cue parent package; all 32 files and 42,933,689 bytes retain
+  their full-tree SHA-256 before and after the operation.
+- Unified regression passes 658 test items across 24 suites plus one syntax
+  check in 338.800 seconds. `git diff --check` passes with line-ending warnings
+  only. No network, ASR, LLM, FFmpeg, synthesis, or paid request ran.
+
+## 2026-08-09 Visible Stale Page-Chinese Drafts
+
+- Root cause: a newer parent translation could invalidate an older page-level
+  translation. ERROR checkpoints deliberately blanked that page Chinese, while
+  stale source-folder imports opened only the current parent package. The old
+  Chinese therefore still existed in the imported SRT but disappeared from 79
+  actual-page rows.
+- A hash-verified stale page SRT now contributes only identity-matched Chinese
+  review drafts. Page ID, parent ID, word range, English, Chinese, and page time
+  must match the companion map, and the same frozen page identity must still
+  exist in the current package. Mismatched pages are not recovered.
+- Recovered Chinese is visible and marked unconfirmed; it is never aggregated
+  into the current parent or accepted as authoritative page Chinese. Formal
+  publication explicitly rejects stale-unconfirmed entries. Single-page cues
+  use current parent Chinese because no page allocation decision exists.
+- The non-authoritative drafts are hash-bound inside the manual edit artifact
+  and survive both zero-confirmation and partial-confirmation save/reload.
+- Read-only desktop replay now shows 303/303 rows with Chinese, including 79
+  stale drafts and zero blanks; all 261 parent cues retain Chinese, and the
+  imported SRT SHA-256 and mtime remain unchanged. Focused manual-editor and
+  stable-publication suites pass. Final unified regression passes 25/25 stages
+  in 356.408 seconds and `git diff --check` passes. No network, ASR, LLM,
+  FFmpeg, synthesis, or paid request ran.
+
+## 2026-08-09 Empty Intermediate Page Edit Recovery
+
+- A later 309-page manual checkpoint reproduced the remaining GUI defect: 89
+  page rows were blank even though the imported stale page SRT still supplied
+  79 exact page-identity Chinese drafts. Persisted empty intermediate edits were
+  incorrectly taking precedence over those recovered drafts.
+- Preview now treats an exact recovered draft as visible, stale, and
+  unconfirmed when the current page edit is empty. The authoritative edit and
+  parent Chinese remain unchanged, and formal publication remains blocked.
+- Page-boundary or page-count work on another parent preserves this stale
+  ownership instead of silently converting the displayed draft into confirmed
+  Chinese. Pages whose word ranges actually changed receive no old draft.
+- Read-only replay of the current desktop import exposes 309 rows, 79 recovered
+  drafts, and 10 intentionally blank changed-span pages. The source SRT hash and
+  mtime remain unchanged. Manual-editor tests pass 44/44, stable-publication UI
+  tests pass 43/43, and unified regression passes 25/25 stages in 339.2 seconds.
+  `git diff --check` passes; external requests remain zero.
+
+## 2026-08-09 Vocabulary Batch Cache Recovery
+
+- Root cause: vocabulary selection wrote any usable subset into the ordinary
+  cache after a request timeout or the 240-second generation budget. That cache
+  did not record batch completion, so later renders treated a front-loaded
+  partial result as a complete episode plan.
+- Vocabulary cache schema v2 now records stable content-derived chunk IDs,
+  `chunk_order`, `completed_chunk_ids`, per-chunk cards, and `complete`. A
+  successful empty array completes its chunk; only completion of every current
+  semantic-group chunk completes the cache.
+- Request order is timeline-balanced (opening, ending, middle, then intervening
+  ranges). Every successful chunk is atomically saved to a separate v2 progress
+  cache. A later render merges valid local/global progress and requests only
+  missing chunks.
+- A legacy prompt-v16 cache is not overwritten while v2 progress is partial.
+  Its candidates are merged with every completed v2 batch and the combined set
+  is rescheduled for the current render, so a recovered late-episode candidate
+  is not hidden behind the legacy plan. The ordinary per-subtitle and global
+  cache files are atomically replaced only after the v2 contract is complete.
+  Card content, trigger time, full-card persistence, subtitle data, and layout
+  are unchanged.
+- Offline replay of the 199-cue `中国AI为何更省钱？` production subtitle used its
+  existing nine-card cache across seven real request chunks: the first pass
+  completed 3/7 without changing the legacy cache, and the second pass requested
+  only the remaining four and reached 7/7. The final scheduled plan remained at
+  eight cards.
+- Seven focused cache tests and the unified 25-stage regression pass. The latter
+  exited `0` in 368.3 seconds; unrelated log-rotation file-lock warnings did not
+  fail a stage. The checkable 1920x1080 frame is
+  `tests/caption_audit/out/vocab-cache-recovery-sample.png`, with replay facts in
+  `tests/caption_audit/out/vocab-cache-recovery-replay.json`. No external model,
+  ASR, FFmpeg, or synthesis request ran.
+
+## 2026-08-09 Vocabulary Timeline Distribution
+
+- `中国AI为何更省钱？` is 912.8 seconds long, so the current density target is
+  15 cards. Its legacy cache contains nine raw candidates; eight pass the local
+  scheduler. The last legacy card, `physical bottlenecks`, begins at 409.5
+  seconds and therefore remains visible for 503.6 seconds when no later
+  candidate is available.
+- Root cause of the excessive tail hold was twofold: the old incomplete cache
+  contained no later candidate, and the recovery path used `legacy or partial`,
+  which hid completed v2 candidates until all batches finished. Recovery now
+  merges legacy and completed-v2 candidates before the common quality and
+  timeline scheduler runs.
+- The scheduler targets one card per minute and spreads eligible candidates
+  across equal time strata. It retains the existing priority >= 3 quality gate,
+  exact-source-phrase rule, duplicate removal, 15-second minimum interval, and
+  three-concept cap. It does not use ordinary vocabulary to force 15 cards.
+- Syntax compilation and seven focused vocabulary tests pass. Both full
+  regressions passed the vocabulary smoke stage but were blocked by unrelated
+  dirty-worktree test instability: one `stable subtitle publication` failure
+  passed 46/46 in isolation; the later `video synthesis publication safety`
+  failure reproduces in a `SimpleNamespace` UI fixture missing
+  `_set_manual_editor_mode`.
+- The current 1920x1080 real-data frame is
+  `tests/caption_audit/out/vocab-card-schedule-sample-20260809.png`; schedule
+  evidence is in
+  `tests/caption_audit/out/vocab-card-schedule-report-20260809.json`, and the
+  labeled target-versus-legacy diagram is
+  `tests/caption_audit/out/vocab-card-timeline-comparison-20260809.png`. No
+  external model, ASR, FFmpeg, or synthesis request ran for this validation.
+
+## 2026-08-09 Missing Manual-Page Chinese Proposals
+
+- Root cause: exact old page identities recovered Chinese for 79 of 89 blank
+  manual-page edits, but five re-paged parents had ten new word ranges with no
+  page-level Chinese. Their parent cues still contained complete Chinese.
+- For a manual page override only, the editor now uses the existing strict
+  Chinese token-boundary splitter and each English page's word count to propose
+  a complete local allocation. It returns no proposal when a safe Chinese
+  boundary cannot be found. It does not call an LLM or change parent cues,
+  frozen English, word ranges, word times, or renderer-authoritative data.
+- Source priority is explicit: confirmed manual Chinese, exact identity-matched
+  recovered draft, current local parent-split proposal, saved stale draft,
+  stale artifact text, then blank. Every non-authoritative value stays marked
+  unconfirmed and formal publication remains blocked.
+- Repeating the same manual page count is now a no-op only when page IDs, word
+  ranges, and frozen English all match. Confirmed page Chinese, history, and
+  overrides are preserved. A real page-count or boundary change still clears
+  the affected authoritative page Chinese and requires review.
+- Read-only replay of the current desktop import reports 309/309 non-empty
+  Chinese rows: 220 authoritative, 79 recovered drafts, and 10 local proposals
+  across `S0016`, `S0034`, `S0095`, `S0137`, and `S0166`. Each proposal group
+  concatenates exactly to its current parent Chinese. The source SRT SHA-256,
+  length, and mtime are unchanged.
+- Manual-editor tests pass 45/45 and stable-publication/UI tests pass 43/43.
+  Unified regression passes 25/25 stages in about 345 seconds, and
+  `git diff --check` passes. Network, ASR, LLM, FFmpeg, synthesis, and paid
+  requests are zero.
+
+## 2026-08-09 Existing-Page Expansion With Manual Review Boundaries
+
+- Root cause: explicit manual page-count planning allowed the lowest-risk
+  REVIEW boundary, but the following frozen-plan rebuild omitted
+  `allow_manual_review=True`. Existing two-page parents could therefore report
+  `manual_page_boundary_is_hard` when the user asked for a third page.
+- The manual split path now carries the same review authorization through the
+  rebuild. Automatic page planning remains strict. Continuous word ownership,
+  fixed parent IDs/text/timing, minimum page duration, fixed-font layout fit,
+  and structural-overflow checks remain mandatory.
+- The actual-page menu treats an existing page count as its baseline: a
+  two-page parent offers three or four total pages rather than repeating a
+  no-op two-page request. A true no-op no longer dirties editor state, revokes
+  synthesis authorization, refreshes the table, or reports false success.
+- Read-only real-package replay passes for `S0196` and `S0216`: each changes
+  from two to three pages, 309 to 310 visible rows, with continuous word
+  ranges, unchanged frozen parent cues and word ledger, and all other 307 rows
+  unchanged. All 11 package files retain their size, mtime, and SHA-256.
+- The focused regression passes, the manual-final editor script passes,
+  stable-publication/UI passes 49 tests, video-synthesis safety passes, and the
+  unified regression completes 25/25 stages with no failure summary.
+  `git diff --check` passes. Network, ASR, LLM, FFmpeg, synthesis, and paid
+  requests are zero.
+
+## 2026-08-09 Manual File Menu And Format Export
+
+- Root cause: the custom `RoundMenu` keeps an already-added action in its own
+  list widget when `QAction.setVisible(False)` is called, so compatibility
+  correction and document prompt remained visible as disabled rows in
+  manual-final mode. That mode also hid the complete format-export button,
+  including the existing bilingual TXT output.
+- Manual-final mode now removes the two upstream-only actions from the menu
+  through `RoundMenu.removeAction`. Ordinary processing mode inserts them back
+  before subtitle settings in their original order, and repeated mode changes
+  do not duplicate entries.
+- The existing format dropdown remains available as `导出字幕` in manual-final
+  mode. It continues to use the current visible table, selected bilingual
+  layout, and existing format choices including TXT; subtitle IDs, page plans,
+  timing, manifests, and synthesis authorization are unchanged.
+- Three focused menu/export tests pass, stable-publication/UI passes 51/51,
+  and the unified regression passes all 25/25 stages (about 653 test items) in
+  343.325 seconds. `git diff --check` passes. No network, ASR, LLM, FFmpeg,
+  synthesis, or paid request ran. A separate offscreen menu screenshot attempt
+  crashed in the Qt platform plugin and is not claimed as visual acceptance.
+
+## 2026-08-09 Interactive Review Gate And Organized Media Outputs
+
+- Root cause of automatic synthesis: the interactive subtitle task reused
+  `need_next_task`, and `SubtitleInterface` emitted the Home synthesis signal
+  immediately after loading the completed manual session. `SubtitleTask` now
+  carries an explicit `require_manual_review_before_synthesis` contract. Home
+  sets it, so a completed interactive run stays in the editor; batch tasks keep
+  their existing automatic chain.
+- Root cause of scattered files: stable exports, QA files, manual packages,
+  compatibility SRT, and videos independently derived paths from the media
+  parent. `media_result_dir` now owns one
+  `<output-anchor-parent>/<source-media-stem>-处理结果/` directory. Normal Home
+  runs therefore place all user-facing outputs beside the audio in that one
+  folder; E2E report anchors remain isolated. Internal work-dir artifacts and
+  source media are unchanged, and existing loose files are not moved or deleted.
+- Focused task-context tests pass 5/5, stable-publication/UI tests pass 53/53,
+  the manual-final editor script and video-synthesis safety script pass, and
+  the unified regression passes all 25/25 stages in 330.3 seconds. The first
+  two unified attempts exposed and then fixed output-anchor/name test-contract
+  mismatches; the final run exits 0. Network, ASR, LLM, FFmpeg synthesis, and
+  paid requests are zero.
+
+## 2026-08-09 Podcast English-Only Synthesis Toggle
+
+- The synthesis command bar now exposes `仅英文字幕` whenever the English
+  learning template is enabled. Enabling it also enables video synthesis and
+  the learning template; its persisted value is frozen into the synthesis task
+  so a queued render cannot change when the UI is edited later.
+- The selected simple workflow is two explicit runs: leave the toggle off for
+  the bilingual video, then turn it on and synthesize again for the English-only
+  video. One-click generation of both variants is intentionally not included.
+- English-only mode suppresses only the bottom Chinese subtitle draw call. It
+  does not erase `Cue.zh`, recalculate English wrapping or article pages, or
+  remove Chinese vocabulary-card glosses. Both templates therefore retain the
+  same English and vocabulary-card regions for the same frozen inputs.
+- Output names are isolated: `【文章单词模板】标题.mp4` and
+  `【文章单词模板-英文字幕版】标题.mp4` for the article template, with the
+  equivalent `【英语学习模板】` names for the dark-podcast template. Manual draft
+  output follows the same `-英文字幕版` suffix rule.
+- A formal smart-card render still requires a complete vocabulary plan before
+  encoding. The language toggle is not part of the vocabulary cache key, so two
+  runs over the same source, prompt version, model configuration, and completed
+  cache reuse the same plan.
+- Syntax checks, the video-synthesis safety script, the task-context contract,
+  and focused two-template pixel-region tests pass. The unified regression
+  passes all 25 stages in 362.9 seconds. Checkable 1920x1080 frames are
+  `tests/caption_audit/out/article-template-english-only-sample-20260809.png`
+  and `tests/caption_audit/out/podcast-template-english-only-sample-20260809.png`;
+  the checked 1400x850 command-bar capture is
+  `tests/caption_audit/out/synthesis-english-only-toggle-ui-20260809.png`.
+  No real FFmpeg pair, ASR, external model, or paid request ran.
+
+## 2026-08-09 Local Manual Page Reflow And Exact Chinese Recovery
+
+- Root cause: a formal English boundary move cleared the entire
+  `display_page_edits` and `display_page_boundary_overrides` state. One stale
+  parent therefore replaced the full actual-page table, and an all-or-nothing
+  page reuse path could make unrelated Chinese pages disappear after refresh.
+- Formal boundary moves now snapshot the complete visible page model, rebuild
+  only the two affected parents, and freeze every unaffected page by page ID,
+  parent ID, word range, English, Chinese, and timing. Affected Chinese remains
+  visible as an explicitly unconfirmed draft; publication stays fail-closed.
+- Saved packages that already contain blank page Chinese can recover text from
+  their hash-verified undo history only when page ID, parent ID, word range,
+  and normalized English all match. Recovered text is never authoritative until
+  manually confirmed. Ordinary one-page parent Chinese remains authoritative;
+  only pages created by formal-boundary reflow retain the stale-draft marker.
+- The manual table vertical header now shows `Sxxxx` or `Sxxxx.Pxx` instead of
+  a drifting visual row number, with enough manual-mode width to read the ID.
+- Read-only replay of the current `中国年轻人为何不爱留学了？` manual package
+  restored all 77 blank Chinese pages: 303 rows, zero blank Chinese, zero
+  unavailable pages. Moving `right?` from `S0080` to `S0079` in memory kept 303
+  page rows and changed zero unaffected pages; both affected pages remained
+  visible and unconfirmed.
+- Manual-editor tests pass, stable-publication/UI passes 54/54, and the unified
+  regression passes 25/25 stages in 359.2 seconds. `git diff --check` passes.
+  No network, ASR, LLM, FFmpeg synthesis, paid request, or production artifact
+  write ran.
+
+## 2026-08-10 Actual-Page Merge, Row-Scoped Undo, And Stable Focus
+
+- Actual-page editing now distinguishes two operations. Merging adjacent pages
+  inside one parent removes only that visual page boundary; selecting pages
+  from adjacent parents performs the existing formal parent-cue merge. The
+  first operation leaves the parent subtitle ID, English, word range, timeline,
+  and word ledger unchanged.
+- A formal parent merge remaps and rebuilds only the selected parents' page
+  state. If the merged parent cannot satisfy the frozen ledger, timeline, or
+  fixed-layout contract, the cue merge, page edits, boundary overrides, and
+  history entry are rolled back together.
+- The global undo control is hidden. Each subtitle inspector exposes undo only
+  when the latest linear-history operation affects that parent. The editor
+  refuses an older row-scoped rollback when a later operation exists, because
+  out-of-order boundary rollback would invalidate later word ownership.
+- Split, display-boundary, formal-boundary, merge, and undo refreshes restore
+  selection by display-page ID, parent subtitle ID, and word ID instead of by
+  the old visual row number.
+- Focused session checks pass 3/3, focused UI checks pass 6/6,
+  `tests.test_stable_publication` passes 57/57, and the complete manual-editor
+  script passes. The unified regression passes all 25 stages in 353.4 seconds.
+- Read-only replay of the current 303-page production package merges
+  `S0001.P01` with its next page, changes zero fields in the 300 unrelated
+  pages, leaves all parent cues and the word ledger unchanged, and restores all
+  303 pages after undo. The production package was not written. Network, ASR,
+  LLM, FFmpeg, synthesis, and paid requests are zero.
+
+## 2026-08-10 Actual-Page Tail Trim And Source-Media Recovery
+
+- Tail deletion is now available from the actual-page context menu. The cut is
+  owned by the selected page's first word ID. Selecting a later page inside one
+  parent keeps the preceding pages, truncates that parent to the preceding word,
+  and removes all following words and cues without renumbering the retained ID.
+- Source media resolution still prefers the manifest contract. When an imported
+  subtitle has no usable media path, the editor now derives the exact source
+  stem from `<media-stem>-处理结果/` and accepts only one same-stem supported
+  media sibling outside that directory. Multiple candidates remain an error;
+  the editor does not guess.
+- The delete action changes the in-memory subtitle and word-ledger suffix. The
+  explicit manual-final save materializes a separate `*-尾部裁剪.m4a` through
+  FFmpeg, binds its hash into the manifest, and makes synthesis prefer it even
+  when the UI still holds the original media path. The original file remains
+  unchanged.
+- Focused manual-editor tests and 57/57 publication/UI tests pass. The unified
+  regression passes all 25 stages in 459.5 seconds.
+- Read-only replay of the current 303-page package trims from `S0254.P02` at
+  969.689 seconds, retains `S0254.P01`, resolves the original desktop `.m4a`,
+  and restores the complete cue/ledger state after undo. All nine package files
+  retain their size, timestamp, and SHA-256. No production write, external
+  request, ASR, LLM, synthesis, or paid request occurred.
+
+## 2026-08-10 Manual Checkpoint Identity And Per-Page Font Ownership
+
+- Root cause: the manual save path could overwrite the discoverable original
+  parent subtitle, while a failed formal-boundary reflow could clear the whole
+  in-memory page table and its boundary overrides. This made original, page
+  snapshot, and manual-final imports behave like ambiguous reset points.
+- `人工终稿字幕.srt` now continues the current manual package;
+  `原文在上双语字幕.srt` opens the immutable stable parent checkpoint; and
+  `实际分页双语字幕.srt` remains a page snapshot that resolves to the latest
+  matching manual package when one exists. Manual save no longer overwrites the
+  original parent or original actual-page exports.
+- Formal parent-boundary changes are atomic with their local page reflow. A
+  failed reflow restores cues, page edits, overrides, and history. Save rejects
+  the specific corruption pattern where history recorded manual pages but both
+  current page state and boundary overrides unexpectedly became empty.
+- Automatic and manual pagination now recompute typography after final page
+  word spans are selected. Each page chooses its own largest legal
+  56/54/52/50px size; the parent `english_font_size` is the minimum child size
+  only as a compatibility summary. The renderer consumes the page value.
+- The planner contract is `article-fixed-font-pages-v17`; older page-layout
+  caches are invalidated without invalidating ASR, fixed English, parent
+  Chinese, or word-timing caches.
+- Read-only replay of the existing 262-parent, 303-page study-abroad package
+  found six pages whose font can increase and zero pages whose font decreases;
+  all nine package files retained their SHA-256. The unified 25-stage
+  regression passes in 374.5 seconds and `git diff --check` exits zero. No
+  network, ASR, LLM, production FFmpeg, synthesis, or paid request ran.
+
+## 2026-08-10 High-Pressure Page Review And Person Context Correction
+
+- `article-fixed-font-pages-v18` adds a bounded second review only for a static
+  page over 16 words or requiring 52/50px. It promotes a reviewed partition
+  only when every page has at least six words, at least 900ms, and a legal 56px
+  layout, while every boundary has a complete clause restart or a verified
+  pause of at least 500ms. Incomplete modifier/head, subject/predicate,
+  verb/object, and infinitive boundaries remain rejected.
+- Read-only replay of the 262-parent study-abroad checkpoint found 17
+  high-pressure single pages averaging 16.06 words. Only `S0044`, `S0076`, and
+  `S0257` changed page boundaries; the other 259 parent page projections did
+  not change. Parent IDs, English, Chinese, word ranges, and coverage had zero
+  mismatches.
+- Low-similarity titled person names may now use article evidence only when the
+  title matches, the surname keeps its initial and minimum similarity, and the
+  nearby ASR description overlaps the article person description. This is a
+  general evidence gate, not a name replacement table. Real-ledger replay
+  corrected both `Ms. Howe` occurrences to `Ms Hao`, retained all three
+  `haigui` surfaces, and covered all 2860 original word ranges.
+- Interrupted runs reuse article correction output only when its explicit
+  `article-asr-correction-v2` policy matches. An old correction artifact is
+  recomputed without invalidating the article-context or raw-ASR cache.
+- Article-context tests pass 33/33, the complete article display readability
+  contract passes, and the unified regression passes all 25 stages in 375.0
+  seconds. The validation was offline: no network, ASR, LLM, FFmpeg synthesis,
+  paid request, or production artifact write ran.
+
+## 2026-08-10 Frozen-Page Same-Screen Line Layout
+
+- `article-fixed-font-pages-v19` adds one renderer-only English line-layout
+  pass after page spans, page IDs, Chinese assignments, and page timing are
+  frozen. It compares 56/54/52/50px one- or two-line layouts without authority
+  to change page count, page boundaries, word ownership, English, Chinese,
+  subtitle IDs, or timing.
+- The previous layout remains the baseline. A smaller font is accepted only
+  when it produces a strictly better legal line break; equal layouts and equal
+  scores retain the larger font. If any valid size above 50px exists, 50px is
+  excluded from selection. Lexical atoms remain hard line-break protections;
+  only explicit non-atomic subject/predicate evidence is treated as a soft
+  same-screen score.
+- Read-only replay of the current study-abroad manual package checked 253
+  parents and 311 pages. Twenty-seven pages changed only their recorded line
+  layout. Page IDs, parent IDs, page count, English, Chinese, frozen word
+  ranges, start/end times, and source word coverage had zero changes. All 15
+  source-package files retained their SHA-256.
+- The initial offline layout comparison appeared to move font counts from
+  56/54/52/50 = 303/1/6/1 to 299/6/6/0, but renderer revalidation exposed
+  three retained v18 wraps that were not valid v19 layouts. The accepted
+  manual-save result is 297/6/5/3. `S0065.P01`, `S0185.P01`, and `S0223.P01`
+  use the 50px last resort; retaining their old 56/56/52px records makes the
+  renderer reject the artifact.
+- The complete article display readability contract and the 25-stage unified
+  regression pass. The final unified run completed in 407 seconds. Visual
+  before/after inspection found no overflow, overlap, or unexpected third
+  line. No network, ASR, LLM, FFmpeg synthesis, paid request, or production
+  artifact write ran.
+- Manual-final save now upgrades an older frozen page artifact through the same
+  v19 same-screen pass before writing its new contract. The upgrade copies page
+  count, page IDs, word spans, English, Chinese, page times, and boundary
+  evidence unchanged and rewrites only English lines, font size, and measured
+  width. This prevents a v18 manual package from being mislabeled as v19 or
+  rejected later by the renderer.
+- A read-only replay through the actual manual-save blueprint path checked all
+  253 parents, 311 pages, and 311 saved page edits. Twenty-three page layouts
+  changed and the complete structural projection had zero changes. The full
+  article-layout and manual-editor scripts pass, and the post-integration
+  25-stage unified regression passes in 393.2 seconds.
+- A real synthesis attempt then exposed the invalid retained legacy layouts at
+  `S0065.P01`, `S0185.P01`, and `S0223.P01`. Baseline retention now requires
+  the old lines to pass the current v19 validator; an invalid legacy wrap can
+  no longer be relabeled as v19. A temporary full manual-save package with 253
+  parents and 311 pages is accepted by the renderer, and the final 25-stage
+  unified regression passes in 375.9 seconds. No production package was
+  overwritten during this repair.

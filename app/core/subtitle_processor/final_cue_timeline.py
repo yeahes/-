@@ -258,9 +258,19 @@ def validate_final_cue_timeline(
         )
 
     word_by_id = _word_index(words, errors)
+    expected_word_ids = set(range(len(words)))
+    if set(word_by_id) != expected_word_ids:
+        errors.append(
+            {
+                "code": "final_timeline_word_id_set_mismatch",
+                "expected_word_count": len(expected_word_ids),
+                "returned_word_count": len(word_by_id),
+            }
+        )
     previous_end = -1
     previous_subtitle_id = ""
     previous_word_end = -1
+    covered_word_ids: List[int] = []
     for record in records:
         subtitle_id = str(record.get("subtitle_id") or "")
         start = int(record.get("start_ms") or 0)
@@ -295,6 +305,7 @@ def validate_final_cue_timeline(
                 }
             )
             continue
+        covered_word_ids.extend(range(word_start, word_end + 1))
         expected_envelope_start = int(first["start_ms"])
         expected_envelope_end = int(last["end_ms"])
         if envelope_start != expected_envelope_start or envelope_end != expected_envelope_end:
@@ -343,6 +354,26 @@ def validate_final_cue_timeline(
         previous_end = max(previous_end, end)
         previous_subtitle_id = subtitle_id
         previous_word_end = word_end
+
+    covered_word_id_set = set(covered_word_ids)
+    missing_ledger_word_ids = sorted(expected_word_ids - covered_word_id_set)
+    duplicate_ledger_word_ids = sorted(
+        word_id for word_id in covered_word_id_set if covered_word_ids.count(word_id) > 1
+    )
+    if missing_ledger_word_ids or duplicate_ledger_word_ids:
+        errors.append(
+            {
+                "code": "final_timeline_word_coverage_incomplete",
+                "missing_word_ids": missing_ledger_word_ids,
+                "duplicate_word_ids": duplicate_ledger_word_ids,
+                "expected_word_range": [0, len(words) - 1] if words else [],
+                "covered_word_range": (
+                    [min(covered_word_id_set), max(covered_word_id_set)]
+                    if covered_word_id_set
+                    else []
+                ),
+            }
+        )
 
     unique_errors = _unique_errors(errors)
     return {

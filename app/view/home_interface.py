@@ -63,19 +63,27 @@ class HomeInterface(QWidget):
         self.subtitle_optimization_interface.finished.connect(
             self.switch_to_video_synthesis
         )
+        self.subtitle_optimization_interface.manual_final_ready.connect(
+            self.open_manual_final_synthesis
+        )
+        self.subtitle_optimization_interface.manual_draft_ready.connect(
+            self.open_manual_draft_synthesis
+        )
 
     def switch_to_transcription(self, file_path):
-        transcribe_task = TaskFactory.create_transcribe_task(
-            file_path, need_next_task=True
-        )
         state = self.task_creation_interface.get_article_reference_state()
-        transcribe_task.article_reference_text = state.get("article_source_text", "")
-        transcribe_task.article_context_data = state.get("article_context_data")
-        transcribe_task.use_article_reference_assist = bool(
-            state.get("use_article_reference_assist")
-        )
-        transcribe_task.use_article_translation_terms = bool(
-            state.get("use_article_translation_terms")
+        transcribe_task = TaskFactory.create_transcribe_task(
+            file_path,
+            need_next_task=True,
+            source_audio_path=file_path,
+            article_reference_text=state.get("article_source_text", ""),
+            article_context_data=state.get("article_context_data"),
+            use_article_reference_assist=bool(
+                state.get("use_article_reference_assist")
+            ),
+            use_article_translation_terms=bool(
+                state.get("use_article_translation_terms")
+            ),
         )
         self._last_transcribe_task = transcribe_task
         self.transcription_interface.set_task(transcribe_task)
@@ -96,6 +104,11 @@ class HomeInterface(QWidget):
             use_article_translation_terms=bool(
                 getattr(self._last_transcribe_task, "use_article_translation_terms", False)
             ),
+            source_audio_path=(
+                getattr(self._last_transcribe_task, "source_audio_path", None)
+                or video_path
+            ),
+            require_manual_review_before_synthesis=True,
         )
         self.subtitle_optimization_interface.set_task(subtitle_task)
         self.subtitle_optimization_interface.process()
@@ -108,6 +121,24 @@ class HomeInterface(QWidget):
         )
         self.video_synthesis_interface.set_task(synthesis_task)
         self.video_synthesis_interface.process()
+        self.stackedWidget.setCurrentWidget(self.video_synthesis_interface)
+        self.pivot.setCurrentItem("VideoSynthesisInterface")
+
+    def open_manual_final_synthesis(self, media_path, manifest_path):
+        self.video_synthesis_interface.set_inputs(
+            media_path,
+            manifest_path,
+            manual_draft_mode=False,
+        )
+        self.stackedWidget.setCurrentWidget(self.video_synthesis_interface)
+        self.pivot.setCurrentItem("VideoSynthesisInterface")
+
+    def open_manual_draft_synthesis(self, media_path, manifest_path):
+        self.video_synthesis_interface.set_inputs(
+            media_path,
+            manifest_path,
+            manual_draft_mode=True,
+        )
         self.stackedWidget.setCurrentWidget(self.video_synthesis_interface)
         self.pivot.setCurrentItem("VideoSynthesisInterface")
 

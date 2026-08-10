@@ -1,48 +1,48 @@
 # Project State
-
 Status: complete
-Last verified: 2026-08-06 15:06:05 Asia/Shanghai
+Last verified: 2026-08-10 08:14:02 Asia/Shanghai
 Branch: main
-Verified HEAD: 4f3bc8035f549d488ccf58b04e25020e561970ff
-Working tree: clean after the documentation handoff commit
+Verified HEAD: 6b6a1e9da8725c2e51dec27c9639209d529b6249
+Working tree: clean after the stable bilingual workflow checkpoint commit
 
 ## Current Goal
-Maintain the validated fixed-parent-ID display-page translation contract.
+Improve same-screen English line breaks and font selection without changing any frozen subtitle or page contract.
 
 ## Confirmed Facts
-- Real-audio E2E `china-ai-cheaper-e2e-20260806-page-contract-r1` passed with 262 fixed IDs, 2,897 ledger words, 46 multipage parents, and 94 validated pages.
-- Frozen ID order, English, and word spans match `china-ai-cheaper-e2e-20260806-global-boundaries-r2` exactly.
-- Final timing is `PASS`, applied backend is `whisperx-time-only`, overall fallback is false, `source_audio_missing` is absent, and 64.8-66.5s is covered by S0017.
-- Final video exists at the E2E root, is 1003.66s / 1920x1080 H.264/AAC, and fully decodes with zero ffmpeg errors. ffprobe is unavailable.
-- Targeted visual validation passed 22/22 sampled frames, including four
-  multipage cues, all associated +/-80ms transitions, and 64.8/65.6/66.4s.
-  No sampled shrink, crop, overlap, blank, or reversed page was found.
-- Total external requests across the four page-contract attempts: 11. Synthesis used zero.
+- Contract v19 runs only after page spans, IDs, Chinese, and timing are frozen.
+- Read-only replay checked 253 parents, 311 pages, and 311 saved page edits; every structural field had zero changes.
+- Exact renderer validation exposed three invalid retained v18 wraps at S0065.P01, S0185.P01, and S0223.P01.
+- The accepted v19 font counts are 56/54/52/50 = 297/6/5/3. Invalid legacy wraps cannot be retained merely to preserve a larger font.
+- All 15 source-package files retained their SHA-256; no production package or video was regenerated.
 
 ## Approved Decisions
-- Preserve frozen English, parent subtitle IDs, word spans, cue timing, fixed fonts, and SRT/ASS ownership.
-- Add page IDs and page-level Chinese only after the final word timeline is frozen; invalid or missing page artifacts fail before ffmpeg.
-- Bind page artifacts to the manifest using SHA-256 and contract hash; artifact writes fail closed.
+- Same-screen reflow has no authority over page count, page boundaries, IDs, English, Chinese, word ownership, or timing.
+- A valid existing layout is the baseline; an invalid legacy layout must be replaced by the current legal fallback.
+- Lexical atoms remain hard protected. Explicit non-atomic subject/predicate evidence is soft only because both lines remain on screen together.
+- If a legal layout above 50px exists, 50px cannot compete.
 
 ## Relevant Paths
-- `app/core/subtitle_processor/stable_display_planner.py`
-- `app/core/subtitle_processor/stable_display_page_contract.py`
 - `app/core/utils/podcast_learning_video.py`
-- `app/core/subtitle_processor/screen_editor.py`
-- `E:\VideoCaptioner-e2e-runs\china-ai-cheaper-e2e-20260806-page-contract-r1`
+- `app/core/subtitle_processor/stable_display_page_contract.py`
+- `tests/test_article_display_readability_contract.py`
+- `E:\VideoCaptioner-e2e-runs\same-screen-line-layout-v19-audit-20260810`
 
 ## Last Verification
-- Unified regression, focused page-contract tests, E2E subtitle gate, synthesis,
-  manifest/digest checks, frozen-signature comparison, and complete ffmpeg
-  decode passed. Final unified regression is 17/17 and `git diff --check`
-  passes after documentation. Targeted visual validation is 22/22.
+- The complete article display readability contract passes.
+- Complete article-layout and manual-editor scripts pass.
+- A temporary complete manual-save artifact is accepted by the renderer.
+- Final unified regression passes all 25 stages in 375.9 seconds.
+- Visual before/after inspection found no overflow, overlap, or unexpected third line.
+- External requests and production writes are zero.
 
 ## Next Action
-Run one unrelated blind audio before raising unseen-audio confidence above 85%.
+Review the current encoded video, then decide whether unsafe 50px line wraps should trigger upstream visual replanning before page contracts are frozen.
 
 ## Do Not Regress
-- No proportional Chinese fallback, font shrinking, English LLM segmentation, timing rewrite, or sample-specific rule.
+- Never let same-screen line reflow change page count, page boundaries, parent or page IDs, English, Chinese, word spans, cue timing, or word timing.
+- Never shrink a valid layout for an equal line break or retain an invalid legacy layout as v19.
+- Never reuse an older page-layout cache as v19.
 
 ## Unknowns
-- Blind reliability on an unrelated unseen audio has not been measured.
-- Manual-final multipage Chinese edits do not yet have a page-aware editor.
+- No fresh GUI run or video encode has validated the v19 page artifact.
+- Reliability on a completely unrelated blind audio remains unmeasured.

@@ -4,6 +4,7 @@ from typing import Optional
 
 from app.common.config import cfg
 from app.config import MODEL_PATH, SUBTITLE_STYLE_PATH
+from app.core.output_paths import media_result_dir
 from app.core.entities import (
     LANGUAGES,
     FullProcessTask,
@@ -56,7 +57,14 @@ class TaskFactory:
 
     @staticmethod
     def create_transcribe_task(
-        file_path: str, need_next_task: bool = False
+        file_path: str,
+        need_next_task: bool = False,
+        *,
+        source_audio_path: Optional[str] = None,
+        article_reference_text: str = "",
+        article_context_data: Optional[dict] = None,
+        use_article_reference_assist: bool = False,
+        use_article_translation_terms: bool = False,
     ) -> TranscribeTask:
         """创建转录任务"""
 
@@ -117,6 +125,11 @@ class TaskFactory:
             output_path=output_path,
             transcribe_config=config,
             need_next_task=need_next_task,
+            source_audio_path=source_audio_path or file_path,
+            article_reference_text=article_reference_text or "",
+            article_context_data=article_context_data,
+            use_article_reference_assist=use_article_reference_assist,
+            use_article_translation_terms=use_article_translation_terms,
         )
 
     @staticmethod
@@ -129,6 +142,7 @@ class TaskFactory:
         use_article_reference_assist: bool = False,
         use_article_translation_terms: bool = False,
         source_audio_path: Optional[str] = None,
+        require_manual_review_before_synthesis: bool = False,
     ) -> SubtitleTask:
         """创建字幕任务"""
         output_name = (
@@ -240,6 +254,9 @@ class TaskFactory:
             output_path=output_path,
             subtitle_config=config,
             need_next_task=need_next_task,
+            require_manual_review_before_synthesis=bool(
+                require_manual_review_before_synthesis
+            ),
             article_reference_text=article_reference_text or "",
             article_context_data=article_context_data,
             use_article_reference_assist=use_article_reference_assist,
@@ -252,22 +269,45 @@ class TaskFactory:
 
     @staticmethod
     def create_synthesis_task(
-        video_path: str, subtitle_path: str, need_next_task: bool = False
+        video_path: str,
+        subtitle_path: str,
+        need_next_task: bool = False,
+        *,
+        manual_draft_mode: bool = False,
     ) -> SynthesisTask:
         """创建视频合成任务"""
+        output_dir = media_result_dir(video_path)
         if cfg.podcast_learning_template.value:
             template_name = cfg.podcast_template_style.value or "暗色播客"
-            prefix = "【文章单词模板】" if template_name == "文章单词" else "【英语学习模板】"
+            english_only = bool(cfg.podcast_template_english_only.value)
+            if manual_draft_mode:
+                prefix = (
+                    "【人工草稿-英文字幕版】"
+                    if english_only
+                    else "【人工草稿】"
+                )
+            elif template_name == "文章单词":
+                prefix = (
+                    "【文章单词模板-英文字幕版】"
+                    if english_only
+                    else "【文章单词模板】"
+                )
+            else:
+                prefix = (
+                    "【英语学习模板-英文字幕版】"
+                    if english_only
+                    else "【英语学习模板】"
+                )
             output_path = str(
-                Path(video_path).parent / f"{prefix}{Path(video_path).stem}.mp4"
+                output_dir / f"{prefix}{Path(video_path).stem}.mp4"
             )
         elif need_next_task:
             output_path = str(
-                Path(video_path).parent / f"【卡卡】{Path(video_path).stem}.mp4"
+                output_dir / f"【卡卡】{Path(video_path).stem}.mp4"
             )
         else:
             output_path = str(
-                Path(video_path).parent / f"【卡卡】{Path(video_path).stem}.mp4"
+                output_dir / f"【卡卡】{Path(video_path).stem}.mp4"
             )
 
         config = SynthesisConfig(
@@ -276,12 +316,14 @@ class TaskFactory:
             podcast_learning_template=cfg.podcast_learning_template.value,
             podcast_template_style=cfg.podcast_template_style.value,
             podcast_template_ai_vocab=cfg.podcast_template_ai_vocab.value,
+            podcast_template_english_only=cfg.podcast_template_english_only.value,
             podcast_template_title=cfg.podcast_template_title.value,
             podcast_template_background=cfg.podcast_template_background.value,
             podcast_template_cover=cfg.podcast_template_cover.value,
             podcast_template_date=cfg.podcast_template_date.value,
             subtitle_render_mode=cfg.subtitle_render_mode.value,
             subtitle_layout=cfg.subtitle_layout.value,
+            manual_draft_mode=bool(manual_draft_mode),
             rounded_style={
                 "font_name": cfg.rounded_font_name.value,
                 "font_size": cfg.rounded_font_size.value,
@@ -314,6 +356,11 @@ class TaskFactory:
         output_path: Optional[str] = None,
         transcribe_config: Optional[TranscribeConfig] = None,
         subtitle_config: Optional[SubtitleConfig] = None,
+        source_audio_path: Optional[str] = None,
+        article_reference_text: str = "",
+        article_context_data: Optional[dict] = None,
+        use_article_reference_assist: bool = False,
+        use_article_translation_terms: bool = False,
     ) -> TranscriptAndSubtitleTask:
         """创建转录和字幕任务"""
         if output_path is None:
@@ -325,6 +372,13 @@ class TaskFactory:
             queued_at=datetime.datetime.now(),
             file_path=file_path,
             output_path=output_path,
+            transcribe_config=transcribe_config,
+            subtitle_config=subtitle_config,
+            source_audio_path=source_audio_path or file_path,
+            article_reference_text=article_reference_text or "",
+            article_context_data=article_context_data,
+            use_article_reference_assist=use_article_reference_assist,
+            use_article_translation_terms=use_article_translation_terms,
         )
 
     @staticmethod
@@ -334,6 +388,11 @@ class TaskFactory:
         transcribe_config: Optional[TranscribeConfig] = None,
         subtitle_config: Optional[SubtitleConfig] = None,
         synthesis_config: Optional[SynthesisConfig] = None,
+        source_audio_path: Optional[str] = None,
+        article_reference_text: str = "",
+        article_context_data: Optional[dict] = None,
+        use_article_reference_assist: bool = False,
+        use_article_translation_terms: bool = False,
     ) -> FullProcessTask:
         """创建完整处理任务（转录+字幕+合成）"""
         if output_path is None:
@@ -346,4 +405,12 @@ class TaskFactory:
             queued_at=datetime.datetime.now(),
             file_path=file_path,
             output_path=output_path,
+            transcribe_config=transcribe_config,
+            subtitle_config=subtitle_config,
+            synthesis_config=synthesis_config,
+            source_audio_path=source_audio_path or file_path,
+            article_reference_text=article_reference_text or "",
+            article_context_data=article_context_data,
+            use_article_reference_assist=use_article_reference_assist,
+            use_article_translation_terms=use_article_translation_terms,
         )

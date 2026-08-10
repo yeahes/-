@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
+import copy
 import hashlib
 import json
 import logging
 import math
+import os
 import re
 import subprocess
-import time
+import tempfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from openai import OpenAI
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
@@ -16,12 +19,24 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFo
 from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
 from app.core.entities import LLMServiceEnum
 from app.core.subtitle_processor.stable_display_planner import plan_word_page_spans
+from app.core.subtitle_processor.chinese_token_boundaries import (
+    chinese_token_boundaries,
+)
 from app.core.subtitle_processor.stable_display_page_contract import (
     DISPLAY_PAGE_PLANNER_VERSION,
     DISPLAY_PAGE_SCHEMA_VERSION,
     display_page_id,
 )
+from app.core.subtitle_processor.stable_artifacts import (
+    file_sha256,
+    validate_manifest_artifact,
+)
 from app.core.utils.json_repair import loads as repair_json_loads
+from app.core.utils.video_utils import (
+    MediaSynthesisCancelled,
+    staged_media_output,
+    terminate_media_process,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -31,9 +46,9 @@ WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
 VOCAB_REQUEST_TIMEOUT_SECONDS = 90
-VOCAB_GENERATION_TIME_BUDGET_SECONDS = 240
 VOCAB_REQUEST_MAX_GROUPS = 25
 VOCAB_REQUEST_MAX_CHARS = 6000
+VOCAB_CACHE_SCHEMA_VERSION = 2
 SX = WIDTH / 1879
 SY = HEIGHT / 1056
 ARTICLE_DESIGN_WIDTH = 1600
@@ -73,6 +88,11 @@ FONT_HANCHAN_BOLD = (
     ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicBold.otf"
     if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicBold.otf").exists()
     else TEMPLATE_DIR / "ChillYunmoGothicBold.otf"
+)
+FONT_HANCHAN_HEAVY = (
+    ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicHeavy.otf"
+    if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicHeavy.otf").exists()
+    else FONT_HANCHAN_BOLD
 )
 FONT_HANCHAN_MEDIUM = (
     ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicMedium.otf"
@@ -129,32 +149,51 @@ VOCAB_GROUP_MAX_SECONDS = 18.0
 VOCAB_GROUP_SILENCE_SECONDS = 0.7
 VOCAB_MIN_CARD_INTERVAL_SECONDS = 15.0
 VOCAB_OPENING_CARD_TRANSITION_SECONDS = 0.25
-VOCAB_CARDS_PER_MINUTE = 1.25
+VOCAB_CARDS_PER_MINUTE = 1.0
 VOCAB_MIN_CARDS_PER_EPISODE = 3
 VOCAB_MAX_CARDS_PER_EPISODE = 22
 VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 3
-ARTICLE_SUBTITLE_EN_FONT_SIZE = 58
+ARTICLE_SUBTITLE_EN_FONT_SIZE = 56
 ARTICLE_SUBTITLE_ZH_FONT_SIZE = 46
-ARTICLE_SUBTITLE_EN_MIN_SIZE = ARTICLE_SUBTITLE_EN_FONT_SIZE
+ARTICLE_SUBTITLE_EN_FALLBACK_SIZES = (56, 54, 52, 50)
+ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES: tuple[int, ...] = ()
+ARTICLE_SUBTITLE_EN_ALLOWED_SIZES = (
+    *ARTICLE_SUBTITLE_EN_FALLBACK_SIZES,
+    *ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES,
+)
+ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE = min(ARTICLE_SUBTITLE_EN_FALLBACK_SIZES)
+ARTICLE_SUBTITLE_EN_MIN_SIZE = min(ARTICLE_SUBTITLE_EN_ALLOWED_SIZES)
 ARTICLE_SUBTITLE_ZH_MIN_SIZE = ARTICLE_SUBTITLE_ZH_FONT_SIZE
+ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH = 1260
 ARTICLE_SUBTITLE_EN_WIDTH = 1455
-# A cue may use the full safe panel width while retaining the fixed 58px
-# font. This is a layout profile, never a segmentation budget.
+# A cue may use the full safe panel width while retaining the preferred font.
+# This is a layout profile, never a segmentation budget.
 ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH = 1498
 ARTICLE_SUBTITLE_ZH_WIDTH = 1455
 ARTICLE_PAGE_MIN_DURATION_MS = 900
+ARTICLE_PAGE_COMFORTABLE_MAX_DURATION_MS = 6500
 ARTICLE_PAGE_LEAD_IN_MS = 70
 ARTICLE_PAGE_TAIL_HOLD_MS = 120
 ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
-ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS = 120
+ARTICLE_PAGE_UNSUPPORTED_TRANSITION_MIN_PAUSE_MS = 260
+ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS = 200
+ARTICLE_PAGE_STRONG_PAUSE_REVIEW_MS = 600
+ARTICLE_PAGE_PUNCTUATED_PREDICATE_REVIEW_MS = 320
+ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS = 180
+ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT = 4
+ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS = 6
+ARTICLE_PAGE_SECONDARY_REVIEW_STRONG_PAUSE_MS = 500
 # A long frozen cue remains one subtitle ID and one timing envelope, but the
 # article template may paginate it inside that envelope.  These are render
 # budgets, not segmentation or translation limits.
-# Keep the existing normal hard ceiling as the renderer page ceiling. The
-# preferred 6-12 word target still guides the balanced split when possible.
-ARTICLE_VISUAL_PAGE_MAX_WORDS = 16
+# Keep 16 words as a soft renderer preference. The preferred 6-12 word target
+# still guides the balanced split when possible.
+# This is a preference, not a feasibility rule. Proportional-font pixel fit,
+# grammar evidence, and page timing decide whether a page is renderable.
+ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS = 16
 ARTICLE_VISUAL_PAGE_PREFERRED_WORDS = 12
 ARTICLE_VISUAL_PAGE_MIN_WORDS = 4
+ARTICLE_VISUAL_PAGE_MAX_PAGES = 4
 ARTICLE_STATIC_TWO_WORD_LINE_MAX_WORDS = ARTICLE_VISUAL_PAGE_MIN_WORDS * 2
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
@@ -165,6 +204,20 @@ ARTICLE_MIXED_AVOID_LINE_START = frozenset(
 ARTICLE_MIXED_PREFERRED_BREAK_AFTER = frozenset(
     "，。；：、来的于与和及或但而并把被将让使为对从向给由因比像"
 )
+ARTICLE_CONCEPT_LEAD_IN_SUBJECTS = ("本句", "这句", "文中", "这里")
+ARTICLE_CONCEPT_LEAD_IN_PREDICATES = (
+    "说明",
+    "表明",
+    "表示",
+    "意味着",
+    "强调",
+    "形容",
+    "比喻",
+    "描述",
+    "解释",
+)
+ARTICLE_CONCEPT_LEAD_IN_MIN_CJK = 6
+ARTICLE_CONCEPT_LEAD_IN_MAX_CJK = 12
 
 LINE_BREAK_AVOID_BEFORE_WORDS = {
     "about", "above", "across", "after", "against", "although", "among", "around",
@@ -184,6 +237,8 @@ LINE_BREAK_AVOID_AFTER_WORDS = {
     "has", "had", "can", "could", "will", "would", "shall", "should", "may", "might", "must",
 }
 CAPTION_HARD_BREAK_PENALTY = 12_000
+ARTICLE_LINE_SOFT_MODIFIER_PENALTY = 1_600
+ARTICLE_LINE_FONT_PIXEL_PENALTY = 2_500
 # A complete phrase that starts on the next line/page is readable, but it is
 # still slightly less desirable than a neutral boundary.  Keep this below the
 # hard threshold so callers can distinguish a review-worthy preference from a
@@ -233,13 +288,41 @@ ARTICLE_PAGE_CONTINUATION_START_WORDS = frozenset(
     (LINE_BREAK_AVOID_BEFORE_WORDS - ARTICLE_PAGE_PHRASE_START_WORDS)
     | {"and", "but", "nor", "or", "so", "yet"}
 )
+MANUAL_DRAFT_PAGE_SCHEMA_VERSION = 1
 ARTICLE_PAGE_OBJECT_DETERMINERS = frozenset(
     {"a", "an", "the", "this", "that", "these", "those", "my", "your", "our", "their", "its"}
+)
+ARTICLE_PAGE_TO_INFINITIVE_HEADS = frozenset(
+    {
+        "ability", "attempt", "chance", "decision", "effort", "goal", "need",
+        "opportunity", "option", "permission", "plan", "power", "reason", "way",
+    }
+)
+ARTICLE_PAGE_COMPLETE_CONTINUATION_START_WORDS = frozenset(
+    {
+        "although", "and", "because", "but", "if", "nor", "or", "so",
+        "that", "unless", "when", "where", "which", "while", "who", "yet",
+    }
+)
+ARTICLE_PAGE_COMPLETE_WH_CLAUSE_START_WORDS = frozenset(
+    {
+        "how",
+        "what",
+        "when",
+        "where",
+        "whether",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "why",
+    }
 )
 ENGLISH_VISUAL_MODIFIER_SUFFIXES = (
     "able", "al", "ant", "ary", "ed", "ent", "ful", "ic", "ical", "ible",
     "ish", "ive", "less", "ory", "ous",
 )
+ENGLISH_VISUAL_NOMINAL_SUFFIXES = ("ment",)
 ENGLISH_VISUAL_MODIFIER_WORDS = frozenset(
     {
         "another", "bigger", "first", "former", "higher", "last", "larger",
@@ -250,6 +333,98 @@ ENGLISH_VISUAL_MODIFIER_WORDS = frozenset(
 ENGLISH_NUMERIC_MAGNITUDE_WORDS = frozenset(
     {"hundred", "thousand", "million", "billion", "trillion"}
 )
+ENGLISH_RATE_DETERMINERS = frozenset({"a", "an", "each", "per"})
+ENGLISH_RATE_PERIOD_WORDS = frozenset(
+    {
+        "day", "days", "hour", "hours", "minute", "minutes", "month",
+        "months", "quarter", "quarters", "second", "seconds", "week",
+        "weeks", "year", "years",
+    }
+)
+
+# Formal cue boundaries and renderer-only page boundaries share evidence, but
+# not every cue-level warning is an absolute page prohibition. Coordinators
+# and complete dependency phrases remain reviewable; atomic lexical or
+# predicate attachments stay hard.
+DISPLAY_PAGE_REVIEWABLE_BOUNDARY_ISSUES = frozenset(
+    {
+        "clause_introducer_split",
+        "coordinated_constituent_split",
+        "dependency_phrase_entrance_split",
+        "fronted_wh_clause_split",
+        "modifier_head_split",
+        "object_attached_modifier_split",
+        "post_noun_participial_modifier_split",
+        "verb_preposition_complement_split",
+        "zero_relative_clause_split",
+    }
+)
+DISPLAY_PAGE_ATOMIC_SOFT_ISSUES = frozenset(
+    {
+        "comparative_clause_split",
+        "compound_noun_split",
+        "modifier_noun_head_split",
+        "phrasal_verb_particle_split",
+        "short_verb_object_split",
+        "verb_complement_split",
+    }
+)
+DISPLAY_PAGE_STRONG_PAUSE_REVIEWABLE_HARD_ISSUES = frozenset(
+    {
+        "relative_clause_subject_verb_split",
+        "subject_finite_verb_split",
+        "subject_predicate_split",
+    }
+)
+# A page transition hides the previous text, while a line wrap keeps both
+# halves visible together. Only genuinely atomic language units remain hard at
+# a same-screen line boundary; broader clause and predicate warnings are
+# quality signals used to rank otherwise valid layouts.
+ARTICLE_LINE_ATOMIC_BOUNDARY_ISSUES = frozenset(
+    {
+        "abbreviation_name_split",
+        "auxiliary_predicate_split",
+        "be_complement_split",
+        "candidate_protected_named_phrase_split",
+        "compound_noun_split",
+        "compound_preposition_split",
+        "determiner_head_phrase_split",
+        "determiner_noun_split",
+        "determiner_numeric_noun_split",
+        "high_confidence_modifier_head_split",
+        "hyphenated_measure_noun_split",
+        "initialism_continuation_split",
+        "modifier_head_split",
+        "modifier_noun_head_split",
+        "numeric_magnitude_split",
+        "numeric_range_split",
+        "numeric_unit_or_noun_split",
+        "particle_or_preposition_complement_split",
+        "phrasal_verb_particle_split",
+        "phrasal_verb_split",
+        "possessive_head_split",
+        "predicate_complement_chain_split",
+        "preposition_object_split",
+        "protected_named_phrase_split",
+        "protected_phrasal_boundary_split",
+        "quantifier_phrase_split",
+        "separable_verb_particle_chain_split",
+        "to_infinitive_split",
+        "verb_adverb_preposition_split",
+        "verb_particle_preposition_chain_split",
+        "verb_particle_split",
+        "verb_preposition_complement_split",
+        "verb_preposition_split",
+    }
+)
+DISPLAY_PAGE_REVIEW_PENALTY = 2_800
+DISPLAY_PAGE_LOW_CONFIDENCE_REVIEW_PENALTY = 800
+DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY = 7_200
+DISPLAY_PAGE_FORCED_CONTINUATION_REVIEW_PENALTY = 12_000
+DISPLAY_PAGE_HIGH_RISK_COST = 6_000
+DISPLAY_PAGE_FONT_STEP_PENALTY = 650
+DISPLAY_PAGE_COUNT_DEVIATION_PENALTY = 600
+DISPLAY_PAGE_TRANSITION_PENALTY = 150
 
 # A Chinese visual page may switch before a new grammatical phrase, but it
 # must not switch inside an unspaced lexical unit.  This is intentionally a
@@ -278,6 +453,7 @@ class Cue:
     word_timing: tuple[dict, ...] = ()
     article_page_plan: dict | None = None
     display_page_translations: dict[str, str] | None = None
+    display_boundary_evidence: dict[str, dict] | None = None
 
 
 class RenderStructuralOverflowError(RuntimeError):
@@ -292,6 +468,26 @@ class RenderStructuralOverflowError(RuntimeError):
             for error in self.errors
         )
         super().__init__(f"{self.code}: {details}")
+
+
+class VocabularyPlanIncompleteError(RuntimeError):
+    """Block synthesis until every current vocabulary batch is complete."""
+
+    code = "vocabulary_plan_incomplete"
+
+    def __init__(
+        self,
+        completed_chunks: int,
+        total_chunks: int,
+        failures: Sequence[str] = (),
+    ) -> None:
+        self.completed_chunks = completed_chunks
+        self.total_chunks = total_chunks
+        self.failures = tuple(failures)
+        super().__init__(
+            "智能单词卡生成未完成"
+            f"（{completed_chunks}/{total_chunks} 批）；已保存进度，请重试合成"
+        )
 
 
 @dataclass(frozen=True)
@@ -392,6 +588,8 @@ def article_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
 
 def article_cjk_font(size: int, weight: int = 700) -> ImageFont.FreeTypeFont:
     size = acx(size)
+    if weight >= 800 and FONT_HANCHAN_HEAVY.exists():
+        return font(FONT_HANCHAN_HEAVY, size, weight)
     if weight >= 700 and FONT_HANCHAN_BOLD.exists():
         return font(FONT_HANCHAN_BOLD, size, weight)
     if weight >= 500 and FONT_HANCHAN_MEDIUM.exists():
@@ -437,6 +635,32 @@ def is_english(text: str) -> bool:
     return letters > cjk
 
 
+def _split_bilingual_srt_payload(payload: list[str]) -> tuple[str, str]:
+    first = payload[0]
+    remaining = payload[1:]
+    joined_remaining = "".join(remaining)
+    if is_english(first):
+        return first, joined_remaining
+    if re.search(r"[\u4e00-\u9fff]", first):
+        return " ".join(remaining) if remaining else first, first
+    if any(is_english(line) for line in remaining):
+        return " ".join(remaining), first
+
+    first_has_ascii_terminal = bool(re.search(r"[.!?;:]", first))
+    first_has_cjk_terminal = bool(re.search(r"[。！？；：]", first))
+    remaining_has_ascii_terminal = bool(
+        re.search(r"[.!?;:]", joined_remaining)
+    )
+    remaining_has_cjk_terminal = bool(
+        re.search(r"[。！？；：]", joined_remaining)
+    )
+    if first_has_ascii_terminal and remaining_has_cjk_terminal:
+        return first, joined_remaining
+    if first_has_cjk_terminal and remaining_has_ascii_terminal:
+        return " ".join(remaining), first
+    return (" ".join(remaining) if remaining else first), first
+
+
 def parse_srt(path: str | Path) -> list[Cue]:
     text = Path(path).read_text(encoding="utf-8-sig")
     blocks = re.split(r"\n\s*\n", text.strip())
@@ -448,12 +672,7 @@ def parse_srt(path: str | Path) -> list[Cue]:
             continue
         start_s, end_s = [part.strip() for part in lines[1].split("-->")]
         payload = lines[2:]
-        if is_english(payload[0]):
-            en = payload[0]
-            zh = "".join(payload[1:])
-        else:
-            zh = payload[0]
-            en = " ".join(payload[1:]) if len(payload) > 1 else payload[0]
+        en, zh = _split_bilingual_srt_payload(payload)
         cues.append(Cue(len(cues) + 1, parse_ts(start_s), parse_ts(end_s), en, zh, speaker))
         if len(en.split()) >= 4 or en.endswith("?"):
             speaker = "female" if speaker == "male" else "male"
@@ -471,18 +690,65 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         cue.word_timing = ()
         cue.article_page_plan = None
         cue.display_page_translations = None
+        cue.display_boundary_evidence = None
 
     manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
     if not manifest_path.exists():
         return False
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        stable_path = Path(
+            str((manifest.get("paths") or {}).get("original_top_srt") or "")
+        )
+        if Path(subtitle_path).resolve() != stable_path.resolve():
+            return False
+        if not validate_manifest_artifact(
+            manifest,
+            "original_top_srt",
+            stable_path,
+        ):
+            return False
         timeline_path = Path(str(manifest.get("final_cue_timeline_path") or ""))
         if not timeline_path.is_file():
             return False
         timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
         ledger_path = timeline_path.with_name("word-ledger.json")
+        manifest_ledger_path = str(manifest.get("word_ledger_path") or "")
+        if manifest_ledger_path and Path(manifest_ledger_path).resolve() != ledger_path.resolve():
+            return False
+        expected_timeline_sha256 = str(
+            manifest.get("final_cue_timeline_sha256") or ""
+        )
+        expected_ledger_sha256 = str(manifest.get("word_ledger_sha256") or "")
+        if expected_timeline_sha256 and file_sha256(timeline_path) != expected_timeline_sha256:
+            return False
+        if expected_ledger_sha256 and file_sha256(ledger_path) != expected_ledger_sha256:
+            return False
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        boundary_evidence: Mapping[str, object] | None = None
+        boundary_path_value = str(
+            manifest.get("display_boundary_evidence_path") or ""
+        )
+        if boundary_path_value:
+            boundary_path = Path(boundary_path_value)
+            if not boundary_path.is_absolute():
+                boundary_path = manifest_path.parent / boundary_path
+            expected_boundary_sha256 = str(
+                manifest.get("display_boundary_evidence_sha256") or ""
+            )
+            if (
+                not boundary_path.is_file()
+                or not expected_boundary_sha256
+                or file_sha256(boundary_path) != expected_boundary_sha256
+            ):
+                return False
+            boundary_artifact = json.loads(
+                boundary_path.read_text(encoding="utf-8")
+            )
+            raw_boundaries = boundary_artifact.get("boundaries")
+            if not isinstance(raw_boundaries, Mapping):
+                return False
+            boundary_evidence = raw_boundaries
         records = list(timeline.get("records") or [])
         words = list(ledger.get("words") or [])
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -491,7 +757,9 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
 
     if len(records) != len(cues) or not words:
         return False
-    attached: list[tuple[Cue, str, tuple[dict, ...]]] = []
+    attached: list[tuple[Cue, str, tuple[dict, ...], dict[str, dict] | None]] = []
+    seen_subtitle_ids: set[str] = set()
+    previous_word_end = -1
     for cue, record in zip(cues, records):
         try:
             subtitle_id = str(record["subtitle_id"])
@@ -502,8 +770,9 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         except (KeyError, TypeError, ValueError):
             return False
         if (
-            not subtitle_id
-            or word_start < 0
+            not re.fullmatch(r"S\d{4,}", subtitle_id)
+            or subtitle_id in seen_subtitle_ids
+            or word_start != previous_word_end + 1
             or word_end < word_start
             or word_end >= len(words)
             or abs(record_start - cue.start) > 0.005
@@ -536,11 +805,33 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         ]
         if not cue_tokens or cue_tokens != ledger_tokens:
             return False
-        attached.append((cue, subtitle_id, tuple(timed_words)))
+        if (
+            not timed_words
+            or float(timed_words[0]["start"]) < cue.start - 0.005
+            or float(timed_words[-1]["end"]) > cue.end + 0.005
+        ):
+            return False
+        cue_boundary_evidence: dict[str, dict] | None = None
+        if boundary_evidence is not None:
+            cue_boundary_evidence = {}
+            for boundary_word_id in range(word_start + 1, word_end + 1):
+                raw_boundary = boundary_evidence.get(str(boundary_word_id))
+                if not isinstance(raw_boundary, Mapping):
+                    return False
+                cue_boundary_evidence[str(boundary_word_id)] = dict(raw_boundary)
+        seen_subtitle_ids.add(subtitle_id)
+        previous_word_end = word_end
+        attached.append(
+            (cue, subtitle_id, tuple(timed_words), cue_boundary_evidence)
+        )
 
-    for cue, subtitle_id, timed_words in attached:
+    if previous_word_end != len(words) - 1:
+        return False
+
+    for cue, subtitle_id, timed_words, cue_boundary_evidence in attached:
         cue.subtitle_id = subtitle_id
         cue.word_timing = timed_words
+        cue.display_boundary_evidence = cue_boundary_evidence
     return True
 
 
@@ -556,7 +847,9 @@ def get_duration(media_path: str | Path) -> float:
     )
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
     if not match:
-        raise RuntimeError("无法读取音频/视频时长")
+        detail = result.stderr.strip()[-2000:]
+        suffix = f"：{detail}" if detail else ""
+        raise RuntimeError(f"无法读取音频/视频时长{suffix}")
     h, m, s = match.groups()
     return int(h) * 3600 + int(m) * 60 + float(s)
 
@@ -1056,13 +1349,35 @@ def episode_vocab_overview_items(vocab_plan: dict[int, dict], limit: int = 3) ->
     )[:limit]
 
 
+def article_vocab_phrase_display_start(cue: Cue, key: str) -> float | None:
+    """Return the start of the one final article page that shows the phrase."""
+    plan = cue.article_page_plan
+    if not plan or plan.get("status") != "ok":
+        return None
+    matches = [
+        page
+        for page in list(plan.get("pages") or [])
+        if find_vocab_source_phrase(str(page.get("en") or ""), key)
+    ]
+    if len(matches) != 1:
+        return None
+    try:
+        display_start = float(matches[0]["start"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if display_start < float(cue.start) or display_start >= float(cue.end):
+        return None
+    return display_start
+
+
 def schedule_vocab_card_plan(
     candidates: dict[int, dict],
     cues: list[Cue],
     *,
     max_cards: int = VOCAB_MAX_CARDS_PER_EPISODE,
+    align_to_article_pages: bool = False,
 ) -> dict[int, dict]:
-    """Start each card on its word's subtitle and keep it within that group."""
+    """Select strong cards across the episode and start them on their own cue."""
     cue_by_index = {cue.index: cue for cue in cues}
     groups = build_vocab_semantic_groups(cues)
     group_by_cue = {
@@ -1070,60 +1385,136 @@ def schedule_vocab_card_plan(
         for group in groups
         for cue_index in group.cue_indices
     }
-    scheduled: list[tuple[int, dict, VocabSemanticGroup]] = []
-    selected_starts: list[float] = []
-    selected_keys: set[str] = set()
-    concept_cards = 0
-
-    ranked_candidates = sorted(
-        candidates.items(),
-        key=lambda pair: (
-            -vocab_card_priority(pair[1]),
-            float(pair[1].get("group_start", math.inf)),
-            pair[0],
-        ),
-    )
-    for cue_index, item in ranked_candidates:
+    display_starts: dict[int, float] = {}
+    eligible: list[tuple[int, dict, Cue, VocabSemanticGroup, str]] = []
+    for cue_index, item in candidates.items():
         cue = cue_by_index.get(cue_index)
         key = str(item.get("key") or "").strip().lower()
         group = group_by_cue.get(cue_index)
         if not cue or not key or not group:
             continue
-        # Scores 1-2 are deliberately available to the model so it can signal
-        # a marginal candidate, but such words are not strong enough to occupy
-        # a visible learning-card slot.
+        # Scores 1-2 let the model report a marginal candidate without making
+        # it eligible merely to fill a time bucket.
         if vocab_card_priority(item) < 3:
             continue
-        if key in selected_keys:
-            continue
+        display_start = float(cue.start)
+        if align_to_article_pages:
+            display_start = article_vocab_phrase_display_start(cue, key)
+            if display_start is None:
+                continue
+        display_starts[cue_index] = display_start
+        eligible.append((cue_index, item, cue, group, key))
+
+    card_limit = min(max(0, max_cards), len(eligible))
+    if card_limit <= 0:
+        return {}
+
+    episode_start = min(cue.start for cue in cues)
+    episode_end = max(cue.end for cue in cues)
+    episode_duration = max(0.0, episode_end - episode_start)
+    bucket_count = card_limit if episode_duration > 0 else 1
+    buckets: list[list[tuple[int, dict, Cue, VocabSemanticGroup, str]]] = [
+        [] for _ in range(bucket_count)
+    ]
+    for entry in eligible:
+        display_start = display_starts[entry[0]]
+        if episode_duration <= 0:
+            bucket_index = 0
+        else:
+            relative = max(0.0, min(1.0, (display_start - episode_start) / episode_duration))
+            bucket_index = min(bucket_count - 1, int(relative * bucket_count))
+        buckets[bucket_index].append(entry)
+
+    scheduled: list[tuple[int, dict, Cue, VocabSemanticGroup, str]] = []
+    selected_starts: list[float] = []
+    selected_keys: set[str] = set()
+    selected_cue_indices: set[int] = set()
+
+    def try_schedule(entry: tuple[int, dict, Cue, VocabSemanticGroup, str]) -> bool:
+        cue_index, _, _, _, key = entry
+        display_start = display_starts[cue_index]
+        if cue_index in selected_cue_indices or key in selected_keys:
+            return False
         if any(
-            abs(cue.start - selected_start) < VOCAB_MIN_CARD_INTERVAL_SECONDS
+            abs(display_start - selected_start) < VOCAB_MIN_CARD_INTERVAL_SECONDS
             for selected_start in selected_starts
         ):
-            continue
-        scheduled_item = dict(item)
-        if vocab_card_type(scheduled_item) == "concept":
-            if concept_cards >= VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE:
-                scheduled_item["card_type"] = "standard"
-                scheduled_item["detail"] = ""
-            else:
-                concept_cards += 1
-        scheduled.append((cue_index, scheduled_item, group))
+            return False
+        scheduled.append(entry)
+        selected_cue_indices.add(cue_index)
         selected_keys.add(key)
-        selected_starts.append(cue.start)
-        if len(scheduled) >= max(0, max_cards):
+        selected_starts.append(display_start)
+        return True
+
+    # One strong candidate per timeline stratum prevents an opening cluster
+    # from consuming the entire episode budget. Empty strata stay empty rather
+    # than admitting a low-value word merely to meet the target count.
+    for bucket in buckets:
+        for entry in sorted(
+            bucket,
+            key=lambda value: (
+                -vocab_card_priority(value[1]),
+                display_starts[value[0]],
+                value[0],
+            ),
+        ):
+            if try_schedule(entry):
+                break
+
+    # If some strata had no candidate, fill the remaining budget with the best
+    # valid expressions while preferring distance from cards already selected.
+    while len(scheduled) < card_limit:
+        remaining = [
+            entry
+            for entry in eligible
+            if entry[0] not in selected_cue_indices and entry[4] not in selected_keys
+            and all(
+                abs(display_starts[entry[0]] - selected_start)
+                >= VOCAB_MIN_CARD_INTERVAL_SECONDS
+                for selected_start in selected_starts
+            )
+        ]
+        if not remaining:
             break
+        entry = min(
+            remaining,
+            key=lambda value: (
+                -vocab_card_priority(value[1]),
+                -min(abs(display_starts[value[0]] - start) for start in selected_starts),
+                display_starts[value[0]],
+                value[0],
+            ),
+        )
+        try_schedule(entry)
+
+    detailed_concepts = {
+        entry[0]
+        for entry in sorted(
+            (entry for entry in scheduled if vocab_card_type(entry[1]) == "concept"),
+            key=lambda value: (
+                -vocab_card_priority(value[1]),
+                float(value[1].get("group_start", math.inf)),
+                value[0],
+            ),
+        )[:VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE]
+    }
 
     plan: dict[int, dict] = {}
-    for cue_index, item, group in sorted(scheduled, key=lambda entry: entry[0]):
-        trigger_cue = cue_by_index[cue_index]
-        item["group_id"] = group.id
-        item["group_cue_indices"] = list(group.cue_indices)
+    for cue_index, item, _, group, _ in sorted(
+        scheduled,
+        key=lambda entry: (display_starts[entry[0]], entry[0]),
+    ):
+        scheduled_item = dict(item)
+        if vocab_card_type(scheduled_item) == "concept" and cue_index not in detailed_concepts:
+            scheduled_item["card_type"] = "standard"
+            scheduled_item["detail"] = ""
+        scheduled_item["group_id"] = group.id
+        scheduled_item["group_cue_indices"] = list(group.cue_indices)
         # A card cannot foreshadow the word before its own subtitle appears.
         # It stays visible until the next card replaces it.
-        item["display_start"] = trigger_cue.start
-        item["display_id"] = f"{cue_index}:{item['key']}"
-        plan[cue_index] = item
+        scheduled_item["display_start"] = display_starts[cue_index]
+        scheduled_item["display_id"] = f"{cue_index}:{scheduled_item['key']}"
+        plan[cue_index] = scheduled_item
 
     return plan
 
@@ -1212,6 +1603,159 @@ def split_vocab_groups_for_requests(
     return chunks
 
 
+def order_vocab_request_chunks(
+    chunks: list[list[VocabSemanticGroup]],
+) -> list[list[VocabSemanticGroup]]:
+    """Interleave the timeline so a partial run is not front-loaded."""
+    if len(chunks) < 3:
+        return list(chunks)
+
+    indices = [0, len(chunks) - 1]
+    intervals = deque([(0, len(chunks) - 1)])
+    while intervals:
+        left, right = intervals.popleft()
+        middle = (left + right) // 2
+        if middle not in indices:
+            indices.append(middle)
+        if middle - left > 1:
+            intervals.append((left, middle))
+        if right - middle > 1:
+            intervals.append((middle, right))
+    return [chunks[index] for index in indices]
+
+
+def vocab_request_chunk_id(groups: list[VocabSemanticGroup]) -> str:
+    """Return a stable content ID for one vocabulary request batch."""
+    payload = [
+        {
+            "group_id": group.id,
+            "cue_indices": list(group.cue_indices),
+            "english": group.english,
+        }
+        for group in groups
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return f"VC{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def vocab_progress_cache_path(cache_path: str | Path) -> Path:
+    """Keep resumable state beside, but separate from, the display cache."""
+    path = Path(cache_path)
+    return path.with_name(
+        f"{path.stem}.v{VOCAB_CACHE_SCHEMA_VERSION}.progress{path.suffix}"
+    )
+
+
+def atomic_write_vocab_cache(path: str | Path, payload: Mapping[str, object]) -> bool:
+    """Atomically replace a cache file without damaging its previous value."""
+    target = Path(path)
+    temporary_path: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        temporary_path.replace(target)
+        return True
+    except Exception as exc:
+        logger.warning("Unable to atomically write vocabulary cache %s: %s", target, exc)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+
+def _read_vocab_progress_cache(
+    path: Path,
+    *,
+    source_hash: str,
+    model: str,
+    chunk_order: list[str],
+    chunks_by_id: Mapping[str, list[VocabSemanticGroup]],
+) -> dict | None:
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(cached, Mapping) or (
+        cached.get("cache_schema_version") != VOCAB_CACHE_SCHEMA_VERSION
+        or cached.get("source_hash") != source_hash
+        or cached.get("prompt_version") != VOCAB_PROMPT_VERSION
+        or cached.get("model") != model
+        or cached.get("chunk_order") != chunk_order
+    ):
+        return None
+
+    completed_raw = cached.get("completed_chunk_ids")
+    cached_chunks = cached.get("chunks")
+    if not isinstance(completed_raw, list) or not isinstance(cached_chunks, Mapping):
+        return None
+    completed = [str(chunk_id) for chunk_id in completed_raw]
+    if len(completed) != len(set(completed)) or any(
+        chunk_id not in chunks_by_id for chunk_id in completed
+    ):
+        return None
+
+    normalized_chunks: dict[str, dict] = {}
+    for chunk_id in completed:
+        entry = cached_chunks.get(chunk_id)
+        groups = chunks_by_id[chunk_id]
+        expected_group_ids = [group.id for group in groups]
+        if not isinstance(entry, Mapping) or entry.get("group_ids") != expected_group_ids:
+            return None
+        cards = entry.get("cards")
+        if not isinstance(cards, list) or any(not isinstance(card, dict) for card in cards):
+            return None
+        if any(str(card.get("group_id") or "") not in expected_group_ids for card in cards):
+            return None
+        normalized_chunks[chunk_id] = {
+            "group_ids": expected_group_ids,
+            "cards": [dict(card) for card in cards],
+        }
+
+    is_complete = set(completed) == set(chunk_order)
+    if not isinstance(cached.get("complete"), bool) or cached.get("complete") != is_complete:
+        return None
+    return {
+        "cache_schema_version": VOCAB_CACHE_SCHEMA_VERSION,
+        "source_hash": source_hash,
+        "prompt_version": VOCAB_PROMPT_VERSION,
+        "model": model,
+        "complete": is_complete,
+        "chunk_order": list(chunk_order),
+        "completed_chunk_ids": completed,
+        "chunks": normalized_chunks,
+    }
+
+
+def _vocab_cards_from_progress(payload: Mapping[str, object]) -> list[dict]:
+    cards: list[dict] = []
+    chunks = payload.get("chunks")
+    if not isinstance(chunks, Mapping):
+        return cards
+    for chunk_id in payload.get("chunk_order") or []:
+        entry = chunks.get(str(chunk_id))
+        if isinstance(entry, Mapping):
+            cards.extend(
+                dict(card)
+                for card in entry.get("cards") or []
+                if isinstance(card, dict)
+            )
+    return cards
+
+
 def build_vocab_selection_prompt(groups: list[VocabSemanticGroup], max_cards: int) -> str:
     serialized_groups = [
         {
@@ -1250,53 +1794,109 @@ def load_or_generate_vocab_plan(
     cues: list[Cue],
     enabled: bool,
     progress_callback=None,
+    *,
+    align_to_article_pages: bool = False,
 ) -> dict[int, dict]:
     if not enabled:
         return {}
 
     groups = build_vocab_semantic_groups(cues)
+    if not groups:
+        return {}
     episode_card_target = vocabulary_card_target(cues)
     source_hash = vocab_source_hash(cues)
     cache_path = Path(subtitle_path).with_suffix(".vocab_cards.json")
     global_cache_dir = CACHE_PATH / "podcast_vocab_cards"
     global_cache_path = global_cache_dir / f"{source_hash}.json"
+    formal_cache_paths = (cache_path, global_cache_path)
+    progress_cache_paths = tuple(
+        vocab_progress_cache_path(candidate) for candidate in formal_cache_paths
+    )
     base_url, api_key, model = current_llm_config()
-    for candidate in (cache_path, global_cache_path):
+
+    request_groups = order_vocab_request_chunks(
+        split_vocab_groups_for_requests(
+            groups,
+            max_groups=VOCAB_REQUEST_MAX_GROUPS,
+            max_chars=VOCAB_REQUEST_MAX_CHARS,
+        )
+    )
+    chunk_order = [vocab_request_chunk_id(chunk) for chunk in request_groups]
+    chunks_by_id = dict(zip(chunk_order, request_groups))
+    progress_payload = {
+        "cache_schema_version": VOCAB_CACHE_SCHEMA_VERSION,
+        "source_hash": source_hash,
+        "prompt_version": VOCAB_PROMPT_VERSION,
+        "model": model,
+        "complete": False,
+        "chunk_order": chunk_order,
+        "completed_chunk_ids": [],
+        "chunks": {},
+    }
+
+    def make_plan(cards: list[dict]) -> dict[int, dict]:
+        plan = schedule_vocab_card_plan(
+            normalize_vocab_plan(cards, cues, groups),
+            cues,
+            max_cards=episode_card_target,
+            align_to_article_pages=align_to_article_pages,
+        )
+        if not plan:
+            return {}
+        return apply_episode_vocab_ranks(
+            plan,
+            fallback_episode_vocab_indices(plan),
+        )
+
+    for candidate in (*formal_cache_paths, *progress_cache_paths):
         if not candidate.exists():
             continue
-        try:
-            cached = json.loads(candidate.read_text(encoding="utf-8"))
-            if (
-                cached.get("source_hash") == source_hash
-                and cached.get("prompt_version") == VOCAB_PROMPT_VERSION
-                and cached.get("model") == model
-            ):
-                cached_cards = cached.get("cards", [])
-                plan = schedule_vocab_card_plan(
-                    normalize_vocab_plan(cached_cards, cues, groups),
-                    cues,
-                    max_cards=episode_card_target,
-                )
-                if plan:
-                    if progress_callback:
-                        progress_callback(4, "智能单词卡命中缓存")
-                    return apply_episode_vocab_ranks(
-                        plan,
-                        # Ranks are presentation-only. Recalculate them locally so
-                        # older caches do not preserve a now-retired long-word bias.
-                        fallback_episode_vocab_indices(plan),
-                    )
-                logger.warning(
-                    "Vocabulary cache has no usable cards; regenerating instead of rendering an empty plan: %s",
-                    candidate,
-                )
-        except Exception:
-            pass
+        cached_progress = _read_vocab_progress_cache(
+            candidate,
+            source_hash=source_hash,
+            model=model,
+            chunk_order=chunk_order,
+            chunks_by_id=chunks_by_id,
+        )
+        if cached_progress is not None:
+            completed = progress_payload["completed_chunk_ids"]
+            progress_chunks = progress_payload["chunks"]
+            for chunk_id in cached_progress["completed_chunk_ids"]:
+                if chunk_id not in completed:
+                    completed.append(chunk_id)
+                    progress_chunks[chunk_id] = cached_progress["chunks"][chunk_id]
+
+    completed_ids = progress_payload["completed_chunk_ids"]
+
+    def persist_progress() -> None:
+        for candidate in progress_cache_paths:
+            atomic_write_vocab_cache(candidate, progress_payload)
+
+    def incomplete_error(failures: Sequence[str]) -> VocabularyPlanIncompleteError:
+        return VocabularyPlanIncompleteError(
+            len(completed_ids),
+            len(chunk_order),
+            failures,
+        )
+
+    progress_payload["complete"] = set(completed_ids) == set(chunk_order)
+    if progress_payload["complete"]:
+        cards = _vocab_cards_from_progress(progress_payload)
+        plan = make_plan(cards)
+        for candidate in formal_cache_paths:
+            atomic_write_vocab_cache(candidate, progress_payload)
+        if progress_callback:
+            progress_callback(4, "智能单词卡命中完整缓存")
+        return plan
 
     if not base_url or not api_key or not model:
+        persist_progress()
         if progress_callback:
-            progress_callback(4, "智能单词卡未配置，已跳过")
-        return {}
+            progress_callback(
+                4,
+                f"智能单词卡未完成（{len(completed_ids)}/{len(chunk_order)} 批）：模型未配置",
+            )
+        raise incomplete_error(("vocabulary model is not configured",))
 
     if progress_callback:
         progress_callback(1, "智能单词卡生成中")
@@ -1310,33 +1910,19 @@ def load_or_generate_vocab_plan(
             # 90-second request into several minutes without producing a card.
             max_retries=0,
         )
-        cards = []
         failed_chunks: list[str] = []
-        started_at = time.monotonic()
-        request_groups = split_vocab_groups_for_requests(
-            groups,
-            max_groups=VOCAB_REQUEST_MAX_GROUPS,
-            max_chars=VOCAB_REQUEST_MAX_CHARS,
-        )
         cards_per_request = max(1, math.ceil(episode_card_target / max(1, len(request_groups))))
-        for position, group_chunk in enumerate(request_groups, 1):
-            if time.monotonic() - started_at >= VOCAB_GENERATION_TIME_BUDGET_SECONDS:
-                failed_chunks.append(
-                    f"{position}/{len(request_groups)}: generation time budget exhausted"
-                )
-                failed_chunks.extend(
-                    f"{remaining}/{len(request_groups)}: generation time budget exhausted"
-                    for remaining in range(position + 1, len(request_groups) + 1)
-                )
-                logger.warning(
-                    "Vocabulary card generation stopped after %.1fs to keep video synthesis responsive.",
-                    time.monotonic() - started_at,
-                )
-                break
+        pending_chunks = [
+            (chunk_id, chunks_by_id[chunk_id])
+            for chunk_id in chunk_order
+            if chunk_id not in completed_ids
+        ]
+        for chunk_id, group_chunk in pending_chunks:
+            completed_count = len(completed_ids)
             if progress_callback:
                 progress_callback(
-                    max(1, min(3, round(position * 3 / max(1, len(request_groups))))),
-                    f"智能单词卡生成中（{position}/{len(request_groups)}）",
+                    max(1, min(3, round((completed_count + 1) * 3 / max(1, len(request_groups))))),
+                    f"智能单词卡生成中（已完成 {completed_count}/{len(request_groups)} 批）",
                 )
             prompt = build_vocab_selection_prompt(group_chunk, cards_per_request)
             chunk_cards = None
@@ -1358,8 +1944,9 @@ def load_or_generate_vocab_plan(
                 except Exception as exc:
                     last_error = exc
                     logger.warning(
-                        "Vocabulary card batch %s/%s failed on attempt %s: %s",
-                        position,
+                        "Vocabulary card batch %s (%s/%s) failed on attempt %s: %s",
+                        chunk_id,
+                        completed_count + 1,
                         len(request_groups),
                         attempt,
                         exc,
@@ -1367,66 +1954,68 @@ def load_or_generate_vocab_plan(
             if isinstance(chunk_cards, list):
                 # The provider occasionally ignores a batch cardinality limit.
                 # Enforce it locally using the requested editorial order/priority.
-                cards.extend(
-                    sorted(
-                        (item for item in chunk_cards if isinstance(item, dict)),
-                        key=vocab_card_priority,
-                        reverse=True,
-                    )[:cards_per_request]
-                )
+                group_ids = [group.id for group in group_chunk]
+                bounded_cards = sorted(
+                    (
+                        item
+                        for item in chunk_cards
+                        if isinstance(item, dict)
+                        and str(item.get("group_id") or "") in group_ids
+                    ),
+                    key=vocab_card_priority,
+                    reverse=True,
+                )[:cards_per_request]
+                progress_payload["chunks"][chunk_id] = {
+                    "group_ids": group_ids,
+                    "cards": bounded_cards,
+                }
+                completed_ids.append(chunk_id)
+                progress_payload["complete"] = set(completed_ids) == set(chunk_order)
+                persist_progress()
             else:
                 failed_chunks.append(
-                    f"{position}/{len(request_groups)}: {str(last_error or 'unknown error')[:120]}"
+                    f"{chunk_id}: {str(last_error or 'unknown error')[:120]}"
                 )
-        plan = schedule_vocab_card_plan(
-            normalize_vocab_plan(cards, cues, groups),
-            cues,
-            max_cards=episode_card_target,
-        )
-        if plan:
-            # Card ranking only affects the opening overview. A stable local
-            # ranking avoids an extra LLM request without changing card content.
-            overview_indices = fallback_episode_vocab_indices(plan)
-            plan = apply_episode_vocab_ranks(plan, overview_indices)
-        else:
-            overview_indices = []
-        if plan:
-            payload = {
-                "source_hash": source_hash,
-                "prompt_version": VOCAB_PROMPT_VERSION,
-                "model": model,
-                "cards": cards,
-                "episode_vocab_cue_indices": overview_indices,
-            }
-            cache_text = json.dumps(payload, ensure_ascii=False, indent=2)
-            for candidate in (cache_path, global_cache_path):
-                try:
-                    candidate.parent.mkdir(parents=True, exist_ok=True)
-                    candidate.write_text(cache_text, encoding="utf-8")
-                except Exception:
-                    pass
-        else:
+        progress_payload["complete"] = set(completed_ids) == set(chunk_order)
+        cards = _vocab_cards_from_progress(progress_payload)
+        plan = make_plan(cards)
+        if progress_payload["complete"]:
+            for candidate in formal_cache_paths:
+                atomic_write_vocab_cache(candidate, progress_payload)
+        if not plan:
             logger.warning(
-                "Vocabulary model returned no usable cards; empty result will not be cached. raw_cards=%s failed_batches=%s",
+                "Vocabulary model returned no usable cards. raw_cards=%s failed_batches=%s complete=%s",
                 len(cards),
                 len(failed_chunks),
+                progress_payload["complete"],
             )
         if progress_callback:
             if failed_chunks:
                 progress_callback(
                     4,
-                    f"智能单词卡部分生成完成（{len(failed_chunks)} 批失败，已跳过）",
+                    "智能单词卡生成未完成"
+                    f"（{len(completed_ids)}/{len(chunk_order)} 批），已保存进度",
                 )
             elif not plan:
                 progress_callback(4, "智能单词卡未选出合适单词，已跳过")
             else:
                 progress_callback(4, "智能单词卡生成完成")
-        return plan
+        if progress_payload["complete"]:
+            return plan
+        persist_progress()
+        raise incomplete_error(failed_chunks)
+    except VocabularyPlanIncompleteError:
+        raise
     except Exception as exc:
         logger.exception("Vocabulary card generation failed: %s", exc)
+        persist_progress()
         if progress_callback:
-            progress_callback(4, f"智能单词卡生成失败，已跳过：{str(exc)[:100]}")
-        return {}
+            progress_callback(
+                4,
+                "智能单词卡生成未完成"
+                f"（{len(completed_ids)}/{len(chunk_order)} 批），已保存进度",
+            )
+        raise incomplete_error((f"generation failed: {str(exc)[:120]}",)) from exc
 
 
 def _has_short_caption_line(lines: list[str]) -> bool:
@@ -1447,6 +2036,9 @@ def _looks_like_english_modifier_boundary(previous: str, following: str) -> bool
         len(previous) >= 3
         and following.isalpha()
         and following not in LINE_BREAK_AVOID_BEFORE_WORDS
+        and following not in ARTICLE_PAGE_OBJECT_DETERMINERS
+        and following not in {"and", "but", "nor", "or", "so", "yet"}
+        and not previous.endswith(ENGLISH_VISUAL_NOMINAL_SUFFIXES)
         and (
             previous in ENGLISH_VISUAL_MODIFIER_WORDS
             or previous.endswith(ENGLISH_VISUAL_MODIFIER_SUFFIXES)
@@ -1477,6 +2069,26 @@ def _looks_like_numeric_phrase_boundary(words: list[str], split: int) -> bool:
 
     previous = normalized(split - 1)
     following = normalized(split)
+    nearby_left = [normalized(index) for index in range(max(0, split - 5), split)]
+    has_nearby_quantity = any(
+        is_numeric_value(token) or token in ENGLISH_NUMERIC_MAGNITUDE_WORDS
+        for token in nearby_left
+    )
+    if (
+        has_nearby_quantity
+        and following in ENGLISH_RATE_DETERMINERS
+        and split + 1 < len(words)
+        and normalized(split + 1) in ENGLISH_RATE_PERIOD_WORDS
+    ):
+        return True
+    if (
+        has_nearby_quantity
+        and previous in ENGLISH_RATE_DETERMINERS
+        and following in ENGLISH_RATE_PERIOD_WORDS
+    ):
+        return True
+    if is_numeric_value(previous) and is_numeric_value(following):
+        return True
     if is_numeric_value(previous) and following in ENGLISH_NUMERIC_MAGNITUDE_WORDS:
         return True
     if (
@@ -1493,6 +2105,7 @@ def _looks_like_numeric_phrase_boundary(words: list[str], split: int) -> bool:
         split >= 3
         and previous.isalpha()
         and following.isalpha()
+        and following not in LINE_BREAK_AVOID_BEFORE_WORDS
         and normalized(split - 2) in ENGLISH_NUMERIC_MAGNITUDE_WORDS
         and (
             is_numeric_value(normalized(split - 3))
@@ -1505,21 +2118,31 @@ def _looks_like_numeric_phrase_boundary(words: list[str], split: int) -> bool:
 
 def _caption_line_break_penalty(words: list[str], split: int) -> int:
     """Score a renderer-only line break without changing cue ownership."""
+    previous_surface = str(words[split - 1]).strip()
     previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
     following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+    punctuation_boundary = bool(
+        re.search(r"[,;:.!?][\"')\]]*$", previous_surface)
+    )
     penalty = 0
     if previous in LINE_BREAK_AVOID_AFTER_WORDS:
         penalty += CAPTION_HARD_BREAK_PENALTY
     if _caption_boundary_has_stranded_dependency(words, split):
         penalty += CAPTION_HARD_BREAK_PENALTY
     elif following in LINE_BREAK_AVOID_BEFORE_WORDS:
-        if _caption_phrase_start_is_complete(words, split):
+        if (
+            _caption_phrase_start_is_complete(words, split)
+            or _caption_complete_continuation_clause(words[split:])
+        ):
             penalty += CAPTION_COMPLETE_PHRASE_START_PENALTY
         else:
             penalty += CAPTION_HARD_BREAK_PENALTY
-    if _looks_like_english_modifier_boundary(words[split - 1], words[split]):
+    if (
+        not punctuation_boundary
+        and _looks_like_english_modifier_boundary(words[split - 1], words[split])
+    ):
         penalty += CAPTION_HARD_BREAK_PENALTY
-    if _looks_like_numeric_phrase_boundary(words, split):
+    if not punctuation_boundary and _looks_like_numeric_phrase_boundary(words, split):
         penalty += CAPTION_HARD_BREAK_PENALTY
     if "-" in words[split - 1]:
         penalty += CAPTION_HARD_BREAK_PENALTY * 2
@@ -1530,6 +2153,43 @@ def _caption_line_break_penalty(words: list[str], split: int) -> int:
     return penalty
 
 
+def _article_intrinsic_line_break_penalty(words: list[str], split: int) -> int:
+    """Keep lexical morphology hard when no frozen syntax evidence exists."""
+    return _caption_line_break_penalty(words, split)
+
+
+def _article_same_screen_intrinsic_line_break_penalty(
+    cue: Cue,
+    words: list[str],
+    split: int,
+    global_split: int,
+) -> int:
+    """Soften a morphology false positive only at a proven predicate start."""
+    penalty = _article_intrinsic_line_break_penalty(words, split)
+    if not _looks_like_english_modifier_boundary(
+        words[split - 1],
+        words[split],
+    ):
+        return penalty
+    decision = _article_display_boundary_decision(cue, global_split)
+    issue_codes = set(decision.get("issue_codes") or [])
+    predicate_issues = {
+        "relative_clause_subject_verb_split",
+        "subject_finite_verb_split",
+        "subject_predicate_split",
+    }
+    if (
+        issue_codes & predicate_issues
+        and not issue_codes & ARTICLE_LINE_ATOMIC_BOUNDARY_ISSUES
+    ):
+        return (
+            penalty
+            - CAPTION_HARD_BREAK_PENALTY
+            + ARTICLE_LINE_SOFT_MODIFIER_PENALTY
+        )
+    return penalty
+
+
 def _caption_boundary_has_stranded_dependency(words: list[str], split: int) -> bool:
     """Return whether a split leaves a known lexical dependency behind."""
     if split <= 0 or split >= len(words):
@@ -1537,6 +2197,41 @@ def _caption_boundary_has_stranded_dependency(words: list[str], split: int) -> b
     previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
     following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
     return (previous, following) in CAPTION_DEPENDENT_BOUNDARY_PAIRS
+
+
+def _caption_has_terminal_completion(words: list[str]) -> bool:
+    if not words:
+        return False
+    return bool(re.search(r"[.!?][\"')\]]*$", str(words[-1]).strip()))
+
+
+def _caption_complete_continuation_clause(words: list[str]) -> bool:
+    """Treat a full visible continuation clause as reviewable, not invalid."""
+    if len(words) < ARTICLE_VISUAL_PAGE_MIN_WORDS:
+        return False
+    first = re.sub(r"[^A-Za-z']", "", words[0]).lower()
+    return bool(
+        first in ARTICLE_PAGE_COMPLETE_CONTINUATION_START_WORDS
+        and _caption_has_terminal_completion(words)
+    )
+
+
+def _caption_complete_page_clause_start(words: list[str], split: int) -> bool:
+    """Return whether a page starts with a complete visible clause."""
+    if split <= 0 or split >= len(words):
+        return False
+    remaining = words[split:]
+    if len(remaining) < ARTICLE_VISUAL_PAGE_MIN_WORDS:
+        return False
+    first = re.sub(r"[^A-Za-z']", "", remaining[0]).lower()
+    return bool(
+        first
+        in (
+            ARTICLE_PAGE_COMPLETE_CONTINUATION_START_WORDS
+            | ARTICLE_PAGE_COMPLETE_WH_CLAUSE_START_WORDS
+        )
+        and _caption_has_terminal_completion(remaining)
+    )
 
 
 def _caption_phrase_start_is_complete(words: list[str], split: int) -> bool:
@@ -1557,15 +2252,28 @@ def _caption_phrase_start_is_complete(words: list[str], split: int) -> bool:
     return remaining[-1] not in LINE_BREAK_AVOID_AFTER_WORDS
 
 
-def _has_discouraged_caption_break(text: str, lines: list[str]) -> bool:
-    if len(lines) != 2:
+def _has_discouraged_caption_break(
+    text: str,
+    lines: list[str],
+    *,
+    boundary_penalty: Callable[[int], int] | None = None,
+    intrinsic_penalty: Callable[[list[str], int], int] | None = None,
+) -> bool:
+    if len(lines) < 2:
         return False
     words = text.split()
-    first_line_words = len(lines[0].split())
-    return (
-        0 < first_line_words < len(words)
-        and _caption_line_break_penalty(words, first_line_words) >= CAPTION_HARD_BREAK_PENALTY
-    )
+    split = 0
+    score_break = intrinsic_penalty or _caption_line_break_penalty
+    for line in lines[:-1]:
+        split += len(line.split())
+        if not 0 < split < len(words):
+            continue
+        penalty = score_break(words, split)
+        if boundary_penalty is not None:
+            penalty += int(boundary_penalty(split))
+        if penalty >= CAPTION_HARD_BREAK_PENALTY:
+            return True
+    return False
 
 
 def wrap_en(
@@ -1575,6 +2283,8 @@ def wrap_en(
     max_width: int,
     *,
     minimum_line_words: int = 3,
+    boundary_penalty: Callable[[int], int] | None = None,
+    intrinsic_penalty: Callable[[list[str], int], int] | None = None,
 ) -> list[str]:
     """Choose a balanced two-line fit while retaining basic phrase units."""
     words = text.split()
@@ -1589,7 +2299,10 @@ def wrap_en(
         a, b = " ".join(words[:split]), " ".join(words[split:])
         aw, bw = text_w(draw, a, fnt), text_w(draw, b, fnt)
         if aw <= max_width and bw <= max_width:
-            score = abs(aw - bw) + _caption_line_break_penalty(words, split)
+            score_break = intrinsic_penalty or _caption_line_break_penalty
+            score = abs(aw - bw) + score_break(words, split)
+            if boundary_penalty is not None:
+                score += int(boundary_penalty(split))
             if score < best_score:
                 best = [a, b]
                 best_score = score
@@ -1639,6 +2352,8 @@ def wrap_en_preserving_highlight(
     key: str | None,
     *,
     minimum_line_words: int = 3,
+    boundary_penalty: Callable[[int], int] | None = None,
+    intrinsic_penalty: Callable[[list[str], int], int] | None = None,
 ) -> list[str]:
     """Avoid splitting the active vocabulary expression when a two-line fit permits it."""
     lines = wrap_en(
@@ -1647,6 +2362,8 @@ def wrap_en_preserving_highlight(
         fnt,
         max_width,
         minimum_line_words=minimum_line_words,
+        boundary_penalty=boundary_penalty,
+        intrinsic_penalty=intrinsic_penalty,
     )
     if not key or len(lines) != 2 or any(key.lower() in line.lower() for line in lines):
         return lines
@@ -1684,7 +2401,10 @@ def wrap_en_preserving_highlight(
         # Keep the expression at a line edge when possible, then retain the
         # previous wrapper's preference for visually balanced line lengths.
         edge_distance = min(abs(split - phrase_start), abs(split - phrase_end))
-        break_penalty = _caption_line_break_penalty(words, split)
+        score_break = intrinsic_penalty or _caption_line_break_penalty
+        break_penalty = score_break(words, split)
+        if boundary_penalty is not None:
+            break_penalty += int(boundary_penalty(split))
         if break_penalty >= CAPTION_HARD_BREAK_PENALTY:
             continue
         score = (
@@ -1911,6 +2631,7 @@ def draw_frame(
     show_vocab: bool = False,
     title_text: str = TITLE_TEXT,
     display_time: float | None = None,
+    english_only: bool = False,
 ) -> Image.Image:
     img = base.copy()
     d = ImageDraw.Draw(img, "RGBA")
@@ -1953,7 +2674,7 @@ def draw_frame(
             highlight_ranges[idx],
         )
 
-    if cue.zh:
+    if cue.zh and not english_only:
         zh_font = fit_standard_zh_font(d, cue.zh, en_width)
         zh_lines = wrap_zh(d, cue.zh, zh_font, en_width)
         zh_gap = 66
@@ -1977,9 +2698,14 @@ def draw_frame(
     return img
 
 
-def fit_article_en_font(draw, text: str, max_width: int) -> ImageFont.FreeTypeFont:
-    """Article subtitle typography is fixed; page planning owns overflow."""
-    return article_en_font(ARTICLE_SUBTITLE_EN_FONT_SIZE, 600)
+def fit_article_en_font(
+    draw,
+    text: str,
+    max_width: int,
+    font_size: int = ARTICLE_SUBTITLE_EN_FONT_SIZE,
+) -> ImageFont.FreeTypeFont:
+    """Return the explicit font chosen by the frozen page plan."""
+    return article_en_font(int(font_size), 600)
 
 
 def article_visual_page_count(cue: Cue | None) -> int:
@@ -1987,7 +2713,7 @@ def article_visual_page_count(cue: Cue | None) -> int:
     if cue is None:
         return 1
     english_words = len(str(cue.en or "").split())
-    return max(1, math.ceil(english_words / ARTICLE_VISUAL_PAGE_MAX_WORDS))
+    return max(1, math.ceil(english_words / ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS))
 
 
 def article_visual_page_index(cue: Cue | None, display_time: float | None) -> int:
@@ -2031,7 +2757,7 @@ def split_article_visual_pages(text: str, page_count: int) -> list[str]:
         min_split = boundaries[-1] + 1
         max_split = min(
             len(words) - (page_count - page),
-            boundaries[-1] + ARTICLE_VISUAL_PAGE_MAX_WORDS,
+            boundaries[-1] + ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS,
         )
         candidates = range(max(min_split, target - 5), min(max_split, target + 5) + 1)
         split = min(candidates, key=lambda value: _article_visual_break_score(words, value, target))
@@ -2063,36 +2789,9 @@ def split_chinese_visual_pages(
     ) or []
 
 
-_CHINESE_VISUAL_TOKENIZER = None
-
-
 def _chinese_visual_token_boundaries(text: str) -> dict[int, tuple[int, int]] | None:
     """Return deterministic token-boundary context from the vendored jieba model."""
-    global _CHINESE_VISUAL_TOKENIZER
-    try:
-        if _CHINESE_VISUAL_TOKENIZER is None:
-            from app._vendor import jieba
-
-            jieba.setLogLevel(logging.WARNING)
-            tokenizer = jieba.Tokenizer(
-                dictionary=str(Path(jieba.__file__).with_name("dict.txt"))
-            )
-            cache_dir = CACHE_PATH / "jieba"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tokenizer.tmp_dir = str(cache_dir)
-            tokenizer.cache_file = "visual-segmentation.cache"
-            _CHINESE_VISUAL_TOKENIZER = tokenizer
-        tokens = [str(token) for token in _CHINESE_VISUAL_TOKENIZER.cut(text, HMM=True)]
-        boundaries: dict[int, tuple[int, int]] = {}
-        offset = 0
-        for index, token in enumerate(tokens):
-            offset += len(token)
-            if index + 1 < len(tokens):
-                boundaries[offset] = (len(token), len(tokens[index + 1]))
-        return boundaries if offset == len(text) else None
-    except Exception:
-        logger.exception("Chinese visual tokenizer unavailable")
-        return None
+    return chinese_token_boundaries(text)
 
 
 def _strict_split_chinese_visual_pages(
@@ -2228,21 +2927,40 @@ def _article_fixed_english_lines(
     draw: ImageDraw.ImageDraw,
     text: str,
     key: str | None = None,
+    *,
+    font_size: int = ARTICLE_SUBTITLE_EN_FONT_SIZE,
+    enforce_word_limit: bool = True,
+    boundary_penalty: Callable[[int], int] | None = None,
+    relax_same_screen_syntax: bool = False,
+    intrinsic_penalty: Callable[[list[str], int], int] | None = None,
 ) -> list[str]:
-    if len(str(text or "").split()) > ARTICLE_VISUAL_PAGE_MAX_WORDS:
-        return []
-    fnt = article_en_font(ARTICLE_SUBTITLE_EN_FONT_SIZE, 600)
-    # First use a wider, still panel-safe profile for a complete one-line cue.
-    # A page transition is only needed when neither fixed-font layout fits.
-    if text_w(draw, text, fnt) <= acx(ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH):
+    # Kept as a compatibility argument for callers/tests from the earlier
+    # fixed-word contract. Word count now affects ranking only; it cannot
+    # reject a page that fits the measured two-line region.
+    _ = enforce_word_limit
+    fnt = article_en_font(int(font_size), 600)
+    score_intrinsic = intrinsic_penalty
+    if score_intrinsic is None and relax_same_screen_syntax:
+        score_intrinsic = _article_intrinsic_line_break_penalty
+    # Keep ordinary lines within a comfortable reading measure. The wider
+    # profiles remain controlled fallbacks when a natural two-line wrap is not
+    # available; they are not the first-choice one-line target.
+    if text_w(draw, text, fnt) <= acx(ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH):
         return [text]
     minimum_word_candidates = (
         (3, 2)
-        if len(text.split()) <= ARTICLE_STATIC_TWO_WORD_LINE_MAX_WORDS
+        if (
+            len(text.split()) <= ARTICLE_STATIC_TWO_WORD_LINE_MAX_WORDS
+            or font_size == ARTICLE_SUBTITLE_EN_MIN_SIZE
+        )
         else (3,)
     )
     for minimum_line_words in minimum_word_candidates:
-        for width in (ARTICLE_SUBTITLE_EN_WIDTH, ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH):
+        for width in (
+            ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
+            ARTICLE_SUBTITLE_EN_WIDTH,
+            ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
+        ):
             max_width = acx(width)
             lines = wrap_en_preserving_highlight(
                 draw,
@@ -2251,10 +2969,13 @@ def _article_fixed_english_lines(
                 max_width,
                 key,
                 minimum_line_words=minimum_line_words,
+                boundary_penalty=boundary_penalty,
+                intrinsic_penalty=score_intrinsic,
             )
+            max_lines = 3 if font_size == ARTICLE_SUBTITLE_EN_MIN_SIZE else 2
             if (
                 not lines
-                or len(lines) > 2
+                or len(lines) > max_lines
                 or any(text_w(draw, line, fnt) > max_width for line in lines)
                 or (
                     len(lines) > 1
@@ -2263,7 +2984,15 @@ def _article_fixed_english_lines(
                         for line in lines
                     )
                 )
-                or _has_discouraged_caption_break(text, lines)
+                or (
+                    font_size != ARTICLE_SUBTITLE_EN_MIN_SIZE
+                    and _has_discouraged_caption_break(
+                        text,
+                        lines,
+                        boundary_penalty=boundary_penalty,
+                        intrinsic_penalty=score_intrinsic,
+                    )
+                )
             ):
                 continue
             # Two-word lines are an article-template fallback only. They avoid
@@ -2271,6 +3000,23 @@ def _article_fixed_english_lines(
             # one-word orphan and every hard lexical break remain forbidden.
             return lines
     return []
+
+
+def _article_english_layout_width(
+    draw: ImageDraw.ImageDraw,
+    lines: Sequence[str],
+    font_size: int,
+) -> int:
+    fnt = article_en_font(font_size, 600)
+    measured = max((text_w(draw, line, fnt) for line in lines), default=0)
+    for width in (
+        ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
+        ARTICLE_SUBTITLE_EN_WIDTH,
+        ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
+    ):
+        if measured <= acx(width):
+            return width
+    return ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH
 
 
 def _article_fixed_chinese_lines(draw: ImageDraw.ImageDraw, text: str) -> list[str]:
@@ -2287,41 +3033,431 @@ def _article_preferred_readability_page_count(
     draw: ImageDraw.ImageDraw,
     words: list[str],
     chinese: str,
+    *,
+    font_size: int = ARTICLE_SUBTITLE_EN_FONT_SIZE,
+    cue_duration_ms: int | None = None,
 ) -> int:
-    """Request two visual pages only for a genuinely dense fixed-font cue."""
-    english_lines = _article_fixed_english_lines(draw, " ".join(words))
-    chinese_lines = _article_fixed_chinese_lines(draw, chinese) if chinese else []
-    needs_english_page_transition = bool(
-        len(words) >= ARTICLE_VISUAL_PAGE_PREFERRED_WORDS + 3
-        and len(english_lines) >= 2
-        and _has_discouraged_caption_break(" ".join(words), english_lines)
+    """Choose page count from display load, before evaluating break quality."""
+    if not words:
+        return 1
+    english_font = article_en_font(font_size, 600)
+    english_pixels = text_w(draw, " ".join(words), english_font)
+    english_capacity = max(1, 2 * acx(ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH))
+    english_pixel_pages = max(1, math.ceil(english_pixels / english_capacity))
+    english_word_pages = max(
+        1,
+        math.ceil(len(words) / ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS),
     )
-    last_word = re.sub(r"[^A-Za-z']", "", words[-1]).lower() if words else ""
-    has_dangling_tail = last_word in LINE_BREAK_AVOID_AFTER_WORDS
-    has_four_bilingual_lines = len(english_lines) + len(chinese_lines) >= 4
-    if len(words) > ARTICLE_VISUAL_PAGE_PREFERRED_WORDS and (
-        needs_english_page_transition or has_dangling_tail or has_four_bilingual_lines
+
+    chinese_pages = 1
+    if chinese:
+        chinese_font = article_cjk_font(ARTICLE_SUBTITLE_ZH_FONT_SIZE, 700)
+        chinese_pixels = text_w(draw, chinese, chinese_font)
+        chinese_capacity = max(1, 2 * acx(ARTICLE_SUBTITLE_ZH_WIDTH))
+        chinese_pages = max(1, math.ceil(chinese_pixels / chinese_capacity))
+
+    duration_pages = 1
+    if cue_duration_ms is not None and cue_duration_ms > 0:
+        duration_pages = max(
+            1,
+            math.ceil(cue_duration_ms / ARTICLE_PAGE_COMFORTABLE_MAX_DURATION_MS),
+        )
+    return min(
+        ARTICLE_VISUAL_PAGE_MAX_PAGES,
+        max(
+            english_pixel_pages,
+            english_word_pages,
+            chinese_pages,
+            duration_pages,
+        ),
+    )
+
+
+def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
+    evidence = dict(cue.display_boundary_evidence or {})
+    if split <= 0 or split >= len(cue.word_timing):
+        return {
+            "classification": "allow",
+            "issue_codes": [],
+            "confidence": "low",
+        }
+    right_word_id = cue.word_timing[split].get("word_id")
+    item = dict(evidence.get(str(right_word_id)) or {})
+    hard_issues = {
+        str(code) for code in item.get("hard_issues") or [] if str(code)
+    }
+    soft_issues = {
+        str(code) for code in item.get("soft_issues") or [] if str(code)
+    }
+    words = str(cue.en or "").split()
+    previous_surface = words[split - 1] if split <= len(words) else ""
+    previous = re.sub(r"[^A-Za-z']", "", previous_surface).lower()
+    following = (
+        re.sub(r"[^A-Za-z']", "", words[split]).lower()
+        if split < len(words)
+        else ""
+    )
+    punctuation_boundary = bool(
+        re.search(r"[,;:.!?][\"')\]]*$", previous_surface)
+    )
+    if not punctuation_boundary and following == "of":
+        hard_issues.add("atomic_of_complement_split")
+    if (
+        not punctuation_boundary
+        and previous in {"and", "but", "nor", "or", "so", "yet"}
     ):
-        return 2
-    return 1
+        hard_issues.add("dangling_coordinator_page_split")
+
+    pause_ms = item.get("pause_ms")
+    if pause_ms is None and len(cue.word_timing) == len(words):
+        pause_ms = max(
+            0,
+            round(
+                (
+                    float(cue.word_timing[split]["start"])
+                    - float(cue.word_timing[split - 1]["end"])
+                )
+                * 1000
+            ),
+        )
+    issue_codes = set(hard_issues | soft_issues)
+    atomic = (hard_issues - DISPLAY_PAGE_REVIEWABLE_BOUNDARY_ISSUES) | (
+        soft_issues & DISPLAY_PAGE_ATOMIC_SOFT_ISSUES
+    )
+    complete_page_clause_start = _caption_complete_page_clause_start(
+        words,
+        split,
+    )
+    complete_wh_clause_start = bool(
+        following in ARTICLE_PAGE_COMPLETE_WH_CLAUSE_START_WORDS
+        and complete_page_clause_start
+        and issue_codes
+        and issue_codes
+        <= {
+            "clause_introducer_split",
+            "short_verb_complement_split",
+            "verb_complement_split",
+        }
+    )
+    complete_clause_restart = bool(
+        complete_page_clause_start
+        and following in ARTICLE_PAGE_COMPLETE_CONTINUATION_START_WORDS
+        and min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and pause_ms is not None
+        and int(pause_ms) >= ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS
+        and issue_codes
+        and issue_codes
+        <= {
+            "clause_introducer_split",
+            "coordinated_constituent_split",
+            "object_content_clause_split",
+            "protected_syntax_cut",
+            "short_verb_complement_split",
+            "verb_complement_split",
+        }
+    )
+    coordinated_phrase_restart = bool(
+        following in {"and", "but", "nor", "or", "so", "yet"}
+        and _caption_complete_continuation_clause(words[split:])
+        and min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and pause_ms is not None
+        and int(pause_ms) >= ARTICLE_PAGE_STRONG_PAUSE_REVIEW_MS
+        and issue_codes
+        and issue_codes <= {"coordinated_constituent_split"}
+    )
+    balanced_predicate_restart = bool(
+        min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and _caption_has_terminal_completion(words[split:])
+        and pause_ms is not None
+        and int(pause_ms) >= ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS
+        and atomic
+        and atomic
+        <= {
+            "relative_clause_subject_verb_split",
+            "subject_finite_verb_split",
+            "subject_predicate_split",
+        }
+    )
+    strong_pause_restarts_ing_clause = bool(
+        atomic
+        and atomic <= {"determiner_head_phrase_split"}
+        and "clause_introducer_split" in issue_codes
+        and previous == "that"
+        and following.endswith("ing")
+    )
+    punctuated_predicate_restart = bool(
+        atomic
+        and atomic <= DISPLAY_PAGE_STRONG_PAUSE_REVIEWABLE_HARD_ISSUES
+        and punctuation_boundary
+        and pause_ms is not None
+        and int(pause_ms) >= ARTICLE_PAGE_PUNCTUATED_PREDICATE_REVIEW_MS
+    )
+    strong_pause_reviews_clause_boundary = bool(
+        atomic
+        and (
+            atomic <= DISPLAY_PAGE_STRONG_PAUSE_REVIEWABLE_HARD_ISSUES
+            or strong_pause_restarts_ing_clause
+        )
+        and pause_ms is not None
+        and (
+            int(pause_ms) >= ARTICLE_PAGE_STRONG_PAUSE_REVIEW_MS
+            or punctuated_predicate_restart
+        )
+    )
+    if complete_wh_clause_start:
+        classification = "review"
+        confidence = "medium"
+    elif strong_pause_reviews_clause_boundary:
+        classification = "review"
+        confidence = "high"
+    elif (
+        complete_clause_restart
+        or coordinated_phrase_restart
+        or balanced_predicate_restart
+    ):
+        classification = "review"
+        confidence = "medium"
+    elif atomic:
+        classification = "hard"
+        confidence = "high"
+    elif hard_issues or soft_issues:
+        classification = "review"
+        confidence = "medium"
+    else:
+        classification = "allow"
+        confidence = "low"
+    complete_phrase_start = _article_page_can_start_with_complete_phrase(
+        words,
+        split,
+    )
+    if (
+        classification == "review"
+        and complete_phrase_start
+        and following in {"by", "into", "to"}
+        and issue_codes
+        and issue_codes <= {"dependency_phrase_entrance_split"}
+    ):
+        confidence = "low"
+    if (
+        classification == "allow"
+        and not punctuation_boundary
+        and (
+            pause_ms is None
+            or int(pause_ms) < ARTICLE_PAGE_UNSUPPORTED_TRANSITION_MIN_PAUSE_MS
+        )
+    ):
+        classification = "review"
+        confidence = "medium" if complete_phrase_start else "low"
+        issue_codes.add("unsupported_tight_page_transition")
+    tight_complete_phrase_start = bool(
+        complete_phrase_start
+        and not punctuation_boundary
+        and (
+            pause_ms is None
+            or int(pause_ms) < ARTICLE_PAGE_UNSUPPORTED_TRANSITION_MIN_PAUSE_MS
+        )
+    )
+    return {
+        "classification": classification,
+        "issue_codes": sorted(issue_codes),
+        "confidence": confidence,
+        "pause_ms": pause_ms,
+        "boundary_score": item.get("boundary_score"),
+        "protected_syntax": bool(item.get("protected_syntax")),
+        "strong_pause_evidence": bool(
+            strong_pause_reviews_clause_boundary
+            or complete_clause_restart
+            or coordinated_phrase_restart
+            or balanced_predicate_restart
+        ),
+        "complete_page_clause_start": complete_page_clause_start,
+        "balanced_predicate_restart": balanced_predicate_restart,
+        "tight_complete_phrase_start": tight_complete_phrase_start,
+    }
+
+
+def _article_line_boundary_penalty(cue: Cue, split: int) -> int:
+    """Project frozen syntax evidence onto a renderer-only line break."""
+    decision = _article_display_boundary_decision(cue, split)
+    issue_codes = set(decision.get("issue_codes") or [])
+    if issue_codes & ARTICLE_LINE_ATOMIC_BOUNDARY_ISSUES:
+        return CAPTION_HARD_BREAK_PENALTY
+    if decision.get("classification") == "hard":
+        # Both lines remain visible simultaneously, so cue/page-level syntax
+        # prohibitions should steer a wrap without making the cue unrenderable.
+        return DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY
+    if decision.get("classification") != "review":
+        return 0
+    return {
+        "high": DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY,
+        "medium": DISPLAY_PAGE_REVIEW_PENALTY,
+        "low": DISPLAY_PAGE_LOW_CONFIDENCE_REVIEW_PENALTY,
+    }.get(str(decision.get("confidence") or "low"), 0)
+
+
+def _article_page_planning_line_boundary_penalty(cue: Cue, split: int) -> int:
+    """Retain v18 line feasibility while page spans are being selected."""
+    decision = _article_display_boundary_decision(cue, split)
+    issue_codes = set(decision.get("issue_codes") or [])
+    if "verb_preposition_complement_split" in issue_codes:
+        return CAPTION_HARD_BREAK_PENALTY
+    if decision.get("classification") == "hard":
+        return DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY
+    if decision.get("classification") != "review":
+        return 0
+    return {
+        "high": DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY,
+        "medium": DISPLAY_PAGE_REVIEW_PENALTY,
+        "low": DISPLAY_PAGE_LOW_CONFIDENCE_REVIEW_PENALTY,
+    }.get(str(decision.get("confidence") or "low"), 0)
+
+
+def _article_forced_continuation_decision(
+    cue: Cue,
+    words: list[str],
+    split: int,
+) -> dict:
+    """Downgrade only a complete continuation phrase after strict planning fails.
+
+    These are page transitions inside one frozen cue, not new subtitle
+    boundaries.  Atomic lexical units remain hard; only a whole visible
+    prepositional/infinitive phrase or continuation clause can enter the
+    reviewable fallback tier.
+    """
+    decision = _article_display_boundary_decision(cue, split)
+    if decision.get("classification") != "hard":
+        return decision
+    issue_codes = set(decision.get("issue_codes") or [])
+    reviewable = {
+        "atomic_of_complement_split",
+        "clause_introducer_split",
+        "dependency_phrase_entrance_split",
+        "short_verb_complement_split",
+        "stranded_leading_complement_split",
+        "verb_complement_split",
+    }
+    following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+    next_word = (
+        re.sub(r"[^A-Za-z']", "", words[split + 1]).lower()
+        if split + 1 < len(words)
+        else ""
+    )
+    likely_infinitive_start = bool(
+        following == "to"
+        and next_word
+        and next_word not in ARTICLE_PAGE_OBJECT_DETERMINERS
+        and next_word not in LINE_BREAK_AVOID_BEFORE_WORDS
+    )
+    forced_subject_predicate = bool(
+        following
+        in {
+            "am", "are", "can", "could", "had", "has", "have", "is",
+            "may", "might", "must", "should", "was", "were", "will", "would",
+        }
+        and split >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and len(words) - split >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and issue_codes
+        <= {
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut",
+            "subject_finite_verb_split",
+        }
+    )
+    if likely_infinitive_start:
+        reviewable.add("protected_syntax_cut")
+    complete_phrase = _caption_phrase_start_is_complete(words, split)
+    complete_continuation = _caption_complete_continuation_clause(words[split:])
+    if (
+        forced_subject_predicate
+        or (
+            issue_codes
+            and issue_codes <= reviewable
+            and (complete_phrase or complete_continuation or likely_infinitive_start)
+            and (
+                not _caption_boundary_has_stranded_dependency(words, split)
+                or likely_infinitive_start
+                or (
+                    following in {"of", "for", "from"}
+                    and re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
+                    not in {
+                        "amount", "half", "kind", "none", "number", "one",
+                        "part", "sort",
+                    }
+                )
+            )
+        )
+    ):
+        return {
+            **decision,
+            "classification": "review",
+            "confidence": "high",
+            "issue_codes": sorted(
+                issue_codes
+                | {
+                    (
+                        "forced_subject_predicate_page_split"
+                        if forced_subject_predicate
+                        else "forced_complete_continuation_page_split"
+                    )
+                }
+            ),
+            "forced_display_continuation": True,
+            "forced_subject_predicate": forced_subject_predicate,
+        }
+    return decision
 
 
 def _article_page_break_score(
+    cue: Cue,
     words: list[str],
     split: int,
     target_words: float,
     word_timing: tuple[dict, ...],
-) -> int:
+    *,
+    allow_forced_continuation: bool = False,
+    allow_review_boundary: bool = False,
+    boundary_decision: Mapping | None = None,
+) -> int | None:
     score = abs(split - target_words) * 240
     if split >= len(words):
         return int(score)
-    if _article_page_has_tight_nonfinite_complement(
+    if boundary_decision is None:
+        boundary_decision = (
+            _article_forced_continuation_decision(cue, words, split)
+            if allow_forced_continuation
+            else _article_display_boundary_decision(cue, split)
+        )
+    if boundary_decision.get("classification") == "hard":
+        return None
+    manual_review_boundary = bool(
+        allow_review_boundary
+        and boundary_decision.get("classification") == "review"
+    )
+    if not manual_review_boundary and _article_page_has_tight_nonfinite_complement(
         words,
         split,
         word_timing,
+        boundary_decision,
     ):
-        return CAPTION_HARD_BREAK_PENALTY
+        return None
+    if not manual_review_boundary and _article_page_break_is_forbidden(
+        words,
+        split,
+        boundary_decision=boundary_decision,
+    ):
+        return None
     break_penalty = _article_visual_break_penalty(words, split)
+    previous_surface = str(words[split - 1]).strip()
+    previous = re.sub(r"[^A-Za-z']", "", previous_surface).lower()
+    if (
+        previous in LINE_BREAK_AVOID_AFTER_WORDS
+        and re.search(r"[,;:][\"')\]]*$", previous_surface)
+        and _caption_complete_page_clause_start(words, split)
+    ):
+        # Punctuation closes the preceding phrase here; the lexical function-
+        # word penalty must not override a complete following clause.
+        break_penalty -= CAPTION_HARD_BREAK_PENALTY
     if _article_page_can_start_with_complete_phrase(words, split):
         # A page transition differs from a line wrap: the phrase begins on a
         # fresh page and remains intact there. Remove only the penalties that
@@ -2330,9 +3466,20 @@ def _article_page_break_score(
         following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
         if following in ARTICLE_AVOID_LINE_START_WORDS:
             break_penalty -= CAPTION_HARD_BREAK_PENALTY
-    if break_penalty >= CAPTION_HARD_BREAK_PENALTY:
-        return CAPTION_HARD_BREAK_PENALTY
     score += break_penalty
+    if boundary_decision.get("classification") == "review":
+        confidence = str(boundary_decision.get("confidence") or "medium")
+        if (
+            boundary_decision.get("strong_pause_evidence")
+            and not boundary_decision.get("forced_display_continuation")
+        ):
+            confidence = "medium"
+        score += {
+            "low": DISPLAY_PAGE_LOW_CONFIDENCE_REVIEW_PENALTY,
+            "high": DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY,
+        }.get(confidence, DISPLAY_PAGE_REVIEW_PENALTY)
+    if boundary_decision.get("forced_display_continuation"):
+        score += DISPLAY_PAGE_FORCED_CONTINUATION_REVIEW_PENALTY
     if len(word_timing) == len(words):
         pause_ms = max(
             0,
@@ -2342,18 +3489,193 @@ def _article_page_break_score(
     return int(score)
 
 
+def _article_page_break_rank(
+    cue: Cue,
+    words: list[str],
+    split: int,
+    target_words: float,
+    word_timing: tuple[dict, ...],
+    *,
+    allow_forced_continuation: bool = False,
+    allow_review_boundary: bool = False,
+) -> tuple[int, float] | None:
+    decision = (
+        _article_forced_continuation_decision(cue, words, split)
+        if allow_forced_continuation
+        else _article_display_boundary_decision(cue, split)
+    )
+    cost = _article_page_break_score(
+        cue,
+        words,
+        split,
+        target_words,
+        word_timing,
+        allow_forced_continuation=allow_forced_continuation,
+        allow_review_boundary=allow_review_boundary,
+        boundary_decision=decision,
+    )
+    if cost is None:
+        return None
+    risk = _article_page_boundary_risk(decision, cost)
+    return risk, float(cost)
+
+
+def _article_page_boundary_risk(decision: Mapping, cost: int | float) -> int:
+    """Keep review confidence visible to the partitioning dynamic program."""
+    risk = 0
+    if decision.get("classification") == "review":
+        risk = {
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+        }.get(str(decision.get("confidence") or "medium"), 2)
+        if (
+            decision.get("strong_pause_evidence")
+            and not decision.get("forced_display_continuation")
+        ):
+            # A verified acoustic restart makes a clause-level review more
+            # usable, even though the audit remains high-confidence evidence.
+            risk = min(risk, 2)
+        issue_codes = set(decision.get("issue_codes") or [])
+        if "verb_preposition_complement_split" in issue_codes:
+            risk = max(risk, 4)
+        if "atomic_of_complement_split" in issue_codes:
+            risk = max(risk, 5)
+    if float(cost) >= DISPLAY_PAGE_HIGH_RISK_COST:
+        risk = max(risk, 1)
+    if decision.get("forced_display_continuation"):
+        risk = max(risk, 4)
+    if decision.get("forced_subject_predicate"):
+        risk = max(risk, 5)
+    return risk
+
+
+def _article_page_break_is_forbidden(
+    words: list[str],
+    split: int,
+    *,
+    boundary_decision: Mapping | None = None,
+) -> bool:
+    """Return hard presentation constraints separately from preference cost."""
+    if split <= 0 or split >= len(words):
+        return False
+    previous_surface = str(words[split - 1]).strip()
+    previous = re.sub(r"[^A-Za-z']", "", previous_surface).lower()
+    following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+    punctuation_boundary = bool(
+        re.search(r"[,;:.!?][\"')\]]*$", previous_surface)
+    )
+    complete_phrase = _caption_phrase_start_is_complete(words, split)
+    complete_continuation = _caption_complete_continuation_clause(words[split:])
+    complete_page_clause_start = _caption_complete_page_clause_start(words, split)
+    punctuated_complete_clause_start = bool(
+        punctuation_boundary and complete_page_clause_start
+    )
+    issue_codes = set((boundary_decision or {}).get("issue_codes") or [])
+    pause_ms = (boundary_decision or {}).get("pause_ms")
+    strong_pause_evidence = bool(
+        (boundary_decision or {}).get("strong_pause_evidence")
+    )
+    supported_relative_start = bool(
+        following in {"that", "which", "who", "whom", "whose", "where", "when"}
+        and "dependency_phrase_entrance_split" in issue_codes
+    )
+    if (
+        "fronted_wh_clause_split" in issue_codes
+        and not punctuated_complete_clause_start
+    ):
+        return True
+    if (
+        not punctuation_boundary
+        and following == "to"
+        and previous in ARTICLE_PAGE_TO_INFINITIVE_HEADS
+    ):
+        return True
+    if (
+        not punctuation_boundary
+        and following.endswith(("ing", "ed"))
+        and pause_ms is not None
+        and int(pause_ms) <= ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS
+        and issue_codes
+        & {
+            "dependency_phrase_entrance_split",
+            "object_attached_modifier_split",
+            "post_noun_participial_modifier_split",
+        }
+    ):
+        return True
+    if (
+        not punctuation_boundary
+        and following in ARTICLE_PAGE_PHRASE_START_WORDS
+        and pause_ms is not None
+        and int(pause_ms) <= ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS
+        and issue_codes
+        & {
+            "dependency_phrase_entrance_split",
+            "object_attached_modifier_split",
+            "verb_preposition_complement_split",
+        }
+    ):
+        # Parser-backed tight complements remain atomic even when the relaxed
+        # continuation planner is evaluating an otherwise complete phrase.
+        return True
+    if (boundary_decision or {}).get("forced_display_continuation"):
+        return False
+    if (
+        previous in LINE_BREAK_AVOID_AFTER_WORDS
+        and not strong_pause_evidence
+        and not punctuated_complete_clause_start
+        and not (boundary_decision or {}).get("forced_display_continuation")
+    ):
+        return True
+    if (
+        _caption_boundary_has_stranded_dependency(words, split)
+        and not (boundary_decision or {}).get("forced_display_continuation")
+    ):
+        return True
+    if (
+        following in LINE_BREAK_AVOID_BEFORE_WORDS
+        and not complete_phrase
+        and not complete_continuation
+        and not supported_relative_start
+        and not (boundary_decision or {}).get("forced_display_continuation")
+    ):
+        return True
+    if (
+        not punctuation_boundary
+        and _looks_like_english_modifier_boundary(words[split - 1], words[split])
+    ):
+        return True
+    if not punctuation_boundary and _looks_like_numeric_phrase_boundary(words, split):
+        return True
+    if "-" in previous_surface and not punctuation_boundary:
+        return True
+    if following in ARTICLE_AVOID_LINE_START_WORDS and not complete_phrase:
+        return True
+    return False
+
+
 def _article_page_has_tight_nonfinite_complement(
     words: list[str],
     split: int,
     word_timing: tuple[dict, ...],
+    boundary_decision: Mapping | None = None,
 ) -> bool:
-    """Reject a page switch inside a tightly spoken non-finite verb phrase."""
+    """Reject only parser-supported, tightly spoken non-finite attachments."""
     if split <= 0 or split >= len(words) or len(word_timing) != len(words):
         return False
     previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
     following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
+    issue_codes = set((boundary_decision or {}).get("issue_codes") or [])
+    nonfinite_evidence = issue_codes & {
+        "object_attached_modifier_split",
+        "post_noun_participial_modifier_split",
+        "verb_complement_split",
+        "verb_preposition_complement_split",
+    }
     if (
-        not previous.endswith("ing")
+        not previous.endswith(("ing", "ed"))
+        or not nonfinite_evidence
         or following
         not in (ARTICLE_PAGE_PHRASE_START_WORDS | ARTICLE_PAGE_OBJECT_DETERMINERS)
     ):
@@ -2367,11 +3689,7 @@ def _article_page_has_tight_nonfinite_complement(
 
 def _article_page_can_start_with_complete_phrase(words: list[str], split: int) -> bool:
     """Allow a full prepositional or infinitive phrase to start a new page."""
-    remaining = words[split:]
-    if len(remaining) < ARTICLE_VISUAL_PAGE_MIN_WORDS:
-        return False
-    first = re.sub(r"[^A-Za-z']", "", remaining[0]).lower()
-    return first in ARTICLE_PAGE_PHRASE_START_WORDS
+    return _caption_phrase_start_is_complete(words, split)
 
 
 def _article_page_span_is_readable(
@@ -2379,6 +3697,8 @@ def _article_page_span_is_readable(
     *,
     is_first_page: bool,
     paginated: bool,
+    allow_attached_continuation: bool = False,
+    allow_dangling_end: bool = False,
 ) -> bool:
     """Reject a timed page that is visibly too short or syntactically dangling."""
     if not paginated:
@@ -2387,9 +3707,71 @@ def _article_page_span_is_readable(
         return False
     first = re.sub(r"[^A-Za-z']", "", words[0]).lower()
     last = re.sub(r"[^A-Za-z']", "", words[-1]).lower()
-    if not is_first_page and first in ARTICLE_PAGE_CONTINUATION_START_WORDS:
+    terminal_completion = _caption_has_terminal_completion(words)
+    phrase_boundary = bool(
+        re.search(r"[,;:][\"')\]]*$", str(words[-1]).strip())
+    )
+    if (
+        not is_first_page
+        and first in ARTICLE_PAGE_CONTINUATION_START_WORDS
+        and not _caption_complete_continuation_clause(words)
+        and not allow_attached_continuation
+    ):
         return False
-    return last not in LINE_BREAK_AVOID_AFTER_WORDS
+    return bool(
+        last not in LINE_BREAK_AVOID_AFTER_WORDS
+        or terminal_completion
+        or phrase_boundary
+        or allow_dangling_end
+    )
+
+
+def _article_page_span_balance_cost(
+    draw: ImageDraw.ImageDraw,
+    words: list[str],
+    start: int,
+    end: int,
+    word_timing: tuple[dict, ...],
+    font_size: int,
+    page_count: int,
+) -> float:
+    """Score page load by words, rendered pixels, and spoken duration."""
+    if page_count <= 1:
+        return 0.0
+    span_word_count = end - start
+    target_words = len(words) / page_count
+    word_delta = (span_word_count - target_words) / max(target_words, 1.0)
+
+    fnt = article_en_font(font_size, 600)
+    total_pixels = text_w(draw, " ".join(words), fnt)
+    span_pixels = text_w(draw, " ".join(words[start:end]), fnt)
+    target_pixels = total_pixels / page_count
+    pixel_delta = (span_pixels - target_pixels) / max(target_pixels, 1.0)
+
+    score = word_delta * word_delta * 1_600
+    score += pixel_delta * pixel_delta * 1_400
+    if len(word_timing) == len(words):
+        total_duration = max(
+            float(word_timing[-1]["end"]) - float(word_timing[0]["start"]),
+            0.001,
+        )
+        span_duration = max(
+            float(word_timing[end - 1]["end"])
+            - float(word_timing[start]["start"]),
+            0.001,
+        )
+        target_duration = total_duration / page_count
+        duration_delta = (span_duration - target_duration) / max(
+            target_duration,
+            0.001,
+        )
+        score += duration_delta * duration_delta * 900
+    if span_word_count < max(
+        ARTICLE_VISUAL_PAGE_MIN_WORDS,
+        math.floor(target_words * 0.55),
+    ):
+        score += 4_000
+    return score
 
 
 def _partition_article_english_pages(
@@ -2398,6 +3780,13 @@ def _partition_article_english_pages(
     words: list[str],
     page_count: int,
     word_timing: tuple[dict, ...],
+    font_size: int,
+    diagnostics: set[str] | None = None,
+    *,
+    allow_forced_continuation: bool = False,
+    allow_review_boundary: bool = False,
+    span_layout: Callable[[int, int, int, bool], Sequence[str]] | None = None,
+    span_balance: Callable[[int, int, int, int], float] | None = None,
 ) -> list[tuple[int, int]] | None:
     """Find fixed-font page spans without creating a hard phrase split."""
     def span_is_readable(
@@ -2407,13 +3796,71 @@ def _partition_article_english_pages(
         paginated: bool,
     ) -> bool:
         page_words = words[start:end]
+        boundary_decision = (
+            (
+                _article_forced_continuation_decision(cue, words, start)
+                if allow_forced_continuation
+                else _article_display_boundary_decision(cue, start)
+            )
+            if start > 0
+            else {}
+        )
+        first = (
+            re.sub(r"[^A-Za-z']", "", page_words[0]).lower()
+            if page_words
+            else ""
+        )
+        allow_attached_continuation = bool(
+            start > 0
+            and (
+                (
+                    first
+                    in {"that", "which", "who", "whom", "whose", "where", "when"}
+                    and "dependency_phrase_entrance_split"
+                    in set(boundary_decision.get("issue_codes") or [])
+                    and re.search(r"[,;:.!?][\"')\]]*$", page_words[-1])
+                )
+                or (
+                    first in {"and", "but", "nor", "or", "so", "yet"}
+                    and len(page_words) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+                )
+                or bool(boundary_decision.get("forced_display_continuation"))
+                or bool(
+                    allow_review_boundary
+                    and boundary_decision.get("classification") == "review"
+                )
+            )
+        )
+        outgoing_decision = (
+            _article_forced_continuation_decision(cue, words, end)
+            if allow_forced_continuation and end < len(words)
+            else {}
+        )
+        lines = (
+            list(span_layout(start, end, font_size, paginated))
+            if span_layout is not None
+            else _article_fixed_english_lines(
+                draw,
+                " ".join(page_words),
+                font_size=font_size,
+                enforce_word_limit=paginated,
+                boundary_penalty=lambda local_split: _article_page_planning_line_boundary_penalty(
+                    cue,
+                    start + local_split,
+                ),
+            )
+        )
         return bool(
             _article_page_span_is_readable(
                 page_words,
                 is_first_page=is_first_page,
                 paginated=paginated,
+                allow_attached_continuation=allow_attached_continuation,
+                allow_dangling_end=bool(
+                    outgoing_decision.get("forced_display_continuation")
+                ),
             )
-            and _article_fixed_english_lines(draw, " ".join(page_words))
+            and lines
         )
 
     return plan_word_page_spans(
@@ -2424,25 +3871,56 @@ def _partition_article_english_pages(
         word_timing=word_timing,
         min_page_duration=ARTICLE_PAGE_MIN_DURATION_MS / 1000.0,
         span_is_readable=span_is_readable,
-        break_score=lambda end, target: _article_page_break_score(
+        break_score=lambda end, target: _article_page_break_rank(
+            cue,
             words,
             end,
             target,
             word_timing,
+            allow_forced_continuation=allow_forced_continuation,
+            allow_review_boundary=allow_review_boundary,
         ),
+        span_score=(
+            (lambda start, end: span_balance(
+                start,
+                end,
+                font_size,
+                page_count,
+            ))
+            if span_balance is not None
+            else (
+                lambda start, end: _article_page_span_balance_cost(
+                    draw,
+                    words,
+                    start,
+                    end,
+                    word_timing,
+                    font_size,
+                    page_count,
+                )
+            )
+        ),
+        diagnostics=diagnostics,
     )
 
 
 def _schedule_article_page_boundaries(
     cue: Cue,
     spans: list[tuple[int, int]],
+    *,
+    minimum_page_duration_ms: int | None = None,
 ) -> tuple[list[float] | None, str]:
     if len(spans) <= 1:
         return [float(cue.start), float(cue.end)], ""
     words = cue.word_timing
     if len(words) != len(str(cue.en or "").split()):
         return None, "missing_or_mismatched_word_ledger"
-    min_duration = ARTICLE_PAGE_MIN_DURATION_MS / 1000.0
+    configured_minimum = (
+        ARTICLE_PAGE_MIN_DURATION_MS
+        if minimum_page_duration_ms is None
+        else max(int(minimum_page_duration_ms), 0)
+    )
+    min_duration = configured_minimum / 1000.0
     if float(cue.end) - float(cue.start) + 1e-6 < len(spans) * min_duration:
         return None, "cue_duration_below_page_minimum"
 
@@ -2468,9 +3946,343 @@ def _schedule_article_page_boundaries(
     return boundaries, ""
 
 
+def _article_final_page_layout(
+    draw: ImageDraw.ImageDraw,
+    cue: Cue,
+    words: Sequence[str],
+    start: int,
+    end: int,
+) -> tuple[int, list[str]] | None:
+    """Choose font and line wrap together for one frozen page span."""
+    text = " ".join(words[start:end])
+    candidates: list[tuple[int, int, list[str]]] = []
+    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        lines = _article_fixed_english_lines(
+            draw,
+            text,
+            font_size=font_size,
+            boundary_penalty=lambda split, base=start: (
+                _article_line_boundary_penalty(cue, base + split)
+            ),
+            relax_same_screen_syntax=True,
+            intrinsic_penalty=lambda page_words, split, base=start: (
+                _article_same_screen_intrinsic_line_break_penalty(
+                    cue,
+                    page_words,
+                    split,
+                    base + split,
+                )
+            ),
+        )
+        if lines:
+            score = _article_same_screen_layout_score(
+                cue,
+                words,
+                start,
+                end,
+                int(font_size),
+                lines,
+            )
+            candidates.append((score, int(font_size), list(lines)))
+    if not candidates:
+        return None
+    normal_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[1] > ARTICLE_SUBTITLE_EN_MIN_SIZE
+    ]
+    if normal_candidates:
+        candidates = normal_candidates
+    _, font_size, lines = min(
+        candidates,
+        key=lambda candidate: (candidate[0], -candidate[1]),
+    )
+    return font_size, lines
+
+
+def _article_same_screen_layout_score(
+    cue: Cue,
+    words: Sequence[str],
+    start: int,
+    end: int,
+    font_size: int,
+    lines: Sequence[str],
+) -> int:
+    """Compare renderer-only layouts without changing their frozen page span."""
+    page_words = list(words[start:end])
+    split = 0
+    break_penalty = 0
+    for line in lines[:-1]:
+        split += len(str(line).split())
+        break_penalty += _article_same_screen_intrinsic_line_break_penalty(
+            cue,
+            page_words,
+            split,
+            start + split,
+        )
+        break_penalty += _article_line_boundary_penalty(
+            cue,
+            start + split,
+        )
+    return (
+        break_penalty
+        + (ARTICLE_SUBTITLE_EN_FONT_SIZE - int(font_size))
+        * ARTICLE_LINE_FONT_PIXEL_PENALTY
+    )
+
+
+def _article_planning_final_page_layout(
+    draw: ImageDraw.ImageDraw,
+    cue: Cue,
+    words: Sequence[str],
+    start: int,
+    end: int,
+) -> tuple[int, list[str]] | None:
+    """Use the v18 feasibility contract while selecting page boundaries."""
+    text = " ".join(words[start:end])
+    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        lines = _article_fixed_english_lines(
+            draw,
+            text,
+            font_size=font_size,
+            boundary_penalty=lambda split, base=start: (
+                _article_page_planning_line_boundary_penalty(cue, base + split)
+            ),
+        )
+        if lines:
+            return int(font_size), list(lines)
+    return None
+
+
+def _finalize_article_same_screen_layout(
+    cue: Cue,
+    draw: ImageDraw.ImageDraw,
+    plan: Mapping[str, object],
+) -> dict:
+    """Reflow frozen pages without changing their IDs, spans, or timing."""
+    finalized = dict(plan)
+    words = str(cue.en or "").split()
+    pages = [dict(page) for page in plan.get("pages") or []]
+    page_fonts: list[int] = []
+    for page in pages:
+        start = int(page["word_start"])
+        end = int(page["word_end"]) + 1
+        layout = _article_final_page_layout(draw, cue, words, start, end)
+        if layout is None:
+            return finalized
+        font_size, lines = layout
+        previous_font_size = int(
+            page.get("english_font_size") or ARTICLE_SUBTITLE_EN_FONT_SIZE
+        )
+        previous_lines = [
+            " ".join(str(line or "").split())
+            for line in page.get("en_lines") or []
+            if str(line or "").strip()
+        ]
+        previous_valid_lines = _article_fixed_english_lines(
+            draw,
+            " ".join(words[start:end]),
+            font_size=previous_font_size,
+            boundary_penalty=lambda split, base=start: (
+                _article_line_boundary_penalty(cue, base + split)
+            ),
+            relax_same_screen_syntax=True,
+            intrinsic_penalty=lambda page_words, split, base=start: (
+                _article_same_screen_intrinsic_line_break_penalty(
+                    cue,
+                    page_words,
+                    split,
+                    base + split,
+                )
+            ),
+        )
+        if (
+            font_size < previous_font_size
+            and previous_font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
+            and " ".join(previous_lines).split() == words[start:end]
+            and previous_lines == previous_valid_lines
+            and _article_same_screen_layout_score(
+                cue,
+                words,
+                start,
+                end,
+                font_size,
+                lines,
+            )
+            >= _article_same_screen_layout_score(
+                cue,
+                words,
+                start,
+                end,
+                previous_font_size,
+                previous_lines,
+            )
+        ):
+            font_size = previous_font_size
+            lines = previous_lines
+        page["en_lines"] = list(lines)
+        page["english_font_size"] = int(font_size)
+        page["en_width"] = _article_english_layout_width(
+            draw,
+            lines,
+            font_size,
+        )
+        page["line_wrap_review"] = bool(
+            _has_discouraged_caption_break(
+                str(page.get("en") or ""),
+                lines,
+                boundary_penalty=lambda split, base=start: (
+                    _article_line_boundary_penalty(cue, base + split)
+                ),
+                intrinsic_penalty=lambda page_words, split, base=start: (
+                    _article_same_screen_intrinsic_line_break_penalty(
+                        cue,
+                        page_words,
+                        split,
+                        base + split,
+                    )
+                ),
+            )
+        )
+        page_fonts.append(int(font_size))
+    if not pages or not page_fonts:
+        return finalized
+    selected_font = min(page_fonts)
+    finalized["pages"] = pages
+    finalized["font_size"] = {
+        **dict(plan.get("font_size") or {}),
+        "english": selected_font,
+    }
+    finalized["font_fallback"] = (
+        {"used": False}
+        if selected_font == ARTICLE_SUBTITLE_EN_FONT_SIZE
+        else {
+            "used": True,
+            "from": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+            "to": selected_font,
+            "reason": (
+                "no_safe_normal_font_layout"
+                if selected_font < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
+                else "no_safe_higher_font_layout"
+            ),
+        }
+    )
+    return finalized
+
+
+def reflow_article_frozen_page_plan_same_screen(
+    cue: Cue,
+    frozen_plan: Mapping[str, object],
+) -> dict:
+    """Upgrade only the typography inside already frozen display pages."""
+    words = str(cue.en or "").split()
+    timing = list(cue.word_timing or ())
+    raw_pages = list(frozen_plan.get("pages") or [])
+    try:
+        first_word_id = int(timing[0]["word_id"])
+        last_word_id = int(timing[-1]["word_id"])
+        plan_word_start = int(frozen_plan["word_start"])
+        plan_word_end = int(frozen_plan["word_end"])
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
+        ) from exc
+    if (
+        not words
+        or len(words) != len(timing)
+        or not raw_pages
+        or plan_word_start != first_word_id
+        or plan_word_end != last_word_id
+    ):
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
+        )
+
+    local_pages: list[dict] = []
+    expected_start = first_word_id
+    for raw_page in raw_pages:
+        if not isinstance(raw_page, Mapping):
+            raise RenderStructuralOverflowError(
+                [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
+            )
+        try:
+            global_start = int(raw_page["word_start"])
+            global_end = int(raw_page["word_end"])
+            previous_font = int(raw_page["english_font_size"])
+            previous_width = int(raw_page["english_width"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RenderStructuralOverflowError(
+                [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
+            ) from exc
+        local_start = global_start - first_word_id
+        local_end = global_end - first_word_id
+        page_english = " ".join(words[local_start : local_end + 1])
+        if (
+            global_start != expected_start
+            or local_start < 0
+            or local_end < local_start
+            or local_end >= len(words)
+            or page_english
+            != " ".join(str(raw_page.get("english") or "").split())
+        ):
+            raise RenderStructuralOverflowError(
+                [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
+            )
+        local_pages.append(
+            {
+                "word_start": local_start,
+                "word_end": local_end,
+                "en": page_english,
+                "en_lines": list(raw_page.get("english_lines") or []),
+                "english_font_size": previous_font,
+                "en_width": previous_width,
+            }
+        )
+        expected_start = global_end + 1
+    if expected_start - 1 != last_word_id:
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
+        )
+
+    local_plan = {
+        "font_size": {
+            "english": int(
+                frozen_plan.get("english_font_size")
+                or min(page["english_font_size"] for page in local_pages)
+            ),
+            "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        },
+        "font_fallback": dict(frozen_plan.get("font_fallback") or {"used": False}),
+        "pages": local_pages,
+    }
+    finalized = _finalize_article_same_screen_layout(cue, ImageDraw.Draw(
+        Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT))
+    ), local_plan)
+    finalized_pages = list(finalized.get("pages") or [])
+    if len(finalized_pages) != len(raw_pages):
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
+        )
+
+    upgraded = copy.deepcopy(dict(frozen_plan))
+    upgraded_pages = list(upgraded.get("pages") or [])
+    for upgraded_page, finalized_page in zip(upgraded_pages, finalized_pages):
+        upgraded_page["english_lines"] = list(finalized_page["en_lines"])
+        upgraded_page["english_font_size"] = int(
+            finalized_page["english_font_size"]
+        )
+        upgraded_page["english_width"] = int(finalized_page["en_width"])
+    upgraded["pages"] = upgraded_pages
+    upgraded["english_font_size"] = int(finalized["font_size"]["english"])
+    upgraded["font_fallback"] = dict(finalized.get("font_fallback") or {})
+    return upgraded
+
+
 def _build_article_english_page_plan(
     cue: Cue,
     draw: ImageDraw.ImageDraw,
+    *,
+    _return_candidates: bool = False,
 ) -> dict:
     """Freeze the English word pages before any Chinese page text is selected."""
     words = str(cue.en or "").split()
@@ -2480,104 +4292,549 @@ def _build_article_english_page_plan(
             "errors": [{"cue_index": cue.index, "reason": "empty_english_cue"}],
         }
     failure_reasons: set[str] = set()
-    preferred_page_count = _article_preferred_readability_page_count(draw, words, "")
-    page_counts = list(range(preferred_page_count, len(words) + 1))
-    if preferred_page_count > 1:
-        # Static one-page layout remains safe if a word-timed transition would
-        # be too brief or land inside a protected phrase.  Record the unmet
-        # readability preference instead of shrinking the font or inventing a
-        # timing boundary.
-        page_counts.append(1)
-    for page_count in page_counts:
-        spans = _partition_article_english_pages(draw, cue, words, page_count, cue.word_timing)
-        if spans is None:
-            continue
-        english_layouts = [
-            _article_fixed_english_lines(draw, " ".join(words[start:end]))
-            for start, end in spans
-        ]
-        if any(not lines for lines in english_layouts):
-            failure_reasons.add("english_does_not_fit_fixed_font")
-            continue
-        boundaries, timing_reason = _schedule_article_page_boundaries(cue, spans)
-        if boundaries is None:
-            failure_reasons.add(timing_reason)
-            continue
-        pages = [
-            {
-                "index": index,
-                "display_page_id": (
-                    display_page_id(cue.subtitle_id, index + 1)
-                    if cue.subtitle_id
-                    else ""
-                ),
-                "parent_subtitle_id": str(cue.subtitle_id or ""),
-                "en": " ".join(words[start:end]),
-                "word_start": start,
-                "word_end": end - 1,
-                "global_word_start": (
-                    int(cue.word_timing[start].get("word_id"))
-                    if len(cue.word_timing) == len(words)
-                    and cue.word_timing[start].get("word_id") is not None
-                    else None
-                ),
-                "global_word_end": (
-                    int(cue.word_timing[end - 1].get("word_id"))
-                    if len(cue.word_timing) == len(words)
-                    and cue.word_timing[end - 1].get("word_id") is not None
-                    else None
-                ),
-                "start": boundaries[index],
-                "end": boundaries[index + 1],
-                "en_lines": english_layouts[index],
-                "en_width": (
-                    ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH
-                    if any(
-                        text_w(
-                            draw,
-                            line,
-                            article_en_font(ARTICLE_SUBTITLE_EN_FONT_SIZE, 600),
+    candidates: list[dict] = []
+    layout_cache: dict[tuple[int, int, int, bool], tuple[str, ...]] = {}
+    balance_cache: dict[tuple[int, int, int, int], float] = {}
+
+    def span_layout(
+        start: int,
+        end: int,
+        font_size: int,
+        paginated: bool,
+    ) -> tuple[str, ...]:
+        key = (start, end, font_size, paginated)
+        if key not in layout_cache:
+            layout_cache[key] = tuple(
+                _article_fixed_english_lines(
+                    draw,
+                    " ".join(words[start:end]),
+                    font_size=font_size,
+                    enforce_word_limit=paginated,
+                    boundary_penalty=lambda local_split, base=start: (
+                        _article_page_planning_line_boundary_penalty(
+                            cue,
+                            base + local_split,
                         )
-                        > acx(ARTICLE_SUBTITLE_EN_WIDTH)
-                        for line in english_layouts[index]
-                    )
-                    else ARTICLE_SUBTITLE_EN_WIDTH
-                ),
-                # A same-page line wrap can be review-worthy without becoming
-                # a timed boundary error. It remains available to render
-                # inspection but cannot create or move a cue/page boundary.
-                "line_wrap_review": bool(
-                    _has_discouraged_caption_break(
-                        " ".join(words[start:end]),
+                    ),
+                )
+            )
+        return layout_cache[key]
+
+    def span_balance(
+        start: int,
+        end: int,
+        font_size: int,
+        page_count: int,
+    ) -> float:
+        key = (start, end, font_size, page_count)
+        if key not in balance_cache:
+            balance_cache[key] = _article_page_span_balance_cost(
+                draw,
+                words,
+                start,
+                end,
+                cue.word_timing,
+                font_size,
+                page_count,
+            )
+        return balance_cache[key]
+
+    base_static_lines = list(
+        span_layout(
+            0,
+            len(words),
+            ARTICLE_SUBTITLE_EN_FONT_SIZE,
+            False,
+        )
+    )
+    base_preferred_page_count = _article_preferred_readability_page_count(
+        draw,
+        words,
+        str(cue.zh or ""),
+        font_size=ARTICLE_SUBTITLE_EN_FONT_SIZE,
+        cue_duration_ms=max(0, round((float(cue.end) - float(cue.start)) * 1000)),
+    )
+    if not base_static_lines and len(words) > ARTICLE_VISUAL_PAGE_PREFERRED_WORDS:
+        base_preferred_page_count = max(2, base_preferred_page_count)
+
+    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        max_page_count = min(ARTICLE_VISUAL_PAGE_MAX_PAGES, len(words))
+        for page_count in range(1, max_page_count + 1):
+            attempt_diagnostics: set[str] = set()
+            spans = _partition_article_english_pages(
+                draw,
+                cue,
+                words,
+                page_count,
+                cue.word_timing,
+                font_size,
+                diagnostics=attempt_diagnostics,
+                span_layout=span_layout,
+                span_balance=span_balance,
+            )
+            forced_continuation = False
+            if spans is None and page_count > 1:
+                spans = _partition_article_english_pages(
+                    draw,
+                    cue,
+                    words,
+                    page_count,
+                    cue.word_timing,
+                    font_size,
+                    diagnostics=attempt_diagnostics,
+                    allow_forced_continuation=True,
+                    span_layout=span_layout,
+                    span_balance=span_balance,
+                )
+                forced_continuation = spans is not None
+            if spans is None:
+                failure_reasons.update(
+                    attempt_diagnostics or {"no_complete_legal_page_partition"}
+                )
+                continue
+            page_layouts = [
+                _article_planning_final_page_layout(draw, cue, words, start, end)
+                for start, end in spans
+            ]
+            if any(layout is None for layout in page_layouts):
+                failure_reasons.add("english_does_not_fit_fixed_font")
+                continue
+            page_font_sizes = [int(layout[0]) for layout in page_layouts if layout]
+            english_layouts = [list(layout[1]) for layout in page_layouts if layout]
+            selected_parent_font = min(page_font_sizes)
+            boundaries, timing_reason = _schedule_article_page_boundaries(cue, spans)
+            if boundaries is None:
+                failure_reasons.add(timing_reason)
+                continue
+            boundary_decisions = [
+                (
+                    _article_forced_continuation_decision(cue, words, start)
+                    if forced_continuation
+                    else _article_display_boundary_decision(cue, start)
+                )
+                for start, _ in spans[1:]
+            ]
+            boundary_costs = [
+                _article_page_break_score(
+                    cue,
+                    words,
+                    start,
+                    len(words) / page_count,
+                    cue.word_timing,
+                    allow_forced_continuation=forced_continuation,
+                )
+                for start, _ in spans[1:]
+            ]
+            if any(cost is None for cost in boundary_costs):
+                failure_reasons.add("hard_page_boundary")
+                continue
+            boundary_risks = [
+                _article_page_boundary_risk(decision, int(cost or 0))
+                for decision, cost in zip(boundary_decisions, boundary_costs)
+            ]
+            review_count = sum(
+                decision.get("classification") == "review"
+                for decision in boundary_decisions
+            )
+            high_risk_count = sum(risk > 0 for risk in boundary_risks)
+            medium_risk_count = sum(
+                decision.get("classification") == "review"
+                and decision.get("confidence") == "medium"
+                for decision in boundary_decisions
+            )
+            low_risk_count = sum(
+                decision.get("classification") == "review"
+                and decision.get("confidence") == "low"
+                for decision in boundary_decisions
+            )
+            supported_restart_count = sum(
+                decision.get("classification") == "review"
+                and decision.get("strong_pause_evidence")
+                for decision in boundary_decisions
+            )
+            tight_complete_phrase_count = sum(
+                bool(decision.get("tight_complete_phrase_start"))
+                for decision in boundary_decisions
+            )
+            risk_score = sum(boundary_risks)
+            soft_word_overflow = sum(
+                max(0, end - start - ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS)
+                for start, end in spans
+            )
+            page_balance_cost = sum(
+                span_balance(start, end, font_size, page_count)
+                for start, end in spans
+            )
+            pages = [
+                {
+                    "index": index,
+                    "display_page_id": (
+                        display_page_id(cue.subtitle_id, index + 1)
+                        if cue.subtitle_id
+                        else ""
+                    ),
+                    "parent_subtitle_id": str(cue.subtitle_id or ""),
+                    "en": " ".join(words[start:end]),
+                    "word_start": start,
+                    "word_end": end - 1,
+                    "global_word_start": (
+                        int(cue.word_timing[start].get("word_id"))
+                        if len(cue.word_timing) == len(words)
+                        and cue.word_timing[start].get("word_id") is not None
+                        else None
+                    ),
+                    "global_word_end": (
+                        int(cue.word_timing[end - 1].get("word_id"))
+                        if len(cue.word_timing) == len(words)
+                        and cue.word_timing[end - 1].get("word_id") is not None
+                        else None
+                    ),
+                    "start": boundaries[index],
+                    "end": boundaries[index + 1],
+                    "en_lines": english_layouts[index],
+                    "english_font_size": page_font_sizes[index],
+                    "boundary_before": (
+                        boundary_decisions[index - 1]
+                        if index > 0
+                        else {
+                            "classification": "allow",
+                            "issue_codes": [],
+                            "confidence": "low",
+                        }
+                    ),
+                    "en_width": _article_english_layout_width(
+                        draw,
                         english_layouts[index],
-                    )
-                ),
-            }
-            for index, (start, end) in enumerate(spans)
-        ]
-        return {
-            "status": "ok",
-            "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
-            "font_size": {
-                "english": ARTICLE_SUBTITLE_EN_FONT_SIZE,
-                "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
-            },
-            "pages": pages,
-            "readability_warnings": (
-                [
+                        page_font_sizes[index],
+                    ),
+                    "line_wrap_review": bool(
+                        _has_discouraged_caption_break(
+                            " ".join(words[start:end]),
+                            english_layouts[index],
+                            boundary_penalty=lambda split, base=start: (
+                                _article_line_boundary_penalty(cue, base + split)
+                            ),
+                        )
+                    ),
+                }
+                for index, (start, end) in enumerate(spans)
+            ]
+            warnings = []
+            last_word = (
+                re.sub(r"[^A-Za-z']", "", words[-1]).lower()
+                if words
+                else ""
+            )
+            static_dangling_tail = bool(
+                page_count == 1
+                and last_word in LINE_BREAK_AVOID_AFTER_WORDS
+                and not _caption_has_terminal_completion(words)
+            )
+            if (
+                (
+                    page_count < base_preferred_page_count
+                    or static_dangling_tail
+                )
+                and not (
+                    page_count == 1
+                    and _caption_has_terminal_completion(words)
+                )
+            ):
+                warnings.append(
                     {
                         "reason": "preferred_readability_page_unscheduled",
-                        "requested_page_count": preferred_page_count,
+                        "requested_page_count": max(
+                            base_preferred_page_count,
+                            2 if static_dangling_tail else 1,
+                        ),
                     }
+                )
+            if review_count:
+                warnings.append(
+                    {
+                        "reason": "review_boundary_fallback",
+                        "boundary_count": review_count,
+                        "high_risk_count": high_risk_count,
+                        "risk_score": risk_score,
+                    }
+                )
+            if forced_continuation:
+                warnings.append(
+                    {
+                        "reason": "forced_complete_continuation_page_split",
+                        "boundary_count": sum(
+                            bool(decision.get("forced_display_continuation"))
+                            for decision in boundary_decisions
+                        ),
+                        "requires_review": True,
+                    }
+                )
+            if soft_word_overflow:
+                warnings.append(
+                    {
+                        "reason": "visual_word_budget_exceeded",
+                        "soft_limit": ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS,
+                        "overflow_words": soft_word_overflow,
+                    }
+                )
+            if selected_parent_font < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE:
+                warnings.append(
+                    {
+                        "reason": "emergency_font_fallback",
+                        "normal_minimum": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
+                        "selected": selected_parent_font,
+                        "requires_review": True,
+                    }
+                )
+            page_word_counts = [end - start for start, end in spans]
+            if (
+                len(page_word_counts) > 1
+                and max(page_word_counts) / max(min(page_word_counts), 1) >= 1.8
+            ):
+                warnings.append(
+                    {
+                        "reason": "display_page_load_imbalance",
+                        "page_word_counts": page_word_counts,
+                        "balance_cost": round(page_balance_cost),
+                    }
+                )
+            plan = {
+                "status": "ok",
+                "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
+                "font_size": {
+                    "english": selected_parent_font,
+                    "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+                },
+                "font_fallback": (
+                    {
+                        "used": True,
+                        "from": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+                        "to": selected_parent_font,
+                        "reason": (
+                            "no_safe_normal_font_layout"
+                            if selected_parent_font < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
+                            else "no_safe_higher_font_layout"
+                        ),
+                    }
+                    if selected_parent_font != ARTICLE_SUBTITLE_EN_FONT_SIZE
+                    else {"used": False}
+                ),
+                "pages": pages,
+                "readability_warnings": warnings,
+            }
+            font_reduction = ARTICLE_SUBTITLE_EN_FONT_SIZE - selected_parent_font
+            quality_cost = (
+                sum(int(cost or 0) for cost in boundary_costs)
+                + page_balance_cost
+                + soft_word_overflow * 300
+                + font_reduction * DISPLAY_PAGE_FONT_STEP_PENALTY
+                + abs(page_count - base_preferred_page_count)
+                * DISPLAY_PAGE_COUNT_DEVIATION_PENALTY
+                + max(0, page_count - 1) * DISPLAY_PAGE_TRANSITION_PENALTY
+            )
+            candidates.append(
+                {
+                    "plan": plan,
+                    "page_count": page_count,
+                    "font_reduction": font_reduction,
+                    "forced_continuation": forced_continuation,
+                    "risk_score": risk_score,
+                    "high_risk_count": high_risk_count,
+                    "medium_risk_count": medium_risk_count,
+                    "low_risk_count": low_risk_count,
+                    "supported_restart_count": supported_restart_count,
+                    "severe_risk_count": sum(
+                        risk >= 3 for risk in boundary_risks
+                    ),
+                    "tight_complete_phrase_count": tight_complete_phrase_count,
+                    "review_count": review_count,
+                    "quality_cost": round(quality_cost),
+                    "page_pressures": tuple(
+                        _article_display_page_pressure(page) for page in pages
+                    ),
+                }
+            )
+    if candidates:
+        normal_font_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["plan"]["font_size"]["english"]
+            >= ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
+        ]
+        if normal_font_candidates:
+            candidates = normal_font_candidates
+        # Page count is a reading-load decision. Break rewards and penalties
+        # are deliberately absent here; they select a boundary only after the
+        # number of pages is fixed.
+        strict_candidates = [
+            candidate
+            for candidate in candidates
+            if not candidate["forced_continuation"]
+        ]
+        selection_pool = strict_candidates or candidates
+        secondary_review_candidates = _article_high_pressure_review_candidates(
+            selection_pool,
+            total_word_count=len(words),
+        )
+        if secondary_review_candidates:
+            selection_pool = secondary_review_candidates
+        if _return_candidates:
+            if not secondary_review_candidates:
+                safe_preferred_font_candidates = [
+                    candidate
+                    for candidate in selection_pool
+                    if candidate["plan"]["font_size"]["english"]
+                    == ARTICLE_SUBTITLE_EN_FONT_SIZE
+                    and not candidate["forced_continuation"]
+                    and not candidate["severe_risk_count"]
+                    and not candidate["medium_risk_count"]
                 ]
-                if page_count < preferred_page_count
-                else []
-            ),
+                if safe_preferred_font_candidates:
+                    selection_pool = safe_preferred_font_candidates
+            by_page_count = {
+                page_count: [
+                    candidate
+                    for candidate in selection_pool
+                    if candidate["page_count"] == page_count
+                ]
+                for page_count in sorted(
+                    {candidate["page_count"] for candidate in selection_pool}
+                )
+            }
+            preferred_candidates = by_page_count.get(
+                base_preferred_page_count,
+                [],
+            )
+            static_candidates = by_page_count.get(1, [])
+            best_static_font_reduction = min(
+                (
+                    candidate["font_reduction"]
+                    for candidate in static_candidates
+                ),
+                default=None,
+            )
+            preferred_is_low_confidence_or_supported_only = bool(
+                preferred_candidates
+                and all(
+                    candidate["review_count"]
+                    == candidate["low_risk_count"]
+                    + candidate["supported_restart_count"]
+                    for candidate in preferred_candidates
+                )
+            )
+            if (
+                not secondary_review_candidates
+                and base_preferred_page_count > 1
+                and preferred_candidates
+                and static_candidates
+                and all(
+                    candidate["severe_risk_count"]
+                    or candidate["tight_complete_phrase_count"]
+                    for candidate in preferred_candidates
+                )
+                and (
+                    not preferred_is_low_confidence_or_supported_only
+                    or best_static_font_reduction
+                    <= ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT
+                )
+            ):
+                selection_pool = static_candidates
+            return {
+                "status": "candidate_bundle",
+                "candidates": selection_pool,
+                "preferred_page_count": base_preferred_page_count,
+                "candidate_mode": (
+                    "strict" if strict_candidates else "forced_continuation"
+                ),
+            }
+        by_page_count = {
+            page_count: [
+                candidate
+                for candidate in selection_pool
+                if candidate["page_count"] == page_count
+            ]
+            for page_count in sorted(
+                {candidate["page_count"] for candidate in selection_pool}
+            )
         }
+        available_page_counts = sorted(by_page_count)
+        selected_page_count = min(
+            available_page_counts,
+            key=lambda page_count: (
+                abs(page_count - base_preferred_page_count),
+                page_count < base_preferred_page_count,
+                page_count,
+            ),
+        )
+        preferred_candidates = by_page_count.get(base_preferred_page_count, [])
+        best_static_font_reduction = min(
+            (
+                candidate["font_reduction"]
+                for candidate in by_page_count.get(1, [])
+            ),
+            default=None,
+        )
+        preferred_is_low_confidence_or_supported_only = bool(
+            preferred_candidates
+            and all(
+                candidate["review_count"]
+                == candidate["low_risk_count"]
+                + candidate["supported_restart_count"]
+                for candidate in preferred_candidates
+            )
+        )
+        if (
+            not secondary_review_candidates
+            and base_preferred_page_count > 1
+            and preferred_candidates
+            and 1 in by_page_count
+            and all(
+                candidate["severe_risk_count"]
+                or candidate["tight_complete_phrase_count"]
+                for candidate in preferred_candidates
+            )
+            and (
+                not preferred_is_low_confidence_or_supported_only
+                or best_static_font_reduction
+                <= ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT
+            )
+        ):
+            # Avoid structurally uncertain page turns. A low-confidence turn
+            # may still beat the deepest 50px fallback, but not the normal
+            # 54/52px fallback range; medium/high risk never wins on font size.
+            selected_page_count = 1
+
+        selected = min(
+            by_page_count[selected_page_count],
+            key=lambda candidate: (
+                candidate["risk_score"],
+                candidate["high_risk_count"],
+                candidate["medium_risk_count"],
+                candidate["low_risk_count"],
+                candidate["font_reduction"],
+                candidate["quality_cost"],
+            ),
+        )
+        selected["plan"]["page_count_decision"] = {
+            "preferred": base_preferred_page_count,
+            "selected": selected_page_count,
+            "candidate_mode": (
+                "strict" if strict_candidates else "forced_continuation"
+            ),
+            "basis": "pixel_word_chinese_duration_load",
+        }
+        return _finalize_article_same_screen_layout(
+            cue,
+            draw,
+            selected["plan"],
+        )
     reason_priority = (
         "missing_or_mismatched_word_ledger",
         "no_word_boundary_with_minimum_page_duration",
         "cue_duration_below_page_minimum",
+        "hard_page_boundary",
+        "fixed_font_span_unreadable",
+        "no_complete_legal_page_partition",
         "no_fixed_font_page_partition",
     )
     primary_reason = next(
@@ -2596,11 +4853,238 @@ def _build_article_english_page_plan(
     }
 
 
+def _article_display_page_pressure(page: Mapping[str, object]) -> float:
+    """Measure page density without turning a word target into a hard limit."""
+    english = " ".join(str(page.get("en") or "").split())
+    word_count = len(english.split())
+    duration = max(
+        float(page.get("end") or 0.0) - float(page.get("start") or 0.0),
+        0.001,
+    )
+    word_load = word_count / max(ARTICLE_VISUAL_PAGE_PREFERRED_WORDS, 1)
+    width_load = float(page.get("en_width") or 0.0) / max(
+        float(acx(ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH)),
+        1.0,
+    )
+    spoken_load = (word_count / duration) / 3.2
+    return round(max(word_load, width_load, spoken_load), 6)
+
+
+def _article_high_pressure_review_candidates(
+    candidates: Sequence[Mapping[str, object]],
+    *,
+    total_word_count: int,
+) -> list[dict]:
+    """Promote only complete, readable review cuts over a dense static page."""
+    static_candidates = [
+        candidate
+        for candidate in candidates
+        if int(candidate.get("page_count") or 0) == 1
+    ]
+    if not static_candidates:
+        return []
+    static_is_high_pressure = any(
+        total_word_count > ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS
+        or int(candidate.get("plan", {}).get("font_size", {}).get("english") or 0)
+        <= 52
+        for candidate in static_candidates
+    )
+    if not static_is_high_pressure:
+        return []
+
+    promoted: list[dict] = []
+    for candidate in candidates:
+        plan = candidate.get("plan") or {}
+        pages = list(plan.get("pages") or [])
+        if (
+            int(candidate.get("page_count") or 0) <= 1
+            or int(plan.get("font_size", {}).get("english") or 0)
+            != ARTICLE_SUBTITLE_EN_FONT_SIZE
+            or candidate.get("forced_continuation")
+            or int(candidate.get("severe_risk_count") or 0)
+            or not pages
+        ):
+            continue
+        if any(
+            len(str(page.get("en") or "").split())
+            < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+            or (
+                float(page.get("end") or 0.0)
+                - float(page.get("start") or 0.0)
+            )
+            * 1000
+            < ARTICLE_PAGE_MIN_DURATION_MS
+            for page in pages
+        ):
+            continue
+        if not all(
+            _article_secondary_review_boundary_is_complete(page)
+            for page in pages[1:]
+        ):
+            continue
+
+        promoted_candidate = dict(candidate)
+        promoted_plan = dict(plan)
+        warnings = list(promoted_plan.get("readability_warnings") or [])
+        warnings.append(
+            {
+                "reason": "high_pressure_secondary_page_review",
+                "review_required": True,
+            }
+        )
+        promoted_plan["readability_warnings"] = warnings
+        promoted_candidate["plan"] = promoted_plan
+        promoted_candidate["secondary_review_promoted"] = True
+        promoted.append(promoted_candidate)
+    return promoted
+
+
+def _article_secondary_review_boundary_is_complete(
+    right_page: Mapping[str, object],
+) -> bool:
+    decision = right_page.get("boundary_before") or {}
+    if str(decision.get("classification") or "") == "reject":
+        return False
+    issue_codes = {
+        str(issue or "") for issue in decision.get("issue_codes") or []
+    }
+    if issue_codes & {
+        "modifier_head_split",
+        "modifier_noun_head_split",
+        "post_noun_participial_modifier_split",
+        "subject_predicate_split",
+        "subject_finite_verb_split",
+        "verb_object_split",
+        "to_infinitive_split",
+    }:
+        return False
+    words = str(right_page.get("en") or "").split()
+    if not words:
+        return False
+    first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
+    return bool(
+        decision.get("strong_pause_evidence")
+        and int(decision.get("pause_ms") or 0)
+        >= ARTICLE_PAGE_SECONDARY_REVIEW_STRONG_PAUSE_MS
+        or decision.get("complete_page_clause_start")
+        or first_word in {"that", "who", "which"}
+    )
+
+
+def _article_dense_page_pair_cost(left: float, right: float) -> float:
+    shared_overload = max(0.0, min(float(left), float(right)) - 0.95)
+    return shared_overload * shared_overload * 6_000
+
+
+def _article_candidate_sequence_cost(candidate: Mapping[str, object]) -> float:
+    pressures = tuple(float(value) for value in candidate.get("page_pressures") or ())
+    overload_cost = sum(max(0.0, value - 1.0) ** 2 * 3_000 for value in pressures)
+    consecutive_cost = sum(
+        _article_dense_page_pair_cost(left, right)
+        for left, right in zip(pressures, pressures[1:])
+    )
+    return float(candidate.get("quality_cost") or 0.0) + overload_cost + consecutive_cost
+
+
+def _select_article_page_plan_sequence(
+    candidate_groups: Sequence[Sequence[Mapping[str, object]]],
+) -> list[Mapping[str, object]]:
+    """Choose cue-local page plans while accounting for adjacent page pressure.
+
+    The state space is bounded by the existing per-cue candidates.  The
+    dynamic program never moves words across frozen subtitle IDs; it only
+    chooses among already valid renderer projections.
+    """
+    groups = [list(group) for group in candidate_groups]
+    if not groups or any(not group for group in groups):
+        return []
+
+    states: list[tuple[tuple[int, int, float], list[Mapping[str, object]]]] = []
+    for candidate in groups[0]:
+        states.append(
+            (
+                (
+                    int(bool(candidate.get("forced_continuation"))),
+                    int(candidate.get("severe_risk_count") or 0),
+                    _article_candidate_sequence_cost(candidate),
+                ),
+                [candidate],
+            )
+        )
+
+    for group in groups[1:]:
+        next_states = []
+        for candidate in group:
+            local_rank = (
+                int(bool(candidate.get("forced_continuation"))),
+                int(candidate.get("severe_risk_count") or 0),
+                _article_candidate_sequence_cost(candidate),
+            )
+            current_pressures = tuple(
+                float(value) for value in candidate.get("page_pressures") or ()
+            )
+            best = None
+            for previous_rank, previous_path in states:
+                previous = previous_path[-1]
+                previous_pressures = tuple(
+                    float(value) for value in previous.get("page_pressures") or ()
+                )
+                transition_cost = 0.0
+                if previous_pressures and current_pressures:
+                    transition_cost = _article_dense_page_pair_cost(
+                        previous_pressures[-1],
+                        current_pressures[0],
+                    )
+                rank = (
+                    previous_rank[0] + local_rank[0],
+                    previous_rank[1] + local_rank[1],
+                    previous_rank[2] + local_rank[2] + transition_cost,
+                )
+                proposed = (rank, [*previous_path, candidate])
+                if best is None or proposed[0] < best[0]:
+                    best = proposed
+            if best is not None:
+                next_states.append(best)
+        states = next_states
+        if not states:
+            return []
+    return min(states, key=lambda state: state[0])[1]
+
+
+def _finalize_article_sequence_candidate(
+    candidate: Mapping[str, object],
+    bundle: Mapping[str, object],
+) -> dict:
+    plan = dict(candidate.get("plan") or {})
+    plan["page_count_decision"] = {
+        "preferred": int(bundle.get("preferred_page_count") or 1),
+        "selected": int(candidate.get("page_count") or 1),
+        "candidate_mode": str(bundle.get("candidate_mode") or "strict"),
+        "basis": (
+            "high_pressure_secondary_review"
+            if candidate.get("secondary_review_promoted")
+            else "semantic_pixel_duration_sequence_pressure"
+        ),
+    }
+    return plan
+
+
 def build_article_visual_page_plan(
     cue: Cue,
     draw: ImageDraw.ImageDraw,
 ) -> dict:
     """Plan fixed-font pages from frozen English plus validated page Chinese."""
+    # A validated display-page artifact owns the renderer projection. Replanning
+    # a single cue here can choose different spans from the sequence planner and
+    # invalidate otherwise correct page translations.
+    frozen_plan = cue.article_page_plan
+    if (
+        isinstance(frozen_plan, Mapping)
+        and frozen_plan.get("status") == "ok"
+        and str(frozen_plan.get("source") or "").startswith("frozen_")
+    ):
+        return dict(frozen_plan)
+
     plan = _build_article_english_page_plan(cue, draw)
     if plan.get("status") != "ok":
         return plan
@@ -2653,7 +5137,14 @@ def article_display_page_layout_profile() -> dict:
         "width": ARTICLE_WIDTH,
         "height": ARTICLE_HEIGHT,
         "english_font_size": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+        "english_font_fallback_sizes": list(ARTICLE_SUBTITLE_EN_FALLBACK_SIZES),
+        "english_emergency_fallback_sizes": list(
+            ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES
+        ),
+        "english_normal_min_size": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
+        "english_min_size": ARTICLE_SUBTITLE_EN_MIN_SIZE,
         "chinese_font_size": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        "english_comfortable_width": ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
         "english_width": ARTICLE_SUBTITLE_EN_WIDTH,
         "english_wide_safe_width": ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
         "chinese_width": ARTICLE_SUBTITLE_ZH_WIDTH,
@@ -2665,16 +5156,34 @@ def article_display_page_layout_profile() -> dict:
 def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
     """Return only multi-page parents after final word timing is frozen."""
     draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
-    parents: list[dict] = []
     errors: list[dict] = []
+    bundles: list[dict] = []
     for cue in cues:
-        plan = _build_article_english_page_plan(cue, draw)
-        if plan.get("status") != "ok":
-            errors.extend(plan.get("errors") or [])
+        bundle = _build_article_english_page_plan(
+            cue,
+            draw,
+            _return_candidates=True,
+        )
+        if bundle.get("status") != "candidate_bundle":
+            errors.extend(bundle.get("errors") or [])
             continue
+        bundles.append(bundle)
+    if errors:
+        raise RenderStructuralOverflowError(errors)
+    selected_candidates = _select_article_page_plan_sequence(
+        [bundle["candidates"] for bundle in bundles]
+    )
+    if len(selected_candidates) != len(cues):
+        raise RenderStructuralOverflowError(
+            [{"cue_index": "all", "reason": "display_page_sequence_unavailable"}]
+        )
+
+    parents: list[dict] = []
+    render_plans: list[dict] = []
+    for cue, bundle, selected in zip(cues, bundles, selected_candidates):
+        plan = _finalize_article_sequence_candidate(selected, bundle)
+        plan = _finalize_article_same_screen_layout(cue, draw, plan)
         pages = list(plan.get("pages") or [])
-        if len(pages) <= 1:
-            continue
         if (
             not cue.subtitle_id
             or not pages
@@ -2688,6 +5197,35 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
                 }
             )
             continue
+        frozen_pages = [
+            {
+                "display_page_id": page["display_page_id"],
+                "word_start": int(page["global_word_start"]),
+                "word_end": int(page["global_word_end"]),
+                "english": page["en"],
+                "start_ms": round(float(page["start"]) * 1000),
+                "end_ms": round(float(page["end"]) * 1000),
+                "english_lines": list(page.get("en_lines") or []),
+                "english_font_size": int(page["english_font_size"]),
+                "english_width": int(page["en_width"]),
+                "boundary_before": dict(page.get("boundary_before") or {}),
+            }
+            for page in pages
+        ]
+        render_plans.append(
+            {
+                "parent_subtitle_id": cue.subtitle_id,
+                "english": cue.en,
+                "chinese": cue.zh,
+                "word_start": int(pages[0]["global_word_start"]),
+                "word_end": int(pages[-1]["global_word_end"]),
+                "english_font_size": int(plan["font_size"]["english"]),
+                "font_fallback": dict(plan.get("font_fallback") or {"used": False}),
+                "pages": frozen_pages,
+            }
+        )
+        if len(pages) <= 1:
+            continue
         parents.append(
             {
                 "parent_subtitle_id": cue.subtitle_id,
@@ -2695,17 +5233,7 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
                 "chinese": cue.zh,
                 "word_start": int(pages[0]["global_word_start"]),
                 "word_end": int(pages[-1]["global_word_end"]),
-                "pages": [
-                    {
-                        "display_page_id": page["display_page_id"],
-                        "word_start": int(page["global_word_start"]),
-                        "word_end": int(page["global_word_end"]),
-                        "english": page["en"],
-                        "start_ms": round(float(page["start"]) * 1000),
-                        "end_ms": round(float(page["end"]) * 1000),
-                    }
-                    for page in pages
-                ],
+                "pages": frozen_pages,
             }
         )
     if errors:
@@ -2714,6 +5242,495 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
         "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
         "layout_profile": article_display_page_layout_profile(),
         "parents": parents,
+        "render_plans": render_plans,
+    }
+
+
+def propose_article_manual_page_word_ranges(
+    cue: Cue,
+    page_count: int,
+    *,
+    allow_review_boundary: bool = False,
+) -> list[tuple[int, int]]:
+    """Plan an explicit page count with the normal syntax/timing scorer."""
+    requested = int(page_count)
+    words = str(cue.en or "").split()
+    timing = list(cue.word_timing or ())
+    if (
+        requested < 2
+        or requested > ARTICLE_VISUAL_PAGE_MAX_PAGES
+        or requested > len(words)
+        or len(words) != len(timing)
+    ):
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "manual_page_count_invalid"}]
+        )
+    try:
+        first_word_id = int(timing[0]["word_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "missing_or_mismatched_word_ledger"}]
+        ) from exc
+
+    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    attempted_reasons: set[str] = set()
+    for allow_forced_continuation in (False, True):
+        for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+            diagnostics: set[str] = set()
+            spans = _partition_article_english_pages(
+                draw,
+                cue,
+                words,
+                requested,
+                cue.word_timing,
+                font_size,
+                diagnostics=diagnostics,
+                allow_forced_continuation=allow_forced_continuation,
+            )
+            attempted_reasons.update(diagnostics)
+            if spans is None:
+                continue
+            schedule, schedule_error = _schedule_article_page_boundaries(cue, spans)
+            if schedule is None:
+                attempted_reasons.add(schedule_error)
+                continue
+            return [
+                (first_word_id + start, first_word_id + end - 1)
+                for start, end in spans
+            ]
+
+    if allow_review_boundary:
+        for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+            diagnostics: set[str] = set()
+            spans = _partition_article_english_pages(
+                draw,
+                cue,
+                words,
+                requested,
+                cue.word_timing,
+                font_size,
+                diagnostics=diagnostics,
+                allow_review_boundary=True,
+            )
+            attempted_reasons.update(diagnostics)
+            if spans is None:
+                continue
+            schedule, schedule_error = _schedule_article_page_boundaries(cue, spans)
+            if schedule is None:
+                attempted_reasons.add(schedule_error)
+                continue
+            return [
+                (first_word_id + start, first_word_id + end - 1)
+                for start, end in spans
+            ]
+
+    raise RenderStructuralOverflowError(
+        [
+            {
+                "cue_index": cue.index,
+                "reason": "manual_page_count_has_no_safe_partition",
+                "requested_page_count": requested,
+                "attempted_reasons": sorted(
+                    reason for reason in attempted_reasons if reason
+                ),
+            }
+        ]
+    )
+
+
+def rebuild_article_frozen_page_plan_from_word_ranges(
+    cue: Cue,
+    frozen_plan: Mapping[str, object],
+    page_word_ranges: Sequence[tuple[int, int]],
+    page_translations: Mapping[str, str],
+    *,
+    allow_page_count_change: bool = False,
+    allow_incomplete_page_translations: bool = False,
+    allow_manual_review: bool = False,
+) -> dict:
+    """Rebuild one frozen render plan after an explicit manual page-boundary move.
+
+    The parent cue remains immutable. Only the continuous word ranges owned by
+    its existing display-page IDs may change. Layout, timing, minimum duration,
+    and hard-boundary checks are recomputed from the authoritative word ledger.
+    """
+    words = str(cue.en or "").split()
+    timing = list(cue.word_timing or ())
+    raw_pages = list(frozen_plan.get("pages") or [])
+    if (
+        not words
+        or len(words) != len(timing)
+        or not raw_pages
+        or (
+            len(page_word_ranges) != len(raw_pages)
+            and not allow_page_count_change
+        )
+    ):
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "manual_page_boundary_invalid"}]
+        )
+
+    try:
+        first_word_id = int(timing[0]["word_id"])
+        last_word_id = int(timing[-1]["word_id"])
+        ranges = [(int(start), int(end)) for start, end in page_word_ranges]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "manual_page_boundary_invalid"}]
+        ) from exc
+
+    expected_start = first_word_id
+    for start, end in ranges:
+        if start != expected_start or end < start or end > last_word_id:
+            raise RenderStructuralOverflowError(
+                [{"cue_index": cue.index, "reason": "manual_page_boundary_not_contiguous"}]
+            )
+        expected_start = end + 1
+    if expected_start - 1 != last_word_id:
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "manual_page_boundary_not_contiguous"}]
+        )
+
+    local_spans = [
+        (start - first_word_id, end - first_word_id + 1)
+        for start, end in ranges
+    ]
+    schedule, schedule_error = _schedule_article_page_boundaries(
+        cue,
+        local_spans,
+        minimum_page_duration_ms=(0 if allow_manual_review else None),
+    )
+    if schedule is None:
+        raise RenderStructuralOverflowError(
+            [
+                {
+                    "cue_index": cue.index,
+                    "reason": schedule_error or "manual_page_timing_invalid",
+                }
+            ]
+        )
+
+    boundary_decisions: list[dict] = [{}]
+    for local_start, _local_end in local_spans[1:]:
+        decision = dict(_article_display_boundary_decision(cue, local_start) or {})
+        if (
+            str(decision.get("classification") or "") == "hard"
+            and not allow_manual_review
+        ):
+            raise RenderStructuralOverflowError(
+                [
+                    {
+                        "cue_index": cue.index,
+                        "reason": "manual_page_boundary_is_hard",
+                        "word_start": first_word_id + local_start,
+                        "issue_codes": list(decision.get("issue_codes") or []),
+                    }
+                ]
+            )
+        if str(decision.get("classification") or "") == "hard":
+            decision["classification"] = "review"
+            decision["confidence"] = "high"
+            decision["manual_original_classification"] = "hard"
+        decision["manual_override"] = True
+        boundary_decisions.append(decision)
+
+    if allow_manual_review:
+        short_page_indices = [
+            page_index
+            for page_index in range(len(local_spans))
+            if (
+                float(schedule[page_index + 1]) - float(schedule[page_index])
+            )
+            * 1000.0
+            + 1e-6
+            < ARTICLE_PAGE_MIN_DURATION_MS
+        ]
+        for page_index in short_page_indices:
+            decision_index = min(max(page_index, 1), len(boundary_decisions) - 1)
+            decision = boundary_decisions[decision_index]
+            issue_codes = set(decision.get("issue_codes") or [])
+            issue_codes.add("manual_short_page_review")
+            decision["issue_codes"] = sorted(issue_codes)
+            decision["classification"] = "review"
+            decision["manual_override"] = True
+            decision["page_duration_ms"] = round(
+                (
+                    float(schedule[page_index + 1])
+                    - float(schedule[page_index])
+                )
+                * 1000
+            )
+
+    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    selected_layouts = [
+        _article_final_page_layout(draw, cue, words, local_start, local_end)
+        for local_start, local_end in local_spans
+    ]
+    if any(layout is None for layout in selected_layouts):
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "manual_page_layout_overflow"}]
+        )
+    selected_page_fonts = [
+        int(layout[0]) for layout in selected_layouts if layout
+    ]
+    selected_lines = [list(layout[1]) for layout in selected_layouts if layout]
+    selected_font = min(selected_page_fonts)
+
+    page_templates = (
+        raw_pages
+        if len(raw_pages) == len(ranges)
+        else [
+            {"display_page_id": display_page_id(str(cue.subtitle_id or ""), index + 1)}
+            for index in range(len(ranges))
+        ]
+    )
+    frozen_pages = []
+    for page_index, (
+        (global_start, global_end),
+        raw_page,
+        lines,
+        page_font_size,
+    ) in enumerate(
+        zip(ranges, page_templates, selected_lines, selected_page_fonts)
+    ):
+        page_id = str(raw_page.get("display_page_id") or "")
+        if page_id != display_page_id(str(cue.subtitle_id or ""), page_index + 1):
+            raise RenderStructuralOverflowError(
+                [{"cue_index": cue.index, "reason": "manual_page_id_mismatch"}]
+            )
+        local_start = global_start - first_word_id
+        local_end = global_end - first_word_id + 1
+        frozen_pages.append(
+            {
+                "display_page_id": page_id,
+                "word_start": global_start,
+                "word_end": global_end,
+                "english": " ".join(words[local_start:local_end]),
+                "start_ms": round(float(schedule[page_index]) * 1000),
+                "end_ms": round(float(schedule[page_index + 1]) * 1000),
+                "english_lines": list(lines),
+                "english_font_size": page_font_size,
+                "english_width": _article_english_layout_width(
+                    draw,
+                    lines,
+                    page_font_size,
+                ),
+                "boundary_before": boundary_decisions[page_index],
+            }
+        )
+
+    rebuilt = {
+        "parent_subtitle_id": str(cue.subtitle_id or ""),
+        "english": str(cue.en or ""),
+        "chinese": str(cue.zh or ""),
+        "word_start": first_word_id,
+        "word_end": last_word_id,
+        "english_font_size": selected_font,
+        "font_fallback": (
+            {"used": False}
+            if selected_font == ARTICLE_SUBTITLE_EN_FONT_SIZE
+            else {
+                "used": True,
+                "from": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+                "to": selected_font,
+                "reason": "manual_page_boundary_layout",
+            }
+        ),
+        "pages": frozen_pages,
+    }
+    if (
+        not allow_incomplete_page_translations
+        and _article_plan_from_frozen_artifact(
+            cue,
+            rebuilt,
+            page_translations,
+            draw,
+        ) is None
+    ):
+        raise RenderStructuralOverflowError(
+            [{"cue_index": cue.index, "reason": "manual_page_boundary_invalid"}]
+        )
+    return rebuilt
+
+
+def _article_plan_from_frozen_artifact(
+    cue: Cue,
+    frozen: Mapping[str, object],
+    page_translations: Mapping[str, str],
+    draw: ImageDraw.ImageDraw,
+) -> dict | None:
+    words = str(cue.en or "").split()
+    timing = list(cue.word_timing or ())
+    if not words or len(words) != len(timing):
+        return None
+    try:
+        first_word_id = int(timing[0]["word_id"])
+        last_word_id = int(timing[-1]["word_id"])
+        font_size = int(frozen["english_font_size"])
+        frozen_word_start = int(frozen["word_start"])
+        frozen_word_end = int(frozen["word_end"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        str(frozen.get("parent_subtitle_id") or "") != str(cue.subtitle_id or "")
+        or " ".join(str(frozen.get("english") or "").split()) != " ".join(words)
+        or frozen_word_start != first_word_id
+        or frozen_word_end != last_word_id
+        or font_size not in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
+    ):
+        return None
+    font_fallback = dict(frozen.get("font_fallback") or {})
+    if font_size == ARTICLE_SUBTITLE_EN_FONT_SIZE:
+        if bool(font_fallback.get("used")):
+            return None
+    elif (
+        not bool(font_fallback.get("used"))
+        or int(font_fallback.get("from") or 0) != ARTICLE_SUBTITLE_EN_FONT_SIZE
+        or int(font_fallback.get("to") or 0) != font_size
+    ):
+        return None
+
+    raw_pages = list(frozen.get("pages") or [])
+    if not raw_pages:
+        return None
+    pages: list[dict] = []
+    expected_global_start = first_word_id
+    previous_end_ms: int | None = None
+    for page_index, raw_page in enumerate(raw_pages):
+        if not isinstance(raw_page, Mapping):
+            return None
+        try:
+            global_start = int(raw_page["word_start"])
+            global_end = int(raw_page["word_end"])
+            start_ms = int(raw_page["start_ms"])
+            end_ms = int(raw_page["end_ms"])
+            page_font_size = int(raw_page["english_font_size"])
+            english_width = int(raw_page["english_width"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        local_start = global_start - first_word_id
+        local_end = global_end - first_word_id
+        if (
+            global_start != expected_global_start
+            or local_start < 0
+            or local_end < local_start
+            or local_end >= len(words)
+            or page_font_size not in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
+            or english_width
+            not in {
+                ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
+                ARTICLE_SUBTITLE_EN_WIDTH,
+                ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
+            }
+            or (previous_end_ms is not None and start_ms != previous_end_ms)
+        ):
+            return None
+        page_english = " ".join(words[local_start : local_end + 1])
+        if page_english != " ".join(str(raw_page.get("english") or "").split()):
+            return None
+        expected_lines = _article_fixed_english_lines(
+            draw,
+            page_english,
+            font_size=page_font_size,
+            boundary_penalty=lambda split, base=local_start: (
+                _article_line_boundary_penalty(cue, base + split)
+            ),
+            relax_same_screen_syntax=True,
+            intrinsic_penalty=lambda page_words, split, base=local_start: (
+                _article_same_screen_intrinsic_line_break_penalty(
+                    cue,
+                    page_words,
+                    split,
+                    base + split,
+                )
+            ),
+        )
+        frozen_lines = [
+            " ".join(str(line or "").split())
+            for line in raw_page.get("english_lines") or []
+        ]
+        expected_width = _article_english_layout_width(
+            draw,
+            expected_lines,
+            page_font_size,
+        )
+        boundary_before = dict(raw_page.get("boundary_before") or {})
+        if (
+            not expected_lines
+            or frozen_lines != expected_lines
+            or english_width != expected_width
+            or (page_index > 0 and boundary_before.get("classification") == "hard")
+        ):
+            return None
+        if page_index == 0:
+            if abs(start_ms / 1000.0 - float(cue.start)) > 0.005:
+                return None
+        else:
+            previous_word_end = float(timing[local_start - 1]["end"])
+            next_word_start = float(timing[local_start]["start"])
+            if not previous_word_end - 0.005 <= start_ms / 1000.0 <= next_word_start + 0.005:
+                return None
+        if page_index == len(raw_pages) - 1 and abs(
+            end_ms / 1000.0 - float(cue.end)
+        ) > 0.005:
+            return None
+        page_id = str(raw_page.get("display_page_id") or "")
+        if page_id != display_page_id(str(cue.subtitle_id or ""), page_index + 1):
+            return None
+        chinese = (
+            re.sub(r"\s+", "", str(page_translations.get(page_id) or ""))
+            if len(raw_pages) > 1
+            else re.sub(r"\s+", "", str(cue.zh or ""))
+        )
+        if not chinese or not _article_fixed_chinese_lines(draw, chinese):
+            return None
+        pages.append(
+            {
+                "index": page_index,
+                "display_page_id": page_id,
+                "parent_subtitle_id": str(cue.subtitle_id or ""),
+                "en": page_english,
+                "zh": chinese,
+                "word_start": local_start,
+                "word_end": local_end,
+                "global_word_start": global_start,
+                "global_word_end": global_end,
+                "start": start_ms / 1000.0,
+                "end": end_ms / 1000.0,
+                "en_lines": frozen_lines,
+                "english_font_size": page_font_size,
+                "en_width": english_width,
+                "boundary_before": boundary_before,
+                "line_wrap_review": bool(
+                    _has_discouraged_caption_break(
+                        page_english,
+                        frozen_lines,
+                        boundary_penalty=lambda split, base=local_start: (
+                            _article_line_boundary_penalty(cue, base + split)
+                        ),
+                    )
+                ),
+            }
+        )
+        expected_global_start = global_end + 1
+        previous_end_ms = end_ms
+    if expected_global_start - 1 != last_word_id:
+        return None
+    if min(int(page["english_font_size"]) for page in pages) != font_size:
+        return None
+    if "".join(page["zh"] for page in pages) != re.sub(r"\s+", "", str(cue.zh or "")):
+        return None
+    return {
+        "status": "ok",
+        "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
+        "font_size": {
+            "english": font_size,
+            "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        },
+        "font_fallback": font_fallback,
+        "pages": pages,
+        "readability_warnings": [],
+        "source": "frozen_display_page_artifact",
     }
 
 
@@ -2721,9 +5738,10 @@ def apply_article_display_page_translation_artifact(
     cues: Sequence[Cue],
     artifact: Mapping[str, object],
 ) -> bool:
-    """Attach page Chinese only after matching the final renderer blueprint."""
+    """Validate and attach the frozen page plans selected after final timing."""
     for cue in cues:
         cue.display_page_translations = None
+        cue.article_page_plan = None
     if (
         int(artifact.get("schema_version") or 0) != DISPLAY_PAGE_SCHEMA_VERSION
         or str(artifact.get("status") or "") != "PASS"
@@ -2731,70 +5749,83 @@ def apply_article_display_page_translation_artifact(
         or dict(artifact.get("layout_profile") or {}) != article_display_page_layout_profile()
     ):
         return False
-    try:
-        blueprint = build_article_display_page_blueprint(cues)
-    except RenderStructuralOverflowError:
+    frozen_plans = list(artifact.get("render_plans") or [])
+    expected_ids = {str(cue.subtitle_id or "") for cue in cues}
+    frozen_ids = [
+        str(plan.get("parent_subtitle_id") or "")
+        for plan in frozen_plans
+        if isinstance(plan, Mapping)
+    ]
+    if len(frozen_ids) != len(set(frozen_ids)) or set(frozen_ids) != expected_ids:
         return False
-    expected = {
-        str(parent["parent_subtitle_id"]): parent
-        for parent in blueprint.get("parents") or []
-    }
     returned_parents = list(artifact.get("parents") or [])
     returned_ids = [
         str(parent.get("parent_subtitle_id") or "")
         for parent in returned_parents
         if isinstance(parent, Mapping)
     ]
-    if len(returned_ids) != len(set(returned_ids)) or set(returned_ids) != set(expected):
+    if len(returned_ids) != len(set(returned_ids)):
         return False
     cues_by_id = {str(cue.subtitle_id): cue for cue in cues if cue.subtitle_id}
-    pending: list[tuple[Cue, dict[str, str]]] = []
+    translations_by_parent: dict[str, dict[str, str]] = {}
     for parent in returned_parents:
         if not isinstance(parent, Mapping):
             return False
         parent_id = str(parent.get("parent_subtitle_id") or "")
         cue = cues_by_id.get(parent_id)
-        expected_parent = expected.get(parent_id)
-        if cue is None or expected_parent is None:
+        if cue is None:
             return False
         aggregate = re.sub(r"\s+", "", str(parent.get("aggregate_chinese") or ""))
         if aggregate != re.sub(r"\s+", "", str(cue.zh or "")):
             return False
-        expected_pages = list(expected_parent.get("pages") or [])
         returned_pages = list(parent.get("pages") or [])
-        if len(returned_pages) != len(expected_pages):
+        if len(returned_pages) < 2:
             return False
         translations: dict[str, str] = {}
-        for expected_page, returned_page in zip(expected_pages, returned_pages):
+        for returned_page in returned_pages:
             if not isinstance(returned_page, Mapping):
                 return False
             page_id = str(returned_page.get("display_page_id") or "")
             chinese = re.sub(r"\s+", "", str(returned_page.get("zh") or ""))
-            try:
-                returned_word_start = int(returned_page["word_start"])
-                returned_word_end = int(returned_page["word_end"])
-                expected_word_start = int(expected_page["word_start"])
-                expected_word_end = int(expected_page["word_end"])
-            except (KeyError, TypeError, ValueError):
-                return False
             if (
-                page_id != str(expected_page.get("display_page_id") or "")
-                or returned_word_start != expected_word_start
-                or returned_word_end != expected_word_end
-                or " ".join(str(returned_page.get("english") or "").split())
-                != " ".join(str(expected_page.get("english") or "").split())
-                or abs(int(returned_page.get("start_ms") or 0) - int(expected_page.get("start_ms") or 0)) > 5
-                or abs(int(returned_page.get("end_ms") or 0) - int(expected_page.get("end_ms") or 0)) > 5
+                not page_id
                 or not chinese
                 or page_id in translations
             ):
                 return False
             translations[page_id] = chinese
-        if "".join(translations[page["display_page_id"]] for page in expected_pages) != aggregate:
+        if "".join(translations.values()) != aggregate:
             return False
-        pending.append((cue, translations))
-    for cue, translations in pending:
-        cue.display_page_translations = translations
+        translations_by_parent[parent_id] = translations
+    multipage_plan_ids = {
+        str(plan.get("parent_subtitle_id") or "")
+        for plan in frozen_plans
+        if isinstance(plan, Mapping) and len(list(plan.get("pages") or [])) > 1
+    }
+    if set(returned_ids) != multipage_plan_ids:
+        return False
+    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    frozen_by_id = {
+        str(plan.get("parent_subtitle_id") or ""): plan
+        for plan in frozen_plans
+        if isinstance(plan, Mapping)
+    }
+    pending_plans: list[tuple[Cue, dict, dict[str, str]]] = []
+    for cue in cues:
+        parent_id = str(cue.subtitle_id or "")
+        translations = translations_by_parent.get(parent_id, {})
+        plan = _article_plan_from_frozen_artifact(
+            cue,
+            frozen_by_id[parent_id],
+            translations,
+            draw,
+        )
+        if plan is None:
+            return False
+        pending_plans.append((cue, plan, translations))
+    for cue, plan, translations in pending_plans:
+        cue.article_page_plan = plan
+        cue.display_page_translations = translations or None
     return True
 
 
@@ -2827,7 +5858,403 @@ def load_article_display_page_translation_artifact(
     return apply_article_display_page_translation_artifact(cues, artifact)
 
 
-def prepare_article_visual_page_plans(cues: list[Cue], subtitle_path: str | Path) -> None:
+def _manual_draft_page_boundaries(
+    cue: Cue,
+    spans: Sequence[tuple[int, int]],
+) -> list[float] | None:
+    if len(cue.word_timing) != len(str(cue.en or "").split()):
+        return None
+    boundaries = [float(cue.start)]
+    for start, _ in spans[1:]:
+        if start <= 0 or start >= len(cue.word_timing):
+            return None
+        left_end = float(cue.word_timing[start - 1]["end"])
+        right_start = float(cue.word_timing[start]["start"])
+        boundary = (left_end + right_start) / 2.0
+        if boundary <= boundaries[-1] or boundary >= float(cue.end):
+            return None
+        boundaries.append(boundary)
+    boundaries.append(float(cue.end))
+    if any(right - left < 0.25 for left, right in zip(boundaries, boundaries[1:])):
+        return None
+    return boundaries
+
+
+def build_article_manual_draft_page_plan(
+    cue: Cue,
+    draw: ImageDraw.ImageDraw,
+) -> dict:
+    """Build an explicit best-effort page plan without weakening final export."""
+    normal = _build_article_english_page_plan(cue, draw)
+    if normal.get("status") == "ok":
+        english_plan = normal
+    else:
+        words = str(cue.en or "").split()
+        english_plan = {}
+        preferred = max(1, min(ARTICLE_VISUAL_PAGE_MAX_PAGES, article_visual_page_count(cue)))
+        page_counts = list(range(preferred, ARTICLE_VISUAL_PAGE_MAX_PAGES + 1))
+        page_counts.extend(range(1, preferred))
+        for page_count in page_counts:
+            english_pages = split_article_visual_pages(cue.en, page_count)
+            if len(english_pages) != page_count:
+                continue
+            word_counts = [len(page.split()) for page in english_pages]
+            boundaries = [0]
+            for count in word_counts:
+                boundaries.append(boundaries[-1] + count)
+            if boundaries[-1] != len(words):
+                continue
+            spans = list(zip(boundaries, boundaries[1:]))
+            timed_boundaries = _manual_draft_page_boundaries(cue, spans)
+            if timed_boundaries is None:
+                continue
+            for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+                layouts = [
+                    _article_fixed_english_lines(
+                        draw,
+                        page,
+                        font_size=font_size,
+                        enforce_word_limit=False,
+                        boundary_penalty=lambda split, base=start: (
+                            _article_line_boundary_penalty(cue, base + split)
+                        ),
+                        relax_same_screen_syntax=True,
+                        intrinsic_penalty=lambda page_words, split, base=start: (
+                            _article_same_screen_intrinsic_line_break_penalty(
+                                cue,
+                                page_words,
+                                split,
+                                base + split,
+                            )
+                        ),
+                    )
+                    for page in english_pages
+                ]
+                if any(not lines for lines in layouts):
+                    continue
+                pages = []
+                for index, ((start, end), page, lines) in enumerate(
+                    zip(spans, english_pages, layouts)
+                ):
+                    pages.append(
+                        {
+                            "index": index,
+                            "display_page_id": display_page_id(cue.subtitle_id, index + 1),
+                            "parent_subtitle_id": str(cue.subtitle_id or ""),
+                            "en": page,
+                            "word_start": start,
+                            "word_end": end - 1,
+                            "global_word_start": int(cue.word_timing[start]["word_id"]),
+                            "global_word_end": int(cue.word_timing[end - 1]["word_id"]),
+                            "start": timed_boundaries[index],
+                            "end": timed_boundaries[index + 1],
+                            "en_lines": list(lines),
+                            "english_font_size": font_size,
+                            "boundary_before": {
+                                "classification": "review" if index else "allow",
+                                "confidence": "high" if index else "low",
+                                "issue_codes": (
+                                    ["manual_draft_relaxed_boundary"] if index else []
+                                ),
+                            },
+                            "en_width": _article_english_layout_width(
+                                draw,
+                                lines,
+                                font_size,
+                            ),
+                            "line_wrap_review": False,
+                        }
+                    )
+                english_plan = {
+                    "status": "ok",
+                    "planner_version": f"{DISPLAY_PAGE_PLANNER_VERSION}-manual-draft",
+                    "font_size": {
+                        "english": font_size,
+                        "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+                    },
+                    "font_fallback": {
+                        "used": font_size != ARTICLE_SUBTITLE_EN_FONT_SIZE,
+                        "from": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+                        "to": font_size,
+                        "reason": "manual_draft_relaxed_partition",
+                    },
+                    "pages": pages,
+                    "readability_warnings": [
+                        {
+                            "reason": "manual_draft_relaxed_partition",
+                            "requires_review": True,
+                        }
+                    ],
+                }
+                break
+            if english_plan:
+                break
+        if not english_plan:
+            return normal
+
+    pages = [dict(page) for page in english_plan.get("pages") or []]
+    chinese = re.sub(r"\s+", "", str(cue.zh or ""))
+    page_word_counts = [int(page["word_end"]) - int(page["word_start"]) + 1 for page in pages]
+    chinese_pages = _strict_split_chinese_visual_pages(
+        chinese,
+        len(pages),
+        page_word_counts,
+        strict=True,
+    )
+    if chinese_pages is None or len(chinese_pages) != len(pages):
+        return {
+            "status": "render_structural_overflow",
+            "errors": [
+                {
+                    "cue_index": cue.index,
+                    "reason": "manual_draft_chinese_no_safe_boundary",
+                }
+            ],
+        }
+    if any(not _article_fixed_chinese_lines(draw, page) for page in chinese_pages if page):
+        return {
+            "status": "render_structural_overflow",
+            "errors": [
+                {
+                    "cue_index": cue.index,
+                    "reason": "manual_draft_chinese_does_not_fit_fixed_font",
+                }
+            ],
+        }
+    for page, chinese_page in zip(pages, chinese_pages):
+        page["zh"] = chinese_page
+    english_plan["pages"] = pages
+    english_plan["manual_draft_mode"] = True
+    return english_plan
+
+
+def _freeze_article_page_plan(cue: Cue, plan: Mapping[str, object]) -> dict:
+    pages = list(plan.get("pages") or [])
+    if not pages:
+        return {}
+    frozen_pages = []
+    for index, page in enumerate(pages):
+        if not isinstance(page, Mapping):
+            return {}
+        try:
+            frozen_pages.append(
+                {
+                    "display_page_id": str(page["display_page_id"]),
+                    "page_index": index + 1,
+                    "word_start": int(page["global_word_start"]),
+                    "word_end": int(page["global_word_end"]),
+                    "english": str(page["en"]),
+                    "chinese": str(page.get("zh") or page.get("chinese") or ""),
+                    "start_ms": round(float(page["start"]) * 1000),
+                    "end_ms": round(float(page["end"]) * 1000),
+                    "english_lines": list(page.get("en_lines") or []),
+                    "english_font_size": int(page["english_font_size"]),
+                    "english_width": int(page["en_width"]),
+                    "boundary_before": dict(page.get("boundary_before") or {}),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            return {}
+    return {
+        "parent_subtitle_id": str(cue.subtitle_id or ""),
+        "english": str(cue.en or ""),
+        "chinese": str(cue.zh or ""),
+        "word_start": int(frozen_pages[0]["word_start"]),
+        "word_end": int(frozen_pages[-1]["word_end"]),
+        "english_font_size": int(plan["font_size"]["english"]),
+        "font_fallback": dict(plan.get("font_fallback") or {"used": False}),
+        "manual_draft_mode": True,
+        "pages": frozen_pages,
+    }
+
+
+def build_article_manual_draft_page_artifact(
+    cues: Sequence[Cue],
+    frozen_render_plans: Sequence[Mapping[str, object]] | None = None,
+    semantic_page_translations: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict:
+    """Persist a draft map without inventing page-level Chinese boundaries."""
+    frozen_by_id: dict[str, Mapping[str, object]] = {}
+    for plan in frozen_render_plans or ():
+        if not isinstance(plan, Mapping):
+            continue
+        parent_id = str(plan.get("parent_subtitle_id") or "")
+        if not parent_id or parent_id in frozen_by_id:
+            raise RenderStructuralOverflowError(
+                [{"cue_index": parent_id or "all", "reason": "invalid_frozen_draft_page_plan"}]
+            )
+        frozen_by_id[parent_id] = plan
+
+    draw = ImageDraw.Draw(Image.new("RGBA", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    render_plans: list[dict] = []
+    errors: list[dict] = []
+    for cue in cues:
+        parent_id = str(cue.subtitle_id or "")
+        frozen = dict(frozen_by_id.get(parent_id) or {})
+        if not frozen:
+            planned = build_article_manual_draft_page_plan(cue, draw)
+            if planned.get("status") != "ok":
+                errors.extend(planned.get("errors") or [])
+                continue
+            frozen = _freeze_article_page_plan(cue, planned)
+        raw_pages = [dict(page) for page in frozen.get("pages") or []]
+        if not raw_pages:
+            errors.append({"cue_index": cue.index, "reason": "missing_frozen_draft_page_plan"})
+            continue
+        chinese_pages: list[str] = []
+        if len(raw_pages) == 1:
+            chinese_pages = [re.sub(r"\s+", "", str(cue.zh or ""))]
+        else:
+            for page in raw_pages:
+                page_id = str(page.get("display_page_id") or "")
+                semantic = dict((semantic_page_translations or {}).get(page_id) or {})
+                try:
+                    identity_matches = bool(
+                        page_id
+                        and str(semantic.get("parent_subtitle_id") or "") == parent_id
+                        and int(semantic.get("word_start", -1)) == int(page["word_start"])
+                        and int(semantic.get("word_end", -1)) == int(page["word_end"])
+                        and " ".join(str(semantic.get("english") or "").split())
+                        == " ".join(str(page.get("english") or "").split())
+                    )
+                except (KeyError, TypeError, ValueError):
+                    identity_matches = False
+                chinese = re.sub(r"\s+", "", str(semantic.get("chinese") or ""))
+                if not identity_matches or not chinese:
+                    chinese_pages = []
+                    break
+                chinese_pages.append(chinese)
+        if (
+            len(chinese_pages) != len(raw_pages)
+            or "".join(chinese_pages)
+            != re.sub(r"\s+", "", str(cue.zh or ""))
+        ):
+            errors.append(
+                {
+                    "cue_index": cue.index,
+                    "reason": "manual_draft_page_translation_required",
+                }
+            )
+            continue
+        if any(
+            not chinese or not _article_fixed_chinese_lines(draw, chinese)
+            for chinese in chinese_pages
+        ):
+            errors.append({"cue_index": cue.index, "reason": "manual_draft_chinese_does_not_fit_fixed_font"})
+            continue
+        translations: dict[str, str] = {}
+        for page_index, (page, chinese) in enumerate(zip(raw_pages, chinese_pages), 1):
+            page_id = str(page.get("display_page_id") or "")
+            page["page_index"] = page_index
+            page["chinese"] = chinese
+            translations[page_id] = chinese
+        frozen["pages"] = raw_pages
+        frozen["manual_draft_mode"] = True
+        if _article_plan_from_frozen_artifact(cue, frozen, translations, draw) is None:
+            errors.append({"cue_index": cue.index, "reason": "invalid_frozen_draft_page_plan"})
+            continue
+        render_plans.append(frozen)
+    if errors:
+        raise RenderStructuralOverflowError(errors)
+    return {
+        "schema_version": MANUAL_DRAFT_PAGE_SCHEMA_VERSION,
+        "status": "REVIEW",
+        "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
+        "layout_profile": article_display_page_layout_profile(),
+        "render_plans": render_plans,
+    }
+
+
+def apply_article_manual_draft_page_artifact(
+    cues: Sequence[Cue],
+    artifact: Mapping[str, object],
+) -> bool:
+    """Validate and attach the exact page map persisted by the editor save."""
+    for cue in cues:
+        cue.display_page_translations = None
+        cue.article_page_plan = None
+    if (
+        int(artifact.get("schema_version") or 0) != MANUAL_DRAFT_PAGE_SCHEMA_VERSION
+        or str(artifact.get("status") or "") != "REVIEW"
+        or str(artifact.get("planner_version") or "") != DISPLAY_PAGE_PLANNER_VERSION
+        or dict(artifact.get("layout_profile") or {}) != article_display_page_layout_profile()
+    ):
+        return False
+    frozen_plans = list(artifact.get("render_plans") or [])
+    frozen_by_id: dict[str, Mapping[str, object]] = {}
+    for plan in frozen_plans:
+        if not isinstance(plan, Mapping):
+            return False
+        parent_id = str(plan.get("parent_subtitle_id") or "")
+        if not parent_id or parent_id in frozen_by_id:
+            return False
+        frozen_by_id[parent_id] = plan
+    expected_ids = {str(cue.subtitle_id or "") for cue in cues}
+    if not all(expected_ids) or set(frozen_by_id) != expected_ids:
+        return False
+
+    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    pending: list[tuple[Cue, dict, dict[str, str]]] = []
+    for cue in cues:
+        frozen = frozen_by_id[str(cue.subtitle_id or "")]
+        raw_pages = list(frozen.get("pages") or [])
+        translations: dict[str, str] = {}
+        for page in raw_pages:
+            if not isinstance(page, Mapping):
+                return False
+            page_id = str(page.get("display_page_id") or "")
+            chinese = re.sub(r"\s+", "", str(page.get("chinese") or ""))
+            if not page_id or not chinese or page_id in translations:
+                return False
+            translations[page_id] = chinese
+        plan = _article_plan_from_frozen_artifact(cue, frozen, translations, draw)
+        if plan is None:
+            return False
+        plan["manual_draft_mode"] = True
+        plan["source"] = "frozen_manual_draft_page_artifact"
+        pending.append((cue, plan, translations))
+    for cue, plan, translations in pending:
+        cue.article_page_plan = plan
+        cue.display_page_translations = translations
+    return True
+
+
+def load_article_manual_draft_page_artifact(
+    cues: Sequence[Cue],
+    subtitle_path: str | Path,
+) -> bool:
+    manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        artifact_path = Path(str(manifest.get("manual_draft_page_plan_path") or ""))
+        expected_sha256 = str(manifest.get("manual_draft_page_plan_sha256") or "")
+        override = manifest.get("manual_final_override") or {}
+        if not isinstance(override, Mapping):
+            return False
+        override_path = Path(str(override.get("manual_draft_page_plan_path") or ""))
+        override_sha256 = str(override.get("manual_draft_page_plan_sha256") or "")
+        artifact_dir = Path(str(override.get("artifact_dir") or ""))
+        if (
+            not artifact_path.is_file()
+            or not expected_sha256
+            or artifact_path.resolve().parent != artifact_dir.resolve()
+            or artifact_path.resolve() != override_path.resolve()
+            or expected_sha256 != override_sha256
+            or file_sha256(artifact_path) != expected_sha256
+        ):
+            return False
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return apply_article_manual_draft_page_artifact(cues, artifact)
+
+
+def prepare_article_visual_page_plans(
+    cues: list[Cue],
+    subtitle_path: str | Path,
+    *,
+    allow_manual_draft: bool = False,
+) -> None:
     """Prepare every article-template page plan before starting ffmpeg."""
     if not attach_article_word_timing(cues, subtitle_path):
         raise RenderStructuralOverflowError(
@@ -2839,6 +6266,17 @@ def prepare_article_visual_page_plans(cues: list[Cue], subtitle_path: str | Path
             ]
         )
     if not load_article_display_page_translation_artifact(cues, subtitle_path):
+        if allow_manual_draft:
+            if load_article_manual_draft_page_artifact(cues, subtitle_path):
+                return
+            raise RenderStructuralOverflowError(
+                [
+                    {
+                        "cue_index": "all",
+                        "reason": "missing_or_invalid_manual_draft_page_artifact",
+                    }
+                ]
+            )
         raise RenderStructuralOverflowError(
             [
                 {
@@ -2847,12 +6285,15 @@ def prepare_article_visual_page_plans(cues: list[Cue], subtitle_path: str | Path
                 }
             ]
         )
-    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
     errors: list[dict] = []
     for cue in cues:
-        cue.article_page_plan = build_article_visual_page_plan(cue, draw)
-        if cue.article_page_plan.get("status") != "ok":
-            errors.extend(cue.article_page_plan.get("errors") or [])
+        if not cue.article_page_plan or cue.article_page_plan.get("status") != "ok":
+            errors.append(
+                {
+                    "cue_index": cue.index,
+                    "reason": "missing_frozen_display_page_plan",
+                }
+            )
     if errors:
         raise RenderStructuralOverflowError(errors)
 
@@ -2902,14 +6343,18 @@ def wrap_article_en_subtitle(
 
 
 def _article_visual_break_penalty(words: list[str], split: int) -> int:
-    previous = re.sub(r"[^A-Za-z']", "", words[split - 1])
+    previous_surface = str(words[split - 1]).strip()
+    previous = re.sub(r"[^A-Za-z']", "", previous_surface)
     following = re.sub(r"[^A-Za-z']", "", words[split])
     previous_lower = previous.lower()
     following_lower = following.lower()
+    punctuation_boundary = bool(
+        re.search(r"[,;:.!?][\"')\]]*$", previous_surface)
+    )
     penalty = _caption_line_break_penalty(words, split)
     if following_lower in ARTICLE_AVOID_LINE_START_WORDS:
         penalty += CAPTION_HARD_BREAK_PENALTY
-    if previous.endswith("ly"):
+    if previous.endswith("ly") and not punctuation_boundary:
         penalty += 1_200
     if previous[:1].isupper() and following[:1].isupper():
         penalty += 1_600
@@ -2974,6 +6419,195 @@ def wrap_article_mixed_text(
     if current.strip():
         lines.append(current.rstrip())
     return rebalance_article_mixed_lines(draw, lines, fnt, max_width) or [""]
+
+
+def _article_title_break_offsets(text: str) -> list[int]:
+    """Return lexical and punctuation break opportunities for one title line."""
+    offsets = {0, len(text)}
+    token_boundaries = chinese_token_boundaries(text)
+    if isinstance(token_boundaries, dict):
+        offsets.update(int(offset) for offset in token_boundaries)
+    for match in re.finditer(r"\s+|[，。！？；：、,.!?;:]+", text):
+        offsets.add(match.end())
+
+    closing = frozenset("，。！？；：、,.!?;:)]}】》〉」』")
+    opening = frozenset("([{【《〈「『")
+    safe = []
+    for offset in sorted(offsets):
+        if offset in {0, len(text)}:
+            safe.append(offset)
+            continue
+        before = text[:offset].rstrip()
+        after = text[offset:].lstrip()
+        if not before or not after:
+            continue
+        if after[0] in closing or before[-1] in opening:
+            continue
+        if before[-1].isascii() and after[0].isascii() and (
+            before[-1].isalnum() or after[0].isalnum()
+        ):
+            continue
+        safe.append(offset)
+    return safe
+
+
+def _wrap_article_title_paragraph(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap one title paragraph at lexical boundaries and balance its lines."""
+    paragraph = text.strip()
+    if not paragraph or text_w(draw, paragraph, fnt) <= max_width:
+        return [paragraph]
+
+    offsets = _article_title_break_offsets(paragraph)
+    if len(offsets) <= 2:
+        return wrap_article_mixed_text(draw, paragraph, fnt, max_width)
+
+    segments: dict[tuple[int, int], tuple[str, int]] = {}
+    for start_index, start in enumerate(offsets[:-1]):
+        for end in offsets[start_index + 1 :]:
+            line = paragraph[start:end].strip()
+            if not line:
+                continue
+            width = text_w(draw, line, fnt)
+            if width <= max_width:
+                segments[(start, end)] = (line, width)
+
+    reachable = {0}
+    line_count = 0
+    while reachable and len(paragraph) not in reachable:
+        line_count += 1
+        reachable = {
+            end
+            for start in reachable
+            for end in offsets
+            if end > start and (start, end) in segments
+        }
+    if len(paragraph) not in reachable or line_count <= 0:
+        return wrap_article_mixed_text(draw, paragraph, fnt, max_width)
+
+    total_width = sum(
+        text_w(draw, paragraph[start:end].strip(), fnt)
+        for start, end in zip(offsets, offsets[1:])
+    )
+    target_width = total_width / line_count
+    states: dict[int, tuple[float, list[str]]] = {0: (0.0, [])}
+    for _ in range(line_count):
+        next_states: dict[int, tuple[float, list[str]]] = {}
+        for start, (cost, lines) in states.items():
+            for end in offsets:
+                segment = segments.get((start, end))
+                if segment is None:
+                    continue
+                line, width = segment
+                candidate = (cost + (width - target_width) ** 2, [*lines, line])
+                previous = next_states.get(end)
+                if previous is None or candidate[0] < previous[0]:
+                    next_states[end] = candidate
+        states = next_states
+    selected = states.get(len(paragraph))
+    return selected[1] if selected is not None else wrap_article_mixed_text(
+        draw, paragraph, fnt, max_width
+    )
+
+
+def wrap_article_title_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap a title without splitting lexical words; explicit newlines are fixed."""
+    paragraphs = [part.strip() for part in re.split(r"\r?\n", str(text).strip())]
+    lines: list[str] = []
+    for paragraph in paragraphs:
+        if paragraph:
+            lines.extend(_wrap_article_title_paragraph(draw, paragraph, fnt, max_width))
+    return lines or [""]
+
+
+def _article_concept_semantic_break_offsets(
+    text: str,
+    safe_offsets: Sequence[int],
+) -> set[int]:
+    """Find the boundary between a short explanatory lead-in and its content."""
+    if not text.startswith(ARTICLE_CONCEPT_LEAD_IN_SUBJECTS):
+        return set()
+
+    safe = set(safe_offsets)
+    offsets: set[int] = set()
+    for predicate in ARTICLE_CONCEPT_LEAD_IN_PREDICATES:
+        search_from = 0
+        while True:
+            start = text.find(predicate, search_from)
+            if start < 0:
+                break
+            end = start + len(predicate)
+            before_cjk = len(re.findall(r"[\u4e00-\u9fff]", text[:end]))
+            after_cjk = len(re.findall(r"[\u4e00-\u9fff]", text[end:]))
+            if (
+                end in safe
+                and ARTICLE_CONCEPT_LEAD_IN_MIN_CJK
+                <= before_cjk
+                <= ARTICLE_CONCEPT_LEAD_IN_MAX_CJK
+                and after_cjk >= 4
+            ):
+                offsets.add(end)
+            search_from = end
+    return offsets
+
+
+def wrap_article_concept_detail(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap a concept note into at most two lexical, meaning-led lines."""
+    paragraph = str(text).strip()
+    if not paragraph or text_w(draw, paragraph, fnt) <= max_width:
+        return [paragraph]
+
+    safe_offsets = _article_title_break_offsets(paragraph)
+    semantic_offsets = _article_concept_semantic_break_offsets(
+        paragraph,
+        safe_offsets,
+    )
+    candidates: list[tuple[tuple[int, int, int], list[str]]] = []
+    for offset in safe_offsets:
+        if offset in {0, len(paragraph)}:
+            continue
+        before = paragraph[:offset].rstrip()
+        after = paragraph[offset:].lstrip()
+        if (
+            not before
+            or not after
+            or after[0] in ARTICLE_MIXED_AVOID_LINE_START
+            or after[0] in "，。！？；：、,.!?;:)]}】》〉」』"
+        ):
+            continue
+        before_width = text_w(draw, before, fnt)
+        after_width = text_w(draw, after, fnt)
+        if before_width > max_width or after_width > max_width:
+            continue
+        before_cjk = len(re.findall(r"[\u4e00-\u9fff]", before))
+        after_cjk = len(re.findall(r"[\u4e00-\u9fff]", after))
+        if min(before_cjk, after_cjk) < 4:
+            continue
+
+        score = (
+            0 if offset in semantic_offsets else 1,
+            0 if after_width >= before_width else 1,
+            abs(after_width - before_width),
+        )
+        candidates.append((score, [before, after]))
+
+    if candidates:
+        return min(candidates, key=lambda candidate: candidate[0])[1]
+    return wrap_article_mixed_text(draw, paragraph, fnt, max_width)[:2]
 
 
 def rebalance_article_mixed_lines(
@@ -3346,7 +6980,7 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
             26,
             20,
             lambda size: article_cjk_font(size, 400),
-            wrap_article_mixed_text,
+            wrap_article_concept_detail,
         )
     elif detail:
         detail_font, detail_lines = fit_article_wrapped_font(
@@ -3581,8 +7215,8 @@ def draw_article_opening_topic_panel(
         3,
         52,
         24,
-        (lambda size: article_cjk_font(size, 700)) if has_cjk else (lambda size: article_en_font(size, 700)),
-        wrap_article_mixed_text if has_cjk else wrap_en,
+        (lambda size: article_cjk_font(size, 800)) if has_cjk else (lambda size: article_en_font(size, 700)),
+        wrap_article_title_text,
     )
     line_gap = int(title_font.size * 1.25)
     block_height = max(line_gap, len(title_lines) * line_gap)
@@ -3708,6 +7342,7 @@ def draw_article_frame(
     title_text: str = TITLE_TEXT,
     date_text: str = "Jul 23rd 2026",
     display_time: float | None = None,
+    english_only: bool = False,
 ) -> Image.Image:
     img = Image.new("RGBA", (ARTICLE_WIDTH, ARTICLE_HEIGHT), (247, 243, 234, 255))
     d = ImageDraw.Draw(img, "RGBA")
@@ -3753,7 +7388,16 @@ def draw_article_frame(
         visual_en, visual_zh = article_visual_page_text(cue, display_time)
         en_width = int(page.get("en_width", ARTICLE_SUBTITLE_EN_WIDTH)) if page else ARTICLE_SUBTITLE_EN_WIDTH
         en_x = (1600 - en_width) // 2
-        en_font = fit_article_en_font(d, visual_en, en_width)
+        en_font = fit_article_en_font(
+            d,
+            visual_en,
+            en_width,
+            font_size=int(
+                page.get("english_font_size", ARTICLE_SUBTITLE_EN_FONT_SIZE)
+                if page
+                else ARTICLE_SUBTITLE_EN_FONT_SIZE
+            ),
+        )
         en_lines = list(page.get("en_lines") or []) if page else []
         if not en_lines:
             en_lines = wrap_article_en_subtitle(d, visual_en, en_font, acx(en_width))
@@ -3794,7 +7438,7 @@ def draw_article_frame(
             else:
                 line_x = acx(en_x) + (acx(en_width) - text_w(d, line, en_font)) // 2
                 draw_stroked_text(d, (line_x, acy(en_y) + idx * en_gap), line, en_font, fill, stroke_width=0)
-        if zh_lines:
+        if zh_lines and not english_only:
             zh_fill = with_alpha((65, 81, 104, 255), subtitle_alpha)
             for idx, line in enumerate(zh_lines):
                 draw_stroked_text(d, (ARTICLE_WIDTH // 2, acy(zh_y) + idx * acy(zh_gap)), line, zh_font, zh_fill, anchor="ma", stroke_width=0)
@@ -3839,6 +7483,10 @@ def render_podcast_learning_video(
     cover_path: str = "",
     date_text: str = "",
     progress_callback=None,
+    cancel_check: Callable[[], bool] | None = None,
+    process_callback: Callable[[object | None], None] | None = None,
+    allow_manual_draft: bool = False,
+    english_only: bool = False,
 ) -> None:
     cues = parse_srt(subtitle_path)
     if not cues:
@@ -3847,13 +7495,18 @@ def render_podcast_learning_video(
     if is_article_template:
         # Reject any unreadable fixed-font page before a vocabulary request or
         # ffmpeg process can create a partial output.
-        prepare_article_visual_page_plans(cues, subtitle_path)
+        prepare_article_visual_page_plans(
+            cues,
+            subtitle_path,
+            allow_manual_draft=allow_manual_draft,
+        )
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     vocab_plan = load_or_generate_vocab_plan(
         subtitle_path,
         cues,
         show_ai_vocab,
         progress_callback=progress_callback,
+        align_to_article_pages=is_article_template,
     )
     # The template is a video presentation of the source media, not a subtitle
     # clip. Keep the entire audio/video even when its final subtitle ends early.
@@ -3867,106 +7520,174 @@ def render_podcast_learning_video(
     title_text = (title_text or TITLE_TEXT).strip() or TITLE_TEXT
     date_text = (date_text or "Jul 23rd 2026").strip() or "Jul 23rd 2026"
 
-    cmd = [
-        str(FFMPEG),
-        "-y",
-        "-f",
-        "rawvideo",
-        "-vcodec",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{out_width}x{out_height}",
-        "-r",
-        str(FPS),
-        "-i",
-        "-",
-        "-i",
-        str(media_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-preset",
-        "slow",
-        "-crf",
-        "15",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-shortest",
-        str(output_path),
-    ]
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=False,
-        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-    )
-    last_index = 0
-    last_cue_key = object()
-    cached_frame_bytes = None
-    try:
-        for frame_index in range(frames):
-            t = frame_index / FPS
-            cue, last_index = active_cue(cues, t, last_index)
-            alpha = fade_alpha(cue, t)
-            vocab, vocab_state = vocab_card_display_state(vocab_plan, cue, t) if show_ai_vocab else (None, "hidden")
-            vocab_display_id = (
-                f"{vocab.get('display_id', '')}:{vocab_state}" if vocab else None
-            )
-            cue_key = (
-                template_style,
-                cue.start if cue else None,
-                cue.end if cue else None,
-                cue.en if cue else None,
-                cue.zh if cue else None,
-                alpha,
-                title_text,
-                article_visual_page_index(cue, t) if is_article_template else 0,
-                vocab_display_id,
-            )
-            if cue_key != last_cue_key:
-                if is_article_template:
-                    frame = draw_article_frame(
-                        article_image,
-                        cue,
-                        vocab_plan,
+    with staged_media_output(output_path) as staged_output:
+        cmd = [
+            str(FFMPEG),
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{out_width}x{out_height}",
+            "-r",
+            str(FPS),
+            "-i",
+            "-",
+            "-i",
+            str(media_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "slow",
+            "-crf",
+            "15",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            str(staged_output),
+        ]
+        process = None
+        last_index = 0
+        last_cue_key = object()
+        cached_frame_bytes = None
+
+        with tempfile.TemporaryFile(mode="w+b") as stderr_file:
+            def ffmpeg_stderr_detail() -> str:
+                stderr_file.flush()
+                stderr_file.seek(0)
+                return stderr_file.read().decode(
+                    "utf-8", errors="replace"
+                ).strip()
+
+            try:
+                if cancel_check and cancel_check():
+                    raise MediaSynthesisCancelled("视频合成已取消")
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=stderr_file,
+                        text=False,
+                        creationflags=(
+                            subprocess.CREATE_NO_WINDOW
+                            if hasattr(subprocess, "CREATE_NO_WINDOW")
+                            else 0
+                        ),
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"无法启动 FFmpeg：{exc}") from exc
+
+                if process_callback:
+                    process_callback(process)
+                for frame_index in range(frames):
+                    if cancel_check and cancel_check():
+                        raise MediaSynthesisCancelled("视频合成已取消")
+                    t = frame_index / FPS
+                    cue, last_index = active_cue(cues, t, last_index)
+                    alpha = fade_alpha(cue, t)
+                    vocab, vocab_state = (
+                        vocab_card_display_state(vocab_plan, cue, t)
+                        if show_ai_vocab
+                        else (None, "hidden")
+                    )
+                    vocab_display_id = (
+                        f"{vocab.get('display_id', '')}:{vocab_state}"
+                        if vocab
+                        else None
+                    )
+                    cue_key = (
+                        template_style,
+                        cue.start if cue else None,
+                        cue.end if cue else None,
+                        cue.en if cue else None,
+                        cue.zh if cue else None,
                         alpha,
-                        show_ai_vocab,
                         title_text,
-                        date_text,
-                        t,
-                    ).convert("RGB")
-                else:
-                    frame = draw_frame(
-                        base,
-                        male,
-                        female,
-                        cue,
-                        vocab_plan,
-                        alpha,
-                        show_ai_vocab,
-                        title_text,
-                        t,
-                    ).convert("RGB")
-                cached_frame_bytes = frame.tobytes()
-                last_cue_key = cue_key
-            process.stdin.write(cached_frame_bytes)
-            if progress_callback and (frame_index % 25 == 0 or frame_index == frames - 1):
-                progress_callback(int(frame_index / max(frames - 1, 1) * 100), "英语学习模板渲染中")
-        process.stdin.close()
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError("模板视频合成失败")
-    finally:
-        if process.poll() is None:
-            process.kill()
+                        article_visual_page_index(cue, t)
+                        if is_article_template
+                        else 0,
+                        vocab_display_id,
+                        english_only,
+                    )
+                    if cue_key != last_cue_key:
+                        if is_article_template:
+                            frame = draw_article_frame(
+                                article_image,
+                                cue,
+                                vocab_plan,
+                                alpha,
+                                show_ai_vocab,
+                                title_text,
+                                date_text,
+                                t,
+                                english_only,
+                            ).convert("RGB")
+                        else:
+                            frame = draw_frame(
+                                base,
+                                male,
+                                female,
+                                cue,
+                                vocab_plan,
+                                alpha,
+                                show_ai_vocab,
+                                title_text,
+                                t,
+                                english_only,
+                            ).convert("RGB")
+                        cached_frame_bytes = frame.tobytes()
+                        last_cue_key = cue_key
+                    try:
+                        process.stdin.write(cached_frame_bytes)
+                    except (BrokenPipeError, OSError) as exc:
+                        if cancel_check and cancel_check():
+                            raise MediaSynthesisCancelled("视频合成已取消") from exc
+                        terminate_media_process(process)
+                        detail = ffmpeg_stderr_detail()
+                        suffix = f"：{detail[-4000:]}" if detail else ""
+                        raise RuntimeError(
+                            f"模板视频写入 FFmpeg 失败{suffix}"
+                        ) from exc
+                    if progress_callback and (
+                        frame_index % 25 == 0 or frame_index == frames - 1
+                    ):
+                        progress_callback(
+                            int(frame_index / max(frames - 1, 1) * 100),
+                            "英语学习模板渲染中",
+                        )
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError) as exc:
+                    if cancel_check and cancel_check():
+                        raise MediaSynthesisCancelled("视频合成已取消") from exc
+                    terminate_media_process(process)
+                    detail = ffmpeg_stderr_detail()
+                    suffix = f"：{detail[-4000:]}" if detail else ""
+                    raise RuntimeError(
+                        f"模板视频结束 FFmpeg 输入失败{suffix}"
+                    ) from exc
+                return_code = process.wait()
+                if cancel_check and cancel_check():
+                    raise MediaSynthesisCancelled("视频合成已取消")
+                if return_code != 0:
+                    detail = ffmpeg_stderr_detail()
+                    suffix = f"：{detail[-4000:]}" if detail else ""
+                    raise RuntimeError(
+                        f"模板视频合成失败，FFmpeg 退出码 {return_code}{suffix}"
+                    )
+            finally:
+                terminate_media_process(process)
+                if process_callback:
+                    process_callback(None)
