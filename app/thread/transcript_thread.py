@@ -9,6 +9,10 @@ from app.core.bk_asr import transcribe
 from app.core.bk_asr.asr_data import ASRData
 from app.core.entities import TranscribeTask, TranscribeModelEnum
 from app.core.subtitle_processor.stable_ts_alignment import align_to_word_timestamps
+from app.core.subtitle_processor.word_timing_trust import (
+    describe_word_timing_issue,
+    find_implausible_word_timing_runs,
+)
 from app.core.utils.logger import setup_logger
 from app.core.utils.video_utils import video2audio
 from app.core.storage.cache_manager import ServiceUsageManager
@@ -97,6 +101,16 @@ def _has_trusted_word_timing(asr_data: ASRData) -> bool:
         asr_data
         and getattr(asr_data, "word_timing_trusted", False)
         and asr_data.is_word_timestamp()
+    )
+
+
+def _require_plausible_word_timing(asr_data: ASRData) -> None:
+    issues = find_implausible_word_timing_runs(asr_data.segments)
+    if not issues:
+        return
+    raise RuntimeError(
+        "Acoustic word timing is implausibly compressed at "
+        + describe_word_timing_issue(issues[0])
     )
 
 
@@ -262,6 +276,12 @@ class TranscriptThread(QThread):
                         logger.info("词级时间轴对齐已应用到转录结果")
                     else:
                         logger.info("词级时间轴对齐未应用，原转录时间轴将接受可信性检查")
+
+            if (
+                self.task.need_next_task
+                and self.task.transcribe_config.need_word_time_stamp
+            ):
+                _require_plausible_word_timing(asr_data)
 
             if (
                 self.task.need_next_task

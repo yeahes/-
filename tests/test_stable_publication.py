@@ -1328,9 +1328,14 @@ class StablePublicationTests(unittest.TestCase):
 
         class Session:
             save_calls = 0
+            deepcopy_calls = 0
 
             def __init__(self):
                 self.history = []
+
+            def __deepcopy__(self, memo):
+                Session.deepcopy_calls += 1
+                return self
 
             def save_to_source_folder(
                 self,
@@ -1388,6 +1393,11 @@ class StablePublicationTests(unittest.TestCase):
             SubtitleInterface.save_manual_final_output(interface)
 
         self.assertEqual(Session.save_calls, 0)
+        self.assertEqual(
+            Session.deepcopy_calls,
+            0,
+            "the GUI thread must not copy a large manual session before dispatch",
+        )
         self.assertEqual(len(started_threads), 1)
         self.assertFalse(interface.subtitle_table.enabled)
         self.assertFalse(interface.manual_final_save_action.enabled)
@@ -1405,6 +1415,7 @@ class StablePublicationTests(unittest.TestCase):
 
         worker = started_threads[0]
         worker.target(*worker.args)
+        self.assertEqual(Session.deepcopy_calls, 1)
         self.assertEqual(Session.save_calls, 1)
         self.assertFalse(SubtitleInterface.manual_final_save_in_progress(interface))
         self.assertEqual(len(interface.manual_final_save_finished.calls), 1)
@@ -2607,6 +2618,59 @@ class StablePublicationTests(unittest.TestCase):
         self.assertFalse(reload_failed._manual_refresh_requested)
         self.assertTrue(reload_failed._manual_parent_boundaries_dirty)
         self.assertEqual(reload_split_calls, [])
+
+    def test_reload_failure_keeps_current_actual_page_session_and_view(self):
+        current_session = SimpleNamespace(subtitle_path=Path("current.srt"))
+        apply_calls = []
+        interface = SimpleNamespace(
+            manual_final_session=current_session,
+            _manual_save_request_id=9,
+            _manual_save_in_progress=True,
+            _manual_pending_page_split=None,
+            _manual_refresh_requested=False,
+            _manual_active_save_context={
+                "request_id": 9,
+                "refresh_requested": False,
+            },
+            _manual_parent_boundaries_dirty=False,
+            _manual_page_view=True,
+            _manual_has_unsaved_changes=True,
+            _manual_package_manifest_path="",
+            _set_manual_final_save_busy=lambda _busy: None,
+            _apply_manual_final_session=lambda: apply_calls.append(True),
+            status_label=SimpleNamespace(setText=lambda _value: None),
+            tr=lambda value: value,
+        )
+
+        with patch.object(
+            ManualFinalSubtitleSession,
+            "load_from_manifest",
+            side_effect=ManualFinalSubtitleEditError("reload failed"),
+        ), patch("app.view.subtitle_interface.InfoBar.warning"):
+            SubtitleInterface._apply_manual_final_save_result(
+                interface,
+                9,
+                {"manifest_path": "broken-manifest.json"},
+                "",
+            )
+
+        self.assertIs(interface.manual_final_session, current_session)
+        self.assertTrue(interface._manual_page_view)
+        self.assertFalse(interface._manual_parent_boundaries_dirty)
+        self.assertTrue(interface._manual_has_unsaved_changes)
+        self.assertEqual(apply_calls, [])
+
+    def test_manual_sync_rejects_mutation_while_save_snapshot_is_running(self):
+        interface = SimpleNamespace(
+            manual_final_session=object(),
+            _manual_save_in_progress=True,
+        )
+
+        with self.assertRaisesRegex(
+            ManualFinalSubtitleEditError,
+            "正在保存",
+        ):
+            SubtitleInterface._sync_manual_final_text_edits(interface)
 
     def test_clean_parent_split_runs_immediately_without_refresh(self):
         split_calls = []

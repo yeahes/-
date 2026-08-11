@@ -207,6 +207,23 @@ def test_artifact_rejects_ledger_words_outside_the_first_and_last_cue():
     ]
 
 
+def test_reconcile_rejects_compressed_multiword_cluster_before_boundary_repair():
+    words = _words(
+        (1077980, 1078100),
+        (1077980, 1078100),
+        (1077980, 1078100),
+        (1077980, 1078100),
+        (1077980, 1078100),
+        (1077980, 1078100),
+    )
+
+    result = reconcile_frozen_word_ledger(words)
+
+    assert result["words"] == []
+    assert result["reconciliations"] == []
+    assert result["errors"][0]["code"] == "final_timeline_word_timing_density_invalid"
+
+
 def test_artifact_rejects_cues_reordered_from_frozen_subtitle_ids():
     words = _words((1000, 1200), (1210, 1400), (1410, 1600), (1610, 1800))
     artifact = final_cue_timeline_artifact(
@@ -240,6 +257,7 @@ def test_artifact_rejects_cues_reordered_from_frozen_subtitle_ids():
 
 
 if __name__ == "__main__":
+    test_reconcile_rejects_compressed_multiword_cluster_before_boundary_repair()
     test_final_timeline_cue_covers_its_last_frozen_word()
     test_final_timeline_cue_covers_its_first_frozen_word()
     test_padding_overlap_is_reconciled_without_cutting_either_word_envelope()

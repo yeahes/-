@@ -16,7 +16,11 @@ if str(ROOT) not in sys.path:
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
 from app.core.subtitle_processor.stable_ts_alignment import (
     align_frozen_word_ledger_with_whisperx,
+    _fallback_implausible_stable_ts_updates,
     _make_whisperx_word_segments,
+)
+from app.core.subtitle_processor.word_timing_trust import (
+    find_implausible_word_timing_runs,
 )
 from app.core.subtitle_processor.stable_display_planner import (
     plan_word_page_spans,
@@ -6728,7 +6732,7 @@ def test_article_template_shows_topic_panel_before_first_card():
         assert not topic_panel.called
 
 
-def test_article_template_crossfades_only_from_topic_to_first_card():
+def test_article_template_first_vocab_card_is_full_strength_at_trigger_time():
     article_image = Image.new(
         "RGB",
         (podcast_learning_video.acx(854), podcast_learning_video.acy(480)),
@@ -6739,16 +6743,19 @@ def test_article_template_crossfades_only_from_topic_to_first_card():
         2: {"key": "next expression", "word": "next expression", "meaning": "下一个表达", "display_start": 24.0, "display_end": 32.0},
     }
     with patch.object(podcast_learning_video, "draw_article_opening_topic_panel") as topic_panel, \
-         patch.object(podcast_learning_video, "draw_article_vocab_card") as card:
+         patch.object(podcast_learning_video, "draw_article_vocab_card") as card, \
+         patch.object(podcast_learning_video.Image, "blend") as blend:
         podcast_learning_video.draw_article_frame(
             article_image,
             cue,
             plan,
             show_vocab=True,
-            display_time=4.1,
+            display_time=4.0,
         )
-        assert topic_panel.called
         assert card.called
+        assert card.call_args.args[1] == plan[1]
+        assert not topic_panel.called
+        assert not blend.called
 
         topic_panel.reset_mock()
         card.reset_mock()
@@ -6757,15 +6764,12 @@ def test_article_template_crossfades_only_from_topic_to_first_card():
             cue,
             plan,
             show_vocab=True,
-            display_time=24.1,
+            display_time=24.0,
         )
         assert not topic_panel.called
         assert card.called
-
-    assert podcast_learning_video.opening_card_transition_progress(plan, plan[1], "full", 4.0) == 0.0
-    assert podcast_learning_video.opening_card_transition_progress(plan, plan[1], "full", 4.125) == 0.5
-    assert podcast_learning_video.opening_card_transition_progress(plan, plan[1], "full", 4.25) is None
-    assert podcast_learning_video.opening_card_transition_progress(plan, plan[2], "full", 24.1) is None
+        assert card.call_args.args[1] == plan[2]
+        assert not blend.called
 
 
 def test_episode_vocab_overview_uses_editor_rank_instead_of_earliest_words():
@@ -11243,6 +11247,80 @@ def test_validation_summary_error_writes_failure_without_publishing_manifest():
         assert not (root / "output.srt").exists()
 
 
+def test_review_only_validation_error_publishes_stable_outputs():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        task = SubtitleTask(
+            subtitle_path=str(root / "source.srt"),
+            output_path=str(root / "output.srt"),
+        )
+        thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = task
+        config = SubtitleConfig(
+            need_screen_subtitle_edit=True,
+            screen_subtitle_stable_mode=True,
+            subtitle_layout="original_top",
+        )
+        data = ASRData([ASRDataSeg("This is short.", 0, 1500, "这条中文字幕阅读速度偏快。")])
+        summary = {
+            "status": "ERROR",
+            "errors": [{"code": "reading_speed_error"}],
+            "warnings": [],
+            "info": [],
+            "review": {
+                "schema_version": 2,
+                "summary": {
+                    "blocker_count": 0,
+                    "review_count": 1,
+                    "info_count": 0,
+                    "actionable_count": 1,
+                },
+                "items": [
+                    {
+                        "severity": "REVIEW",
+                        "source_level": "error",
+                        "code": "reading_speed_error",
+                    },
+                    {
+                        "severity": "BLOCKER",
+                        "source_level": "allocation_quality",
+                        "code": "allocation_quality_unresolved",
+                    },
+                ],
+            },
+        }
+
+        assert not SubtitleThread._stable_validation_summary_blocks_render(summary)
+        thread._save_stable_subtitle_outputs(
+            data,
+            config,
+            validation_status="passed",
+            validation_summary=summary,
+        )
+
+        manifest = json.loads((root / "stable-final-manifest.json").read_text(encoding="utf-8"))
+        assert manifest["render_blocked"] is False
+        assert manifest["validation_summary"]["errors"][0]["code"] == "reading_speed_error"
+        assert not (root / "stable-last-failure.json").exists()
+        assert (root / "stable-final-original-top.srt").exists()
+        assert (root / "output.srt").exists()
+
+
+def test_validation_blocker_severity_and_legacy_error_still_block_render():
+    blocker_summary = {
+        "status": "ERROR",
+        "errors": [{"code": "final_cue_timeline_invalid"}],
+        "review": {"summary": {"blocker_count": 1}},
+    }
+    legacy_error_summary = {
+        "status": "ERROR",
+        "errors": [{"code": "unknown_legacy_error"}],
+    }
+
+    assert SubtitleThread._stable_validation_summary_blocks_render(blocker_summary)
+    assert SubtitleThread._stable_validation_summary_blocks_render(legacy_error_summary)
+
+
 def test_runtime_module_import_path_is_available():
     result = subprocess.run(
         [str(ROOT / "runtime" / "python.exe"), "-m", "tests.caption_audit.run_all", "--help"],
@@ -11341,6 +11419,113 @@ def test_whisperx_expansion_compression_fallback_is_local_and_opt_in():
             "rejected_whisperx_range_ms": [412677, 414218],
         }
     ]
+
+
+def test_whisperx_plain_word_density_fallback_is_local():
+    words = "does this all mean for you we're stuck".split()
+    source = [
+        ASRDataSeg(word, 1077000 + index * 240, 1077180 + index * 240)
+        for index, word in enumerate(words)
+    ]
+    aligned_words = [
+        {
+            "text": word,
+            "start": 1077.860 + index * 0.015,
+            "end": 1078.601,
+        }
+        for index, word in enumerate(words)
+    ]
+
+    mapped = _make_whisperx_word_segments(source, aligned_words)
+
+    assert mapped.word_timing_trust_issues == []
+    assert mapped.whisperx_density_fallbacks == [
+        {
+            "code": "whisperx_implausible_word_density_fallback",
+            "fallback_word_ids": list(range(len(words))),
+            "rejected_whisperx_range_ms": [1077860, 1078601],
+        }
+    ]
+    assert [
+        (segment.start_time, segment.end_time, segment.alignment_source)
+        for segment in mapped.segments
+    ] == [
+        (segment.start_time, segment.end_time, "stable-ts-fallback")
+        for segment in source
+    ]
+
+
+def test_stable_ts_plain_word_density_fallback_keeps_valid_native_times():
+    words = "So what does this all mean for you We're looking".split()
+    source = [
+        ASRDataSeg(word, 1075600 + index * 220, 1075780 + index * 220)
+        for index, word in enumerate(words)
+    ]
+    aligned = [
+        ASRDataSeg(word, segment.start_time, segment.end_time)
+        for word, segment in zip(words, source)
+    ]
+    for index in range(2, 10):
+        aligned[index].start_time = 1077980 + (index - 2) * 10
+        aligned[index].end_time = 1078100
+
+    fallbacks = _fallback_implausible_stable_ts_updates(
+        source,
+        aligned,
+        source_timing_trusted=True,
+    )
+
+    assert fallbacks
+    assert [
+        (segment.start_time, segment.end_time)
+        for segment in aligned
+    ] == [
+        (segment.start_time, segment.end_time)
+        for segment in source
+    ]
+    assert find_implausible_word_timing_runs(aligned) == []
+
+
+def test_stable_ts_density_fallback_rejects_an_implausible_native_baseline():
+    words = "does this all mean for you we're stuck".split()
+    source = [
+        ASRDataSeg(word, 1077980 + index * 10, 1078100)
+        for index, word in enumerate(words)
+    ]
+    aligned = [
+        ASRDataSeg(word, segment.start_time, segment.end_time)
+        for word, segment in zip(words, source)
+    ]
+
+    fallbacks = _fallback_implausible_stable_ts_updates(
+        source,
+        aligned,
+        source_timing_trusted=True,
+    )
+
+    assert fallbacks == []
+    assert find_implausible_word_timing_runs(aligned)
+
+
+def test_stable_ts_density_fallback_stops_on_an_unmappable_empty_token():
+    words = ["", "this", "all", "mean", "for", "you", "right", "now"]
+    source = [
+        ASRDataSeg(word, 1000 + index * 220, 1180 + index * 220)
+        for index, word in enumerate(words)
+    ]
+    aligned = [
+        ASRDataSeg(word, 2000, 2120)
+        for word in words
+    ]
+
+    fallbacks = _fallback_implausible_stable_ts_updates(
+        source,
+        aligned,
+        source_timing_trusted=True,
+    )
+
+    assert fallbacks == []
+    assert find_implausible_word_timing_runs(aligned)
 
 
 if __name__ == "__main__":
@@ -11612,7 +11797,7 @@ if __name__ == "__main__":
     test_vocabulary_card_target_is_about_one_per_minute()
     test_article_template_does_not_fallback_to_per_subtitle_vocab_lookup()
     test_article_template_shows_topic_panel_before_first_card()
-    test_article_template_crossfades_only_from_topic_to_first_card()
+    test_article_template_first_vocab_card_is_full_strength_at_trigger_time()
     test_episode_vocab_overview_uses_editor_rank_instead_of_earliest_words()
     test_template_frame_cache_keeps_the_full_vocab_card_stable()
     test_stable_srt_writer_keeps_bilingual_original_top()
@@ -11695,6 +11880,10 @@ if __name__ == "__main__":
     test_runtime_module_import_path_is_available()
     test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
     test_whisperx_expansion_compression_fallback_is_local_and_opt_in()
+    test_whisperx_plain_word_density_fallback_is_local()
+    test_stable_ts_plain_word_density_fallback_keeps_valid_native_times()
+    test_stable_ts_density_fallback_rejects_an_implausible_native_baseline()
+    test_stable_ts_density_fallback_stops_on_an_unmappable_empty_token()
     test_whisperx_time_only_preserves_text_and_translation_while_retiming()
     test_whisperx_frozen_ledger_keeps_only_unmatched_word_on_stable_ts_time()
     test_whisperx_frozen_ledger_reverts_a_candidate_that_inverts_fallback_word_order()

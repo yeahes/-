@@ -48,6 +48,10 @@ from app.core.subtitle_processor.optimize import SubtitleOptimizer
 from app.core.subtitle_processor.stable_ts_alignment import (
     align_frozen_word_ledger_with_whisperx,
 )
+from app.core.subtitle_processor.word_timing_trust import (
+    describe_word_timing_issue,
+    find_implausible_word_timing_runs,
+)
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor
 from app.core.subtitle_processor.translate import TranslatorFactory, TranslatorType
 from app.core.utils.logger import setup_logger
@@ -476,6 +480,14 @@ class SubtitleThread(QThread):
             }
 
         def use_stable_ledger_fallback(reason: str) -> ASRData:
+            baseline_issues = find_implausible_word_timing_runs(
+                word_ledger.segments
+            )
+            if baseline_issues:
+                raise RuntimeError(
+                    "Authoritative word ledger has implausibly compressed timing at "
+                    + describe_word_timing_issue(baseline_issues[0])
+                )
             logger.warning(
                 "WhisperX time-only unavailable; rebuilding final cues from stable word ledger: %s",
                 reason,
@@ -538,8 +550,19 @@ class SubtitleThread(QThread):
                 getattr(aligned_word_ledger, "whisperx_expansion_fallbacks", []) or []
             )
             local_timing_fallbacks.extend(
+                getattr(aligned_word_ledger, "whisperx_density_fallbacks", []) or []
+            )
+            local_timing_fallbacks.extend(
                 getattr(aligned_word_ledger, "whisperx_monotonicity_fallbacks", []) or []
             )
+            aligned_issues = find_implausible_word_timing_runs(
+                aligned_word_ledger.segments
+            )
+            if aligned_issues:
+                raise RuntimeError(
+                    "WhisperX word ledger has implausibly compressed timing at "
+                    + describe_word_timing_issue(aligned_issues[0])
+                )
             screen_editor.record_final_timeline_alignment(
                 requested_backend="whisperx-time-only",
                 applied_backend="whisperx-time-only",
@@ -798,6 +821,33 @@ class SubtitleThread(QThread):
             if isinstance(issue, dict)
         )
 
+    @staticmethod
+    def _stable_validation_summary_blocks_render(
+        validation_summary: dict | None,
+    ) -> bool:
+        if not validation_summary:
+            return False
+        if validation_summary.get("status") != "ERROR":
+            return False
+        errors = validation_summary.get("errors")
+        if not isinstance(errors, list) or not errors:
+            return True
+        review_items = (validation_summary.get("review") or {}).get("items")
+        if not isinstance(review_items, list):
+            return True
+        error_review_severity = {
+            str(item.get("code") or ""): str(item.get("severity") or "")
+            for item in review_items
+            if isinstance(item, dict) and item.get("source_level") == "error"
+        }
+        for error in errors:
+            if not isinstance(error, dict):
+                return True
+            code = str(error.get("code") or "")
+            if error_review_severity.get(code) not in {"REVIEW", "INFO"}:
+                return True
+        return False
+
     def _stable_attempt_id(self) -> str:
         attempt_id = str(self.__dict__.get("attempt_id", "") or "").strip()
         if not attempt_id:
@@ -913,7 +963,7 @@ class SubtitleThread(QThread):
         output_dir = output_path.parent
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if validation_summary and validation_summary.get("status") == "ERROR":
+        if self._stable_validation_summary_blocks_render(validation_summary):
             validation_status = "failed"
         render_blocked = validation_status == "failed"
         if render_blocked:
@@ -1893,9 +1943,8 @@ class SubtitleThread(QThread):
                     raise RuntimeError(
                         self.tr("最终时间轴存在严重短字幕，已停止后续合成。")
                     )
-                if (
+                if self._stable_validation_summary_blocks_render(
                     screen_editor.last_validation_summary
-                    and screen_editor.last_validation_summary.get("status") == "ERROR"
                 ):
                     self._save_stable_subtitle_outputs(
                         asr_data,

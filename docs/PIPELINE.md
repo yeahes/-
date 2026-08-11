@@ -16,6 +16,12 @@ Important rules:
 - CUDA should be preferred when available.
 - ASR may miss speech or create overly short word timings.
 - Word-level timestamps are useful but not perfectly reliable.
+- Faster-Whisper word-timestamp output is checked for internal 1.8-15 second
+  gaps before any English boundary or ID is frozen. A gap is locally
+  retranscribed without previous-text conditioning only when FFmpeg confirms
+  audio activity. New words are inserted only when exact text anchors match on
+  both sides; an unanchored local result is diagnostic evidence and cannot
+  mutate the transcript.
 - Article-assisted ASR correction runs before stable English boundaries freeze.
   Fresh, cached, and UI-supplied article analysis must all be enriched with
   source evidence in memory before either ASR correction or the translation
@@ -95,6 +101,12 @@ Rules:
 - Each final cue is derived from its own `subtitle_id -> [word_start, word_end]`
   envelope. WhisperX may update ledger word times but cannot map final cue text
   to a separate time range.
+- Stable-ts and WhisperX updates are rejected locally when four words occupy no
+  more than 250ms, or eight words occupy no more than 750ms at ten or more
+  words per second. The detector selects the smallest anomalous core, expands
+  only words collapsed inside that same time envelope, restores their trusted
+  upstream times, and reruns detection. An implausible upstream ledger cannot
+  authorize a fallback and blocks final timeline export.
 - A padding overlap may be reconciled only at a shared boundary that stays
   between the adjacent word envelopes.
 - Do not change English text, Chinese text, subtitle ID, word range, or order.

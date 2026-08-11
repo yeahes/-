@@ -12,7 +12,11 @@ from app.core.bk_asr.qwen3_asr_runner import proportional_word_segments
 from app.core.bk_asr.whisper_api import WhisperAPI
 from app.core.bk_asr.whisper_cpp import WhisperCppASR
 from app.core.entities import TranscribeModelEnum
+from app.core.subtitle_processor.word_timing_trust import (
+    find_implausible_word_timing_runs,
+)
 from app.thread.transcript_thread import (
+    _require_plausible_word_timing,
     _write_srt_atomically,
     TranscriptThread,
     can_reuse_downloaded_subtitle,
@@ -78,6 +82,91 @@ class _LineStream:
 
 
 class ASRTrustContractTests(unittest.TestCase):
+    def test_word_timing_trust_rejects_multiword_compression_cluster(self):
+        segments = [
+            ASRDataSeg(word, 100000 + index * 15, 100120)
+            for index, word in enumerate(
+                "does this all mean for you we're stuck".split()
+            )
+        ]
+
+        issues = find_implausible_word_timing_runs(segments)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["code"], "implausible_word_timing_density")
+        self.assertEqual(issues[0]["word_count"], 4)
+
+    def test_word_timing_trust_accepts_fast_but_plausible_words(self):
+        segments = [
+            ASRDataSeg(word, index * 180, index * 180 + 150)
+            for index, word in enumerate("this remains a fairly quick spoken sentence".split())
+        ]
+
+        self.assertEqual(find_implausible_word_timing_runs(segments), [])
+
+    def test_word_timing_trust_reports_the_minimal_extreme_core(self):
+        segments = [
+            ASRDataSeg(word, 99000 + index * 220, 99180 + index * 220)
+            for index, word in enumerate(
+                "So what does this all mean for you we're completely stuck now".split()
+            )
+        ]
+        for index in range(2, 8):
+            segments[index].start_time = 100000
+            segments[index].end_time = 100120
+
+        issues = find_implausible_word_timing_runs(segments)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["start_index"], 2)
+        self.assertEqual(issues[0]["end_index"], 5)
+        self.assertEqual(issues[0]["word_count"], 4)
+
+    def test_word_timing_trust_does_not_chain_dense_windows(self):
+        segments = [
+            ASRDataSeg(f"w{index}", index * 70, index * 70 + 80)
+            for index in range(40)
+        ]
+
+        issues = find_implausible_word_timing_runs(segments)
+
+        self.assertEqual(len(issues), 1)
+        self.assertLessEqual(issues[0]["word_count"], 8)
+
+    def test_word_timing_trust_keeps_conservative_border_cases(self):
+        eight_words_741ms = [
+            ASRDataSeg(f"w{index}", index * 95, index * 95 + 76)
+            for index in range(8)
+        ]
+        eight_words_800ms = [
+            ASRDataSeg(f"w{index}", index * 100, index * 100 + 100)
+            for index in range(8)
+        ]
+        seven_words_600ms = [
+            ASRDataSeg(f"w{index}", index * 86, index * 86 + 84)
+            for index in range(7)
+        ]
+
+        issues = find_implausible_word_timing_runs(eight_words_741ms)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["word_count"], 8)
+        self.assertEqual(issues[0]["duration_ms"], 741)
+        self.assertEqual(find_implausible_word_timing_runs(eight_words_800ms), [])
+        self.assertEqual(find_implausible_word_timing_runs(seven_words_600ms), [])
+
+    def test_transcript_pipeline_blocks_implausibly_compressed_word_timing(self):
+        data = ASRData(
+            [
+                ASRDataSeg(word, 1077980 + index * 10, 1078100)
+                for index, word in enumerate(
+                    "does this all mean for you we're stuck".split()
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "implausibly compressed"):
+            _require_plausible_word_timing(data)
+
     def test_empty_backend_result_is_not_cached(self):
         asr = _FakeASR({"segments": []})
 
@@ -310,6 +399,126 @@ class ASRTrustContractTests(unittest.TestCase):
             asr = object.__new__(FasterWhisperASR)
             asr.audio_path = str(audio_path)
             asr.process = None
+            asr.need_word_time_stamp = False
+            asr._build_command = lambda wav_path: ["faster-whisper", str(wav_path)]
+
+            with patch(
+                "app.core.bk_asr.faster_whisper.subprocess.Popen",
+                side_effect=_popen,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "return code"):
+                    asr._run()
+
+    def test_faster_whisper_accepts_valid_output_after_completed_shutdown_crash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.wav"
+            audio_path.write_bytes(b"wav")
+
+            class _Process:
+                def __init__(self, output_path):
+                    self.stdout = _LineStream(
+                        [
+                            "100%\n",
+                            "Subtitles are written to 'output' directory.\n",
+                            "Operation finished in: 0:00:01.000\n",
+                        ]
+                    )
+                    self.returncode = None
+                    self.output_path = output_path
+
+                def poll(self):
+                    return None if self.stdout.lines else 0xC0000409
+
+                def communicate(self):
+                    self.returncode = 0xC0000409
+                    self.output_path.write_text(SRT_TEXT, encoding="utf-8")
+                    return ("", None)
+
+            def _popen(cmd, **_kwargs):
+                return _Process(Path(cmd[1]).with_suffix(".srt"))
+
+            asr = object.__new__(FasterWhisperASR)
+            asr.audio_path = str(audio_path)
+            asr.process = None
+            asr.need_word_time_stamp = False
+            asr._build_command = lambda wav_path: ["faster-whisper", str(wav_path)]
+
+            with patch(
+                "app.core.bk_asr.faster_whisper.subprocess.Popen",
+                side_effect=_popen,
+            ):
+                result = asr._run()
+
+            self.assertEqual(result, SRT_TEXT)
+
+    def test_faster_whisper_rejects_nonzero_exit_without_operation_finished(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.wav"
+            audio_path.write_bytes(b"wav")
+
+            class _Process:
+                def __init__(self, output_path):
+                    self.stdout = _LineStream(
+                        ["Subtitles are written to 'output' directory.\n"]
+                    )
+                    self.returncode = None
+                    self.output_path = output_path
+
+                def poll(self):
+                    return None if self.stdout.lines else 0xC0000409
+
+                def communicate(self):
+                    self.returncode = 0xC0000409
+                    self.output_path.write_text(SRT_TEXT, encoding="utf-8")
+                    return ("", None)
+
+            def _popen(cmd, **_kwargs):
+                return _Process(Path(cmd[1]).with_suffix(".srt"))
+
+            asr = object.__new__(FasterWhisperASR)
+            asr.audio_path = str(audio_path)
+            asr.process = None
+            asr.need_word_time_stamp = False
+            asr._build_command = lambda wav_path: ["faster-whisper", str(wav_path)]
+
+            with patch(
+                "app.core.bk_asr.faster_whisper.subprocess.Popen",
+                side_effect=_popen,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "return code"):
+                    asr._run()
+
+    def test_faster_whisper_rejects_completed_shutdown_crash_with_invalid_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.wav"
+            audio_path.write_bytes(b"wav")
+
+            class _Process:
+                def __init__(self, output_path):
+                    self.stdout = _LineStream(
+                        [
+                            "Subtitles are written to 'output' directory.\n",
+                            "Operation finished in: 0:00:01.000\n",
+                        ]
+                    )
+                    self.returncode = None
+                    self.output_path = output_path
+
+                def poll(self):
+                    return None if self.stdout.lines else 0xC0000409
+
+                def communicate(self):
+                    self.returncode = 0xC0000409
+                    self.output_path.write_text("not an srt", encoding="utf-8")
+                    return ("", None)
+
+            def _popen(cmd, **_kwargs):
+                return _Process(Path(cmd[1]).with_suffix(".srt"))
+
+            asr = object.__new__(FasterWhisperASR)
+            asr.audio_path = str(audio_path)
+            asr.process = None
+            asr.need_word_time_stamp = False
             asr._build_command = lambda wav_path: ["faster-whisper", str(wav_path)]
 
             with patch(
@@ -338,6 +547,212 @@ class ASRTrustContractTests(unittest.TestCase):
             getattr(segments[0], "timing_repair", ""),
             "millisecond_quantization_zero_width",
         )
+
+    @staticmethod
+    def _missing_speech_gap_fixture():
+        source_words = [
+            "focus",
+            "on",
+            "your",
+            "work.",
+            "Wow.",
+            "You",
+            "are",
+            "borrowing",
+            "energy",
+        ]
+        source_times = [
+            (528900, 529100),
+            (529100, 529300),
+            (529300, 529500),
+            (529500, 530300),
+            (530520, 530780),
+            (538120, 538300),
+            (538300, 538500),
+            (538500, 538920),
+            (538920, 539300),
+        ]
+        source = [
+            ASRDataSeg(word, start, end)
+            for word, (start, end) in zip(source_words, source_times)
+        ]
+        local_words = (
+            "focus on your work Wow Which means you procrastinate more fall "
+            "further behind feel worse and then stay up late again to numb the "
+            "anxiety with more scrolling You are borrowing energy"
+        ).split()
+        local = []
+        cursor = 528900
+        for word in local_words:
+            duration = 260
+            local.append(ASRDataSeg(word, cursor, cursor + duration))
+            cursor += duration
+        return source, local
+
+    def test_faster_whisper_merges_only_double_anchored_gap_words(self):
+        source, local = self._missing_speech_gap_fixture()
+        # Keep the fixture inside the original acoustic gap while retaining
+        # exact text anchors on both sides.
+        missing = local[5:-4]
+        step = (538000 - 531000) // len(missing)
+        for index, segment in enumerate(missing):
+            segment.start_time = 531000 + index * step
+            segment.end_time = 531000 + (index + 1) * step - 10
+        for index, segment in enumerate(local[:5]):
+            segment.start_time = source[index].start_time
+            segment.end_time = source[index].end_time
+        for index, segment in enumerate(local[-4:]):
+            segment.start_time = source[5 + index].start_time
+            segment.end_time = source[5 + index].end_time
+
+        result = FasterWhisperASR._merge_anchored_gap_repair(
+            source,
+            left_index=4,
+            local_segments=local,
+        )
+
+        self.assertIsNotNone(result)
+        merged, report = result
+        self.assertIn("Which means you procrastinate more", " ".join(item.text for item in merged))
+        self.assertEqual(report["code"], "asr_internal_speech_gap_repaired")
+        self.assertEqual(report["inserted_word_count"], len(missing))
+
+    def test_faster_whisper_persists_repaired_word_srt_into_asr_cache(self):
+        asr = object.__new__(FasterWhisperASR)
+        asr.use_cache = True
+        asr.last_internal_gap_repairs = [{"code": "asr_internal_speech_gap_repaired"}]
+        asr.last_tail_hallucination_repair = {}
+        asr.cache_manager = _MemoryCache()
+        asr._get_key = lambda: "repaired-key"
+        repaired = ASRData(
+            [
+                ASRDataSeg("Which", 1000, 1200),
+                ASRDataSeg("means", 1200, 1400),
+            ]
+        )
+
+        with patch.object(BaseASR, "run", return_value=repaired):
+            result = asr.run()
+
+        self.assertIs(result, repaired)
+        self.assertEqual(len(asr.cache_manager.writes), 1)
+        self.assertIn("Which", asr.cache_manager.writes[0][2])
+
+    def test_faster_whisper_does_not_merge_gap_without_right_anchor(self):
+        source, local = self._missing_speech_gap_fixture()
+        local[-4:] = [ASRDataSeg("different", 538100, 538300)]
+
+        self.assertIsNone(
+            FasterWhisperASR._merge_anchored_gap_repair(
+                source,
+                left_index=4,
+                local_segments=local,
+            )
+        )
+
+    def test_faster_whisper_unanchored_active_gap_is_recorded_without_mutation(self):
+        source, local = self._missing_speech_gap_fixture()
+        local = [
+            ASRDataSeg("unrelated", 531000, 531300),
+            ASRDataSeg("background", 531300, 531700),
+            ASRDataSeg("speech", 531700, 532100),
+        ]
+        asr = object.__new__(FasterWhisperASR)
+        asr._can_run_local_gap_repair = lambda: True
+        asr._audio_range_has_activity = lambda *_args: True
+        asr._transcribe_local_window = lambda *_args: local
+
+        repaired = asr._repair_suspicious_internal_gaps(source)
+
+        self.assertEqual(
+            [(segment.text, segment.start_time, segment.end_time) for segment in repaired],
+            [(segment.text, segment.start_time, segment.end_time) for segment in source],
+        )
+        self.assertEqual(asr.last_internal_gap_repairs, [])
+        self.assertEqual(len(asr.last_unresolved_internal_gap_candidates), 1)
+
+    def test_faster_whisper_anchor_merge_tolerates_one_missing_edge_interjection(self):
+        source, local = self._missing_speech_gap_fixture()
+        local = [segment for segment in local if segment.text != "Wow"]
+        missing = local[4:-4]
+        step = (538000 - 530900) // len(missing)
+        for index, segment in enumerate(missing):
+            segment.start_time = 530900 + index * step
+            segment.end_time = 530900 + (index + 1) * step - 10
+        for index, segment in enumerate(local[:4]):
+            segment.start_time = source[index].start_time
+            segment.end_time = source[index].end_time
+        for index, segment in enumerate(local[-4:]):
+            segment.start_time = source[5 + index].start_time
+            segment.end_time = source[5 + index].end_time
+
+        result = FasterWhisperASR._merge_anchored_gap_repair(
+            source,
+            left_index=4,
+            local_segments=local,
+        )
+
+        self.assertIsNotNone(result)
+        _, report = result
+        self.assertEqual(report["left_anchor_skipped_words"], 1)
+        self.assertEqual(report["right_anchor_skipped_words"], 0)
+
+    @staticmethod
+    def _tail_duplicate_word_srt(candidate_words):
+        previous_words = (
+            "The real trick is designing a daily environment that requires less "
+            "raw willpower to begin with."
+        ).split()
+        segments = [
+            ASRDataSeg(word, index * 300, (index + 1) * 300)
+            for index, word in enumerate(previous_words)
+        ]
+        tail_start = 5000
+        segments.extend(
+            ASRDataSeg(
+                word,
+                tail_start + (index // 4) * 50,
+                tail_start + (index // 4) * 50 + 60,
+            )
+            for index, word in enumerate(candidate_words)
+        )
+        return ASRData(segments).to_srt("仅原文")
+
+    def test_faster_whisper_removes_high_confidence_silent_tail_duplicate(self):
+        candidate = "We're looking at a daily environment that requires less raw willpower to begin with.".split()
+        asr = object.__new__(FasterWhisperASR)
+        asr.need_word_time_stamp = True
+        asr._tail_audio_is_silent = lambda *_args: True
+
+        segments = asr._make_segments(self._tail_duplicate_word_srt(candidate))
+
+        self.assertEqual(
+            " ".join(segment.text for segment in segments),
+            "The real trick is designing a daily environment that requires less raw willpower to begin with.",
+        )
+        self.assertEqual(asr.last_tail_hallucination_repair["removed_word_count"], 14)
+
+    def test_faster_whisper_keeps_audible_tail_even_when_text_repeats(self):
+        candidate = "We're looking at a daily environment that requires less raw willpower to begin with.".split()
+        asr = object.__new__(FasterWhisperASR)
+        asr.need_word_time_stamp = True
+        asr._tail_audio_is_silent = lambda *_args: False
+
+        segments = asr._make_segments(self._tail_duplicate_word_srt(candidate))
+
+        self.assertEqual(len(segments), 30)
+        self.assertFalse(getattr(asr, "last_tail_hallucination_repair", {}))
+
+    def test_faster_whisper_keeps_silent_tail_without_repeated_phrase_evidence(self):
+        candidate = "This closing thought introduces a completely different and useful final idea for listeners.".split()
+        asr = object.__new__(FasterWhisperASR)
+        asr.need_word_time_stamp = True
+        asr._tail_audio_is_silent = lambda *_args: True
+
+        segments = asr._make_segments(self._tail_duplicate_word_srt(candidate))
+
+        self.assertEqual(len(segments), 16 + len(candidate))
+        self.assertFalse(getattr(asr, "last_tail_hallucination_repair", {}))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,25 @@
 # Progress Log
 
+## 2026-08-11 Full-Strength First Vocabulary Card
+
+- Reproduced the reported pale first card as a renderer-cache interaction. The
+  title-to-card transition depended on frame time, while the cached frame key
+  contained only card identity and subtitle state. A partially blended first
+  frame could therefore remain unchanged until the following subtitle.
+- Removed the first-card fade and its time-dependent rendering branch. The
+  right panel still shows the episode title before the first eligible card; at
+  the card's exact final-page start it switches directly to the complete card,
+  which remains until replacement.
+- Added a focused regression that checks both the first and a later card at
+  their exact trigger times, verifies full card drawing, and rejects image
+  blending. Vocabulary selection, timing, subtitles, IDs, SRT/ASS, manifest,
+  and synthesis routing are unchanged.
+- Two focused tests and Python syntax compilation pass. A pixel comparison
+  confirms that the trigger frame's card area is identical to the settled card
+  0.2 seconds later, while the preceding title frame differs. The complete
+  25-stage regression exits zero in 380.5 seconds. Visual evidence:
+  `tests/caption_audit/out/article-vocab-full-strength-first-card-20260811.png`.
+
 ## 2026-08-10 Semantic Two-Line Vocabulary Notes
 
 - Replaced the article concept-note card's generic character wrapper with a
@@ -1922,3 +1942,117 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
 - Four focused suites pass, including 58 publication/UI tests. The unified
   regression exits zero in 374.9 seconds. External requests, ASR, LLM, network,
   synthesis, paid requests, and production writes are zero.
+
+## 2026-08-10 Faster-Whisper Shutdown-Crash Recovery
+
+- A fresh `如何停止拖延.m4a` run failed twice after Faster-Whisper r245.2
+  reached 100%, wrote its SRT, and printed `Operation finished in:`. Windows
+  Error Reporting identified `faster-whisper-xxl.exe`, `ucrtbase.dll`, and
+  exception `0xC0000409`; older reports prove the executable had the same
+  shutdown failure before the current code.
+- The strict exit check introduced in `6bb5ba8` exposed the latent failure but
+  discarded a completed transcript before shared ASR validation. The wrapper
+  now accepts a nonzero exit only when both completion markers are present and
+  the generated SRT passes the existing `BaseASR` validation contract.
+- Regression coverage proves that a fully completed valid SRT is recovered,
+  while progress-only completion, a missing operation-finished marker, and an
+  invalid SRT all remain failures. No exit-code allowlist or synthetic timing
+  fallback was added.
+- Real local replay reproduced return code `3221226505` and successfully
+  returned 3135 native word-timestamp segments with trusted timing. ASR trust
+  tests pass 19/19, and the full 25-stage regression exits zero in 360.1
+  seconds. Network, LLM, translation, WhisperX, synthesis, paid requests, and
+  production cache writes were zero.
+
+## 2026-08-10 Silent Tail Duplicate And Reading-Speed Gate
+
+- Traced the later task failure past successful translation, WhisperX, final
+  timeline validation, and display-page translation. The visible blocker was
+  one `reading_speed_error`, but its timing pressure came from a 14-word
+  Faster-Whisper tail duplicate compressed into 260ms of audio silence.
+- Added a pre-freeze, Faster-Whisper-only tail guard. It requires extreme word
+  rate, overlapping word times, a long repeated phrase, sentence-final
+  position, and FFmpeg-confirmed silence. Ambiguous, audible, or non-repeated
+  endings are retained.
+- Real read-only replay changes 3,135 word entries to 3,121 and removes only
+  `We're looking at a daily environment that requires less raw willpower to
+  begin with.` The preceding legitimate sentence remains intact.
+- Unified stable publication decisions around per-error review tiers. A
+  top-level error classified as `REVIEW` no longer becomes render-blocking just
+  because the legacy status string is `ERROR`; unknown and structural errors
+  remain fail-closed. Unrelated allocation-review blockers do not change the
+  existing production gate.
+- ASR trust tests pass 22/22, four focused release-gate checks pass, real SRT
+  plus audio replay selects the expected 14-word suffix, and the full 25-stage
+  regression exits zero in 406.2 seconds. No LLM, translation, WhisperX,
+  synthesis, paid request, or production artifact write ran during validation.
+
+## 2026-08-10 Manual Checkpoint Actual-Page Recovery
+
+- Diagnosed the post-save parent-view fallback from the real `如何停止拖延`
+  package. The 21:30:31 edit artifact still owns 283 cues, 92 history entries,
+  353 page edits, 38 overrides, and tail trim; only the derived page artifact
+  lost its render-plan list.
+- Added a fail-closed recovery path that rebuilds an editor preview from exact
+  saved page word ranges only after page IDs, parent IDs, English, continuous
+  ledger coverage, boundary evidence, and cue coverage all match. It does not
+  change frozen English, IDs, word timing, page boundaries, or confirmation
+  state.
+- Real read-only replay restores 353/353 page rows and all 19 visible stale
+  Chinese drafts with zero blank rows. Formal synthesis stays blocked by
+  `manual_page_translation_required`.
+- Added a regression that deletes the derived page plan from a blocked package,
+  reloads from the complete edits, saves again, and proves exact page identity
+  survives. The full manual-editor script, syntax compilation, and 58 UI and
+  publication tests pass. The required 25-stage regression passes in 361
+  seconds. No external request or production write ran.
+
+## 2026-08-10 Manual Editor State And Latency Hardening
+
+- Audited split, visual-boundary move, save, reload, and page/parent view
+  transitions against the real 353-page procrastination package. Repeated full
+  derivation of 38 overridden plans, GUI-thread session copying, destructive
+  boundary-Chinese invalidation, and reload-failure parent fallback were the
+  four root causes.
+- Added state- and artifact-bound complete-model caching plus parent-level
+  preview reuse. The cache fails closed on any cue, edit, override, recovered
+  evidence/draft, manifest, page artifact, draft artifact, or boundary-evidence
+  file change, and callers receive isolated row copies.
+- A page-boundary move preserves existing Chinese visibly as an unconfirmed
+  draft on only the two changed pages and leaves every unaffected page exact.
+  Save snapshot copying now runs after the table is disabled and inside the
+  worker; mutation during save is rejected.
+- A save/reload verification failure keeps the current in-memory session and
+  actual-page view instead of forcing parent rows. It clears synthesis authority
+  and asks for another save without requiring import or audio rerun.
+- Real read-only timings: cached full model 0.012-0.014s, split 0.159s plus
+  0.122s refresh, boundary move 0.136s plus 0.129s refresh; 351 unaffected pages
+  have zero identity/text/timing drift. A cross-parent formal-boundary move took
+  0.940s plus 0.143s refresh with zero drift across 349 unaffected pages.
+  Manual editor, 60 UI/publication tests, syntax compilation, `git diff --check`,
+  and all 25 regression stages pass; the final unified run took 381.4 seconds.
+
+## 2026-08-11 Missing Speech And Compressed Word-Timing Repair
+
+- Reproduced the 08:51 omission as a Faster-Whisper history-context failure:
+  the normal full-file pass jumped from `Wow.` to `You are borrowing...`, while
+  a bounded context-free pass recovered 23 spoken words in the acoustic gap.
+- Added a pre-freeze local repair that requires a long internal word gap,
+  FFmpeg activity, and exact text anchors on both sides. It never gives the
+  local model authority over existing words. Unanchored output is logged only;
+  anchored inserted words retain acoustic times and the repaired SRT replaces
+  the raw ASR cache value.
+- Traced subtitle 281 to stable-ts: six words shared 1077.980-1078.100, and its
+  eight-word cue covered only 741ms. Stable-ts now reverts a compressed local
+  update to trusted native Faster-Whisper times; WhisperX reverts the same
+  defect to the frozen ledger. A bad baseline cannot be used as fallback.
+- Added one shared detector at the actual timing owner. The fixed thresholds
+  are four words in at most 250ms, or eight words in at most 750ms at ten or
+  more words per second. Historical audit of 99 ledgers found no plausible
+  normal-speed false positive, but exposed a 40-word chain caused by merging
+  overlapping windows. The detector now returns a minimum core and callers
+  repair and detect again, preventing broad timing rollback.
+- Final verification: ASR trust 33/33, final cue timeline pass, complete stable
+  caption rules pass, Python compilation pass, and all 25 unified regression
+  stages pass in 362.2 seconds. No translation, display-page, renderer, source
+  audio, or production artifact was changed during these tests.

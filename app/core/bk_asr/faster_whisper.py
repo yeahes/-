@@ -1,4 +1,5 @@
 import hashlib
+from difflib import SequenceMatcher
 import os
 import re
 import shutil
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 from ..utils.logger import setup_logger
+from ..subtitle_processor.word_timing_trust import describe_word_timing_issue
 from .asr_data import ASRDataSeg, ASRData
 from .base import BaseASR
 
@@ -15,6 +17,22 @@ logger = setup_logger("faster_whisper")
 
 
 class FasterWhisperASR(BaseASR):
+    INTERNAL_GAP_MIN_MS = 1800
+    INTERNAL_GAP_MAX_MS = 15000
+    INTERNAL_GAP_CONTEXT_WORDS = 8
+    INTERNAL_GAP_WINDOW_PADDING_MS = 2500
+    INTERNAL_GAP_MIN_INSERTED_WORDS = 3
+    INTERNAL_GAP_ACTIVITY_DB = -42.0
+    INTERNAL_GAP_MAX_REPAIRS = 8
+    TAIL_HALLUCINATION_MIN_WORDS = 6
+    TAIL_HALLUCINATION_MAX_WORDS = 24
+    TAIL_HALLUCINATION_MIN_WPS = 12.0
+    TAIL_HALLUCINATION_MAX_DURATION_MS = 1500
+    TAIL_HALLUCINATION_MIN_OVERLAP_RATIO = 0.30
+    TAIL_HALLUCINATION_MIN_REPEAT_WORDS = 5
+    TAIL_HALLUCINATION_MIN_REPEAT_RATIO = 0.60
+    TAIL_HALLUCINATION_SILENCE_DB = -45.0
+
     def __init__(
         self,
         audio_path: str,
@@ -101,6 +119,20 @@ class FasterWhisperASR(BaseASR):
                     "faster-whisper-xxl 程序未找到，请确保已经下载。"
                 )
             self.faster_whisper_program = "faster-whisper-xxl"
+
+    def run(self, callback=None, **kwargs) -> ASRData:
+        asr_data = super().run(callback, **kwargs)
+        repaired = bool(
+            getattr(self, "last_internal_gap_repairs", [])
+            or getattr(self, "last_tail_hallucination_repair", {})
+        )
+        if repaired and getattr(self, "use_cache", False):
+            self.cache_manager.set_asr_result(
+                self._get_key(),
+                self.__class__.__name__,
+                asr_data.to_srt("仅原文"),
+            )
+        return asr_data
 
     def _build_command(self, audio_path: str) -> List[str]:
         """构建命令行参数"""
@@ -251,7 +283,537 @@ class FasterWhisperASR(BaseASR):
                 or text.startswith("（")
             ):
                 filtered_segments.append(seg)
+        filtered_segments = self._remove_high_confidence_silent_tail_duplicate(
+            filtered_segments
+        )
+        if (
+            getattr(self, "need_word_time_stamp", False)
+            and not getattr(self, "_skip_internal_gap_repair", False)
+        ):
+            filtered_segments = self._repair_suspicious_internal_gaps(
+                filtered_segments
+            )
         return filtered_segments
+
+    @classmethod
+    def _internal_gap_candidates(
+        cls,
+        segments: list[ASRDataSeg],
+    ) -> list[dict]:
+        candidates = []
+        for left_index, (left, right) in enumerate(zip(segments, segments[1:])):
+            gap_start_ms = int(left.end_time)
+            gap_end_ms = int(right.start_time)
+            duration_ms = gap_end_ms - gap_start_ms
+            if not cls.INTERNAL_GAP_MIN_MS <= duration_ms <= cls.INTERNAL_GAP_MAX_MS:
+                continue
+            candidates.append(
+                {
+                    "code": "asr_internal_word_gap",
+                    "left_index": left_index,
+                    "right_index": left_index + 1,
+                    "start_ms": gap_start_ms,
+                    "end_ms": gap_end_ms,
+                    "duration_ms": duration_ms,
+                }
+            )
+        return candidates
+
+    @staticmethod
+    def _normalized_words(segments: list[ASRDataSeg]) -> list[str]:
+        return [
+            FasterWhisperASR._normalize_tail_word(segment.text)
+            for segment in segments
+        ]
+
+    @classmethod
+    def _merge_anchored_gap_repair(
+        cls,
+        segments: list[ASRDataSeg],
+        *,
+        left_index: int,
+        local_segments: list[ASRDataSeg],
+    ) -> Optional[tuple[list[ASRDataSeg], dict]]:
+        if left_index < 0 or left_index + 1 >= len(segments):
+            return None
+        source_words = cls._normalized_words(segments)
+        local_words = cls._normalized_words(local_segments)
+        if any(not word for word in local_words):
+            return None
+
+        anchor_pairs = []
+        for left_edge_skip in range(2):
+            left_anchor_end = left_index - left_edge_skip
+            if left_anchor_end < 1:
+                continue
+            max_left_anchor = min(4, left_anchor_end + 1)
+            for left_count in range(max_left_anchor, 1, -1):
+                left_anchor = source_words[
+                    left_anchor_end - left_count + 1 : left_anchor_end + 1
+                ]
+                left_matches = cls._subsequence_starts(local_words, left_anchor)
+                for right_edge_skip in range(2):
+                    right_anchor_start = left_index + 1 + right_edge_skip
+                    max_right_anchor = min(4, len(segments) - right_anchor_start)
+                    for right_count in range(max_right_anchor, 1, -1):
+                        right_anchor = source_words[
+                            right_anchor_start : right_anchor_start + right_count
+                        ]
+                        right_matches = cls._subsequence_starts(local_words, right_anchor)
+                        for left_start in left_matches:
+                            insert_start = left_start + left_count
+                            for right_start in right_matches:
+                                if right_start <= insert_start:
+                                    continue
+                                inserted_count = right_start - insert_start
+                                if inserted_count < cls.INTERNAL_GAP_MIN_INSERTED_WORDS:
+                                    continue
+                                expected_left_ms = int(segments[left_index].end_time)
+                                expected_right_ms = int(segments[left_index + 1].start_time)
+                                acoustic_distance = abs(
+                                    int(local_segments[insert_start].start_time)
+                                    - expected_left_ms
+                                ) + abs(
+                                    int(local_segments[right_start - 1].end_time)
+                                    - expected_right_ms
+                                )
+                                anchor_pairs.append(
+                                    (
+                                        left_edge_skip + right_edge_skip,
+                                        -left_count - right_count,
+                                        acoustic_distance,
+                                        insert_start,
+                                        right_start,
+                                        left_edge_skip,
+                                        right_edge_skip,
+                                    )
+                                )
+        if not anchor_pairs:
+            return None
+
+        (
+            _,
+            _,
+            _,
+            insert_start,
+            insert_end,
+            left_edge_skip,
+            right_edge_skip,
+        ) = sorted(anchor_pairs)[0]
+        inserted = [
+            ASRDataSeg(
+                text=segment.text,
+                start_time=int(segment.start_time),
+                end_time=int(segment.end_time),
+            )
+            for segment in local_segments[insert_start:insert_end]
+        ]
+        gap_start_ms = int(segments[left_index].end_time)
+        gap_end_ms = int(segments[left_index + 1].start_time)
+        if (
+            not inserted
+            or int(inserted[0].start_time) < gap_start_ms - 250
+            or int(inserted[-1].end_time) > gap_end_ms + 250
+        ):
+            return None
+        if any(int(segment.end_time) <= int(segment.start_time) for segment in inserted):
+            return None
+        if any(
+            int(current.start_time) < int(previous.start_time)
+            for previous, current in zip(inserted, inserted[1:])
+        ):
+            return None
+
+        merged = list(segments[: left_index + 1]) + inserted + list(
+            segments[left_index + 1 :]
+        )
+        return merged, {
+            "code": "asr_internal_speech_gap_repaired",
+            "start_ms": gap_start_ms,
+            "end_ms": gap_end_ms,
+            "inserted_word_count": len(inserted),
+            "inserted_text": " ".join(segment.text.strip() for segment in inserted),
+            "left_anchor_skipped_words": left_edge_skip,
+            "right_anchor_skipped_words": right_edge_skip,
+        }
+
+    @staticmethod
+    def _subsequence_starts(words: list[str], needle: list[str]) -> list[int]:
+        if not needle or len(needle) > len(words):
+            return []
+        return [
+            index
+            for index in range(len(words) - len(needle) + 1)
+            if words[index : index + len(needle)] == needle
+        ]
+
+    def _repair_suspicious_internal_gaps(
+        self,
+        segments: list[ASRDataSeg],
+    ) -> list[ASRDataSeg]:
+        self.last_internal_gap_repairs = []
+        self.last_unresolved_internal_gap_candidates = []
+        if not segments or not self._can_run_local_gap_repair():
+            return segments
+
+        repaired = list(segments)
+        attempts = 0
+        while attempts < self.INTERNAL_GAP_MAX_REPAIRS:
+            candidates = self._internal_gap_candidates(repaired)
+            if not candidates:
+                break
+            applied = False
+            for candidate in candidates:
+                if attempts >= self.INTERNAL_GAP_MAX_REPAIRS:
+                    break
+                if not self._audio_range_has_activity(
+                    candidate["start_ms"], candidate["end_ms"]
+                ):
+                    continue
+                attempts += 1
+                left_index = int(candidate["left_index"])
+                context_start = max(
+                    0,
+                    left_index - self.INTERNAL_GAP_CONTEXT_WORDS + 1,
+                )
+                context_end = min(
+                    len(repaired) - 1,
+                    left_index + self.INTERNAL_GAP_CONTEXT_WORDS,
+                )
+                window_start_ms = max(
+                    0,
+                    int(repaired[context_start].start_time)
+                    - self.INTERNAL_GAP_WINDOW_PADDING_MS,
+                )
+                window_end_ms = (
+                    int(repaired[context_end].end_time)
+                    + self.INTERNAL_GAP_WINDOW_PADDING_MS
+                )
+                local_segments = self._transcribe_local_window(
+                    window_start_ms,
+                    window_end_ms,
+                )
+                merged = self._merge_anchored_gap_repair(
+                    repaired,
+                    left_index=left_index,
+                    local_segments=local_segments,
+                )
+                if merged is not None:
+                    repaired, report = merged
+                    self.last_internal_gap_repairs.append(report)
+                    logger.warning("Repaired Faster Whisper internal speech gap: %s", report)
+                    applied = True
+                    break
+
+                words_inside_gap = [
+                    segment
+                    for segment in local_segments
+                    if int(segment.start_time) >= int(candidate["start_ms"])
+                    and int(segment.end_time) <= int(candidate["end_ms"])
+                ]
+                if len(words_inside_gap) >= self.INTERNAL_GAP_MIN_INSERTED_WORDS:
+                    unresolved = {
+                        **candidate,
+                        "word_count": len(words_inside_gap),
+                        "local_text": " ".join(
+                            segment.text.strip() for segment in words_inside_gap
+                        ),
+                    }
+                    self.last_unresolved_internal_gap_candidates.append(unresolved)
+                    logger.warning(
+                        "Skipped unanchored Faster Whisper gap candidate: %s",
+                        describe_word_timing_issue(unresolved),
+                    )
+            if not applied:
+                break
+        return repaired
+
+    def _can_run_local_gap_repair(self) -> bool:
+        audio_path = getattr(self, "audio_path", None)
+        return bool(
+            isinstance(audio_path, str)
+            and Path(audio_path).is_file()
+            and self._find_ffmpeg() is not None
+            and getattr(self, "faster_whisper_program", None)
+        )
+
+    def _audio_range_has_activity(self, start_ms: int, end_ms: int) -> bool:
+        max_volume_db = self._probe_max_volume_db(start_ms, end_ms)
+        return max_volume_db is not None and max_volume_db > self.INTERNAL_GAP_ACTIVITY_DB
+
+    def _transcribe_local_window(
+        self,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[ASRDataSeg]:
+        ffmpeg = self._find_ffmpeg()
+        if ffmpeg is None:
+            return []
+        duration_ms = max(1, int(end_ms) - int(start_ms))
+        temp_root = Path(tempfile.gettempdir()) / "bk_asr"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root, prefix="gap_repair_") as temp_path:
+            repair_dir = Path(temp_path)
+            clip_path = repair_dir / "repair.wav"
+            extract_command = [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{max(0, int(start_ms)) / 1000.0:.3f}",
+                "-i",
+                str(self.audio_path),
+                "-t",
+                f"{duration_ms / 1000.0:.3f}",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-y",
+                str(clip_path),
+            ]
+            extracted = subprocess.run(
+                extract_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                check=False,
+            )
+            if extracted.returncode != 0 or not clip_path.is_file():
+                logger.warning("Faster Whisper gap audio extraction failed: %s", extracted.stdout[-1000:])
+                return []
+
+            command = self._build_command(str(clip_path))
+            try:
+                output_index = command.index("-o") + 1
+                command[output_index] = str(repair_dir)
+            except (ValueError, IndexError):
+                return []
+            command.extend(["--condition_on_previous_text", "False"])
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=300,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                check=False,
+            )
+            output_path = repair_dir / "repair.srt"
+            if not output_path.is_file():
+                logger.warning("Faster Whisper gap repair produced no SRT: %s", result.stdout[-1000:])
+                return []
+            if result.returncode != 0 and not (
+                "Subtitles are written to" in result.stdout
+                and "Operation finished in:" in result.stdout
+            ):
+                logger.warning("Faster Whisper gap repair failed: %s", result.stdout[-1000:])
+                return []
+
+            local_data = ASRData.from_srt(output_path.read_text(encoding="utf-8"))
+            self._repair_quantized_zero_duration_segments(local_data.segments)
+            for segment in local_data.segments:
+                segment.start_time = int(segment.start_time) + int(start_ms)
+                segment.end_time = int(segment.end_time) + int(start_ms)
+            return local_data.segments
+
+    @staticmethod
+    def _normalize_tail_word(text: str) -> str:
+        return re.sub(r"[^a-z0-9']+", "", str(text or "").lower())
+
+    @classmethod
+    def _tail_duplicate_start_index(
+        cls,
+        segments: list[ASRDataSeg],
+    ) -> Optional[int]:
+        if len(segments) < cls.TAIL_HALLUCINATION_MIN_WORDS * 2:
+            return None
+        if not re.search(r"[.!?][\"')\]]*$", segments[-1].text.strip()):
+            return None
+
+        earliest = max(1, len(segments) - 48)
+        candidate_starts = [
+            index
+            for index in range(earliest, len(segments))
+            if re.search(r"[.!?][\"')\]]*$", segments[index - 1].text.strip())
+        ]
+        for start_index in reversed(candidate_starts):
+            candidate = segments[start_index:]
+            word_count = len(candidate)
+            if not (
+                cls.TAIL_HALLUCINATION_MIN_WORDS
+                <= word_count
+                <= cls.TAIL_HALLUCINATION_MAX_WORDS
+            ):
+                continue
+            duration_ms = int(candidate[-1].end_time) - int(candidate[0].start_time)
+            if duration_ms <= 0 or duration_ms > cls.TAIL_HALLUCINATION_MAX_DURATION_MS:
+                continue
+            words_per_second = word_count * 1000.0 / duration_ms
+            if words_per_second < cls.TAIL_HALLUCINATION_MIN_WPS:
+                continue
+            overlap_count = sum(
+                int(current.start_time) < int(previous.end_time)
+                for previous, current in zip(candidate, candidate[1:])
+            )
+            if overlap_count / max(1, word_count - 1) < cls.TAIL_HALLUCINATION_MIN_OVERLAP_RATIO:
+                continue
+
+            candidate_words = [
+                cls._normalize_tail_word(segment.text) for segment in candidate
+            ]
+            if any(not word for word in candidate_words):
+                continue
+            previous_words = [
+                cls._normalize_tail_word(segment.text)
+                for segment in segments[max(0, start_index - 80) : start_index]
+            ]
+            previous_words = [word for word in previous_words if word]
+            repeated = SequenceMatcher(
+                None,
+                previous_words,
+                candidate_words,
+                autojunk=False,
+            ).find_longest_match()
+            if repeated.size < cls.TAIL_HALLUCINATION_MIN_REPEAT_WORDS:
+                continue
+            if repeated.size / word_count < cls.TAIL_HALLUCINATION_MIN_REPEAT_RATIO:
+                continue
+            return start_index
+        return None
+
+    @staticmethod
+    def _find_ffmpeg() -> Optional[Path]:
+        project_root = Path(__file__).resolve().parents[3]
+        candidates = [
+            project_root / "resource" / "bin" / "ffmpeg.exe",
+            project_root
+            / "resource"
+            / "bin"
+            / "Faster-Whisper-XXL"
+            / "ffmpeg.exe",
+        ]
+        configured = shutil.which("ffmpeg")
+        if configured:
+            candidates.append(Path(configured))
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _tail_audio_is_silent(self, start_ms: int, end_ms: int) -> bool:
+        max_volume_db = self._probe_max_volume_db(start_ms, end_ms)
+        return (
+            max_volume_db is not None
+            and max_volume_db <= self.TAIL_HALLUCINATION_SILENCE_DB
+        )
+
+    def _probe_max_volume_db(
+        self,
+        start_ms: int,
+        end_ms: int,
+    ) -> Optional[float]:
+        audio_path = getattr(self, "audio_path", None)
+        if not isinstance(audio_path, str) or not Path(audio_path).is_file():
+            return None
+        ffmpeg = self._find_ffmpeg()
+        if ffmpeg is None:
+            return None
+        duration_ms = max(1, int(end_ms) - int(start_ms))
+        command = [
+            str(ffmpeg),
+            "-hide_banner",
+            "-nostats",
+            "-ss",
+            f"{max(0, int(start_ms)) / 1000.0:.3f}",
+            "-i",
+            audio_path,
+            "-t",
+            f"{duration_ms / 1000.0:.3f}",
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            os.devnull,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Faster Whisper tail audio probe failed: %s", exc)
+            return None
+        if result.returncode != 0:
+            return None
+        match = re.search(
+            r"max_volume:\s*(-?(?:inf|\d+(?:\.\d+)?))\s*dB",
+            result.stdout or "",
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        raw_volume = match.group(1).lower()
+        max_volume_db = float("-inf") if raw_volume == "-inf" else float(raw_volume)
+        return max_volume_db
+
+    def _remove_high_confidence_silent_tail_duplicate(
+        self,
+        segments: list[ASRDataSeg],
+    ) -> list[ASRDataSeg]:
+        self.last_tail_hallucination_repair = {}
+        if not getattr(self, "need_word_time_stamp", False):
+            return segments
+        start_index = self._tail_duplicate_start_index(segments)
+        if start_index is None:
+            return segments
+        candidate = segments[start_index:]
+        start_ms = int(candidate[0].start_time)
+        end_ms = int(candidate[-1].end_time)
+        if not self._tail_audio_is_silent(start_ms, end_ms):
+            return segments
+        self.last_tail_hallucination_repair = {
+            "code": "high_confidence_silent_tail_duplicate",
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "removed_word_count": len(candidate),
+            "removed_text": " ".join(segment.text.strip() for segment in candidate),
+        }
+        logger.warning(
+            "Removed high-confidence silent Faster Whisper tail duplicate: %s",
+            self.last_tail_hallucination_repair,
+        )
+        return segments[:start_index]
+
+    def _read_validated_completed_output(self, output_path: Path) -> Optional[str]:
+        previous_skip = getattr(self, "_skip_internal_gap_repair", False)
+        self._skip_internal_gap_repair = True
+        try:
+            response_text = output_path.read_text(encoding="utf-8")
+            self._make_validated_data(response_text)
+        except Exception as exc:
+            logger.warning(
+                "Faster Whisper completed output failed validation: %s",
+                exc,
+            )
+            return None
+        finally:
+            self._skip_internal_gap_repair = previous_skip
+        return response_text
 
     def _run(self, callback=None) -> str:
         if callback is None:
@@ -283,6 +845,8 @@ class FasterWhisperASR(BaseASR):
             )
 
             is_finish = False
+            reported_output_written = False
+            reported_operation_finished = False
             error_msg = ""
 
             # 实时打印日志和错误输出
@@ -302,7 +866,10 @@ class FasterWhisperASR(BaseASR):
                     callback(mapped_progress, f"{mapped_progress} %")
                 if "Subtitles are written to" in output:
                     is_finish = True
+                    reported_output_written = True
                     callback(100, "识别完成")
+                if "Operation finished in:" in output:
+                    reported_operation_finished = True
                 if "error" in output:
                     error_msg += output
                     logger.error(output)
@@ -313,14 +880,27 @@ class FasterWhisperASR(BaseASR):
             self.process.communicate()
 
             logger.info("Faster Whisper 返回值: %s", self.process.returncode)
+            recovered_output = None
+            if (
+                reported_output_written
+                and reported_operation_finished
+                and output_path.exists()
+            ):
+                recovered_output = self._read_validated_completed_output(output_path)
             if self.process.returncode != 0:
-                logger.error(
-                    "Faster Whisper exited with return code %s: %s",
+                if recovered_output is None:
+                    logger.error(
+                        "Faster Whisper exited with return code %s: %s",
+                        self.process.returncode,
+                        error_msg,
+                    )
+                    raise RuntimeError(
+                        f"Faster Whisper return code {self.process.returncode}: {error_msg}"
+                    )
+                logger.warning(
+                    "Faster Whisper exited after reporting completion; "
+                    "using validated subtitle output: return_code=%s",
                     self.process.returncode,
-                    error_msg,
-                )
-                raise RuntimeError(
-                    f"Faster Whisper return code {self.process.returncode}: {error_msg}"
                 )
             if not is_finish:
                 logger.error("Faster Whisper 错误: %s", error_msg)
@@ -334,7 +914,7 @@ class FasterWhisperASR(BaseASR):
 
             callback(100, "识别完成")
 
-            return output_path.read_text(encoding="utf-8")
+            return recovered_output or output_path.read_text(encoding="utf-8")
 
     def _get_key(self):
         """获取缓存key"""

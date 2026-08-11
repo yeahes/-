@@ -148,7 +148,6 @@ VOCAB_GROUP_MAX_CUES = 6
 VOCAB_GROUP_MAX_SECONDS = 18.0
 VOCAB_GROUP_SILENCE_SECONDS = 0.7
 VOCAB_MIN_CARD_INTERVAL_SECONDS = 15.0
-VOCAB_OPENING_CARD_TRANSITION_SECONDS = 0.25
 VOCAB_CARDS_PER_MINUTE = 1.0
 VOCAB_MIN_CARDS_PER_EPISODE = 3
 VOCAB_MAX_CARDS_PER_EPISODE = 22
@@ -1560,25 +1559,6 @@ def active_vocab_card(
 ) -> dict | None:
     """Compatibility helper for callers that only need the current card."""
     return vocab_card_display_state(vocab_plan, cue, display_time)[0]
-
-
-def opening_card_transition_progress(
-    vocab_plan: dict[int, dict] | None,
-    vocab: dict | None,
-    vocab_state: str,
-    display_time: float | None,
-) -> float | None:
-    """Return the title-to-first-card crossfade progress, if it is active."""
-    if not vocab_plan or not vocab or vocab_state != "full" or display_time is None:
-        return None
-    first_start = min(float(item.get("display_start", math.inf)) for item in vocab_plan.values())
-    current_start = float(vocab.get("display_start", math.inf))
-    if current_start != first_start:
-        return None
-    elapsed = display_time - first_start
-    if elapsed < 0 or elapsed >= VOCAB_OPENING_CARD_TRANSITION_SECONDS:
-        return None
-    return max(0.0, min(1.0, elapsed / VOCAB_OPENING_CARD_TRANSITION_SECONDS))
 
 
 def split_vocab_groups_for_requests(
@@ -7377,25 +7357,7 @@ def draw_article_frame(
 
     vocab_rect = article_rect(916, 16, 1584, 530)
     vocab, vocab_state = vocab_card_display_state(vocab_plan, cue, display_time) if show_vocab else (None, "hidden")
-    transition_progress = opening_card_transition_progress(
-        vocab_plan,
-        vocab,
-        vocab_state,
-        display_time,
-    )
-    if transition_progress is not None:
-        topic_frame = img.copy()
-        empty_frame = img.copy()
-        card_frame = img.copy()
-        draw_article_opening_topic_panel(topic_frame, vocab_rect, title_text)
-        draw_article_panel(empty_frame, vocab_rect, acx(16), ARTICLE_CARD_CONTAINER)
-        draw_article_vocab_card(card_frame, vocab, vocab_rect)
-        if transition_progress < 0.45:
-            img = Image.blend(topic_frame, empty_frame, transition_progress / 0.45)
-        else:
-            img = Image.blend(empty_frame, card_frame, (transition_progress - 0.45) / 0.55)
-        d = ImageDraw.Draw(img, "RGBA")
-    elif vocab_state == "full" and vocab:
+    if vocab_state == "full" and vocab:
         draw_article_vocab_card(img, vocab, vocab_rect)
     else:
         draw_article_opening_topic_panel(img, vocab_rect, title_text)

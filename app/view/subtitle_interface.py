@@ -2491,6 +2491,10 @@ class SubtitleInterface(QWidget):
     ) -> None:
         if not self.manual_final_session:
             return
+        if bool(getattr(self, "_manual_save_in_progress", False)):
+            raise ManualFinalSubtitleEditError(
+                "人工终稿正在保存，完成前不能继续修改字幕。"
+            )
         commit_editor = getattr(self, "_commit_active_manual_table_editor", None)
         if callable(commit_editor):
             commit_editor()
@@ -2792,7 +2796,6 @@ class SubtitleInterface(QWidget):
                 source_media_path = str(
                     self.manual_final_session.source_media_path.resolve()
                 )
-            session_snapshot = copy.deepcopy(self.manual_final_session)
             self._manual_save_request_id += 1
             request_id = self._manual_save_request_id
             refresh_requested = bool(self._manual_refresh_requested)
@@ -2811,7 +2814,7 @@ class SubtitleInterface(QWidget):
             )
             worker = Thread(
                 target=self._save_manual_final_output_in_background,
-                args=(request_id, session_snapshot, source_media_path),
+                args=(request_id, self.manual_final_session, source_media_path),
                 daemon=True,
             )
             _manual_final_save_worker_started()
@@ -2910,6 +2913,8 @@ class SubtitleInterface(QWidget):
     ) -> None:
         try:
             with _MANUAL_FINAL_SAVE_LOCK:
+                session_snapshot = copy.deepcopy(session)
+
                 def report_progress(percent: int, stage: str) -> None:
                     self.manual_final_save_progress.emit(
                         request_id,
@@ -2917,7 +2922,7 @@ class SubtitleInterface(QWidget):
                         str(stage),
                     )
 
-                paths = session.save_to_source_folder(
+                paths = session_snapshot.save_to_source_folder(
                     source_media_path=source_media_path or None,
                     progress_callback=report_progress,
                 )
@@ -2983,30 +2988,39 @@ class SubtitleInterface(QWidget):
             )
             return
 
-        self._manual_package_manifest_path = str(paths["manifest_path"])
+        manifest_path = str(
+            paths.get("manifest_path") if isinstance(paths, dict) else ""
+        ).strip()
         try:
+            if not manifest_path:
+                raise ManualFinalSubtitleEditError(
+                    "保存结果缺少稳定终稿清单。"
+                )
             refreshed_session = ManualFinalSubtitleSession.load_from_manifest(
-                self._manual_package_manifest_path
+                manifest_path
             )
-        except ManualFinalSubtitleEditError:
+        except Exception:
             LOG.exception("Unable to reload saved manual final subtitle package")
             if pending_for_request:
                 self._manual_pending_page_split = None
-            self._manual_parent_boundaries_dirty = True
-            self._manual_page_view = False
+            self._manual_package_manifest_path = ""
             self._manual_has_unsaved_changes = True
-            apply_session = getattr(self, "_apply_manual_final_session", None)
-            if callable(apply_session):
-                apply_session()
-            self.status_label.setText(self.tr("人工终稿已保存，但无法重新载入实际分页"))
+            self.status_label.setText(
+                self.tr("检查点已写入但重新校验失败；当前编辑内容仍保留")
+            )
             InfoBar.warning(
                 self.tr("刷新实际分页失败"),
-                self.tr("人工终稿包已经保存，但重新载入失败，未继续执行分屏。"),
+                self.tr(
+                    "人工终稿包已经写入，但重新载入校验失败。"
+                    "当前实际分页和未保存编辑均已保留；请再次保存，"
+                    "不要重新导入或重跑音频。"
+                ),
                 duration=5000,
                 parent=self,
             )
             return
         else:
+            self._manual_package_manifest_path = manifest_path
             self.manual_final_session = refreshed_session
             self.subtitle_path = str(refreshed_session.subtitle_path)
             self._manual_parent_boundaries_dirty = False

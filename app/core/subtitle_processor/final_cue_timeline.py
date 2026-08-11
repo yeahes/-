@@ -11,6 +11,10 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Mapping, Sequence
 
+from app.core.subtitle_processor.word_timing_trust import (
+    find_implausible_word_timing_runs,
+)
+
 
 SUBTITLE_ID_RE = re.compile(r"S\d{4}")
 
@@ -24,6 +28,15 @@ def reconcile_frozen_word_ledger(words: Sequence[Mapping[str, Any]]) -> Dict[str
     the shared boundary between the two words and records the adjustment.
     """
     errors: List[Dict[str, Any]] = []
+    timing_issues = find_implausible_word_timing_runs(words)
+    if timing_issues:
+        errors.append(
+            {
+                "code": "final_timeline_word_timing_density_invalid",
+                "issues": timing_issues,
+            }
+        )
+        return {"words": [], "reconciliations": [], "errors": errors}
     indexed = _word_index(words, errors)
     expected_ids = set(range(len(words)))
     if set(indexed) != expected_ids:

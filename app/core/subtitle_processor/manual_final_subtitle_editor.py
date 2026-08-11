@@ -126,6 +126,24 @@ class ManualFinalSubtitleSession:
     loaded_subtitle_path: Path | None = None
     source_media_path: Path | None = None
     import_notice: str = ""
+    _display_page_model_cache_key: str = field(
+        default="",
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _display_page_model_cache: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _display_page_preview_cache: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @staticmethod
     def _expanded_numeric_boundary_word_count(
@@ -1806,8 +1824,13 @@ class ManualFinalSubtitleSession:
         }
 
     def _display_page_model_data(self) -> Dict[str, Dict[str, Any]]:
+        cache_key = self._display_page_model_state_key()
+        if cache_key == self._display_page_model_cache_key:
+            return copy.deepcopy(self._display_page_model_cache)
         previews = self._display_page_previews()
         if not previews:
+            self._display_page_model_cache_key = cache_key
+            self._display_page_model_cache = {}
             return {}
         rows: Dict[str, Dict[str, Any]] = {}
         row_index = 0
@@ -1919,7 +1942,38 @@ class ManualFinalSubtitleSession:
                     "display_page_chinese_confirmed": chinese_confirmed,
                     "chinese_review_required": not chinese_confirmed,
                 }
+        self._display_page_model_cache_key = cache_key
+        self._display_page_model_cache = copy.deepcopy(rows)
         return rows
+
+    @staticmethod
+    def _display_page_cache_file_token(path: Path) -> List[Any]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return [str(path), -1, -1]
+        return [str(path), int(stat.st_size), int(stat.st_mtime_ns)]
+
+    def _display_page_model_state_key(self) -> str:
+        """Bind a reusable page model to all mutable and file-backed owners."""
+        return stable_payload_hash(
+            {
+                "session": self.state_fingerprint(),
+                "recovered_formal_boundary_evidence": (
+                    self.recovered_formal_boundary_evidence
+                ),
+                "recovered_stale_page_drafts": self.recovered_stale_page_drafts,
+                "files": [
+                    self._display_page_cache_file_token(path)
+                    for path in (
+                        self.manifest_path,
+                        self.artifact_dir / "display-page-translations.json",
+                        self.artifact_dir / "manual-draft-page-plan.json",
+                        self.artifact_dir / "display-boundary-evidence.json",
+                    )
+                ],
+            }
+        )
 
     def has_display_page_model(self) -> bool:
         return bool(self._display_page_model_data())
@@ -2452,6 +2506,10 @@ class ManualFinalSubtitleSession:
             for page in rebuilt_plan.get("pages") or []
         }
         new_edits: List[Dict[str, Any]] = []
+        affected_page_ids = {
+            str(left.get("display_page_id") or ""),
+            str(right.get("display_page_id") or ""),
+        }
         for row in model_rows:
             page_id = str(row.get("display_page_id") or "")
             row_parent_id = str(row.get("manual_cue_id") or "")
@@ -2467,31 +2525,38 @@ class ManualFinalSubtitleSession:
                 page_end = int(row["word_end"])
                 english = str(row.get("original_subtitle") or "")
             if row_parent_id == parent_id:
-                same_page_identity = bool(
-                    int(row.get("word_start", -1)) == page_start
-                    and int(row.get("word_end", -1)) == page_end
-                    and str(row.get("original_subtitle") or "") == english
-                )
-                new_edits.append(
-                    {
-                        "display_page_id": page_id,
-                        "parent_subtitle_id": row_parent_id,
-                        "word_start": page_start,
-                        "word_end": page_end,
-                        "english": english,
-                        "chinese": "",
-                        "chinese_review_acknowledged": False,
-                        "boundary_review_acknowledged": bool(
-                            page_id == str(right.get("display_page_id") or "")
-                            or (
-                                same_page_identity
-                                and row.get(
-                                    "display_page_boundary_acknowledged"
-                                )
-                            )
-                        ),
-                    }
-                )
+                if page_id not in affected_page_ids:
+                    new_edits.append(
+                        self._unchanged_display_page_edit_from_model_row(row)
+                    )
+                    continue
+                visible_chinese = str(
+                    row.get("translated_subtitle") or ""
+                ).strip()
+                edit = {
+                    "display_page_id": page_id,
+                    "parent_subtitle_id": row_parent_id,
+                    "word_start": page_start,
+                    "word_end": page_end,
+                    "english": english,
+                    "chinese": "",
+                    "chinese_review_acknowledged": False,
+                    "boundary_review_acknowledged": bool(
+                        page_id == str(right.get("display_page_id") or "")
+                        or row.get("display_page_boundary_acknowledged")
+                    ),
+                }
+                if visible_chinese:
+                    edit.update(
+                        {
+                            "stale_chinese_draft": visible_chinese,
+                            "chinese_stale_unconfirmed": True,
+                            "chinese_draft_kind": (
+                                "manual_boundary_move_draft"
+                            ),
+                        }
+                    )
+                new_edits.append(edit)
             else:
                 new_edits.append(
                     self._unchanged_display_page_edit_from_model_row(row)
@@ -3147,6 +3212,159 @@ class ManualFinalSubtitleSession:
                 return inferred
         return None
 
+    def _recover_display_page_artifact_from_complete_edits(self) -> Dict[str, Any]:
+        """Rebuild an editor-only page model from exact saved word ranges."""
+        from app.core.subtitle_processor.stable_display_page_contract import (
+            DISPLAY_PAGE_PLANNER_VERSION,
+            DISPLAY_PAGE_SCHEMA_VERSION,
+        )
+        from app.core.utils.podcast_learning_video import (
+            RenderStructuralOverflowError,
+            article_display_page_layout_profile,
+            rebuild_article_frozen_page_plan_from_word_ranges,
+        )
+
+        if not self.display_page_edits:
+            return {}
+        edits_by_parent: Dict[str, List[Dict[str, Any]]] = {}
+        seen_page_ids: set[str] = set()
+        try:
+            for raw_edit in self.display_page_edits:
+                if not isinstance(raw_edit, Mapping):
+                    return {}
+                edit = dict(raw_edit)
+                page_id = str(edit.get("display_page_id") or "")
+                parent_id = str(edit.get("parent_subtitle_id") or "")
+                if not page_id or not parent_id or page_id in seen_page_ids:
+                    return {}
+                seen_page_ids.add(page_id)
+                edits_by_parent.setdefault(parent_id, []).append(edit)
+
+            cue_ids = {
+                str(cue.get("cue_id") or "")
+                for cue in self.cues
+                if str(cue.get("cue_id") or "")
+            }
+            if set(edits_by_parent) != cue_ids:
+                return {}
+
+            boundary_payload = self._validated_display_boundary_evidence()
+            boundary_items = dict(boundary_payload.get("boundaries") or {})
+            render_plans: List[Dict[str, Any]] = []
+            parents: List[Dict[str, Any]] = []
+            for cue_index, cue in enumerate(self.cues):
+                parent_id = str(cue.get("cue_id") or "")
+                parent_edits = sorted(
+                    edits_by_parent[parent_id],
+                    key=lambda item: int(item.get("word_start", -1)),
+                )
+                expected_word_start = int(cue["word_start"])
+                page_ranges: List[tuple[int, int]] = []
+                for page_index, edit in enumerate(parent_edits, 1):
+                    word_start = int(edit.get("word_start", -1))
+                    word_end = int(edit.get("word_end", -1))
+                    expected_page_id = display_page_id(parent_id, page_index)
+                    expected_english = self._words_text(
+                        self.word_ledger,
+                        word_start,
+                        word_end,
+                    )
+                    if (
+                        str(edit.get("display_page_id") or "") != expected_page_id
+                        or word_start != expected_word_start
+                        or word_end < word_start
+                        or word_end > int(cue["word_end"])
+                        or self._normalised_tokens(edit.get("english"))
+                        != self._normalised_tokens(expected_english)
+                    ):
+                        return {}
+                    page_ranges.append((word_start, word_end))
+                    expected_word_start = word_end + 1
+                if expected_word_start - 1 != int(cue["word_end"]):
+                    return {}
+
+                render_cue = self._article_render_cue(cue_index, boundary_items)
+                page_translations = {
+                    str(edit["display_page_id"]): str(
+                        edit.get("chinese")
+                        or edit.get("stale_chinese_draft")
+                        or ""
+                    )
+                    for edit in parent_edits
+                }
+                rebuilt = rebuild_article_frozen_page_plan_from_word_ranges(
+                    render_cue,
+                    {
+                        "pages": [
+                            {"display_page_id": display_page_id(parent_id, 1)}
+                        ]
+                    },
+                    page_ranges,
+                    page_translations,
+                    allow_page_count_change=True,
+                    allow_incomplete_page_translations=True,
+                    allow_manual_review=True,
+                )
+                rebuilt_pages = list(rebuilt.get("pages") or [])
+                if len(rebuilt_pages) != len(parent_edits):
+                    return {}
+                parent_pages: List[Dict[str, Any]] = []
+                for page, edit in zip(rebuilt_pages, parent_edits):
+                    if (
+                        str(page.get("display_page_id") or "")
+                        != str(edit.get("display_page_id") or "")
+                        or int(page.get("word_start", -1))
+                        != int(edit.get("word_start", -2))
+                        or int(page.get("word_end", -1))
+                        != int(edit.get("word_end", -2))
+                        or self._normalised_tokens(page.get("english"))
+                        != self._normalised_tokens(edit.get("english"))
+                    ):
+                        return {}
+                    page["chinese"] = str(edit.get("chinese") or "").strip()
+                    page["zh"] = page["chinese"]
+                    parent_pages.append(
+                        {
+                            "display_page_id": str(page["display_page_id"]),
+                            "word_start": int(page["word_start"]),
+                            "word_end": int(page["word_end"]),
+                            "english": str(page.get("english") or ""),
+                        }
+                    )
+                rebuilt["pages"] = rebuilt_pages
+                rebuilt["chinese"] = str(cue.get("translated_subtitle") or "")
+                render_plans.append(rebuilt)
+                if len(parent_pages) > 1:
+                    parents.append(
+                        {
+                            "parent_subtitle_id": parent_id,
+                            "english": str(cue.get("original_subtitle") or ""),
+                            "chinese": str(cue.get("translated_subtitle") or ""),
+                            "word_start": int(cue["word_start"]),
+                            "word_end": int(cue["word_end"]),
+                            "pages": parent_pages,
+                        }
+                    )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            ManualFinalSubtitleEditError,
+            RenderStructuralOverflowError,
+        ):
+            return {}
+
+        return {
+            "schema_version": DISPLAY_PAGE_SCHEMA_VERSION,
+            "status": "REVIEW",
+            "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
+            "layout_profile": article_display_page_layout_profile(),
+            "errors": [{"code": "manual_page_translation_required"}],
+            "parents": parents,
+            "render_plans": render_plans,
+            "recovery_source": "complete_manual_page_edits",
+        }
+
     def _effective_display_page_artifact(self) -> Dict[str, Any]:
         artifact_path = self.artifact_dir / "display-page-translations.json"
         try:
@@ -3194,7 +3412,7 @@ class ManualFinalSubtitleSession:
                     and (artifact.get("parents") or artifact.get("errors"))
                 )
             ):
-                return {}
+                return self._recover_display_page_artifact_from_complete_edits()
         return dict(artifact)
 
     def _display_page_previews(self) -> Dict[str, List[Dict[str, Any]]]:
@@ -3239,6 +3457,11 @@ class ManualFinalSubtitleSession:
             for cue in self.cues
             if str(cue.get("cue_id") or "")
         }
+        cue_index_by_id = {
+            str(cue.get("cue_id") or ""): index
+            for index, cue in enumerate(self.cues)
+            if str(cue.get("cue_id") or "")
+        }
         edited_pages = {
             str(item.get("display_page_id") or ""): dict(item)
             for item in self.display_page_edits
@@ -3280,6 +3503,64 @@ class ManualFinalSubtitleSession:
             subtitle_id = parent_id
             cue = cue_by_id.get(subtitle_id)
             override_starts = self.display_page_boundary_overrides.get(parent_id)
+            if cue is None:
+                self._display_page_preview_cache.pop(parent_id, None)
+                continue
+            parent_page_prefix = f"{parent_id}.P"
+            parent_cache_key = stable_payload_hash(
+                {
+                    "source_word_ledger_hash": self.source_word_ledger_hash,
+                    "cue_index": cue_index_by_id[parent_id],
+                    "cue": cue,
+                    "source_plan": source_plan,
+                    "override_starts": override_starts,
+                    "edited_pages": [
+                        item
+                        for item in self.display_page_edits
+                        if str(item.get("parent_subtitle_id") or "") == parent_id
+                    ],
+                    "translated_pages": {
+                        page_id: page
+                        for page_id, page in translated_pages.items()
+                        if page_id.startswith(parent_page_prefix)
+                    },
+                    "translated_parent_chinese": translated_parent_chinese.get(
+                        parent_id,
+                        "",
+                    ),
+                    "parent_errors": sorted(
+                        translation_errors_by_parent.get(parent_id, set())
+                    ),
+                    "page_errors": {
+                        page_id: sorted(codes)
+                        for page_id, codes in translation_errors_by_page.items()
+                        if page_id.startswith(parent_page_prefix)
+                    },
+                    "recovered_drafts": {
+                        page_id: draft
+                        for page_id, draft in self.recovered_stale_page_drafts.items()
+                        if page_id.startswith(parent_page_prefix)
+                    },
+                    "allow_incomplete_page_chinese": allow_incomplete_page_chinese,
+                    "boundary_evidence": (
+                        {
+                            "file": self._display_page_cache_file_token(
+                                self.artifact_dir
+                                / "display-boundary-evidence.json"
+                            ),
+                            "recovered": self.recovered_formal_boundary_evidence,
+                        }
+                        if override_starts is not None
+                        else None
+                    ),
+                }
+            )
+            cached_parent = self._display_page_preview_cache.get(parent_id) or {}
+            if str(cached_parent.get("key") or "") == parent_cache_key:
+                previews[subtitle_id] = copy.deepcopy(
+                    list(cached_parent.get("pages") or [])
+                )
+                continue
             if cue is not None and override_starts is not None:
                 source_pages = [
                     dict(page)
@@ -3451,7 +3732,14 @@ class ManualFinalSubtitleSession:
                         saved_draft_kind = str(
                             edited.get("chinese_draft_kind") or ""
                         )
-                        if recovered_chinese:
+                        if (
+                            saved_stale_chinese
+                            and saved_draft_kind
+                            == "manual_boundary_move_draft"
+                        ):
+                            stale_chinese = saved_stale_chinese
+                            chinese_draft_kind = saved_draft_kind
+                        elif recovered_chinese:
                             stale_chinese = recovered_chinese
                             chinese_draft_kind = (
                                 "recovered_identity_matched_draft"
@@ -3558,6 +3846,23 @@ class ManualFinalSubtitleSession:
                 == current_chinese
             ):
                 previews[subtitle_id] = pages
+                self._display_page_preview_cache[parent_id] = {
+                    "key": parent_cache_key,
+                    "pages": copy.deepcopy(pages),
+                }
+            else:
+                self._display_page_preview_cache.pop(parent_id, None)
+        active_parent_ids = {
+            str(plan.get("parent_subtitle_id") or "")
+            for plan in artifact.get("render_plans") or []
+            if isinstance(plan, Mapping)
+            and str(plan.get("parent_subtitle_id") or "")
+        }
+        self._display_page_preview_cache = {
+            parent_id: cached
+            for parent_id, cached in self._display_page_preview_cache.items()
+            if parent_id in active_parent_ids
+        }
         return previews
 
     def save_to_source_folder(

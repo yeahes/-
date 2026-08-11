@@ -13,6 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.utils.logger import setup_logger
+from app.core.subtitle_processor.word_timing_trust import (
+    describe_word_timing_issue,
+    find_implausible_word_timing_runs,
+)
 
 logger = setup_logger("stable_ts_alignment")
 
@@ -155,6 +159,117 @@ def _make_word_segments(words: List[dict]) -> ASRData:
     return ASRData(segments)
 
 
+def _fallback_implausible_stable_ts_updates(
+    source_segments: Sequence[ASRDataSeg],
+    aligned_segments: Sequence[ASRDataSeg],
+    *,
+    source_timing_trusted: bool,
+) -> List[dict]:
+    """Keep valid native times only for stable-ts compression clusters."""
+
+    if not source_timing_trusted or not source_segments or not aligned_segments:
+        return []
+    source_words = [
+        _normalize_word(str(getattr(segment, "text", "") or ""))
+        for segment in source_segments
+    ]
+    aligned_words = [
+        _normalize_word(str(getattr(segment, "text", "") or ""))
+        for segment in aligned_segments
+    ]
+
+    fallbacks: List[dict] = []
+    while True:
+        timing_issues = find_implausible_word_timing_runs(aligned_segments)
+        if not timing_issues:
+            break
+        issue = timing_issues[0]
+        start_index, end_index = _expand_compressed_timing_core(
+            aligned_segments,
+            int(issue["start_index"]),
+            int(issue["end_index"]),
+            start_ms=int(issue["start_ms"]),
+            end_ms=int(issue["end_ms"]),
+        )
+        needle = aligned_words[start_index : end_index + 1]
+        if not needle or any(not word for word in needle):
+            break
+        source_starts = [
+            index
+            for index in range(len(source_words) - len(needle) + 1)
+            if source_words[index : index + len(needle)] == needle
+        ]
+        if not source_starts:
+            break
+        source_start = min(
+            source_starts,
+            key=lambda index: abs(
+                int(source_segments[index].start_time) - int(issue["start_ms"])
+            )
+            + abs(
+                int(source_segments[index + len(needle) - 1].end_time)
+                - int(issue["end_ms"])
+            ),
+        )
+        source_slice = source_segments[source_start : source_start + len(needle)]
+        acoustic_distance = abs(
+            int(source_slice[0].start_time) - int(issue["start_ms"])
+        ) + abs(int(source_slice[-1].end_time) - int(issue["end_ms"]))
+        if acoustic_distance > 5000:
+            break
+        if find_implausible_word_timing_runs(source_slice):
+            break
+        for offset, word_id in enumerate(range(start_index, end_index + 1)):
+            baseline = source_slice[offset]
+            candidate = aligned_segments[word_id]
+            candidate.start_time = int(baseline.start_time)
+            candidate.end_time = int(baseline.end_time)
+            candidate.alignment_source = "native-word-timing-fallback"
+        fallbacks.append(
+            {
+                "code": "stable_ts_implausible_word_density_fallback",
+                "fallback_word_ids": list(range(start_index, end_index + 1)),
+                "source_word_ids": list(
+                    range(source_start, source_start + len(needle))
+                ),
+                "rejected_stable_ts_range_ms": [
+                    int(issue["start_ms"]),
+                    int(issue["end_ms"]),
+                ],
+            }
+        )
+    return fallbacks
+
+
+def _expand_compressed_timing_core(
+    segments: Sequence[ASRDataSeg],
+    start_index: int,
+    end_index: int,
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> tuple[int, int]:
+    """Include adjacent words collapsed inside the same tiny time envelope."""
+
+    while start_index > 0:
+        previous = segments[start_index - 1]
+        if (
+            int(previous.start_time) < start_ms
+            or int(previous.end_time) > end_ms
+        ):
+            break
+        start_index -= 1
+    while end_index + 1 < len(segments):
+        following = segments[end_index + 1]
+        if (
+            int(following.start_time) < start_ms
+            or int(following.end_time) > end_ms
+        ):
+            break
+        end_index += 1
+    return start_index, end_index
+
+
 def _configured_alignment_backend() -> str:
     try:
         from app.common.config import cfg
@@ -271,6 +386,22 @@ def align_to_word_timestamps(
             )
             return None
 
+        density_fallbacks = _fallback_implausible_stable_ts_updates(
+            asr_data.segments,
+            aligned.segments,
+            source_timing_trusted=bool(
+                getattr(asr_data, "word_timing_trusted", False)
+            ),
+        )
+        aligned.stable_ts_density_fallbacks = density_fallbacks
+        timing_issues = find_implausible_word_timing_runs(aligned.segments)
+        if timing_issues:
+            logger.warning(
+                "Stable-ts alignment rejected: implausible local word timing: %s",
+                describe_word_timing_issue(timing_issues[0]),
+            )
+            return None
+
         zeroish = sum(1 for seg in aligned.segments if seg.end_time <= seg.start_time + 5)
         logger.info(
             "Stable-ts alignment completed: words=%s zeroish=%s model=%s",
@@ -348,6 +479,10 @@ def _make_whisperx_word_segments(
         if reject_expansion_drift
         else []
     )
+    density_fallbacks = _fallback_implausible_whisperx_updates(
+        source_segments,
+        mapped,
+    )
     monotonicity_fallbacks = _fallback_non_monotonic_whisperx_updates(
         source_segments,
         mapped,
@@ -362,13 +497,65 @@ def _make_whisperx_word_segments(
     result = ASRData(mapped)
     result.whisperx_matched_word_count = matched
     result.whisperx_expansion_fallbacks = expansion_fallbacks
+    result.whisperx_density_fallbacks = density_fallbacks
     result.whisperx_monotonicity_fallbacks = monotonicity_fallbacks
+    result.word_timing_trust_issues = find_implausible_word_timing_runs(
+        result.segments
+    )
     result.whisperx_fallback_word_count = sum(
         1
         for segment in mapped
         if getattr(segment, "alignment_source", "") != "whisperx"
     )
     return result
+
+
+def _fallback_implausible_whisperx_updates(
+    source_segments: Sequence[ASRDataSeg],
+    mapped_segments: Sequence[ASRDataSeg],
+) -> List[dict]:
+    """Reject WhisperX updates that create an impossible local speech rate."""
+
+    if len(source_segments) != len(mapped_segments):
+        return []
+    fallbacks: List[dict] = []
+    while True:
+        timing_issues = find_implausible_word_timing_runs(mapped_segments)
+        if not timing_issues:
+            break
+        issue = timing_issues[0]
+        start_index, end_index = _expand_compressed_timing_core(
+            mapped_segments,
+            int(issue["start_index"]),
+            int(issue["end_index"]),
+            start_ms=int(issue["start_ms"]),
+            end_ms=int(issue["end_ms"]),
+        )
+        fallback_word_ids = []
+        rejected_range = [int(issue["start_ms"]), int(issue["end_ms"])]
+        for word_id in range(start_index, end_index + 1):
+            candidate = mapped_segments[word_id]
+            if getattr(candidate, "alignment_source", "") != "whisperx":
+                continue
+            baseline = source_segments[word_id]
+            candidate.start_time = int(baseline.start_time)
+            candidate.end_time = int(baseline.end_time)
+            candidate.alignment_source = "stable-ts-fallback"
+            candidate.whisperx_rejected_reason = (
+                "whisperx_implausible_word_density_fallback"
+            )
+            fallback_word_ids.append(word_id)
+        if fallback_word_ids:
+            fallbacks.append(
+                {
+                    "code": "whisperx_implausible_word_density_fallback",
+                    "fallback_word_ids": fallback_word_ids,
+                    "rejected_whisperx_range_ms": rejected_range,
+                }
+            )
+            continue
+        break
+    return fallbacks
 
 
 def _is_expansion_sensitive_alignment_token(text: str) -> bool:
@@ -656,6 +843,12 @@ def _align_with_whisperx(
         if len(words) < max(3, int(expected_words * 0.6)):
             logger.warning("WhisperX alignment rejected: too few aligned words, got %s", len(words))
             return None
+        if getattr(aligned, "word_timing_trust_issues", None):
+            logger.warning(
+                "WhisperX alignment rejected: implausible local word timing: %s",
+                describe_word_timing_issue(aligned.word_timing_trust_issues[0]),
+            )
+            return None
         zeroish = sum(1 for seg in aligned.segments if seg.end_time <= seg.start_time + 5)
         logger.info(
             "WhisperX alignment completed: raw_words=%s mapped_words=%s zeroish=%s elapsed=%s device=%s",
@@ -713,6 +906,13 @@ def align_frozen_word_ledger_with_whisperx(
             "WhisperX ledger alignment rejected: word ID set mismatch expected=%s returned=%s",
             len(expected_word_ids),
             len(returned_word_ids),
+        )
+        return None
+    timing_issues = list(getattr(mapped, "word_timing_trust_issues", []) or [])
+    if timing_issues:
+        logger.warning(
+            "WhisperX ledger alignment rejected: implausible local word timing: %s",
+            describe_word_timing_issue(timing_issues[0]),
         )
         return None
     mapped.whisperx_alignment_source_word_count = len(alignment_source.segments)

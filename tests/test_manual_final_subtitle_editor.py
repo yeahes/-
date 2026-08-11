@@ -1147,6 +1147,81 @@ def test_blocked_checkpoint_reloads_unconfirmed_chinese_page_proposals():
         )
 
 
+def test_complete_page_edits_recover_when_blocked_checkpoint_lost_page_artifact():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        session.split_parent_into_display_pages("S0001", 3)
+        first_save = session.save_to_source_folder()
+        assert first_save["render_blocked"] is True
+        assert first_save["manual_draft_ready"] is True
+
+        manifest_path = Path(first_save["manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        artifact_path = Path(manifest["display_page_translation_path"])
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["status"] = "ERROR"
+        artifact["errors"] = [{"code": "manual_page_translation_required"}]
+        artifact["parents"] = []
+        artifact["render_plans"] = []
+        _write_json(artifact_path, artifact)
+        manifest["display_page_translation_sha256"] = file_sha256(artifact_path)
+        draft_path = Path(manifest["manual_draft_page_plan_path"])
+        draft_path.unlink()
+        for owner in (manifest, manifest["manual_final_override"]):
+            owner["manual_draft_page_plan_path"] = ""
+            owner["manual_draft_page_plan_sha256"] = ""
+        _write_json(manifest_path, manifest)
+
+        recovered = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        expected_pages = [
+            (
+                str(item["display_page_id"]),
+                str(item["parent_subtitle_id"]),
+                int(item["word_start"]),
+                int(item["word_end"]),
+                str(item["english"]),
+            )
+            for item in recovered.display_page_edits
+        ]
+
+        recovered_rows = list(
+            recovered.to_model_data(prefer_display_pages=True).values()
+        )
+
+        assert recovered.has_display_page_model() is True
+        assert [
+            (
+                str(row["display_page_id"]),
+                str(row["manual_cue_id"]),
+                int(row["word_start"]),
+                int(row["word_end"]),
+                str(row["original_subtitle"]),
+            )
+            for row in recovered_rows
+        ] == expected_pages
+
+        second_save = recovered.save_to_source_folder()
+
+        assert second_save["render_blocked"] is True
+        assert second_save["render_block_reason"] == "manual_page_translation_required"
+        assert second_save["manual_draft_ready"] is True
+        assert Path(second_save["manual_draft_page_plan_path"]).is_file()
+        reloaded = ManualFinalSubtitleSession.load_from_manifest(
+            second_save["manifest_path"]
+        )
+        assert reloaded.has_display_page_model() is True
+        assert [
+            (
+                str(row["display_page_id"]),
+                str(row["manual_cue_id"]),
+                int(row["word_start"]),
+                int(row["word_end"]),
+                str(row["original_subtitle"]),
+            )
+            for row in reloaded.to_model_data(prefer_display_pages=True).values()
+        ] == expected_pages
+
+
 def test_split_parent_into_two_three_four_pages_preserves_frozen_parent():
     for page_count in (2, 3, 4):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1476,6 +1551,93 @@ def test_moving_page_boundary_confirms_new_boundary_and_invalidates_page_identit
             and row["chinese_review_required"] is True
             for row in after_rows
         )
+
+
+def test_moving_page_boundary_preserves_visible_chinese_and_unaffected_pages():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        with patch.object(
+            podcast_learning_video,
+            "propose_article_manual_page_word_ranges",
+            return_value=[(0, 5), (6, 11), (12, 16)],
+        ):
+            session.split_parent_into_display_pages("S0001", 3)
+
+        rows = session.to_model_data()
+        expected_chinese = ["人工第一页", "人工第二页", "人工第三页"]
+        for row, chinese in zip(rows.values(), expected_chinese):
+            row["translated_subtitle"] = chinese
+            row["display_page_chinese_confirmed"] = True
+            row["chinese_review_required"] = False
+        session.apply_display_page_model_data(rows)
+
+        evidence_path = session.artifact_dir / "display-boundary-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["boundaries"]["5"].update(
+            {
+                "classification": "review",
+                "hard_issues": [],
+                "soft_issues": ["manual_short_page_review"],
+                "issue_codes": ["manual_short_page_review"],
+                "pause_ms": 120,
+            }
+        )
+        _write_json(evidence_path, evidence)
+
+        session.move_display_page_boundary(
+            "S0001.P01",
+            1,
+            move_to_next=True,
+        )
+
+        after_rows = list(session.to_model_data().values())
+        assert [row["translated_subtitle"] for row in after_rows] == expected_chinese
+        assert all(
+            row["display_page_chinese_stale"] is True
+            and row["display_page_chinese_confirmed"] is False
+            and row["chinese_review_required"] is True
+            for row in after_rows[:2]
+        )
+        assert after_rows[2]["display_page_chinese_stale"] is False
+        assert after_rows[2]["display_page_chinese_confirmed"] is True
+        assert after_rows[2]["chinese_review_required"] is False
+
+
+def test_display_page_model_cache_is_isolated_and_invalidates_on_state_change():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        session.split_parent_into_display_pages("S0001", 2)
+        original_previews = session._display_page_previews
+
+        with patch.object(
+            session,
+            "_display_page_previews",
+            wraps=original_previews,
+        ) as previews:
+            first = session._display_page_model_data()
+            second = session._display_page_model_data()
+            assert previews.call_count == 1
+
+            first["1"]["translated_subtitle"] = "不能污染缓存"
+            assert second["1"]["translated_subtitle"] != "不能污染缓存"
+            assert session._display_page_model_data()["1"][
+                "translated_subtitle"
+            ] != "不能污染缓存"
+            assert previews.call_count == 1
+
+            session.display_page_edits[0]["stale_chinese_draft"] = "状态已变化"
+            session.display_page_edits[0]["chinese_stale_unconfirmed"] = True
+            session._display_page_model_data()
+            assert previews.call_count == 2
+
+            evidence_path = (
+                session.artifact_dir / "display-boundary-evidence.json"
+            )
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["boundaries"]["1"]["pause_ms"] = 321
+            _write_json(evidence_path, evidence)
+            session._display_page_model_data()
+            assert previews.call_count == 3
 
 
 def test_bulk_confirmation_keeps_hard_boundary_blocking():
@@ -3735,6 +3897,7 @@ if __name__ == "__main__":
     test_incomplete_page_state_rejects_structural_change_atomically()
     test_edit_artifact_hash_and_embedded_ledger_are_both_verified_on_load()
     test_blocked_checkpoint_reloads_unconfirmed_chinese_page_proposals()
+    test_complete_page_edits_recover_when_blocked_checkpoint_lost_page_artifact()
     test_split_parent_into_two_three_four_pages_preserves_frozen_parent()
     test_split_parent_accepts_planner_review_boundary_without_changing_parent()
     test_split_parent_blocks_unconfirmed_page_proposals_then_saves_idempotently()
@@ -3742,6 +3905,8 @@ if __name__ == "__main__":
     test_confirm_one_display_page_chinese_is_scoped_and_persists_after_reload()
     test_boundary_confirmation_clears_only_review_and_rejects_hard()
     test_moving_page_boundary_confirms_new_boundary_and_invalidates_page_identity()
+    test_moving_page_boundary_preserves_visible_chinese_and_unaffected_pages()
+    test_display_page_model_cache_is_isolated_and_invalidates_on_state_change()
     test_bulk_confirmation_keeps_hard_boundary_blocking()
     test_split_parent_undoes_once_and_rejects_when_no_legal_cut_exists()
     test_manual_page_proposal_can_use_review_boundary_without_relaxing_strict_planning()
