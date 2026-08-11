@@ -2362,3 +2362,14 @@ Result:
   passes, and the complete stable-caption rule script passes. The required
   25-stage unified regression also passes in 362.2 seconds. No production
   artifact, translation, pagination result, or video was written.
+
+## 2026-08-11 Manual Numeric Boundary Comma Fix
+
+- Manual boundary movement no longer treats a trailing comma, semicolon, or
+  colon after a numeric token as an unfinished numeric phrase. This allows
+  `early 2026, / the global market` to move only `the` while preserving the
+  existing protection for phrases such as `740 billion` and `3 months`.
+- The change is limited to manual boundary expansion. It does not change
+  frozen English cue ownership, word timing, display-page planning, Chinese
+  allocation, or synthesis subtitle resolution.
+- Manual-editor tests and the complete 25-stage unified regression pass.

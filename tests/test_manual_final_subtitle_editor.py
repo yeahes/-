@@ -3879,6 +3879,25 @@ def test_numeric_sentence_end_does_not_absorb_the_next_sentence():
     ) == 1
 
 
+def test_numeric_clause_comma_does_not_absorb_the_following_article():
+    words = [
+        {"surface": "early", "normalized": "early"},
+        {"surface": "2026,", "normalized": "2026"},
+        {"surface": "the", "normalized": "the"},
+        {"surface": "global", "normalized": "global"},
+    ]
+
+    assert ManualFinalSubtitleSession._expanded_numeric_boundary_word_count(
+        words,
+        left_word_start=0,
+        left_word_end=1,
+        right_word_start=2,
+        right_word_end=3,
+        requested_word_count=1,
+        move_to_next=True,
+    ) == 1
+
+
 if __name__ == "__main__":
     test_manual_page_export_requires_matching_complete_boundary_evidence()
     test_legacy_package_recovers_omitted_saved_cue_boundary_across_move_and_undo()
@@ -3946,4 +3965,5 @@ if __name__ == "__main__":
     test_manual_page_soft_override_preserves_hard_page_invariants()
     test_numeric_phrase_moves_as_one_unit_in_both_directions()
     test_numeric_sentence_end_does_not_absorb_the_next_sentence()
+    test_numeric_clause_comma_does_not_absorb_the_following_article()
     print("Manual final subtitle editor tests passed.")

@@ -174,7 +174,13 @@ class ManualFinalSubtitleSession:
             if boundary <= 0 or boundary >= len(surfaces):
                 return False
             previous_surface = surfaces[boundary - 1]
-            if re.search(r"[.!?][\"')\]]*\s*$", previous_surface):
+            # A trailing comma/semicolon/colon is a real readable boundary
+            # for a completed date or number clause (for example,
+            # ``2026, the market``).  Do not let the numeric fallback absorb
+            # the following article or noun just because the previous token
+            # happens to be numeric.  Internal thousands separators are not
+            # affected because they do not occur at the end of the surface.
+            if re.search(r"[,;:!?][\"')\]]*\s*$", previous_surface):
                 return False
             from app.core.utils.podcast_learning_video import (
                 _looks_like_numeric_phrase_boundary,
