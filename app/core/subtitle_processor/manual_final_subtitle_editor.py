@@ -14,7 +14,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,11 +28,25 @@ from app.core.entities import SupportedAudioFormats, SupportedVideoFormats
 from app.core.output_paths import media_result_dir
 from app.core.subtitle_processor.stable_artifacts import (
     file_sha256,
+    find_stable_manifest_for_artifact,
+    resolve_manifest_owned_path,
     write_json_artifact,
     write_text_artifact,
 )
+from app.core.subtitle_processor.authoritative_parent_chinese import (
+    AuthoritativeParentChineseError,
+    bind_display_page_parent_records,
+    build_authoritative_parent_chinese_artifact,
+    parent_chinese_records_by_id,
+    validate_authoritative_parent_chinese_artifact,
+    validate_display_page_parent_records,
+)
 from app.core.subtitle_processor.stable_display_page_contract import display_page_id
-from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
+from app.core.subtitle_processor.stable_pipeline_contracts import (
+    WORD_LEDGER_HASH_VERSION,
+    canonical_word_ledger_hash,
+    stable_payload_hash,
+)
 from app.core.utils.video_utils import staged_media_output
 
 
@@ -110,6 +126,8 @@ class ManualFinalSubtitleSession:
     cues: List[Dict[str, Any]]
     source_word_ledger_hash: str
     history: List[Dict[str, Any]]
+    parent_chinese_authority: Dict[str, Any] = field(default_factory=dict)
+    redo_history: List[Dict[str, Any]] = field(default_factory=list)
     display_page_edits: List[Dict[str, Any]] = field(default_factory=list)
     display_page_boundary_overrides: Dict[str, List[int]] = field(
         default_factory=dict
@@ -279,7 +297,11 @@ class ManualFinalSubtitleSession:
                 "找不到与此字幕对应的稳定产物，无法按词级时间调整边界。"
             )
         manifest = cls._read_json(resolved_manifest_path)
-        if cls._is_manifest_display_page_subtitle(source_path, manifest):
+        if cls._is_manifest_display_page_subtitle(
+            source_path,
+            manifest,
+            manifest_path=resolved_manifest_path,
+        ):
             override = manifest.get("manual_final_override") or {}
             source_paths = manifest.get("source_subtitle_paths") or {}
             source_display_text = str(
@@ -297,7 +319,10 @@ class ManualFinalSubtitleSession:
                 )
                 if recovered is not None:
                     return recovered
-            parent_path = cls._display_page_parent_subtitle_path(manifest)
+            parent_path = cls._display_page_parent_subtitle_path(
+                manifest,
+                manifest_path=resolved_manifest_path,
+            )
             if parent_path is None or not parent_path.is_file():
                 raise ManualFinalSubtitleEditError(
                     "实际分页字幕缺少对应的父字幕，不能安全编辑。"
@@ -314,15 +339,39 @@ class ManualFinalSubtitleSession:
         override = manifest.get("manual_final_override") or {}
         override_text = str(override.get("subtitle_path") or "")
         edit_artifact_text = str(override.get("edit_artifact_path") or "")
-        override_path = Path(override_text) if override_text else None
-        edit_artifact_path = Path(edit_artifact_text) if edit_artifact_text else None
-        if (
-            override_path is not None
-            and edit_artifact_path is not None
-            and override_path.exists()
-            and cls._same_path(source_path, override_path)
-            and edit_artifact_path.exists()
-        ):
+        override_path = cls._resolve_owned_package_file(
+            resolved_manifest_path,
+            override_text,
+            str(override.get("subtitle_sha256") or ""),
+        )
+        edit_artifact_path = cls._resolve_owned_package_file(
+            resolved_manifest_path,
+            edit_artifact_text,
+            str(override.get("edit_artifact_sha256") or ""),
+        )
+        manual_source_requested = bool(
+            override_text
+            and (
+                (
+                    override_path is not None
+                    and cls._same_path(source_path, override_path)
+                )
+                or cls._same_path(source_path, Path(override_text))
+                or (
+                    source_path.parent == resolved_manifest_path.parent
+                    and source_path.name == Path(override_text).name
+                )
+            )
+        )
+        if manual_source_requested and override_path is None:
+            raise ManualFinalSubtitleEditError(
+                "人工终稿字幕与清单哈希不一致。"
+            )
+        if manual_source_requested and edit_artifact_path is None:
+            raise ManualFinalSubtitleEditError(
+                "人工终稿编辑记录与清单哈希不一致。"
+            )
+        if manual_source_requested:
             return cls._load_saved_session(source_path, resolved_manifest_path, edit_artifact_path)
 
         artifact_dir = cls._artifact_dir_for_manifest(resolved_manifest_path, manifest)
@@ -341,14 +390,31 @@ class ManualFinalSubtitleSession:
                 "当前字幕条数与稳定产物不一致，拒绝用错误词级账本修改时间轴。"
             )
         cues = cls._build_cues(source_data, spans, word_ledger)
+        if not cues or int(cues[-1].get("word_end", -1)) != len(word_ledger) - 1:
+            raise ManualFinalSubtitleEditError("字幕没有覆盖完整词级账本。")
+        source_word_ledger_hash = cls._semantic_word_ledger_hash(word_ledger)
+        declared_ledger_hash = str(ledger_payload.get("hash") or "").strip()
+        if declared_ledger_hash and declared_ledger_hash != source_word_ledger_hash:
+            raise ManualFinalSubtitleEditError(
+                "稳定产物内的词账本哈希与词级内容不一致。"
+            )
+        parent_chinese_authority = cls._load_parent_chinese_authority(
+            artifact_dir,
+            cues,
+            source_word_ledger_hash,
+            allow_missing_legacy_translation=bool(
+                manifest.get("editable_checkpoint") or manifest.get("render_blocked")
+            ),
+        )
         session = cls(
             subtitle_path=source_path,
             manifest_path=resolved_manifest_path,
             artifact_dir=artifact_dir,
             word_ledger=word_ledger,
             cues=cues,
-            source_word_ledger_hash=stable_payload_hash(cls._ledger_payload(word_ledger)),
+            source_word_ledger_hash=source_word_ledger_hash,
             history=[],
+            parent_chinese_authority=parent_chinese_authority,
             loaded_subtitle_path=source_path,
             source_media_path=cls._manifest_source_media_path(
                 manifest,
@@ -372,8 +438,20 @@ class ManualFinalSubtitleSession:
             or (manifest.get("paths") or {}).get("original_top_srt")
             or ""
         )
-        subtitle_path = Path(subtitle_text)
-        if not subtitle_path.exists():
+        subtitle_hash = str(
+            override.get("subtitle_sha256")
+            or (manifest.get("source_subtitle_paths_sha256") or {}).get(
+                "bilingual_original_top_srt"
+            )
+            or (manifest.get("paths_sha256") or {}).get("original_top_srt")
+            or ""
+        )
+        subtitle_path = cls._resolve_owned_package_file(
+            manifest_file,
+            subtitle_text,
+            subtitle_hash,
+        )
+        if subtitle_path is None:
             raise ManualFinalSubtitleEditError("稳定终稿字幕文件不存在。")
         return cls.load_for_subtitle(subtitle_path, manifest_path=manifest_file)
 
@@ -432,6 +510,25 @@ class ManualFinalSubtitleSession:
             return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
         except OSError:
             return os.path.normcase(str(left)) == os.path.normcase(str(right))
+
+    @classmethod
+    def _resolve_owned_package_file(
+        cls,
+        manifest_path: Path,
+        recorded_path: str | Path,
+        expected_sha256: str = "",
+    ) -> Path | None:
+        """Resolve a manifest-owned file after the whole package was moved."""
+        try:
+            manifest = cls._read_json(Path(manifest_path))
+        except ManualFinalSubtitleEditError:
+            return None
+        return resolve_manifest_owned_path(
+            Path(manifest_path),
+            manifest,
+            recorded_path,
+            expected_sha256,
+        )
 
     @staticmethod
     def _parse_display_page_boundary_overrides(value: Any) -> Dict[str, List[int]]:
@@ -547,6 +644,28 @@ class ManualFinalSubtitleSession:
             path = Path(text)
             if path.is_file():
                 return path.resolve()
+            tail_trim = (
+                (manifest.get("manual_final_override") or {}).get("tail_trim")
+                or manifest.get("tail_trim")
+                or {}
+            )
+            expected_hash = str(tail_trim.get("derived_media_sha256") or "")
+            for anchor in anchors:
+                manifest_path = (
+                    Path(anchor)
+                    if Path(anchor).name == "stable-final-manifest.json"
+                    else find_stable_manifest_for_artifact(anchor)
+                )
+                if manifest_path is None:
+                    continue
+                resolved = resolve_manifest_owned_path(
+                    manifest_path,
+                    manifest,
+                    text,
+                    expected_hash,
+                )
+                if resolved is not None:
+                    return resolved
         for anchor in anchors:
             resolved = cls._source_media_from_result_directory(Path(anchor))
             if resolved is not None:
@@ -558,6 +677,8 @@ class ManualFinalSubtitleSession:
         cls,
         subtitle_path: Path,
         manifest: Mapping[str, Any],
+        *,
+        manifest_path: Path | None = None,
     ) -> bool:
         try:
             actual_hash = file_sha256(subtitle_path).lower()
@@ -572,6 +693,31 @@ class ManualFinalSubtitleSession:
             str(source_paths.get("named_bilingual_original_top_srt") or ""),
             str(source_paths.get("bilingual_original_top_srt") or ""),
         )
+        if manifest_path is not None:
+            parent_hash_values = (
+                str(override.get("subtitle_sha256") or ""),
+                str((manifest.get("paths_sha256") or {}).get("original_top_srt") or ""),
+                str(
+                    (manifest.get("source_subtitle_paths_sha256") or {}).get(
+                        "named_bilingual_original_top_srt"
+                    )
+                    or ""
+                ),
+                str(
+                    (manifest.get("source_subtitle_paths_sha256") or {}).get(
+                        "bilingual_original_top_srt"
+                    )
+                    or ""
+                ),
+            )
+            for value, expected_hash in zip(parent_path_values, parent_hash_values):
+                resolved = cls._resolve_owned_package_file(
+                    Path(manifest_path),
+                    value,
+                    expected_hash,
+                )
+                if resolved is not None and cls._same_path(subtitle_path, resolved):
+                    return False
         if any(
             value and cls._same_path(subtitle_path, Path(value))
             for value in parent_path_values
@@ -582,6 +728,30 @@ class ManualFinalSubtitleSession:
             str(paths.get("display_page_bilingual_srt") or ""),
             str(source_paths.get("display_page_bilingual_srt") or ""),
         )
+        if manifest_path is not None:
+            path_hash_values = (
+                str(override.get("display_page_srt_sha256") or ""),
+                str(
+                    (manifest.get("paths_sha256") or {}).get(
+                        "display_page_bilingual_srt"
+                    )
+                    or ""
+                ),
+                str(
+                    (manifest.get("source_subtitle_paths_sha256") or {}).get(
+                        "display_page_bilingual_srt"
+                    )
+                    or ""
+                ),
+            )
+            for value, expected_hash in zip(path_values, path_hash_values):
+                resolved = cls._resolve_owned_package_file(
+                    Path(manifest_path),
+                    value,
+                    expected_hash,
+                )
+                if resolved is not None and cls._same_path(subtitle_path, resolved):
+                    return True
         if any(
             value and cls._same_path(subtitle_path, Path(value))
             for value in path_values
@@ -610,22 +780,44 @@ class ManualFinalSubtitleSession:
             return False
         return actual_hash in {value for value in hashes if value}
 
-    @staticmethod
+    @classmethod
     def _display_page_parent_subtitle_path(
+        cls,
         manifest: Mapping[str, Any],
+        *,
+        manifest_path: Path | None = None,
     ) -> Path | None:
         override = manifest.get("manual_final_override") or {}
         paths = manifest.get("paths") or {}
         source_paths = manifest.get("source_subtitle_paths") or {}
-        for value in (
-            override.get("subtitle_path"),
-            paths.get("original_top_srt"),
-            source_paths.get("named_bilingual_original_top_srt"),
-            source_paths.get("bilingual_original_top_srt"),
+        path_hashes = manifest.get("paths_sha256") or {}
+        source_hashes = manifest.get("source_subtitle_paths_sha256") or {}
+        for value, expected_hash in (
+            (override.get("subtitle_path"), override.get("subtitle_sha256")),
+            (paths.get("original_top_srt"), path_hashes.get("original_top_srt")),
+            (
+                source_paths.get("named_bilingual_original_top_srt"),
+                source_hashes.get("named_bilingual_original_top_srt"),
+            ),
+            (
+                source_paths.get("bilingual_original_top_srt"),
+                source_hashes.get("bilingual_original_top_srt"),
+            ),
         ):
             text = str(value or "").strip()
-            if text:
-                return Path(text).resolve()
+            if not text:
+                continue
+            if manifest_path is not None:
+                resolved = cls._resolve_owned_package_file(
+                    Path(manifest_path),
+                    text,
+                    str(expected_hash or ""),
+                )
+                if resolved is not None:
+                    return resolved
+            candidate = Path(text)
+            if candidate.is_file():
+                return candidate.resolve()
         return None
 
     @staticmethod
@@ -752,6 +944,9 @@ class ManualFinalSubtitleSession:
         direct = subtitle_path.parent / "stable-final-manifest.json"
         if direct.is_file():
             candidates.append(direct)
+        generation_manifest = find_stable_manifest_for_artifact(subtitle_path)
+        if generation_manifest is not None:
+            candidates.append(generation_manifest)
         candidates.extend(
             subtitle_path.parent.glob("*-人工终稿字幕包/stable-final-manifest.json")
         )
@@ -844,6 +1039,18 @@ class ManualFinalSubtitleSession:
 
     @classmethod
     def _artifact_dir_for_manifest(cls, manifest_path: Path, manifest: Mapping[str, Any]) -> Path:
+        override = manifest.get("manual_final_override") or {}
+        owned_artifact = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str(override.get("artifact_dir") or ""),
+            expect_directory=True,
+        )
+        if (
+            owned_artifact is not None
+            and (owned_artifact / "subtitle-spans.json").is_file()
+        ):
+            return owned_artifact
         coverage_path = Path(str(manifest.get("coverage_report") or ""))
         if coverage_path.name:
             stem = coverage_path.stem.removesuffix("-coverage-report")
@@ -903,6 +1110,137 @@ class ManualFinalSubtitleSession:
             )
         return cues
 
+    @staticmethod
+    def _normalised_chinese(text: object) -> str:
+        return re.sub(r"\s+", "", str(text or ""))
+
+    @classmethod
+    def _assert_subtitle_matches_cues(
+        cls,
+        subtitle_path: Path,
+        cues: Sequence[Mapping[str, Any]],
+    ) -> None:
+        data = ASRData.from_subtitle_file(str(subtitle_path))
+        visible_cues = [cue for cue in cues if not cue.get("display_suppressed")]
+        if len(data.segments) != len(visible_cues):
+            raise ManualFinalSubtitleEditError(
+                "authoritative_parent_chinese_conflict: 父字幕与人工编辑记录条数不一致。"
+            )
+        for index, (segment, cue) in enumerate(
+            zip(data.segments, visible_cues),
+            1,
+        ):
+            if (
+                cls._normalised_tokens(segment.text)
+                != cls._normalised_tokens(str(cue.get("original_subtitle") or ""))
+                or cls._normalised_chinese(segment.translated_text)
+                != cls._normalised_chinese(cue.get("translated_subtitle"))
+                or int(segment.start_time) != int(cue.get("start_time") or 0)
+                or int(segment.end_time) != int(cue.get("end_time") or 0)
+            ):
+                raise ManualFinalSubtitleEditError(
+                    "authoritative_parent_chinese_conflict: "
+                    f"第 {index} 条父字幕与人工编辑记录不一致。"
+                )
+
+    @classmethod
+    def _load_parent_chinese_authority(
+        cls,
+        artifact_dir: Path,
+        cues: Sequence[Mapping[str, Any]],
+        source_word_ledger_hash: str,
+        *,
+        require_authority: bool = False,
+        allow_missing_legacy_translation: bool = False,
+    ) -> Dict[str, Any]:
+        authority_path = artifact_dir / "authoritative-parent-chinese.json"
+        translations_path = artifact_dir / "translations.json"
+        authority: Dict[str, Any] = {}
+        if authority_path.is_file():
+            authority = cls._read_json(authority_path)
+            try:
+                authority = validate_authoritative_parent_chinese_artifact(
+                    authority,
+                    expected_parents=cues,
+                    expected_word_ledger_hash=source_word_ledger_hash,
+                )
+            except AuthoritativeParentChineseError as exc:
+                raise ManualFinalSubtitleEditError(str(exc)) from exc
+        elif require_authority:
+            raise ManualFinalSubtitleEditError(
+                "authoritative_parent_chinese_missing: 人工终稿缺少权威中文记录。"
+            )
+
+        if not translations_path.is_file():
+            if allow_missing_legacy_translation and not require_authority:
+                return build_authoritative_parent_chinese_artifact(
+                    cues,
+                    source_word_ledger_hash=source_word_ledger_hash,
+                    producer="legacy_blocked_checkpoint",
+                )
+            raise ManualFinalSubtitleEditError(
+                "authoritative_parent_chinese_missing: 稳定产物缺少 translations.json。"
+            )
+        translations = cls._read_json(translations_path)
+        translated_by_id = {
+            str(item.get("subtitle_id") or ""): item
+            for item in translations
+            if isinstance(item, Mapping)
+        }
+        cue_by_id = {
+            str(cue.get("cue_id") or ""): cue
+            for cue in cues
+        }
+        if set(translated_by_id) != set(cue_by_id):
+            raise ManualFinalSubtitleEditError(
+                "authoritative_parent_chinese_conflict: translations.json 的固定 ID 不完整。"
+            )
+        for subtitle_id, cue in cue_by_id.items():
+            translated = translated_by_id[subtitle_id]
+            if (
+                cls._normalised_tokens(str(translated.get("text") or ""))
+                != cls._normalised_tokens(str(cue.get("original_subtitle") or ""))
+                or cls._normalised_chinese(translated.get("translated_text"))
+                != cls._normalised_chinese(cue.get("translated_subtitle"))
+            ):
+                raise ManualFinalSubtitleEditError(
+                    "authoritative_parent_chinese_conflict: "
+                    f"{subtitle_id} 的父字幕与 translations.json 中文不一致。"
+                )
+
+        if authority:
+            records_by_id = parent_chinese_records_by_id(authority)
+            for subtitle_id, translated in translated_by_id.items():
+                record = records_by_id[subtitle_id]
+                if (
+                    str(translated.get("parent_source_hash") or "")
+                    != str(record.get("source_hash") or "")
+                    or str(translated.get("parent_record_hash") or "")
+                    != str(record.get("record_hash") or "")
+                ):
+                    raise ManualFinalSubtitleEditError(
+                        "authoritative_parent_chinese_conflict: "
+                        f"{subtitle_id} 的 translations.json 未绑定当前中文记录。"
+                    )
+            display_path = artifact_dir / "display-page-translations.json"
+            if display_path.is_file():
+                display_artifact = cls._read_json(display_path)
+                if str(display_artifact.get("status") or "") == "PASS":
+                    try:
+                        validate_display_page_parent_records(
+                            display_artifact,
+                            records_by_id,
+                        )
+                    except AuthoritativeParentChineseError as exc:
+                        raise ManualFinalSubtitleEditError(str(exc)) from exc
+            return authority
+
+        return build_authoritative_parent_chinese_artifact(
+            cues,
+            source_word_ledger_hash=source_word_ledger_hash,
+            producer="legacy_consistent_import",
+        )
+
     @classmethod
     def _load_saved_session(
         cls, subtitle_path: Path, manifest_path: Path, edit_artifact_path: Path
@@ -911,17 +1249,19 @@ class ManualFinalSubtitleSession:
         override = manifest.get("manual_final_override") or {}
         override_schema = int(override.get("schema_version") or 0)
         owned_edit_text = str(override.get("edit_artifact_path") or "").strip()
-        owned_edit_path = Path(owned_edit_text) if owned_edit_text else None
         expected_edit_hash = str(
             override.get("edit_artifact_sha256") or ""
         ).strip()
+        owned_edit_path = cls._resolve_owned_package_file(
+            manifest_path,
+            owned_edit_text,
+            expected_edit_hash,
+        )
         if override_schema >= 3 or expected_edit_hash:
             if (
                 owned_edit_path is None
-                or not owned_edit_path.is_file()
                 or not cls._same_path(owned_edit_path, edit_artifact_path)
                 or not expected_edit_hash
-                or file_sha256(edit_artifact_path) != expected_edit_hash
             ):
                 raise ManualFinalSubtitleEditError(
                     "人工终稿编辑记录与清单哈希不一致。"
@@ -932,45 +1272,64 @@ class ManualFinalSubtitleSession:
         cues = list(payload.get("cues") or [])
         if not ledger or not cues:
             raise ManualFinalSubtitleEditError("人工终稿编辑记录不完整。")
-        embedded_ledger_hash = stable_payload_hash(cls._ledger_payload(ledger))
+        embedded_ledger_hash = cls._semantic_word_ledger_hash(ledger)
         recorded_ledger_hash = str(
             payload.get("source_word_ledger_hash") or ""
         ).strip()
-        if not recorded_ledger_hash or recorded_ledger_hash != embedded_ledger_hash:
+        accepted_embedded_hashes = {embedded_ledger_hash}
+        if int(payload.get("schema_version") or 0) < 4:
+            accepted_embedded_hashes.add(cls._legacy_word_ledger_hash(ledger))
+        if (
+            not recorded_ledger_hash
+            or recorded_ledger_hash not in accepted_embedded_hashes
+        ):
             raise ManualFinalSubtitleEditError(
                 "人工终稿编辑记录内的词账本哈希不一致。"
             )
         owned_ledger_text = str(override.get("word_ledger_path") or "").strip()
-        owned_ledger_path = Path(owned_ledger_text) if owned_ledger_text else None
         expected_ledger_file_hash = str(
             override.get("word_ledger_sha256") or ""
         ).strip()
+        owned_ledger_path = cls._resolve_owned_package_file(
+            manifest_path,
+            owned_ledger_text,
+            expected_ledger_file_hash,
+        )
         if override_schema >= 3:
             if (
                 owned_ledger_path is None
-                or not owned_ledger_path.is_file()
                 or not expected_ledger_file_hash
-                or file_sha256(owned_ledger_path) != expected_ledger_file_hash
             ):
                 raise ManualFinalSubtitleEditError(
                     "人工终稿词账本与清单哈希不一致。"
                 )
             owned_ledger_payload = cls._read_json(owned_ledger_path)
             owned_ledger = list(owned_ledger_payload.get("words") or [])
+            owned_ledger_hash = cls._semantic_word_ledger_hash(owned_ledger)
+            declared_owned_ledger_hash = str(
+                owned_ledger_payload.get("hash") or ""
+            ).strip()
             if (
                 not owned_ledger
-                or stable_payload_hash(cls._ledger_payload(owned_ledger))
-                != embedded_ledger_hash
+                or owned_ledger_hash != embedded_ledger_hash
+                or (
+                    declared_owned_ledger_hash
+                    and declared_owned_ledger_hash != owned_ledger_hash
+                )
             ):
                 raise ManualFinalSubtitleEditError(
                     "人工终稿编辑记录引用了不同的词账本。"
                 )
         owned_artifact_text = str(override.get("artifact_dir") or "").strip()
-        owned_artifact_path = Path(owned_artifact_text) if owned_artifact_text else None
+        owned_artifact_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            owned_artifact_text,
+            expect_directory=True,
+        )
         if (
             owned_artifact_path is None
             or not owned_artifact_path.is_dir()
-            or not cls._same_path(owned_artifact_path.parent, manifest_path.parent)
             or not (owned_artifact_path / "translations.json").is_file()
         ):
             source_artifact_text = str(
@@ -984,14 +1343,49 @@ class ManualFinalSubtitleSession:
                 manifest_path,
                 manifest,
             )
+        cls._assert_subtitle_matches_cues(subtitle_path, cues)
+        edit_schema = int(payload.get("schema_version") or 0)
+        authority_ledger_hash = (
+            embedded_ledger_hash if edit_schema >= 4 else recorded_ledger_hash
+        )
+        parent_chinese_authority = cls._load_parent_chinese_authority(
+            owned_artifact_path,
+            cues,
+            authority_ledger_hash,
+            require_authority=override_schema >= 4,
+            allow_missing_legacy_translation=bool(
+                manifest.get("editable_checkpoint") or manifest.get("render_blocked")
+            ),
+        )
+        if override_schema >= 4:
+            authority_path = cls._resolve_owned_package_file(
+                manifest_path,
+                str(override.get("parent_chinese_authority_path") or ""),
+                str(override.get("parent_chinese_authority_sha256") or ""),
+            )
+            expected_authority_path = (
+                owned_artifact_path / "authoritative-parent-chinese.json"
+            ).resolve()
+            if (
+                authority_path is None
+                or not cls._same_path(authority_path, expected_authority_path)
+                or str(override.get("parent_chinese_authority_hash") or "")
+                != str(parent_chinese_authority.get("artifact_hash") or "")
+            ):
+                raise ManualFinalSubtitleEditError(
+                    "authoritative_parent_chinese_conflict: "
+                    "人工终稿清单引用了不同的权威中文记录。"
+                )
         session = cls(
             subtitle_path=subtitle_path,
             manifest_path=manifest_path,
             artifact_dir=owned_artifact_path,
             word_ledger=ledger,
             cues=cues,
-            source_word_ledger_hash=str(payload.get("source_word_ledger_hash") or ""),
+            source_word_ledger_hash=authority_ledger_hash,
             history=list(payload.get("history") or []),
+            parent_chinese_authority=parent_chinese_authority,
+            redo_history=list(payload.get("redo_history") or []),
             display_page_edits=list(payload.get("display_page_edits") or []),
             display_page_boundary_overrides=(
                 cls._parse_display_page_boundary_overrides(
@@ -1032,6 +1426,20 @@ class ManualFinalSubtitleSession:
             }
             for word in ledger
         ]
+
+    @staticmethod
+    def _legacy_word_ledger_hash(
+        ledger: Sequence[Mapping[str, Any]],
+    ) -> str:
+        return stable_payload_hash(
+            ManualFinalSubtitleSession._ledger_payload(ledger)
+        )
+
+    @staticmethod
+    def _semantic_word_ledger_hash(
+        ledger: Sequence[Mapping[str, Any]],
+    ) -> str:
+        return canonical_word_ledger_hash(ledger)
 
     @staticmethod
     def _normalised_tokens(text: str) -> List[str]:
@@ -1100,6 +1508,131 @@ class ManualFinalSubtitleSession:
                 "该行英文已被自由修改，无法再按原始词级账本移动边界。"
             )
 
+    @staticmethod
+    def _surface_units(text: str) -> List[str]:
+        return re.findall(r"\S+", str(text or "").strip())
+
+    def _plan_english_surface_edit(
+        self,
+        *,
+        word_start: int,
+        word_end: int,
+        replacement_text: str,
+    ) -> Dict[str, Any] | None:
+        """Bind one visible English correction to exactly one frozen word ID."""
+        replacement = re.sub(r"\s+", " ", str(replacement_text or "")).strip()
+        if not replacement or "\n" in str(replacement_text or ""):
+            raise ManualFinalSubtitleEditError("人工英文不能为空或包含换行。")
+        expected = self._words_text(self.word_ledger, word_start, word_end)
+        if replacement == expected:
+            return None
+
+        target_units = self._surface_units(replacement)
+        current_units: List[str] = []
+        unit_ranges: Dict[int, tuple[int, int]] = {}
+        for word_id in range(word_start, word_end + 1):
+            units = self._surface_units(
+                self.word_ledger[word_id].get(
+                    "surface",
+                    self.word_ledger[word_id].get("token", ""),
+                )
+            )
+            if not units:
+                raise ManualFinalSubtitleEditError(
+                    f"冻结词 {word_id} 没有可编辑的英文词面。"
+                )
+            unit_ranges[word_id] = (len(current_units), len(current_units) + len(units))
+            current_units.extend(units)
+
+        candidates: List[Dict[str, Any]] = []
+        for word_id, (unit_start, unit_end) in unit_ranges.items():
+            before = current_units[:unit_start]
+            after = current_units[unit_end:]
+            if len(target_units) < len(before) + len(after) + 1:
+                continue
+            if target_units[: len(before)] != before:
+                continue
+            if after and target_units[-len(after) :] != after:
+                continue
+            replacement_end = len(target_units) - len(after) if after else len(target_units)
+            replacement_units = target_units[len(before) : replacement_end]
+            if not replacement_units:
+                continue
+            current_word_units = current_units[unit_start:unit_end]
+            if replacement_units == current_word_units:
+                continue
+            candidates.append(
+                {
+                    "word_id": word_id,
+                    "before_surface": " ".join(current_word_units),
+                    "after_surface": " ".join(replacement_units),
+                }
+            )
+
+        unique_candidates = {
+            (int(item["word_id"]), str(item["after_surface"])): item
+            for item in candidates
+        }
+        if len(unique_candidates) != 1:
+            raise ManualFinalSubtitleEditError(
+                "人工英文一次只能修改一个冻结词；如需调整词序或字幕边界，"
+                "请继续使用边界调整功能。"
+            )
+        plan = next(iter(unique_candidates.values()))
+        if len(self._surface_units(plan["after_surface"])) > 4 or len(
+            str(plan["after_surface"])
+        ) > 80:
+            raise ManualFinalSubtitleEditError(
+                "单个冻结词的人工替换过长；请检查是否误改了整句。"
+            )
+        return plan
+
+    def _apply_english_surface_edit_plans(
+        self,
+        plans: Sequence[Mapping[str, Any]],
+    ) -> None:
+        seen_word_ids: set[int] = set()
+        for raw_plan in plans:
+            word_id = int(raw_plan["word_id"])
+            if word_id in seen_word_ids or not 0 <= word_id < len(self.word_ledger):
+                raise ManualFinalSubtitleEditError("人工英文词面修改存在重复或越界词 ID。")
+            seen_word_ids.add(word_id)
+            word = self.word_ledger[word_id]
+            current_surface = str(word.get("surface", word.get("token", "")) or "")
+            if self._surface_units(current_surface) != self._surface_units(
+                raw_plan.get("before_surface", "")
+            ):
+                raise ManualFinalSubtitleEditError("人工英文修改基线已经变化，请重新编辑。")
+            replacement = str(raw_plan.get("after_surface") or "").strip()
+            word["surface"] = replacement
+            if "token" in word:
+                word["token"] = replacement
+            word["normalized"] = " ".join(self._normalised_tokens(replacement))
+
+        for cue in self.cues:
+            cue["original_subtitle"] = self._words_text(
+                self.word_ledger,
+                int(cue["word_start"]),
+                int(cue["word_end"]),
+            )
+        for edit in self.display_page_edits:
+            try:
+                edit["english"] = self._words_text(
+                    self.word_ledger,
+                    int(edit["word_start"]),
+                    int(edit["word_end"]),
+                )
+                if any(
+                    int(edit["word_start"]) <= word_id <= int(edit["word_end"])
+                    for word_id in seen_word_ids
+                ):
+                    edit["chinese_review_acknowledged"] = False
+            except (KeyError, TypeError, ValueError):
+                continue
+        self.source_word_ledger_hash = self._semantic_word_ledger_hash(
+            self.word_ledger
+        )
+
     def _record_history(self, operation: str, before: Sequence[Mapping[str, Any]], **details: Any) -> None:
         self._remember_formal_boundary_evidence(self.cues)
         self._remember_formal_boundary_evidence(before)
@@ -1118,6 +1651,7 @@ class ManualFinalSubtitleSession:
                 **details,
             }
         )
+        self.redo_history.clear()
 
     @staticmethod
     def _cue_boundary_word_ids(
@@ -1177,6 +1711,13 @@ class ManualFinalSubtitleSession:
                 raise ManualFinalSubtitleEditError(f"第 {index} 条的词范围不连续。")
             if start_time < 0 or end_time <= start_time or start_time < previous_end_time:
                 raise ManualFinalSubtitleEditError(f"第 {index} 条的时间轴无效或重叠。")
+            expected_english = self._words_text(self.word_ledger, start, end)
+            if self._normalised_tokens(
+                cue.get("original_subtitle", "")
+            ) != self._normalised_tokens(expected_english):
+                raise ManualFinalSubtitleEditError(
+                    f"第 {index} 条英文与当前词级账本不一致。"
+                )
             cue_id = str(cue.get("cue_id") or "")
             cue_source_ids = [
                 str(value) for value in cue.get("source_subtitle_ids") or []
@@ -1248,9 +1789,174 @@ class ManualFinalSubtitleSession:
                 "display_page_boundary_overrides": (
                     self.display_page_boundary_overrides
                 ),
+                "recovered_stale_page_drafts": self.recovered_stale_page_drafts,
                 "tail_trim": self.tail_trim,
             }
         )
+
+    def _current_parent_chinese_authority(self) -> Dict[str, Any]:
+        try:
+            previous_by_id = parent_chinese_records_by_id(
+                self.parent_chinese_authority
+            )
+        except (AuthoritativeParentChineseError, TypeError, ValueError):
+            previous_by_id = {}
+        records: List[Dict[str, Any]] = []
+        for cue in self.cues:
+            subtitle_id = str(cue.get("cue_id") or "")
+            previous = previous_by_id.get(subtitle_id, {})
+            candidate = build_authoritative_parent_chinese_artifact(
+                [cue],
+                source_word_ledger_hash=self.source_word_ledger_hash,
+                producer="manual_final_editor",
+            )["records"][0]
+            unchanged = bool(
+                previous
+                and str(previous.get("source_hash") or "")
+                == str(candidate.get("source_hash") or "")
+                and str(previous.get("chinese_hash") or "")
+                == str(candidate.get("chinese_hash") or "")
+            )
+            records.append(
+                {
+                    **cue,
+                    "provenance": (
+                        dict(previous.get("provenance") or {})
+                        if unchanged
+                        else {
+                            "kind": "manual_override",
+                            "producer": "manual_final_editor",
+                            "base_record_hash": str(
+                                previous.get("record_hash") or ""
+                            ),
+                            "display_page_contract_hash": "",
+                        }
+                    ),
+                }
+            )
+        return build_authoritative_parent_chinese_artifact(
+            records,
+            source_word_ledger_hash=self.source_word_ledger_hash,
+            producer="manual_final_editor",
+        )
+
+    def snapshot_for_save(self) -> "ManualFinalSubtitleSession":
+        """Freeze current editor state without copying immutable history payloads."""
+        snapshot = copy.copy(self)
+        snapshot.word_ledger = copy.deepcopy(self.word_ledger)
+        snapshot.cues = copy.deepcopy(self.cues)
+        snapshot.parent_chinese_authority = copy.deepcopy(
+            self.parent_chinese_authority
+        )
+        # History entries are append-only after creation.  The save worker only
+        # serializes them, while the UI is disabled for the duration of save.
+        snapshot.history = list(self.history)
+        snapshot.redo_history = list(self.redo_history)
+        snapshot.display_page_edits = copy.deepcopy(self.display_page_edits)
+        snapshot.display_page_boundary_overrides = copy.deepcopy(
+            self.display_page_boundary_overrides
+        )
+        snapshot.recovered_formal_boundary_evidence = copy.deepcopy(
+            self.recovered_formal_boundary_evidence
+        )
+        snapshot.recovered_stale_page_drafts = copy.deepcopy(
+            self.recovered_stale_page_drafts
+        )
+        snapshot.tail_trim = copy.deepcopy(self.tail_trim)
+        snapshot._display_page_model_cache_key = ""
+        snapshot._display_page_model_cache = {}
+        snapshot._display_page_preview_cache = {}
+        return snapshot
+
+    def recovery_draft_path(self) -> Path:
+        """Return a manifest-bound sidecar that never publishes a final package."""
+        try:
+            manifest_hash = file_sha256(self.manifest_path)
+        except OSError as exc:
+            raise ManualFinalSubtitleEditError(
+                "当前稳定清单不可读取，无法保存恢复草稿。"
+            ) from exc
+        return (
+            self.manifest_path.parent
+            / ".manual-editor-drafts"
+            / f"{manifest_hash[:24]}.json"
+        )
+
+    def save_recovery_draft(self) -> Path:
+        """Atomically persist editable state without publishing a final package."""
+        self._validate_cues()
+        self._validate_display_page_boundary_overrides()
+        draft_path = self.recovery_draft_path()
+        state = self._capture_runtime_state()
+        payload = {
+            "schema_version": 1,
+            "kind": "manual-final-working-draft",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "base_manifest_sha256": file_sha256(self.manifest_path),
+            "base_subtitle_sha256": file_sha256(self.subtitle_path),
+            "state": state,
+            "history": self.history,
+            "redo_history": self.redo_history,
+        }
+        payload["draft_state_hash"] = stable_payload_hash(
+            {
+                "state": state,
+                "history": self.history,
+                "redo_history": self.redo_history,
+            }
+        )
+        write_json_artifact(draft_path, payload)
+        return draft_path
+
+    def restore_recovery_draft(self) -> bool:
+        """Restore a draft only when its published base is still exact."""
+        draft_path = self.recovery_draft_path()
+        if not draft_path.is_file():
+            return False
+        payload = self._read_json(draft_path)
+        if (
+            int(payload.get("schema_version") or 0) != 1
+            or str(payload.get("kind") or "") != "manual-final-working-draft"
+            or str(payload.get("base_manifest_sha256") or "")
+            != file_sha256(self.manifest_path)
+            or str(payload.get("base_subtitle_sha256") or "")
+            != file_sha256(self.subtitle_path)
+        ):
+            return False
+        state = payload.get("state") or {}
+        history = list(payload.get("history") or [])
+        redo_history = list(payload.get("redo_history") or [])
+        expected_hash = stable_payload_hash(
+            {
+                "state": state,
+                "history": history,
+                "redo_history": redo_history,
+            }
+        )
+        if str(payload.get("draft_state_hash") or "") != expected_hash:
+            raise ManualFinalSubtitleEditError("人工恢复草稿内容不完整或已损坏。")
+        candidate = copy.copy(self)
+        candidate._restore_runtime_state(state)
+        candidate.history = history
+        candidate.redo_history = redo_history
+        embedded_hash = candidate._semantic_word_ledger_hash(candidate.word_ledger)
+        accepted_hashes = {
+            embedded_hash,
+            candidate._legacy_word_ledger_hash(candidate.word_ledger),
+        }
+        if candidate.source_word_ledger_hash not in accepted_hashes:
+            raise ManualFinalSubtitleEditError("人工恢复草稿的词账本哈希不一致。")
+        self._restore_runtime_state(state)
+        self.history = history
+        self.redo_history = redo_history
+        self.import_notice = "已恢复上次未保存的人工字幕草稿。"
+        return True
+
+    def discard_recovery_draft(self) -> None:
+        try:
+            self.recovery_draft_path().unlink(missing_ok=True)
+        except (ManualFinalSubtitleEditError, OSError):
+            pass
 
     def _invalidate_display_page_state(self) -> None:
         self.display_page_edits = []
@@ -1260,10 +1966,7 @@ class ManualFinalSubtitleSession:
         self,
     ) -> List[Dict[str, Any]]:
         """Snapshot a complete visible page model before parent spans change."""
-        rows = [
-            copy.deepcopy(dict(row))
-            for row in self._display_page_model_data().values()
-        ]
+        rows = self._visible_display_page_rows(self._display_page_model_data())
         if not rows or any(
             row.get("display_page_unavailable")
             or not str(row.get("display_page_id") or "")
@@ -1274,9 +1977,9 @@ class ManualFinalSubtitleSession:
 
     def _recover_identity_matched_history_page_drafts(self) -> int:
         """Recover only blank current pages from the package's hashed undo history."""
-        current_rows = [
-            dict(row) for row in self._display_page_model_data().values()
-        ]
+        current_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
         missing_by_page_id = {
             str(row.get("display_page_id") or ""): row
             for row in current_rows
@@ -1408,10 +2111,9 @@ class ManualFinalSubtitleSession:
 
         self.display_page_boundary_overrides = overrides
         self.display_page_edits = unaffected_edits
-        rebuilt_rows = [
-            copy.deepcopy(dict(row))
-            for row in self._display_page_model_data().values()
-        ]
+        rebuilt_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
         if not rebuilt_rows or any(
             row.get("display_page_unavailable")
             or not str(row.get("display_page_id") or "")
@@ -1448,12 +2150,14 @@ class ManualFinalSubtitleSession:
         self,
         rows: Mapping[str, Mapping[str, Any]],
     ) -> bool:
-        """Apply parent Chinese by stable identity; frozen English stays immutable."""
+        """Apply parent text while keeping IDs, word ownership, and times fixed."""
         if len(rows) != len(self.cues):
             raise ManualFinalSubtitleEditError(
                 "字幕行数已变化，无法安全应用人工终稿操作。"
             )
-        updates: List[tuple[Dict[str, Any], str]] = []
+        chinese_updates: List[tuple[Dict[str, Any], str]] = []
+        english_plans: List[Dict[str, Any]] = []
+        english_parent_ids: set[str] = set()
         for index, cue in enumerate(self.cues, 1):
             row = rows.get(str(index))
             if row is None:
@@ -1479,27 +2183,47 @@ class ManualFinalSubtitleSession:
                 raise ManualFinalSubtitleEditError(
                     "父字幕时间轴已漂移，无法安全写回人工编辑。"
                 )
-            if str(row.get("original_subtitle") or "") != str(
-                cue.get("original_subtitle") or ""
-            ):
-                raise ManualFinalSubtitleEditError(
-                    "父字幕英文由冻结词账本生成，不能直接改写；请使用边界调整。"
+            row_english = str(row.get("original_subtitle") or "")
+            if row_english != str(cue.get("original_subtitle") or ""):
+                plan = self._plan_english_surface_edit(
+                    word_start=int(cue["word_start"]),
+                    word_end=int(cue["word_end"]),
+                    replacement_text=row_english,
                 )
+                if plan is not None:
+                    english_plans.append(plan)
+                    english_parent_ids.add(str(cue.get("cue_id") or ""))
             chinese = str(row.get("translated_subtitle") or "")
             if chinese != str(cue.get("translated_subtitle") or ""):
-                updates.append((cue, chinese))
-        if not updates:
+                chinese_updates.append((cue, chinese))
+        if not chinese_updates and not english_plans:
             return False
         before = copy.deepcopy(self.cues)
         self._record_history(
-            "edit_parent_chinese",
+            "edit_english_surface" if english_plans else "edit_parent_chinese",
             before,
-            affected_parent_ids=[
-                str(cue.get("cue_id") or "") for cue, _chinese in updates
-            ],
+            affected_parent_ids=sorted(
+                english_parent_ids
+                | {
+                    str(cue.get("cue_id") or "")
+                    for cue, _chinese in chinese_updates
+                }
+            ),
+            before_word_ledger=(
+                copy.deepcopy(self.word_ledger) if english_plans else []
+            ),
+            before_source_word_ledger_hash=(
+                self.source_word_ledger_hash if english_plans else ""
+            ),
         )
-        for cue, chinese in updates:
+        if english_plans:
+            self._apply_english_surface_edit_plans(english_plans)
+        for cue, chinese in chinese_updates:
             cue["translated_subtitle"] = chinese
+        for cue in self.cues:
+            if str(cue.get("cue_id") or "") in english_parent_ids:
+                cue["chinese_review_required"] = True
+        self._validate_cues()
         return True
 
     def move_suffix_to_next(self, left_index: int, word_count: int) -> None:
@@ -1695,6 +2419,51 @@ class ManualFinalSubtitleSession:
                 "合并后的实际分页无法满足固定词账本、时间轴或排版约束，字幕未修改。"
             )
 
+    def set_cue_display_suppressed(
+        self,
+        parent_subtitle_id: str,
+        suppressed: bool,
+    ) -> Dict[str, Any]:
+        """Hide one parent cue from rendering without trimming media or ledger words."""
+        parent_id = str(parent_subtitle_id or "").strip()
+        cue = next(
+            (
+                item
+                for item in self.cues
+                if str(item.get("cue_id") or "") == parent_id
+            ),
+            None,
+        )
+        if cue is None:
+            raise ManualFinalSubtitleEditError("找不到要隐藏的固定字幕 ID。")
+        target = bool(suppressed)
+        if bool(cue.get("display_suppressed")) == target:
+            return {"changed": False, "subtitle_id": parent_id, "suppressed": target}
+        if target and sum(
+            not bool(item.get("display_suppressed")) for item in self.cues
+        ) <= 1:
+            raise ManualFinalSubtitleEditError("至少需要保留一条可显示字幕。")
+
+        before = copy.deepcopy(self.cues)
+        self._record_history(
+            "set_display_suppressed",
+            before,
+            affected_parent_ids=[parent_id],
+            parent_subtitle_id=parent_id,
+            suppressed=target,
+        )
+        cue["display_suppressed"] = target
+        if target:
+            self.display_page_edits = [
+                item
+                for item in self.display_page_edits
+                if str(item.get("parent_subtitle_id") or "") != parent_id
+            ]
+            self.display_page_boundary_overrides.pop(parent_id, None)
+        self._display_page_preview_cache.pop(parent_id, None)
+        self._validate_cues()
+        return {"changed": True, "subtitle_id": parent_id, "suppressed": target}
+
     @staticmethod
     def _history_affected_parent_ids(entry: Mapping[str, Any]) -> set[str]:
         affected = {
@@ -1742,13 +2511,100 @@ class ManualFinalSubtitleSession:
             )
         return self.undo()
 
+    def _capture_runtime_state(self) -> Dict[str, Any]:
+        return {
+            "word_ledger": copy.deepcopy(self.word_ledger),
+            "cues": copy.deepcopy(self.cues),
+            "source_word_ledger_hash": self.source_word_ledger_hash,
+            "display_page_edits": copy.deepcopy(self.display_page_edits),
+            "display_page_boundary_overrides": copy.deepcopy(
+                self.display_page_boundary_overrides
+            ),
+            "recovered_formal_boundary_evidence": copy.deepcopy(
+                self.recovered_formal_boundary_evidence
+            ),
+            "recovered_stale_page_drafts": copy.deepcopy(
+                self.recovered_stale_page_drafts
+            ),
+            "tail_trim": copy.deepcopy(self.tail_trim),
+            "source_media_path": (
+                str(self.source_media_path) if self.source_media_path else ""
+            ),
+            "artifact_dir": str(self.artifact_dir),
+        }
+
+    def _restore_runtime_state(self, state: Mapping[str, Any]) -> None:
+        self.word_ledger = copy.deepcopy(list(state.get("word_ledger") or []))
+        self.cues = copy.deepcopy(list(state.get("cues") or []))
+        self.source_word_ledger_hash = str(
+            state.get("source_word_ledger_hash") or ""
+        )
+        self.display_page_edits = copy.deepcopy(
+            list(state.get("display_page_edits") or [])
+        )
+        self.display_page_boundary_overrides = (
+            self._parse_display_page_boundary_overrides(
+                state.get("display_page_boundary_overrides")
+            )
+        )
+        self.recovered_formal_boundary_evidence = copy.deepcopy(
+            dict(state.get("recovered_formal_boundary_evidence") or {})
+        )
+        self.recovered_stale_page_drafts = self._parse_recovered_stale_page_drafts(
+            state.get("recovered_stale_page_drafts")
+        )
+        self.tail_trim = copy.deepcopy(dict(state.get("tail_trim") or {}))
+        media_text = str(state.get("source_media_path") or "").strip()
+        self.source_media_path = Path(media_text) if media_text else None
+        artifact_text = str(state.get("artifact_dir") or "").strip()
+        if artifact_text:
+            self.artifact_dir = Path(artifact_text)
+        self._validate_cues()
+        self._validate_display_page_boundary_overrides()
+
+    def can_redo_for_parent(self, parent_subtitle_id: str) -> bool:
+        parent_id = str(parent_subtitle_id or "").strip()
+        return bool(
+            parent_id
+            and self.redo_history
+            and parent_id
+            in set(self.redo_history[-1].get("affected_parent_ids") or [])
+        )
+
+    def redo_for_parent(self, parent_subtitle_id: str) -> bool:
+        if not self.can_redo_for_parent(parent_subtitle_id):
+            raise ManualFinalSubtitleEditError(
+                "当前字幕没有可重做的最新调整；不能跳过其他修改单独重做。"
+            )
+        return self.redo()
+
+    def redo(self) -> bool:
+        if not self.redo_history:
+            return False
+        redo_entry = self.redo_history.pop()
+        history_entry = copy.deepcopy(dict(redo_entry.get("history_entry") or {}))
+        after_state = redo_entry.get("after_state") or {}
+        if not history_entry or not after_state:
+            return False
+        before_state = self._capture_runtime_state()
+        try:
+            self._restore_runtime_state(after_state)
+        except Exception:
+            self._restore_runtime_state(before_state)
+            self.redo_history.append(redo_entry)
+            raise
+        self.history.append(history_entry)
+        return True
+
     def undo(self) -> bool:
         if not self.history:
             return False
         self._remember_known_formal_boundary_evidence()
+        after_state = self._capture_runtime_state()
         entry = self.history.pop()
         before = list(entry.get("before_cues") or [])
         if not before:
+            self.history.append(entry)
             return False
         if entry["operation"] == "move_suffix_to_next":
             start = int(entry["left_index"])
@@ -1764,10 +2620,22 @@ class ManualFinalSubtitleSession:
             "edit_display_page_chinese",
         }:
             self.cues = before
+        elif entry["operation"] == "edit_english_surface":
+            self.cues = before
+            self.word_ledger = copy.deepcopy(
+                list(entry.get("before_word_ledger") or [])
+            )
+            self.source_word_ledger_hash = str(
+                entry.get("before_source_word_ledger_hash") or ""
+            )
+        elif entry["operation"] == "set_display_suppressed":
+            self.cues = before
         elif entry["operation"] in {
             "move_display_page_boundary",
             "split_parent_into_display_pages",
+            "split_display_page",
             "merge_display_page_with_next",
+            "merge_adjacent_display_pages",
             "confirm_display_page_boundary",
             "confirm_all_nonblocking_display_page_reviews",
         }:
@@ -1788,6 +2656,7 @@ class ManualFinalSubtitleSession:
             if previous_artifact_dir:
                 self.artifact_dir = Path(previous_artifact_dir)
         else:
+            self.history.append(entry)
             return False
         self.display_page_edits = list(
             entry.get("before_display_page_edits") or []
@@ -1800,6 +2669,15 @@ class ManualFinalSubtitleSession:
         self.tail_trim = dict(entry.get("before_tail_trim") or {})
         self._validate_cues()
         self._validate_display_page_boundary_overrides()
+        self.redo_history.append(
+            {
+                "history_entry": copy.deepcopy(entry),
+                "after_state": after_state,
+                "affected_parent_ids": sorted(
+                    self._history_affected_parent_ids(entry)
+                ),
+            }
+        )
         return True
 
     def to_model_data(
@@ -1825,6 +2703,7 @@ class ManualFinalSubtitleSession:
                 "word_start": int(cue["word_start"]),
                 "word_end": int(cue["word_end"]),
                 "chinese_review_required": bool(cue.get("chinese_review_required")),
+                "display_suppressed": bool(cue.get("display_suppressed")),
             }
             for index, cue in enumerate(self.cues, 1)
         }
@@ -1842,6 +2721,35 @@ class ManualFinalSubtitleSession:
         row_index = 0
         for cue_index, cue in enumerate(self.cues):
             parent_id = str(cue.get("cue_id") or "")
+            if cue.get("display_suppressed"):
+                row_index += 1
+                rows[str(row_index)] = {
+                    "start_time": int(cue["start_time"]),
+                    "end_time": int(cue["end_time"]),
+                    "original_subtitle": str(cue["original_subtitle"]),
+                    "translated_subtitle": str(
+                        cue.get("translated_subtitle") or ""
+                    ),
+                    "manual_cue_id": parent_id,
+                    "source_subtitle_ids": list(
+                        cue.get("source_subtitle_ids") or []
+                    ),
+                    "display_page_id": "",
+                    "display_page_view": True,
+                    "display_page_unavailable": False,
+                    "parent_cue_index": cue_index,
+                    "word_start": int(cue["word_start"]),
+                    "word_end": int(cue["word_end"]),
+                    "english_font_size": 0,
+                    "display_page_review_required": False,
+                    "display_page_boundary_classification": "",
+                    "display_page_issue_codes": [],
+                    "display_page_chinese_stale": False,
+                    "display_page_chinese_confirmed": True,
+                    "chinese_review_required": False,
+                    "display_suppressed": True,
+                }
+                continue
             pages = list(previews.get(parent_id) or [])
             if not pages:
                 row_index += 1
@@ -1869,6 +2777,7 @@ class ManualFinalSubtitleSession:
                     "display_page_chinese_stale": False,
                     "display_page_chinese_confirmed": True,
                     "chinese_review_required": True,
+                    "display_suppressed": False,
                 }
                 continue
             for page in pages:
@@ -1947,6 +2856,7 @@ class ManualFinalSubtitleSession:
                     ),
                     "display_page_chinese_confirmed": chinese_confirmed,
                     "chinese_review_required": not chinese_confirmed,
+                    "display_suppressed": False,
                 }
         self._display_page_model_cache_key = cache_key
         self._display_page_model_cache = copy.deepcopy(rows)
@@ -1982,7 +2892,21 @@ class ManualFinalSubtitleSession:
         )
 
     def has_display_page_model(self) -> bool:
-        return bool(self._display_page_model_data())
+        return bool(
+            self._visible_display_page_rows(self._display_page_model_data())
+        )
+
+    @staticmethod
+    def _visible_display_page_rows(
+        rows: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return page rows that participate in the visible render model."""
+        source = rows.values() if isinstance(rows, Mapping) else rows
+        return [
+            copy.deepcopy(dict(row))
+            for row in source
+            if isinstance(row, Mapping) and not row.get("display_suppressed")
+        ]
 
     @staticmethod
     def _unchanged_display_page_edit_from_model_row(
@@ -2034,6 +2958,8 @@ class ManualFinalSubtitleSession:
         fallback_chinese_by_parent: Dict[str, str] = {}
         changed = False
         changed_parent_ids: set[str] = set()
+        english_plans: List[Dict[str, Any]] = []
+        english_parent_ids: set[str] = set()
         for index in range(1, len(expected) + 1):
             key = str(index)
             source = expected.get(key)
@@ -2053,12 +2979,31 @@ class ManualFinalSubtitleSession:
                 raise ManualFinalSubtitleEditError(
                     "实际分页的页面 ID、父 ID、词范围或时间已漂移。"
                 )
-            if str(row.get("original_subtitle") or "") != str(
-                source.get("original_subtitle") or ""
-            ):
-                raise ManualFinalSubtitleEditError(
-                    "实际分页英文由冻结词范围生成，不能直接改写；请回到父字幕处理英文边界。"
+            if source.get("display_suppressed"):
+                if (
+                    str(row.get("original_subtitle") or "")
+                    != str(source.get("original_subtitle") or "")
+                    or str(row.get("translated_subtitle") or "").strip()
+                    != str(source.get("translated_subtitle") or "").strip()
+                ):
+                    raise ManualFinalSubtitleEditError(
+                        "隐藏字幕请先恢复显示，再修改英文或中文。"
+                    )
+                continue
+            row_english = str(row.get("original_subtitle") or "")
+            english_text_changed = bool(
+                row_english != str(source.get("original_subtitle") or "")
+            )
+            parent_id = str(source["manual_cue_id"])
+            if english_text_changed:
+                plan = self._plan_english_surface_edit(
+                    word_start=int(source["word_start"]),
+                    word_end=int(source["word_end"]),
+                    replacement_text=row_english,
                 )
+                if plan is not None:
+                    english_plans.append(plan)
+                    english_parent_ids.add(parent_id)
             chinese = str(row.get("translated_subtitle") or "").strip()
             stale_chinese_draft = bool(source.get("display_page_chinese_stale"))
             chinese_text_changed = bool(
@@ -2085,7 +3030,6 @@ class ManualFinalSubtitleSession:
                 and not allow_incomplete_chinese
             ):
                 raise ManualFinalSubtitleEditError("实际分页中文不能为空。")
-            parent_id = str(source["manual_cue_id"])
             if source.get("display_page_id"):
                 chinese_by_parent.setdefault(parent_id, []).append(
                     authoritative_chinese
@@ -2099,7 +3043,7 @@ class ManualFinalSubtitleSession:
                     "parent_subtitle_id": parent_id,
                     "word_start": int(source["word_start"]),
                     "word_end": int(source["word_end"]),
-                    "english": str(source["original_subtitle"]),
+                    "english": row_english,
                     "chinese": authoritative_chinese,
                     "chinese_review_acknowledged": bool(
                         stale_chinese_confirmed and authoritative_chinese
@@ -2118,15 +3062,17 @@ class ManualFinalSubtitleSession:
             else:
                 fallback_chinese_by_parent[parent_id] = chinese
             row_changed = bool(
-                chinese_text_changed
+                english_text_changed
+                or chinese_text_changed
                 or (stale_chinese_draft and stale_chinese_confirmed)
                 or stale_chinese_confirmed != source_chinese_confirmed
             )
             changed = changed or row_changed
             if row_changed and parent_id:
                 changed_parent_ids.add(parent_id)
-        complete_page_model = all(
-            bool(item.get("display_page_id")) for item in expected.values()
+        visible_expected = self._visible_display_page_rows(expected)
+        complete_page_model = bool(visible_expected) and all(
+            bool(item.get("display_page_id")) for item in visible_expected
         )
         if not changed:
             # Opening the actual-page view establishes the already validated
@@ -2140,10 +3086,27 @@ class ManualFinalSubtitleSession:
 
         before = copy.deepcopy(self.cues)
         self._record_history(
-            "edit_display_page_chinese",
+            "edit_english_surface" if english_plans else "edit_display_page_chinese",
             before,
             affected_parent_ids=sorted(changed_parent_ids),
+            before_word_ledger=(
+                copy.deepcopy(self.word_ledger) if english_plans else []
+            ),
+            before_source_word_ledger_hash=(
+                self.source_word_ledger_hash if english_plans else ""
+            ),
         )
+        if english_plans:
+            self._apply_english_surface_edit_plans(english_plans)
+            for edit in edits:
+                edit["english"] = self._words_text(
+                    self.word_ledger,
+                    int(edit["word_start"]),
+                    int(edit["word_end"]),
+                )
+                if str(edit.get("parent_subtitle_id") or "") in english_parent_ids:
+                    edit["chinese_review_acknowledged"] = False
+            unconfirmed_chinese_parents.update(english_parent_ids)
         cue_by_id = {
             str(cue.get("cue_id") or ""): cue for cue in self.cues
         }
@@ -2170,11 +3133,12 @@ class ManualFinalSubtitleSession:
             cue["translated_subtitle"] = chinese
             cue["chinese_review_required"] = True
         self.display_page_edits = edits if complete_page_model else []
+        self._validate_cues()
         return True
 
     def display_page_review_summary(self) -> Dict[str, Any]:
         """Return actionable manual review counts for the current page identity."""
-        rows = list(self._display_page_model_data().values())
+        rows = self._visible_display_page_rows(self._display_page_model_data())
         chinese_pages = [
             str(row.get("display_page_id") or row.get("manual_cue_id") or "")
             for row in rows
@@ -2256,7 +3220,7 @@ class ManualFinalSubtitleSession:
         )
         edits = [
             self._unchanged_display_page_edit_from_model_row(row)
-            for row in rows.values()
+            for row in self._visible_display_page_rows(rows)
         ]
         for edit in edits:
             if str(edit.get("display_page_id") or "") == str(page_id):
@@ -2268,19 +3232,22 @@ class ManualFinalSubtitleSession:
     def confirm_all_nonblocking_display_page_reviews(self) -> Dict[str, Any]:
         """Accept visible Chinese drafts and REVIEW boundaries, never hard errors."""
         rows = self._display_page_model_data()
-        if not rows or any(row.get("display_page_unavailable") for row in rows.values()):
+        visible_rows = self._visible_display_page_rows(rows)
+        if not visible_rows or any(
+            row.get("display_page_unavailable") for row in visible_rows
+        ):
             raise ManualFinalSubtitleEditError(
                 "当前实际分页不完整，不能批量确认非阻断提醒。"
             )
         chinese_ids = [
             str(row.get("display_page_id") or "")
-            for row in rows.values()
+            for row in visible_rows
             if row.get("chinese_review_required")
             and str(row.get("translated_subtitle") or "").strip()
         ]
         boundary_ids = [
             str(row.get("display_page_id") or "")
-            for row in rows.values()
+            for row in visible_rows
             if row.get("display_page_review_required")
             and str(row.get("display_page_boundary_classification") or "")
             != "hard"
@@ -2313,7 +3280,7 @@ class ManualFinalSubtitleSession:
                 )
             edits = [
                 self._unchanged_display_page_edit_from_model_row(row)
-                for row in current_rows.values()
+                for row in self._visible_display_page_rows(current_rows)
             ]
             boundary_set = set(boundary_ids)
             for edit in edits:
@@ -2336,7 +3303,9 @@ class ManualFinalSubtitleSession:
         """Move words across two adjacent pages of one unchanged parent cue."""
         if word_count <= 0:
             raise ManualFinalSubtitleEditError("移动词数必须大于零。")
-        model_rows = list(self._display_page_model_data().values())
+        model_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
         if not model_rows or any(
             not str(row.get("display_page_id") or "") for row in model_rows
         ):
@@ -2616,7 +3585,9 @@ class ManualFinalSubtitleSession:
     ) -> Dict[str, Any]:
         """Remove one internal page boundary without changing its parent cue."""
         page_id = str(left_page_id or "").strip()
-        model_rows = list(self._display_page_model_data().values())
+        model_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
         if not page_id or not model_rows or any(
             not str(row.get("display_page_id") or "")
             or row.get("display_page_unavailable")
@@ -2811,6 +3782,432 @@ class ManualFinalSubtitleSession:
             "page_count": len(rebuilt_pages),
         }
 
+    def merge_adjacent_display_pages(
+        self,
+        left_page_id: str,
+        right_page_id: str,
+    ) -> Dict[str, Any]:
+        """Merge two selected visible rows as one atomic page operation."""
+        left_id = str(left_page_id or "").strip()
+        right_id = str(right_page_id or "").strip()
+        model_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
+        if not left_id or not right_id or not model_rows or any(
+            not str(row.get("display_page_id") or "")
+            or row.get("display_page_unavailable")
+            for row in model_rows
+        ):
+            raise ManualFinalSubtitleEditError(
+                "当前实际分页不完整，不能安全合并相邻页面。"
+            )
+        positions = {
+            str(row.get("display_page_id") or ""): index
+            for index, row in enumerate(model_rows)
+        }
+        if (
+            left_id not in positions
+            or right_id not in positions
+            or positions[right_id] != positions[left_id] + 1
+        ):
+            raise ManualFinalSubtitleEditError("请选择两条连续相邻的实际分页。")
+
+        left = dict(model_rows[positions[left_id]])
+        right = dict(model_rows[positions[right_id]])
+        left_parent_id = str(left.get("manual_cue_id") or "")
+        right_parent_id = str(right.get("manual_cue_id") or "")
+        if not left_parent_id or not right_parent_id:
+            raise ManualFinalSubtitleEditError("实际分页缺少稳定父字幕 ID。")
+        if left_parent_id == right_parent_id:
+            result = self.merge_display_page_with_next(left_id)
+            result["parent_merge"] = False
+            result["affected_parent_ids"] = [left_parent_id]
+            return result
+
+        cue_index_by_id = {
+            str(cue.get("cue_id") or ""): index
+            for index, cue in enumerate(self.cues)
+        }
+        left_cue_index = cue_index_by_id.get(left_parent_id, -1)
+        right_cue_index = cue_index_by_id.get(right_parent_id, -1)
+        if left_cue_index < 0 or right_cue_index != left_cue_index + 1:
+            raise ManualFinalSubtitleEditError(
+                "所选页面不属于连续相邻的父字幕。"
+            )
+
+        before_cues = copy.deepcopy(self.cues)
+        before_page_edits = copy.deepcopy(self.display_page_edits)
+        before_page_overrides = copy.deepcopy(
+            self.display_page_boundary_overrides
+        )
+        # Existing history entries are immutable; this transaction only appends
+        # temporary entries before replacing the list with the original cursor.
+        before_history = list(self.history)
+        before_tail_trim = copy.deepcopy(self.tail_trim)
+        selected_boundary = (
+            int(left["word_end"]),
+            int(right["word_start"]),
+        )
+        try:
+            self.merge_adjacent(left_cue_index, right_cue_index)
+            merged_rows = self._visible_display_page_rows(
+                self._display_page_model_data()
+            )
+            boundary_position = next(
+                (
+                    index
+                    for index in range(len(merged_rows) - 1)
+                    if str(merged_rows[index].get("manual_cue_id") or "")
+                    == left_parent_id
+                    and str(merged_rows[index + 1].get("manual_cue_id") or "")
+                    == left_parent_id
+                    and int(merged_rows[index].get("word_end", -1))
+                    == selected_boundary[0]
+                    and int(merged_rows[index + 1].get("word_start", -1))
+                    == selected_boundary[1]
+                ),
+                -1,
+            )
+            if boundary_position >= 0:
+                page_result = self.merge_display_page_with_next(
+                    str(merged_rows[boundary_position]["display_page_id"])
+                )
+            else:
+                already_merged = next(
+                    (
+                        row
+                        for row in merged_rows
+                        if str(row.get("manual_cue_id") or "") == left_parent_id
+                        and int(row.get("word_start", -1))
+                        == int(left["word_start"])
+                        and int(row.get("word_end", -1))
+                        == int(right["word_end"])
+                    ),
+                    None,
+                )
+                if already_merged is None:
+                    raise ManualFinalSubtitleEditError(
+                        "父字幕合并后没有保留所选页面边界，无法确认合并结果。"
+                    )
+                page_result = {
+                    "parent_subtitle_id": left_parent_id,
+                    "merged_page_id": str(
+                        already_merged.get("display_page_id") or ""
+                    ),
+                    "page_count": sum(
+                        str(row.get("manual_cue_id") or "") == left_parent_id
+                        for row in merged_rows
+                    ),
+                }
+
+            merged_page_id = str(page_result.get("merged_page_id") or "")
+            merged_chinese = "".join(
+                str(row.get("translated_subtitle") or "").strip()
+                for row in (left, right)
+            )
+            stale_unconfirmed = any(
+                row.get("display_page_chinese_stale")
+                and not row.get("display_page_chinese_confirmed")
+                for row in (left, right)
+            )
+            chinese_confirmed = bool(
+                merged_chinese
+                and not stale_unconfirmed
+                and all(
+                    row.get("display_page_chinese_confirmed")
+                    for row in (left, right)
+                )
+            )
+            merged_edit = next(
+                (
+                    edit
+                    for edit in self.display_page_edits
+                    if str(edit.get("display_page_id") or "") == merged_page_id
+                ),
+                None,
+            )
+            if merged_edit is None:
+                raise ManualFinalSubtitleEditError(
+                    "合并后的页面没有可持久化编辑记录。"
+                )
+            merged_edit.update(
+                {
+                    "chinese": "" if stale_unconfirmed else merged_chinese,
+                    "chinese_review_acknowledged": chinese_confirmed,
+                }
+            )
+            if stale_unconfirmed:
+                merged_edit.update(
+                    {
+                        "stale_chinese_draft": merged_chinese,
+                        "chinese_stale_unconfirmed": True,
+                        "chinese_draft_kind": "merged_page_draft",
+                    }
+                )
+            else:
+                for key in (
+                    "stale_chinese_draft",
+                    "chinese_stale_unconfirmed",
+                    "chinese_draft_kind",
+                ):
+                    merged_edit.pop(key, None)
+
+            self.history = before_history
+            self._record_history(
+                "merge_adjacent_display_pages",
+                before_cues,
+                affected_parent_ids=[left_parent_id, right_parent_id],
+                parent_subtitle_id=left_parent_id,
+                first_index=left_cue_index,
+                last_index=right_cue_index,
+                left_page_id=left_id,
+                right_page_id=right_id,
+                before_display_page_edits=before_page_edits,
+                before_display_page_boundary_overrides=before_page_overrides,
+                before_tail_trim=before_tail_trim,
+            )
+            page_result.update(
+                {
+                    "parent_merge": True,
+                    "affected_parent_ids": [left_parent_id, right_parent_id],
+                }
+            )
+            return page_result
+        except Exception:
+            self.cues = before_cues
+            self.display_page_edits = before_page_edits
+            self.display_page_boundary_overrides = before_page_overrides
+            self.history = before_history
+            self.tail_trim = before_tail_trim
+            self._validate_cues()
+            self._validate_display_page_boundary_overrides()
+            raise
+
+    def split_display_page(self, display_page_id_value: str) -> Dict[str, Any]:
+        """Split only one selected page while freezing every other page."""
+        selected_page_id = str(display_page_id_value or "").strip()
+        current_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
+        if not selected_page_id or not current_rows or any(
+            not str(row.get("display_page_id") or "")
+            or row.get("display_page_unavailable")
+            for row in current_rows
+        ):
+            raise ManualFinalSubtitleEditError(
+                "当前实际分页不完整，不能只拆当前屏。"
+            )
+        selected = next(
+            (
+                dict(row)
+                for row in current_rows
+                if str(row.get("display_page_id") or "") == selected_page_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ManualFinalSubtitleEditError("找不到要拆分的实际分页。")
+        parent_id = str(selected.get("manual_cue_id") or "")
+        parent_rows = [
+            dict(row)
+            for row in current_rows
+            if str(row.get("manual_cue_id") or "") == parent_id
+        ]
+        if len(parent_rows) >= 4:
+            raise ManualFinalSubtitleEditError(
+                "该父字幕已经有 4 屏，不能继续增加页面。"
+            )
+        try:
+            selected_index = next(
+                index
+                for index, row in enumerate(parent_rows)
+                if str(row.get("display_page_id") or "") == selected_page_id
+            )
+        except StopIteration as exc:
+            raise ManualFinalSubtitleEditError("实际分页顺序已变化。") from exc
+
+        cue_index = next(
+            (
+                index
+                for index, cue in enumerate(self.cues)
+                if str(cue.get("cue_id") or "") == parent_id
+            ),
+            -1,
+        )
+        if cue_index < 0:
+            raise ManualFinalSubtitleEditError("实际分页引用了不存在的父字幕。")
+        cue = self.cues[cue_index]
+        self._ensure_unmodified_english(cue)
+        artifact = self._effective_display_page_artifact()
+        source_plan = next(
+            (
+                dict(plan)
+                for plan in artifact.get("render_plans") or []
+                if isinstance(plan, Mapping)
+                and str(plan.get("parent_subtitle_id") or "") == parent_id
+            ),
+            None,
+        )
+        if source_plan is None:
+            raise ManualFinalSubtitleEditError("找不到该父字幕的冻结分页计划。")
+
+        from app.core.utils.podcast_learning_video import (
+            Cue,
+            RenderStructuralOverflowError,
+            propose_article_manual_page_word_ranges,
+            rebuild_article_frozen_page_plan_from_word_ranges,
+        )
+
+        boundary_payload = self._validated_display_boundary_evidence()
+        boundary_items = dict(boundary_payload.get("boundaries") or {})
+        render_cue = self._article_render_cue(cue_index, boundary_items)
+        parent_word_start = int(cue["word_start"])
+        page_word_start = int(selected["word_start"])
+        page_word_end = int(selected["word_end"])
+        local_start = page_word_start - parent_word_start
+        local_end = page_word_end - parent_word_start
+        local_timing = tuple(render_cue.word_timing[local_start : local_end + 1])
+        local_cue = Cue(
+            index=render_cue.index,
+            start=float(local_timing[0]["start"]),
+            end=float(local_timing[-1]["end"]),
+            en=self._words_text(self.word_ledger, page_word_start, page_word_end),
+            zh=str(selected.get("translated_subtitle") or ""),
+            speaker=render_cue.speaker,
+            subtitle_id=parent_id,
+            word_timing=local_timing,
+            display_boundary_evidence={
+                str(right_word): dict(boundary_items[str(right_word)])
+                for right_word in range(page_word_start + 1, page_word_end + 1)
+            },
+        )
+        try:
+            selected_ranges = propose_article_manual_page_word_ranges(
+                local_cue,
+                2,
+                allow_review_boundary=True,
+            )
+            ranges = [
+                (int(row["word_start"]), int(row["word_end"]))
+                for row in parent_rows
+            ]
+            ranges[selected_index : selected_index + 1] = selected_ranges
+            new_page_ids = [
+                display_page_id(parent_id, index + 1)
+                for index in range(len(ranges))
+            ]
+            preserved_by_range = {
+                (int(row["word_start"]), int(row["word_end"])): row
+                for row in parent_rows
+                if str(row.get("display_page_id") or "") != selected_page_id
+            }
+            page_translations = {
+                page_id: str(
+                    preserved_by_range.get(word_range, {}).get(
+                        "translated_subtitle"
+                    )
+                    or ""
+                ).strip()
+                for page_id, word_range in zip(new_page_ids, ranges)
+            }
+            rebuilt_plan = rebuild_article_frozen_page_plan_from_word_ranges(
+                render_cue,
+                source_plan,
+                ranges,
+                page_translations,
+                allow_page_count_change=True,
+                allow_incomplete_page_translations=True,
+                allow_manual_review=True,
+            )
+        except RenderStructuralOverflowError as exc:
+            reasons = ", ".join(
+                str(item.get("reason") or "")
+                for item in getattr(exc, "errors", [])
+                if isinstance(item, Mapping)
+            )
+            raise ManualFinalSubtitleEditError(
+                "当前屏内部找不到满足固定字号和时间轴的可用切点。"
+                + (f"（{reasons}）" if reasons else "")
+            ) from exc
+
+        rebuilt_pages = [
+            dict(page)
+            for page in rebuilt_plan.get("pages") or []
+            if isinstance(page, Mapping)
+        ]
+        if len(rebuilt_pages) != len(parent_rows) + 1:
+            raise ManualFinalSubtitleEditError("当前屏拆分后的页面数量不一致。")
+
+        replacement_edits: List[Dict[str, Any]] = []
+        for page in rebuilt_pages:
+            word_range = (int(page["word_start"]), int(page["word_end"]))
+            source_row = preserved_by_range.get(word_range)
+            if source_row is None:
+                edit = {
+                    "display_page_id": str(page["display_page_id"]),
+                    "parent_subtitle_id": parent_id,
+                    "word_start": word_range[0],
+                    "word_end": word_range[1],
+                    "english": str(page.get("english") or ""),
+                    "chinese": "",
+                    "chinese_review_acknowledged": False,
+                    "boundary_review_acknowledged": False,
+                }
+            else:
+                edit = self._unchanged_display_page_edit_from_model_row(source_row)
+                edit.update(
+                    {
+                        "display_page_id": str(page["display_page_id"]),
+                        "parent_subtitle_id": parent_id,
+                        "word_start": word_range[0],
+                        "word_end": word_range[1],
+                        "english": str(page.get("english") or ""),
+                    }
+                )
+            replacement_edits.append(edit)
+
+        new_edits: List[Dict[str, Any]] = []
+        inserted_parent = False
+        for row in current_rows:
+            if str(row.get("manual_cue_id") or "") == parent_id:
+                if not inserted_parent:
+                    new_edits.extend(replacement_edits)
+                    inserted_parent = True
+                continue
+            new_edits.append(self._unchanged_display_page_edit_from_model_row(row))
+        if not inserted_parent:
+            raise ManualFinalSubtitleEditError(
+                "当前实际分页没有覆盖所选父字幕。"
+            )
+
+        before = copy.deepcopy(self.cues)
+        self._record_history(
+            "split_display_page",
+            before,
+            parent_subtitle_id=parent_id,
+            display_page_id=selected_page_id,
+            page_count=len(rebuilt_pages),
+        )
+        self.display_page_boundary_overrides[parent_id] = [
+            int(page["word_start"]) for page in rebuilt_pages[1:]
+        ]
+        self.display_page_edits = new_edits
+        cue["chinese_review_required"] = True
+        split_pages = rebuilt_pages[selected_index : selected_index + 2]
+        return {
+            "changed": True,
+            "parent_subtitle_id": parent_id,
+            "source_page_id": selected_page_id,
+            "split_page_ids": [
+                str(page["display_page_id"]) for page in split_pages
+            ],
+            "page_count": len(rebuilt_pages),
+            "word_ranges": [
+                [int(page["word_start"]), int(page["word_end"])]
+                for page in split_pages
+            ],
+        }
+
     def split_parent_into_display_pages(
         self,
         parent_subtitle_id: str,
@@ -2888,7 +4285,9 @@ class ManualFinalSubtitleSession:
                 + (f"（{reasons}）" if reasons else "")
             ) from exc
 
-        current_rows = list(self._display_page_model_data().values())
+        current_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
         if not current_rows:
             raise ManualFinalSubtitleEditError("当前实际分页不完整，不能人工拆分。")
         rebuilt_pages = [
@@ -3103,7 +4502,9 @@ class ManualFinalSubtitleSession:
         index = int(decision["first_removed_cue_index"])
         boundary = int(decision["first_removed_word_id"])
         partial_parent_trim = bool(decision.get("partial_parent_trim"))
-        previous_page_rows = list(self._display_page_model_data().values())
+        previous_page_rows = self._visible_display_page_rows(
+            self._display_page_model_data()
+        )
         before_cues = copy.deepcopy(self.cues)
         before_word_ledger = copy.deepcopy(self.word_ledger)
         before_hash = self.source_word_ledger_hash
@@ -3160,8 +4561,8 @@ class ManualFinalSubtitleSession:
         kept_ids = {str(cue.get("cue_id") or "") for cue in kept}
         self.cues = kept
         self.word_ledger = self.word_ledger[: boundary]
-        self.source_word_ledger_hash = stable_payload_hash(
-            self._ledger_payload(self.word_ledger)
+        self.source_word_ledger_hash = self._semantic_word_ledger_hash(
+            self.word_ledger
         )
         if partial_parent_trim and previous_page_rows:
             self.display_page_edits = [
@@ -3250,6 +4651,7 @@ class ManualFinalSubtitleSession:
                 str(cue.get("cue_id") or "")
                 for cue in self.cues
                 if str(cue.get("cue_id") or "")
+                and not cue.get("display_suppressed")
             }
             if set(edits_by_parent) != cue_ids:
                 return {}
@@ -3259,6 +4661,8 @@ class ManualFinalSubtitleSession:
             render_plans: List[Dict[str, Any]] = []
             parents: List[Dict[str, Any]] = []
             for cue_index, cue in enumerate(self.cues):
+                if cue.get("display_suppressed"):
+                    continue
                 parent_id = str(cue.get("cue_id") or "")
                 parent_edits = sorted(
                     edits_by_parent[parent_id],
@@ -3392,17 +4796,15 @@ class ManualFinalSubtitleSession:
         if str(artifact.get("status") or "") != "PASS":
             source_artifact = artifact
             try:
-                draft_path = Path(
-                    str(manifest.get("manual_draft_page_plan_path") or "")
-                )
-                expected_hash = str(
-                    manifest.get("manual_draft_page_plan_sha256") or ""
+                draft_path = resolve_manifest_owned_path(
+                    self.manifest_path,
+                    manifest,
+                    str(manifest.get("manual_draft_page_plan_path") or ""),
+                    str(manifest.get("manual_draft_page_plan_sha256") or ""),
                 )
                 if (
-                    not draft_path.is_file()
-                    or not expected_hash
+                    draft_path is None
                     or not self._same_path(draft_path.parent, self.artifact_dir)
-                    or file_sha256(draft_path) != expected_hash
                 ):
                     raise ManualFinalSubtitleEditError(
                         "人工草稿分页产物不可用。"
@@ -3505,13 +4907,32 @@ class ManualFinalSubtitleSession:
             if not isinstance(source_plan, Mapping):
                 continue
             parent_id = str(source_plan.get("parent_subtitle_id") or "")
-            plan: Mapping[str, Any] = source_plan
+            plan: Mapping[str, Any] = copy.deepcopy(dict(source_plan))
             subtitle_id = parent_id
             cue = cue_by_id.get(subtitle_id)
             override_starts = self.display_page_boundary_overrides.get(parent_id)
             if cue is None:
                 self._display_page_preview_cache.pop(parent_id, None)
                 continue
+            if cue.get("display_suppressed"):
+                self._display_page_preview_cache.pop(parent_id, None)
+                continue
+            plan["english"] = self._words_text(
+                self.word_ledger,
+                int(cue["word_start"]),
+                int(cue["word_end"]),
+            )
+            for page in plan.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                try:
+                    page["english"] = self._words_text(
+                        self.word_ledger,
+                        int(page["word_start"]),
+                        int(page["word_end"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
             parent_page_prefix = f"{parent_id}.P"
             parent_cache_key = stable_payload_hash(
                 {
@@ -3890,6 +5311,11 @@ class ManualFinalSubtitleSession:
         self._validate_cues()
         self._validate_display_page_boundary_overrides()
         self._validate_no_silent_display_page_state_loss()
+        # Loading an older manual package may retain its legacy semantic hash.
+        # Every newly published generation upgrades to the canonical contract.
+        self.source_word_ledger_hash = self._semantic_word_ledger_hash(
+            self.word_ledger
+        )
         report(5, "正在核对冻结字幕和词时间账本")
         source_dir = self.subtitle_path.parent
         media_candidate = source_media_path or self.source_media_path
@@ -3907,21 +5333,29 @@ class ManualFinalSubtitleSession:
         )
         current_manifest = self._read_json(self.manifest_path)
         current_override = current_manifest.get("manual_final_override") or {}
-        existing_override_path = Path(
-            str(current_override.get("subtitle_path") or "")
-        )
         reusing_owned_package = bool(
             int(current_override.get("schema_version") or 0) >= 2
-            and existing_override_path.is_file()
-            and self._same_path(existing_override_path, self.subtitle_path)
-            and self._same_path(self.manifest_path.parent, self.subtitle_path.parent)
-            and self._same_path(self.manifest_path.parent, preferred_package_dir)
+            and self.manifest_path.name == "stable-final-manifest.json"
+            and (
+                self._same_path(self.manifest_path.parent, preferred_package_dir)
+                or self.manifest_path.parent.name.endswith("人工终稿字幕包")
+            )
         )
         package_dir = (
             self.manifest_path.parent
             if reusing_owned_package
             else preferred_package_dir
         )
+        package_dir.mkdir(parents=True, exist_ok=True)
+        generation_id = (
+            datetime.now().strftime("%Y%m%dT%H%M%S%f")
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
+        generation_relative_dir = Path("generations") / generation_id
+        generation_dir = package_dir / generation_relative_dir
+        generation_dir.mkdir(parents=True, exist_ok=False)
+        published_tail_trim = copy.deepcopy(self.tail_trim)
         if self.tail_trim:
             trim_source = self._tail_trim_source_media_path()
             if trim_source is None or not trim_source.is_file():
@@ -3938,22 +5372,27 @@ class ManualFinalSubtitleSession:
                 raise ManualFinalSubtitleEditError(
                     "原始音频已变化，尾部裁剪决定已失效。"
                 )
-            package_dir.mkdir(parents=True, exist_ok=True)
-            trim_audio_path = package_dir / f"{trim_source.stem}-尾部裁剪.m4a"
-            trim_record_path = package_dir / "tail-trim.json"
+            trim_audio_path = generation_dir / f"{trim_source.stem}-尾部裁剪.m4a"
+            trim_record_path = generation_dir / "tail-trim.json"
             reuse_trimmed_audio = False
-            if trim_audio_path.is_file() and trim_record_path.is_file():
+            previous_trimmed_audio = resolve_manifest_owned_path(
+                self.manifest_path,
+                current_manifest,
+                str(self.tail_trim.get("derived_media_path") or ""),
+                str(self.tail_trim.get("derived_media_sha256") or ""),
+            )
+            if previous_trimmed_audio is not None:
                 try:
-                    trim_record = self._read_json(trim_record_path)
                     reuse_trimmed_audio = bool(
-                        str(trim_record.get("decision_hash") or "")
-                        == str(self.tail_trim.get("decision_hash") or "")
-                        and str(trim_record.get("derived_media_sha256") or "")
-                        == file_sha256(trim_audio_path)
+                        str(self.tail_trim.get("decision_hash") or "")
+                        and str(self.tail_trim.get("derived_media_sha256") or "")
+                        == file_sha256(previous_trimmed_audio)
                     )
-                except ManualFinalSubtitleEditError:
+                except OSError:
                     reuse_trimmed_audio = False
-            if not reuse_trimmed_audio:
+            if reuse_trimmed_audio:
+                shutil.copyfile(previous_trimmed_audio, trim_audio_path)
+            else:
                 report(10, "正在生成非破坏式尾部裁剪音频")
                 _materialize_tail_trim_audio(
                     trim_source,
@@ -3962,17 +5401,17 @@ class ManualFinalSubtitleSession:
                 )
             trim_record = {
                 **self.tail_trim,
-                "derived_media_path": str(trim_audio_path),
+                "derived_media_path": str(trim_audio_path.resolve()),
                 "derived_media_sha256": file_sha256(trim_audio_path),
             }
             write_json_artifact(trim_record_path, trim_record)
-            self.tail_trim = trim_record
+            published_tail_trim = trim_record
             media_path = trim_audio_path.resolve()
-        srt_path = package_dir / "人工终稿字幕.srt"
-        display_page_srt_path = package_dir / "人工终稿分页双语字幕.srt"
-        display_page_map_path = package_dir / "人工终稿分页映射.json"
-        edit_path = package_dir / "人工终稿字幕-edits.json"
-        artifact_dir = package_dir / "人工终稿字幕-artifacts"
+        srt_path = generation_dir / "人工终稿字幕.srt"
+        display_page_srt_path = generation_dir / "人工终稿分页双语字幕.srt"
+        display_page_map_path = generation_dir / "人工终稿分页映射.json"
+        edit_path = generation_dir / "人工终稿字幕-edits.json"
+        artifact_dir = generation_dir / "人工终稿字幕-artifacts"
         report(
             18,
             (
@@ -4009,18 +5448,23 @@ class ManualFinalSubtitleSession:
         final_timeline_path = artifact_dir / "final-cue-timeline.json"
         word_ledger_path = artifact_dir / "word-ledger.json"
         edit_payload = {
-            "schema_version": 2,
+            "schema_version": 4,
+            "word_ledger_hash_version": WORD_LEDGER_HASH_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "source_subtitle": str(self.subtitle_path),
             "source_artifact_dir": str(self.artifact_dir),
             "source_word_ledger_hash": self.source_word_ledger_hash,
+            "parent_chinese_authority_hash": render_contract[
+                "parent_chinese_authority_hash"
+            ],
             "word_ledger": self.word_ledger,
             "cues": self.cues,
             "history": self.history,
+            "redo_history": self.redo_history,
             "display_page_edits": self.display_page_edits,
             "display_page_boundary_overrides": self.display_page_boundary_overrides,
             "recovered_stale_page_drafts": self.recovered_stale_page_drafts,
-            "tail_trim": self.tail_trim,
+            "tail_trim": published_tail_trim,
             "source_media_path": str(media_path) if media_path else "",
         }
         report(80, "正在保存可撤销编辑记录")
@@ -4041,38 +5485,68 @@ class ManualFinalSubtitleSession:
             "srt": str(immutable_page_srt) if immutable_page_srt else "",
             "map": str(immutable_page_map) if immutable_page_map else "",
         }
+
+        package_root = package_dir.resolve()
+
+        def owned_relative(path: str | Path) -> str:
+            text = str(path or "").strip()
+            if not text:
+                return ""
+            try:
+                resolved = Path(text).resolve()
+                resolved.relative_to(package_root)
+                return str(resolved)
+            except (OSError, ValueError) as exc:
+                raise ManualFinalSubtitleEditError(
+                    "人工终稿 generation 引用了包目录以外的制品。"
+                ) from exc
+
+        manifest_media_path = (
+            str(published_tail_trim.get("derived_media_path") or "")
+            if published_tail_trim
+            else (str(media_path) if media_path else "")
+        )
         manual_override = {
-            "schema_version": 3,
-            "subtitle_path": str(srt_path),
+            "schema_version": 4,
+            "subtitle_path": owned_relative(srt_path),
             "subtitle_sha256": file_sha256(srt_path),
-            "edit_artifact_path": str(edit_path),
+            "edit_artifact_path": owned_relative(edit_path),
             "edit_artifact_sha256": edit_artifact_sha256,
-            "artifact_dir": str(artifact_dir),
-            "final_cue_timeline_path": str(final_timeline_path),
+            "artifact_dir": owned_relative(artifact_dir),
+            "final_cue_timeline_path": owned_relative(final_timeline_path),
             "final_cue_timeline_sha256": file_sha256(final_timeline_path),
-            "word_ledger_path": str(word_ledger_path),
+            "word_ledger_path": owned_relative(word_ledger_path),
             "word_ledger_sha256": file_sha256(word_ledger_path),
-            "display_page_translation_path": str(
+            "parent_chinese_authority_path": owned_relative(
+                render_contract["parent_chinese_authority_path"]
+            ),
+            "parent_chinese_authority_sha256": render_contract[
+                "parent_chinese_authority_sha256"
+            ],
+            "parent_chinese_authority_hash": render_contract[
+                "parent_chinese_authority_hash"
+            ],
+            "display_page_translation_path": owned_relative(
                 artifact_dir / "display-page-translations.json"
             ),
-            "display_boundary_evidence_path": str(
+            "display_boundary_evidence_path": owned_relative(
                 artifact_dir / "display-boundary-evidence.json"
             ),
-            "display_page_srt_path": exported_page_paths["srt"],
+            "display_page_srt_path": owned_relative(exported_page_paths["srt"]),
             "display_page_srt_sha256": (
                 file_sha256(Path(exported_page_paths["srt"]))
                 if exported_page_paths["srt"]
                 else ""
             ),
-            "display_page_map_path": exported_page_paths["map"],
+            "display_page_map_path": owned_relative(exported_page_paths["map"]),
             "display_page_map_sha256": (
                 file_sha256(Path(exported_page_paths["map"]))
                 if exported_page_paths["map"]
                 else ""
             ),
-            "manual_draft_page_plan_path": render_contract[
-                "manual_draft_page_plan_path"
-            ],
+            "manual_draft_page_plan_path": owned_relative(
+                render_contract["manual_draft_page_plan_path"]
+            ),
             "manual_draft_page_plan_sha256": render_contract[
                 "manual_draft_page_plan_sha256"
             ],
@@ -4080,23 +5554,32 @@ class ManualFinalSubtitleSession:
             "render_block_reason": render_contract["render_block_reason"],
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "source_word_ledger_hash": self.source_word_ledger_hash,
+            "word_ledger_hash_version": WORD_LEDGER_HASH_VERSION,
             "manual_cue_count": len(self.cues),
-            "source_media_path": str(media_path) if media_path else "",
-            "tail_trim": self.tail_trim,
+            "visible_manual_cue_count": sum(
+                not bool(cue.get("display_suppressed")) for cue in self.cues
+            ),
+            "suppressed_subtitle_ids": [
+                str(cue.get("cue_id") or "")
+                for cue in self.cues
+                if cue.get("display_suppressed")
+            ],
+            "source_media_path": manifest_media_path,
+            "tail_trim": published_tail_trim,
             "chinese_review_required_count": sum(
                 bool(cue.get("chinese_review_required")) for cue in self.cues
             ),
             "display_page_review_summary": review_summary,
         }
         manual_manifest = {
-            "schema_version": 2,
+            "schema_version": 4,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "stable_run_id": (
                 "manual-"
                 + stable_payload_hash(
                     {
                         "cues": self.cues,
-                        "tail_trim_decision_hash": self.tail_trim.get(
+                        "tail_trim_decision_hash": published_tail_trim.get(
                             "decision_hash", ""
                         ),
                     }
@@ -4104,7 +5587,12 @@ class ManualFinalSubtitleSession:
             ),
             # This manifest owns the files in the manual package, so its run
             # directory must match the package containing the published SRT.
-            "stable_run_dir": str(package_dir),
+            "package_generation": {
+                "schema_version": 1,
+                "id": generation_id,
+                "relative_dir": str(generation_relative_dir),
+            },
+            "stable_run_dir": str(generation_dir.resolve()),
             "validation_status": (
                 "failed" if render_contract["render_blocked"] else "passed"
             ),
@@ -4115,9 +5603,13 @@ class ManualFinalSubtitleSession:
                 else []
             ),
             "paths": {
-                "original_top_srt": str(srt_path),
+                "original_top_srt": owned_relative(srt_path),
                 **(
-                    {"display_page_bilingual_srt": exported_page_paths["srt"]}
+                    {
+                        "display_page_bilingual_srt": owned_relative(
+                            exported_page_paths["srt"]
+                        )
+                    }
                     if exported_page_paths["srt"]
                     else {}
                 ),
@@ -4151,11 +5643,20 @@ class ManualFinalSubtitleSession:
                     else {}
                 ),
             },
-            "final_cue_timeline_path": str(final_timeline_path),
+            "final_cue_timeline_path": owned_relative(final_timeline_path),
             "final_cue_timeline_sha256": file_sha256(final_timeline_path),
-            "word_ledger_path": str(word_ledger_path),
+            "word_ledger_path": owned_relative(word_ledger_path),
             "word_ledger_sha256": file_sha256(word_ledger_path),
-            "display_page_translation_path": str(
+            "parent_chinese_authority_path": owned_relative(
+                render_contract["parent_chinese_authority_path"]
+            ),
+            "parent_chinese_authority_sha256": render_contract[
+                "parent_chinese_authority_sha256"
+            ],
+            "parent_chinese_authority_hash": render_contract[
+                "parent_chinese_authority_hash"
+            ],
+            "display_page_translation_path": owned_relative(
                 artifact_dir / "display-page-translations.json"
             ),
             "display_page_translation_status": render_contract["display_status"],
@@ -4165,28 +5666,33 @@ class ManualFinalSubtitleSession:
             "display_page_translation_sha256": file_sha256(
                 artifact_dir / "display-page-translations.json"
             ),
-            "display_boundary_evidence_path": str(
+            "display_boundary_evidence_path": owned_relative(
                 artifact_dir / "display-boundary-evidence.json"
             ),
             "display_boundary_evidence_sha256": file_sha256(
                 artifact_dir / "display-boundary-evidence.json"
             ),
-            "display_page_map_path": exported_page_paths["map"],
+            "display_page_map_path": owned_relative(exported_page_paths["map"]),
             "display_page_map_sha256": (
                 file_sha256(Path(exported_page_paths["map"]))
                 if exported_page_paths["map"]
                 else ""
             ),
-            "manual_draft_page_plan_path": render_contract[
-                "manual_draft_page_plan_path"
-            ],
+            "manual_draft_page_plan_path": owned_relative(
+                render_contract["manual_draft_page_plan_path"]
+            ),
             "manual_draft_page_plan_sha256": render_contract[
                 "manual_draft_page_plan_sha256"
             ],
             "manual_final_override": manual_override,
             "display_page_review_summary": review_summary,
-            "source_media_path": str(media_path) if media_path else "",
-            "tail_trim": self.tail_trim,
+            "source_media_path": manifest_media_path,
+            "tail_trim": published_tail_trim,
+            "suppressed_subtitle_ids": [
+                str(cue.get("cue_id") or "")
+                for cue in self.cues
+                if cue.get("display_suppressed")
+            ],
         }
         manual_manifest["source_subtitle_paths_sha256"] = {
             key: file_sha256(Path(value))
@@ -4195,7 +5701,74 @@ class ManualFinalSubtitleSession:
         }
         package_manifest_path = package_dir / "stable-final-manifest.json"
         report(96, "正在校验并发布人工终稿包")
+        candidate_manifest_path = (
+            package_dir / f".stable-final-manifest.{generation_id}.candidate.json"
+        )
+        write_json_artifact(candidate_manifest_path, manual_manifest)
+        try:
+            owned_files = (
+                ("subtitle_path", "subtitle_sha256"),
+                ("edit_artifact_path", "edit_artifact_sha256"),
+                ("final_cue_timeline_path", "final_cue_timeline_sha256"),
+                ("word_ledger_path", "word_ledger_sha256"),
+                (
+                    "parent_chinese_authority_path",
+                    "parent_chinese_authority_sha256",
+                ),
+                ("display_page_srt_path", "display_page_srt_sha256"),
+                ("display_page_map_path", "display_page_map_sha256"),
+                ("manual_draft_page_plan_path", "manual_draft_page_plan_sha256"),
+            )
+            for path_key, hash_key in owned_files:
+                declared = str(manual_override.get(path_key) or "")
+                if not declared:
+                    continue
+                resolved = resolve_manifest_owned_path(
+                    candidate_manifest_path,
+                    manual_manifest,
+                    declared,
+                    str(manual_override.get(hash_key) or ""),
+                )
+                if resolved is None:
+                    raise ManualFinalSubtitleEditError(
+                        f"人工终稿 generation 制品校验失败：{path_key}"
+                    )
+            resolved_artifact_dir = resolve_manifest_owned_path(
+                candidate_manifest_path,
+                manual_manifest,
+                manual_override["artifact_dir"],
+                expect_directory=True,
+            )
+            if resolved_artifact_dir is None:
+                raise ManualFinalSubtitleEditError(
+                    "人工终稿 generation 的 artifacts 目录无效。"
+                )
+            validated_session = self.load_from_manifest(candidate_manifest_path)
+            expected_fingerprint = stable_payload_hash(
+                {
+                    "word_ledger": self._ledger_payload(self.word_ledger),
+                    "cues": self.cues,
+                    "display_page_edits": self.display_page_edits,
+                    "display_page_boundary_overrides": (
+                        self.display_page_boundary_overrides
+                    ),
+                    "recovered_stale_page_drafts": (
+                        self.recovered_stale_page_drafts
+                    ),
+                    "tail_trim": published_tail_trim,
+                }
+            )
+            if validated_session.state_fingerprint() != expected_fingerprint:
+                raise ManualFinalSubtitleEditError(
+                    "人工终稿 generation 回读状态与保存前不一致。"
+                )
+        finally:
+            try:
+                candidate_manifest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         write_json_artifact(package_manifest_path, manual_manifest)
+        self.tail_trim = published_tail_trim
         report(100, "人工终稿包已保存")
         return {
             "subtitle_path": str(srt_path),
@@ -4434,21 +6007,7 @@ class ManualFinalSubtitleSession:
         cls,
         ledger: Sequence[Mapping[str, Any]],
     ) -> str:
-        payload = [
-            [
-                str(word.get("surface", word.get("token", "")) or ""),
-                str(word.get("normalized", word.get("token", "")) or ""),
-                int(word.get("start_ms", word.get("start_time", 0)) or 0),
-                int(word.get("end_ms", word.get("end_time", 0)) or 0),
-            ]
-            for word in ledger
-        ]
-        raw = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return canonical_word_ledger_hash(ledger)
 
     def _validated_display_boundary_evidence(self) -> Dict[str, Any]:
         path = self.artifact_dir / "display-boundary-evidence.json"
@@ -4460,18 +6019,25 @@ class ManualFinalSubtitleSession:
                 "稳定产物缺少冻结分页边界证据。"
             ) from exc
         expected_hash = self._formal_word_ledger_hash(self.word_ledger)
-        accepted_source_hash = (
-            str(self.tail_trim.get("source_formal_word_ledger_hash") or "")
-            if self.tail_trim
-            else expected_hash
-        )
+        accepted_source_hashes = {expected_hash}
+        if self.tail_trim:
+            accepted_source_hashes.add(
+                str(self.tail_trim.get("source_formal_word_ledger_hash") or "")
+            )
+        for entry in self.history:
+            before_ledger = entry.get("before_word_ledger") or []
+            if isinstance(before_ledger, list) and before_ledger:
+                accepted_source_hashes.add(
+                    self._formal_word_ledger_hash(before_ledger)
+                )
+        accepted_source_hashes.discard("")
         if (
             not isinstance(payload, Mapping)
             or int(payload.get("schema_version") or 0) != 1
             or str(payload.get("policy_version") or "")
             != "formal-boundary-evidence-v1"
             or str(payload.get("word_ledger_hash") or "")
-            not in {expected_hash, accepted_source_hash}
+            not in accepted_source_hashes
         ):
             raise ManualFinalSubtitleEditError(
                 "manual_page_boundary_evidence_required: "
@@ -4547,8 +6113,15 @@ class ManualFinalSubtitleSession:
             raise ManualFinalSubtitleEditError(
                 "manual_page_translation_required: 权威分页产物缺少渲染计划。"
             )
+        suppressed_parent_ids = {
+            str(cue.get("cue_id") or "")
+            for cue in self.cues
+            if cue.get("display_suppressed")
+        }
         cues = {
-            str(cue.get("cue_id") or ""): cue for cue in self.cues
+            str(cue.get("cue_id") or ""): cue
+            for cue in self.cues
+            if not cue.get("display_suppressed")
         }
         edits = {
             str(item.get("display_page_id") or ""): item
@@ -4566,6 +6139,8 @@ class ManualFinalSubtitleSession:
                     "manual_page_translation_required: 权威分页计划格式无效。"
                 )
             source_parent_id = str(raw_plan.get("parent_subtitle_id") or "")
+            if source_parent_id in suppressed_parent_ids:
+                continue
             plan = copy.deepcopy(dict(raw_plan))
             parent_id = source_parent_id
             cue = cues.get(parent_id)
@@ -4633,6 +6208,22 @@ class ManualFinalSubtitleSession:
                         "manual_page_translation_required: 人工分页边界无法通过重新校验。"
                     ) from exc
             if cue is not None:
+                plan["english"] = self._words_text(
+                    self.word_ledger,
+                    int(cue["word_start"]),
+                    int(cue["word_end"]),
+                )
+                for page in plan.get("pages") or []:
+                    if not isinstance(page, dict):
+                        continue
+                    try:
+                        page["english"] = self._words_text(
+                            self.word_ledger,
+                            int(page["word_start"]),
+                            int(page["word_end"]),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
                 if boundary_payload is None:
                     boundary_payload = self._validated_display_boundary_evidence()
                 if render_cue is None:
@@ -4765,6 +6356,7 @@ class ManualFinalSubtitleSession:
             subtitle_id = str(cue.get("cue_id") or f"S{index:04d}")
             word_start = int(cue["word_start"])
             word_end = int(cue["word_end"])
+            display_suppressed = bool(cue.get("display_suppressed"))
             records.append(
                 {
                     "subtitle_id": subtitle_id,
@@ -4774,8 +6366,11 @@ class ManualFinalSubtitleSession:
                     "end_ms": int(cue["end_time"]),
                     "original": str(cue["original_subtitle"]),
                     "translated": str(cue.get("translated_subtitle") or ""),
+                    "display_suppressed": display_suppressed,
                 }
             )
+            if display_suppressed:
+                continue
             render_cues.append(
                 Cue(
                     index=index,
@@ -4874,11 +6469,30 @@ class ManualFinalSubtitleSession:
                 ),
                 "render_plans": list(blueprint.get("render_plans") or []),
             }
+        parent_chinese_authority = self._current_parent_chinese_authority()
+        parent_chinese_by_id = parent_chinese_records_by_id(
+            parent_chinese_authority
+        )
+        if str(display_artifact.get("status") or "") == "PASS":
+            try:
+                display_artifact = bind_display_page_parent_records(
+                    display_artifact,
+                    parent_chinese_by_id,
+                )
+            except AuthoritativeParentChineseError as exc:
+                raise ManualFinalSubtitleEditError(str(exc)) from exc
         write_json_artifact(
             artifact_dir / "word-ledger.json",
-            {"words": self.word_ledger},
+            {
+                "schema_version": 2,
+                "hash_version": WORD_LEDGER_HASH_VERSION,
+                "hash": self._semantic_word_ledger_hash(self.word_ledger),
+                "words": self.word_ledger,
+            },
         )
         write_json_artifact(artifact_dir / "final-cue-timeline.json", timeline)
+        authority_path = artifact_dir / "authoritative-parent-chinese.json"
+        write_json_artifact(authority_path, parent_chinese_authority)
         write_json_artifact(
             artifact_dir / "display-page-translations.json",
             display_artifact,
@@ -4915,6 +6529,9 @@ class ManualFinalSubtitleSession:
                     "word_start": record["word_start"],
                     "word_end": record["word_end"],
                     "original": record["original"],
+                    "display_suppressed": bool(
+                        record.get("display_suppressed")
+                    ),
                 }
                 for record in records
             ],
@@ -4925,7 +6542,18 @@ class ManualFinalSubtitleSession:
                 {
                     "subtitle_id": record["subtitle_id"],
                     "text": record["original"],
-                    "translated_text": record["translated"],
+                    "translated_text": str(
+                        parent_chinese_by_id[record["subtitle_id"]]["chinese"]
+                    ),
+                    "parent_source_hash": str(
+                        parent_chinese_by_id[record["subtitle_id"]]["source_hash"]
+                    ),
+                    "parent_record_hash": str(
+                        parent_chinese_by_id[record["subtitle_id"]]["record_hash"]
+                    ),
+                    "display_suppressed": bool(
+                        record.get("display_suppressed")
+                    ),
                 }
                 for record in records
             ],
@@ -4936,6 +6564,11 @@ class ManualFinalSubtitleSession:
             "display_status": display_artifact["status"],
             "display_contract_hash": contract_hash,
             "display_artifact": display_artifact,
+            "parent_chinese_authority_path": str(authority_path),
+            "parent_chinese_authority_sha256": file_sha256(authority_path),
+            "parent_chinese_authority_hash": str(
+                parent_chinese_authority.get("artifact_hash") or ""
+            ),
             "manual_draft_page_plan_path": manual_draft_page_plan_path,
             "manual_draft_page_plan_sha256": manual_draft_page_plan_sha256,
         }
@@ -5078,7 +6711,10 @@ class ManualFinalSubtitleSession:
 
     def _write_bilingual_srt(self, path: Path) -> None:
         lines = []
-        for index, cue in enumerate(self.cues, 1):
+        visible_cues = [
+            cue for cue in self.cues if not cue.get("display_suppressed")
+        ]
+        for index, cue in enumerate(visible_cues, 1):
             lines.extend(
                 [
                     str(index),

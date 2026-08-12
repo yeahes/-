@@ -1,6 +1,75 @@
 # Current State
 
-Last updated: 2026-08-11
+Last updated: 2026-08-13
+
+## 2026-08-13 English Boundary Gate Repair
+
+- Reproduced the cached `AI竞赛：中美殊途` failure at `S0211 | S0212`:
+  `most likely, | to manage` was blocked after alignment reduced the pause.
+- The repair now uses parser-confirmed modified-infinitive scope evidence for
+  this class of boundary. It preserves `most likely, to manage` together while
+  leaving ordinary purpose clauses such as `..., | to manage ...` legal when
+  the audio has a genuine pause.
+- The pre-ID repair gate is the only owner changed. English word text, order,
+  frozen IDs, word times, Chinese allocation, display pagination, and rendering
+  contracts are unchanged.
+- Focused regression, the complete stable-caption suite, and a read-only replay
+  of the immutable 2,596-word production ledger pass. The replay keeps 226
+  cues, complete contiguous coverage, and reports zero hard English boundaries;
+  its target boundary is `well, | most likely, to manage`.
+
+## Recorded Quality-Ceiling Plan
+
+- `docs/QUALITY_CEILING_ROADMAP.md` is the durable plan for remaining
+  translation quality, fixed-ID review, editor efficiency, and selected
+  SmartSub patterns. It is planning evidence, not implemented behavior.
+- SmartSub findings are pinned to commit
+  `27459b3fd0652bc5447ccf4ab30cb398014c35f7`; read the roadmap before
+  re-opening the external repository.
+
+## 2026-08-13 Stable Publication Contract Repair
+
+- The stable producer and manual editor now share one semantic word-ledger
+  identity, `canonical-word-ledger-v1`, over ordered surface text, normalized
+  text, start time, and end time. New ledgers declare the hash version; legacy
+  manual edit schema below version 4 remains readable through its former hash.
+- Stable display-page export is publication-critical. A failed page export now
+  raises `stable_display_page_export_failed`; the root success manifest is
+  published only after that export succeeds, so the GUI cannot report a new
+  optimization as complete while its synthesis input is missing or invalid.
+- Cached replay of `AI竞赛：中美殊途` loaded the immutable run-local subtitle:
+  226 cues and 2,596 words produced a valid display-page SRT and page map. This
+  resolves the observed `authoritative_parent_chinese_ledger_mismatch` without
+  changing English segmentation, cue timing, translation mapping, or rendering.
+- The attempted pause-insensitive `stranded_leading_complement_split` change was
+  not retained. It merely moved `most likely, | to manage` to the also-invalid
+  `most | likely, to manage`; its contradictory tests and completion claim were
+  removed.
+
+## 2026-08-12 Pre-ID Overlong Contract Consistency
+
+- The failed `好莱坞最新热潮：姐弟恋` run had zero final-ledger, timeline,
+  or missing-Chinese errors. Its two blocking `overlong_english` entries came
+  from conflicting English-boundary decisions.
+- `_rebalance_adjacent_pre_id_windows` had removed the valid sentence boundary
+  in `... exact dynamic. / Lots of money.` because the three-word right cue
+  looked parser-dependent. An over-limit merge now proceeds only when the
+  shared structural-overflow check proves that no legal normal-limit split
+  exists. Existing genuinely dependent 17-18 word merges remain accepted.
+- Final overlong validation previously treated any locally proposed split as
+  applicable even when the pre-ID write gate rejected that split in context.
+  Validation now supplies the adjacent frozen cues to the same write gate. A
+  rejected candidate remains one complete audited structural warning instead
+  of becoming a blocking overlong error.
+- Read-only replay from the production word ledger and boundary snapshot keeps
+  the 15/3-word sentence split, reports zero blocking overlong entries, and
+  records 24 structural warnings. Frozen word text/order/times are unchanged;
+  no translation, pagination, font, timeline, renderer, or cache contract was
+  changed.
+- Both production regressions, the complete stable-caption script, Python
+  compilation, and all 25 unified regression stages pass. The final unified
+  run completed in 368.1 seconds without network, LLM, ASR, synthesis, paid
+  requests, or production artifact writes.
 
 ## 2026-08-11 Full-Strength First Vocabulary Card
 
@@ -2344,6 +2413,15 @@ Result:
   unanchored local result is recorded and skipped, so background sound cannot
   silently add words or fail the whole task. A successful repair overwrites
   the raw ASR cache entry with the repaired word SRT.
+- Native Faster-Whisper compression now has a separate pre-freeze recovery
+  path. Millisecond zero-width normalization cannot move a word past a later
+  emitted word with the same timestamp. When the shared detector still finds
+  a compressed run, one bounded context-free retranscription may update that
+  run only if unique exact anchors surround the same word multiset. This can
+  restore a cache whose timestamp sort inverted adjacent words, but cannot
+  add, delete, substitute, or freely rewrite English. The repaired word SRT
+  replaces the stale cache; unresolved or text-changing candidates still fail
+  the normal timing gate.
 - A shared word-timing trust detector now guards transcript handoff, stable-ts,
   WhisperX time-only updates, and final ledger reconciliation. Implausible
   aligner updates fall back only to a timing-trusted upstream ledger. Residual
@@ -2373,3 +2451,177 @@ Result:
   frozen English cue ownership, word timing, display-page planning, Chinese
   allocation, or synthesis subtitle resolution.
 - Manual-editor tests and the complete 25-stage unified regression pass.
+
+## 2026-08-12 Manual English Surface Correction And Display Suppression
+
+- The article-assisted correction candidate for `only as -> OnlyFans` was a
+  false entity match: the article contains a later genuine `OnlyFans`, but the
+  earlier ASR words are the ordinary phrase `only as`. A fuzzy one-token entity
+  can no longer consume a multi-token source phrase containing function words
+  unless the normalized source is an exact orthographic join. The real later
+  `OnlyFans` remains unchanged.
+- The manual editor can now correct the display surface owned by exactly one
+  frozen word ID from either parent or actual-page view. Word IDs, word order,
+  word times, cue/page ranges, and timing stay fixed; multi-ID free rewriting
+  remains rejected. The affected Chinese is marked for confirmation.
+- Because the QFluentWidgets row-selecting table does not reliably open its
+  inline editor on every double-click, the single-row context menu now provides
+  `修正当前英文（保持时间轴）`. Its large text dialog validates and applies the
+  edit immediately through the same frozen-word contract, restores the current
+  page selection, and reports invalid multi-ID edits before manual-final save.
+- A cue may be hidden from the visible subtitle without deleting its audio.
+  `display_suppressed` removes it from visible SRT and page rendering while the
+  final cue timeline retains its original subtitle ID, word envelope, and time.
+  Undo and restore-display operations preserve the complete ledger.
+- Focused verification passes: article correction 34/34, manual-editor direct
+  suite, stable publication/UI 61/61, and video-synthesis safety. The required
+  25-stage unified regression passes in 390.3 seconds after the explicit
+  English-edit dialog integration.
+- Read-only replay of the real 258-parent/311-page `好莱坞最新热潮：姐弟恋`
+  manual package preserved all 88 prior history entries, then added only the
+  two requested operations in memory. Only word ID 353 changed from the false
+  `OnlyFans` surface to `only as`; the later genuine `OnlyFans` at word ID 828,
+  all word IDs/times, and every unrelated page remained exact. The production
+  package was not overwritten.
+
+## 2026-08-12 Suppressed-Cue Page-State And Multi-Token Surface Repair
+
+- A suppressed cue remains visible in the editor as a restore entry with no
+  display-page ID. Page completeness, review, split, merge, boundary-move, and
+  formal-boundary reflow now evaluate only non-suppressed rows. The restore
+  entry remains part of the full cue timeline but cannot clear valid visible
+  page edits or make the whole page model incomplete.
+- Renderer page planning now treats each authoritative timed-word record as
+  one boundary unit. One manually corrected record may therefore display a
+  whitespace phrase such as `only as` without inventing another timestamp or
+  making `len(cue.en.split())` the timing authority. Page IDs, word ranges, and
+  times remain unchanged; the display text still has to equal the joined timed
+  surfaces exactly.
+- Read-only replay of the real 258-parent package retained the hidden `S0021`
+  restore row, all 310 visible pages, and both `S0028.P01/P02` after correcting
+  word ID 353. Word ID 828 remained `OnlyFans`, and every word ID/time stayed
+  exact. A temporary formal render contract passed with 257 visible parent
+  plans; no production artifact was written.
+- Manual-editor, stable publication/UI 61/61, article-readability, and syntax
+  checks pass. The complete 25-stage regression passes in 372.9 seconds.
+
+## 2026-08-12 Actual-Page Local Split, Atomic Merge, And Explicit Editing
+
+- `仅将当前屏拆为 2 屏` now plans a cut only inside the selected display
+  page. Every other page in the parent keeps its word range, Chinese text,
+  confirmation state, and timing; only page IDs after the inserted page may
+  be renumbered to preserve deterministic `Sxxxx.Pxx` order.
+- Merging two adjacent actual pages from different parents is now one atomic
+  operation. It merges the parent cues and removes the selected visual page
+  boundary in the same command. Any failure restores cues, page edits,
+  boundary overrides, history, and tail-trim state, and one undo restores the
+  complete pre-merge state.
+- Model refresh, split, and merge keep the editor in actual-page view but do
+  not automatically expose boundary controls. A subtitle row must be clicked
+  explicitly before its adjustment entry appears; clicking the empty table
+  viewport clears the selection and exits boundary-edit mode.
+- These changes do not alter automatic English segmentation, Chinese
+  allocation, the authoritative word ledger, cue timing, page rendering, or
+  synthesis subtitle resolution.
+- Focused manual-editor tests pass, stable publication/UI passes 63/63, syntax
+  compilation passes, and the complete 25-stage regression passes in 391.8
+  seconds. No production subtitle, audio, or video artifact was written.
+
+## 2026-08-12 Preferred-Font Same-Screen Reflow
+
+- Root cause: the renderer-only same-screen scorer could lower a page from
+  56px to 54px solely to replace a valid two-line layout with one line. This
+  made a manually or automatically split page retain an unnecessarily small
+  font even though the preferred size fit safely within the two-line limit.
+- Same-screen reflow now checks the existing 56/54/52/50px sequence in order
+  and retains the first size with a legal one- or two-line layout. Smaller
+  sizes remain available only when every larger size fails layout validation;
+  page count, page IDs, word ranges, English, Chinese, timing, and boundary
+  evidence remain frozen.
+- Read-only replay of the rendered `好莱坞最新热潮：姐弟恋` manual-final package
+  found 310 display pages. The rendered distribution was 56px=299, 54px=6,
+  52px=2, and 50px=3. Current-code reflow changes only `S0033.P01`,
+  `S0219.P01`, and `S0234.P01` from 54px to valid 56px two-line layouts; the
+  other 307 pages and every non-typography field remain unchanged. The new
+  distribution is 56px=302, 54px=3, 52px=2, and 50px=3.
+- Article readability, manual-final editor, and stable publication/UI 63/63
+  tests pass. The complete 25-stage unified regression passes in 459.2
+  seconds. No production subtitle, audio, or video artifact was overwritten.
+
+## 2026-08-12 WhisperX Numeric Pause Preservation
+
+- The rendered `S0001 -> S0002` delay was upstream timing drift, not a renderer
+  defect. Native timing placed `73%` at 1.560s after a 480ms pause, while
+  WhisperX stretched `field,` to 2.001s and moved `73%` to 2.041s. The final
+  cue therefore appeared about 461ms after the spoken onset.
+- The WhisperX frozen-ledger handoff now preserves a trusted 200ms-or-longer
+  pause before numbers, percentages, currency forms, and acronyms when the
+  aligner substantially erases that pause and would delay the effective token
+  onset by at least 150ms without matching drift in the preceding word start.
+  Only the two words owning the boundary can fall back; word text, IDs, order,
+  cue ownership, and every unrelated time remain unchanged.
+- Exact regressions cover `field, / 73%` and the unmatched `move. / 72%.`
+  boundary, plus a shared-local-shift counterexample. Stable caption rules,
+  ASR trust 38/38, final-cue timeline tests, and `git diff --check` pass. The
+  complete 25-stage unified regression also passes in 367.4 seconds.
+
+## 2026-08-12 Manual Package Relocation And Save Snapshot Cost
+
+- Root cause: a manual-final package recorded absolute Desktop paths for its
+  subtitle, edit journal, artifact directory, word ledger, and page subtitle.
+  Moving the complete result folder to `D:` therefore made the otherwise valid
+  package fail with `稳定终稿字幕文件不存在`.
+- The loader now resolves only the recorded file name and one recorded artifact
+  subdirectory under the manifest-owned package. Subtitle, edit-journal, page,
+  and ledger SHA-256 values remain authoritative; a mismatch still fails closed
+  and cannot fall back to an unrelated stable package.
+- A moved package can be reopened from its manifest, parent bilingual SRT, or
+  actual-page bilingual SRT. The original absolute paths are not rewritten as a
+  side effect of loading.
+- Background save no longer deep-copies the append-only history payload. It
+  freezes the mutable ledger, cues, pages, overrides, recovered drafts, and trim
+  state while the disabled UI prevents concurrent edits. The real 258-cue,
+  311-row Hollywood package improved from about 404ms to 22ms for snapshot
+  creation; cross-parent merge improved from about 1.15s to 0.82s by avoiding a
+  second full-history copy.
+- Direct manual-editor tests, stable publication/UI 63/63, syntax compilation,
+  `git diff --check`, and the complete 25-stage regression pass; the unified
+  regression took 425.6 seconds. Publication remains file-by-file, and delta
+  history, redo, crash recovery, and real GUI workflow validation are not yet
+  complete.
+
+## 2026-08-12 Authoritative Parent-Chinese Replay Gate
+
+- Stable production now writes `authoritative-parent-chinese.json`, binding each
+  fixed parent subtitle ID to its frozen English hash, word span, Chinese hash,
+  provenance, and record hash. Parent SRT, translations, and display-page
+  Chinese must reference the same record; conflicting copies fail closed.
+- The two requested moved production packages are older schema-v2 artifacts and
+  do not contain that new file. Compatibility loading reconstructs an in-memory
+  authority record only after the existing parent, translation, and page data
+  agree; it does not rewrite or upgrade the package during replay.
+- Read-only replay passed for `如何停止拖延-处理结果` (283 cues, 3126 ledger
+  words, 97 history entries) and `中国已成为世界石油强国-处理结果` (170 cues,
+  1676 ledger words, 66 history entries). Undo then redo restored the exact
+  in-memory cue projection for both packages. A recursive mtime, size, and
+  SHA-256 snapshot before and after replay was identical.
+- Focused authority regressions pass. This gate performed no ASR, LLM,
+  translation, synthesis, network request, cache write, or production artifact
+  write.
+
+## 2026-08-12 Legacy Blocked-Checkpoint Compatibility
+
+- The first full regression after the authority contract exposed one real
+  compatibility boundary: a render-blocked editable checkpoint may contain the
+  frozen parent Chinese but no `translations.json`, because display-page
+  translation failed before that artifact was published. Treating that as a
+  corrupt published package broke checkpoint reopening and the renamed-subtitle
+  synthesis path.
+- The loader now permits this missing file only when the manifest explicitly
+  marks `editable_checkpoint` or `render_blocked`. It reconstructs a temporary
+  in-memory authority record from the frozen parent cues; the next successful
+  manual save writes the complete authority and translation artifacts. Published
+  packages and schema-4 manual finals remain fail-closed.
+- `tests/test_video_synthesis_safety.py` and `tests/test_stable_publication.py`
+  pass after the fix. The subsequent full regression reports no failed stage and
+  ends with `Regression command completed.`; `git diff --check` passes.

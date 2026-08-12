@@ -10,6 +10,14 @@ from PIL import Image, ImageDraw
 
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor
+from app.core.subtitle_processor.authoritative_parent_chinese import (
+    AuthoritativeParentChineseError,
+    bind_display_page_parent_records,
+    build_authoritative_parent_chinese_artifact,
+    parent_chinese_records_by_id,
+    validate_authoritative_parent_chinese_artifact,
+    validate_display_page_parent_records,
+)
 from app.core.subtitle_processor.stable_display_page_contract import (
     DisplayPageContractError,
     build_display_page_contract,
@@ -17,6 +25,13 @@ from app.core.subtitle_processor.stable_display_page_contract import (
     page_translation_cache_key,
     parent_chinese_by_id,
     validate_page_translation_response,
+)
+from app.core.subtitle_processor.stable_pipeline_contracts import (
+    WORD_LEDGER_HASH_VERSION,
+    canonical_word_ledger_hash,
+)
+from app.core.subtitle_processor.manual_final_subtitle_editor import (
+    ManualFinalSubtitleSession,
 )
 from app.core.utils import podcast_learning_video
 
@@ -2168,6 +2183,157 @@ def test_frozen_artifact_mismatch_reports_the_exact_single_page_parent():
     ) == failures
 
 
+def test_parent_chinese_authority_binds_exact_id_text_and_word_span():
+    records = [
+        {
+            "subtitle_id": "S0057",
+            "english": "A fixed English parent.",
+            "chinese": "一条固定中文。",
+            "word_start": 120,
+            "word_end": 123,
+            "provenance": {
+                "kind": "automatic",
+                "producer": "fixed_id_allocation",
+            },
+        }
+    ]
+    authority = build_authoritative_parent_chinese_artifact(
+        records,
+        source_word_ledger_hash="ledger-hash",
+        producer="fixed_id_allocation",
+    )
+
+    validated = validate_authoritative_parent_chinese_artifact(
+        authority,
+        expected_parents=records,
+        expected_word_ledger_hash="ledger-hash",
+    )
+    record = parent_chinese_records_by_id(validated)["S0057"]
+
+    assert record["source_hash"]
+    assert record["chinese_hash"]
+    assert record["record_hash"]
+
+
+def test_parent_chinese_authority_rejects_tampered_chinese_and_identity():
+    records = [
+        {
+            "subtitle_id": "S0057",
+            "english": "A fixed English parent.",
+            "chinese": "一条固定中文。",
+            "word_start": 120,
+            "word_end": 123,
+        }
+    ]
+    authority = build_authoritative_parent_chinese_artifact(
+        records,
+        source_word_ledger_hash="ledger-hash",
+        producer="fixed_id_allocation",
+    )
+    tampered = copy.deepcopy(authority)
+    tampered["records"][0]["chinese"] = "被替换的旧译文。"
+
+    try:
+        validate_authoritative_parent_chinese_artifact(tampered)
+        assert False, "tampered Chinese must invalidate the authority record"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_hash_mismatch"
+
+    wrong_span = [{**records[0], "word_end": 124}]
+    try:
+        validate_authoritative_parent_chinese_artifact(
+            authority,
+            expected_parents=wrong_span,
+        )
+        assert False, "a different frozen word span must be rejected"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_projection_mismatch"
+
+
+def test_display_page_parent_must_reference_the_same_chinese_record():
+    records = [
+        {
+            "subtitle_id": "S0057",
+            "english": "A fixed English parent.",
+            "chinese": "一条固定中文。",
+            "word_start": 120,
+            "word_end": 123,
+        }
+    ]
+    authority = build_authoritative_parent_chinese_artifact(
+        records,
+        source_word_ledger_hash="ledger-hash",
+        producer="stable_display_page_translation",
+    )
+    record = parent_chinese_records_by_id(authority)["S0057"]
+    display_artifact = {
+        "status": "PASS",
+        "parents": [
+            {
+                "parent_subtitle_id": "S0057",
+                "parent_english_hash": record["english_hash"],
+                "word_start": 120,
+                "word_end": 123,
+                "aggregate_chinese": "一条固定中文。",
+                "pages": [],
+            }
+        ],
+    }
+    bound = bind_display_page_parent_records(
+        display_artifact,
+        {"S0057": record},
+    )
+    validate_display_page_parent_records(bound, {"S0057": record})
+
+    stale = copy.deepcopy(bound)
+    stale["parents"][0]["aggregate_chinese"] = "旧版分页中文。"
+    try:
+        validate_display_page_parent_records(stale, {"S0057": record})
+        assert False, "stale display-page Chinese must not become authoritative"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_page_conflict"
+
+
+def test_word_ledger_hash_has_one_cross_module_owner():
+    ledger = [
+        {
+            "word_id": 0,
+            "surface": "Most",
+            "normalized": "most",
+            "start_ms": 100,
+            "end_ms": 300,
+        },
+        {
+            "word_id": 1,
+            "surface": "likely,",
+            "normalized": "likely",
+            "start_ms": 320,
+            "end_ms": 620,
+        },
+    ]
+    expected = canonical_word_ledger_hash(ledger)
+
+    assert WORD_LEDGER_HASH_VERSION == "canonical-word-ledger-v1"
+    assert ManualFinalSubtitleSession._semantic_word_ledger_hash(ledger) == expected
+    assert ManualFinalSubtitleSession._formal_word_ledger_hash(ledger) == expected
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor._active_word_entries = [
+        {
+            "surface": row["surface"],
+            "token": row["normalized"],
+            "start_time": row["start_ms"],
+            "end_time": row["end_ms"],
+        }
+        for row in ledger
+    ]
+    assert editor._word_ledger_hash() == expected
+
+    tampered = copy.deepcopy(ledger)
+    tampered[1]["end_ms"] += 1
+    assert canonical_word_ledger_hash(tampered) != expected
+
+
 if __name__ == "__main__":
     test_s0078_reordered_chinese_is_bound_by_page_id()
     test_s0252_monotonic_translation_remains_page_aligned()
@@ -2206,4 +2372,8 @@ if __name__ == "__main__":
     test_stable_artifact_write_failure_is_not_reported_as_success()
     test_golden_page_translations_pass_existing_fixed_id_semantic_gate()
     test_frozen_artifact_mismatch_reports_the_exact_single_page_parent()
+    test_parent_chinese_authority_binds_exact_id_text_and_word_span()
+    test_parent_chinese_authority_rejects_tampered_chinese_and_identity()
+    test_display_page_parent_must_reference_the_same_chinese_record()
+    test_word_ledger_hash_has_one_cross_module_owner()
     print("stable page translation contract tests passed")

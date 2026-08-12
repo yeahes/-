@@ -14,6 +14,10 @@ from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleSession,
 )
 from app.core.subtitle_processor import stable_display_page_contract
+from app.core.subtitle_processor.authoritative_parent_chinese import (
+    parent_chinese_records_by_id,
+    validate_display_page_parent_records,
+)
 from app.core.subtitle_processor.stable_artifacts import file_sha256
 from app.core.utils import podcast_learning_video
 from app.thread.video_synthesis_thread import (
@@ -1813,6 +1817,66 @@ def test_model_data_uses_validated_parent_chinese_instead_of_stale_render_plan()
         ]
 
 
+def test_legacy_parent_and_translations_conflict_fails_closed():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        _, source_srt, manifest_path = _session_fixture(root)
+        translations_path = manifest_path.parent / "output-artifacts" / "translations.json"
+        translations = json.loads(translations_path.read_text(encoding="utf-8"))
+        translations[0]["translated_text"] = "已经更新的新译文"
+        _write_json(translations_path, translations)
+
+        try:
+            ManualFinalSubtitleSession.load_for_subtitle(
+                source_srt,
+                work_dir=root / "work",
+                manifest_path=manifest_path,
+            )
+            assert False, "conflicting parent Chinese must not load by file priority"
+        except ManualFinalSubtitleEditError as exc:
+            assert "authoritative_parent_chinese_conflict" in str(exc)
+
+
+def test_manual_save_publishes_one_parent_chinese_record_across_artifacts():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        rows = session.to_model_data(prefer_display_pages=False)
+        rows["1"]["translated_subtitle"] = "人工确认后的中文一"
+        assert session.apply_parent_model_data(rows) is True
+
+        saved = session.save_to_source_folder()
+        manifest = json.loads(Path(saved["manifest_path"]).read_text(encoding="utf-8"))
+        authority_path = Path(manifest["parent_chinese_authority_path"])
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+        records = parent_chinese_records_by_id(authority)
+        translations = json.loads(
+            (Path(saved["artifact_dir"]) / "translations.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        translated_by_id = {
+            str(row["subtitle_id"]): row for row in translations
+        }
+
+        record = records["S0001"]
+        assert record["chinese"] == "人工确认后的中文一"
+        assert record["provenance"]["kind"] == "manual_override"
+        assert translated_by_id["S0001"]["translated_text"] == record["chinese"]
+        assert translated_by_id["S0001"]["parent_source_hash"] == record["source_hash"]
+        assert translated_by_id["S0001"]["parent_record_hash"] == record["record_hash"]
+        display_artifact = json.loads(
+            (Path(saved["artifact_dir"]) / "display-page-translations.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        validate_display_page_parent_records(display_artifact, records)
+
+        reloaded = ManualFinalSubtitleSession.load_from_manifest(
+            saved["manifest_path"]
+        )
+        assert reloaded.cues[0]["translated_subtitle"] == record["chinese"]
+
+
 def test_page_chinese_aggregate_detects_stale_pages_even_when_parent_copy_is_current():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
@@ -2468,6 +2532,61 @@ def test_move_prefix_and_undo_restore_exact_prior_boundary():
         assert session.to_model_data() == before
 
 
+def test_undo_redo_round_trip_and_new_edit_truncates_redo_branch():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        before = session.state_fingerprint()
+        session.move_suffix_to_next(0, 2)
+        after = session.state_fingerprint()
+        assert after != before
+        assert session.undo() is True
+        assert session.state_fingerprint() == before
+        assert len(session.redo_history) == 1
+        assert session.redo() is True
+        assert session.state_fingerprint() == after
+        assert not session.redo_history
+
+        assert session.undo() is True
+        session.move_suffix_to_next(0, 1)
+        assert not session.redo_history
+        assert session.redo() is False
+
+
+def test_recovery_draft_round_trip_is_atomic_and_manifest_bound():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, manifest_path = _session_fixture(root)
+        base = session.state_fingerprint()
+        session.move_suffix_to_next(0, 2)
+        edited = session.state_fingerprint()
+        draft_path = session.save_recovery_draft()
+        assert draft_path.is_file()
+
+        restarted = ManualFinalSubtitleSession.load_for_subtitle(
+            source_srt,
+            work_dir=root / "work",
+            manifest_path=manifest_path,
+        )
+        assert restarted.state_fingerprint() == base
+        assert restarted.restore_recovery_draft() is True
+        assert restarted.state_fingerprint() == edited
+        assert restarted.import_notice.startswith("已恢复")
+        assert restarted.undo() is True
+        assert restarted.state_fingerprint() == base
+        assert restarted.redo() is True
+        assert restarted.state_fingerprint() == edited
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["unrelated_change"] = True
+        _write_json(manifest_path, manifest)
+        changed_base = ManualFinalSubtitleSession.load_for_subtitle(
+            source_srt,
+            work_dir=root / "work",
+            manifest_path=manifest_path,
+        )
+        assert changed_base.restore_recovery_draft() is False
+
+
 def test_merge_only_combines_adjacent_continuous_word_ranges():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
@@ -2480,6 +2599,286 @@ def test_merge_only_combines_adjacent_continuous_word_ranges():
         assert merged["translated_subtitle"] == "中文一中文二"
         assert (merged["start_time"], merged["end_time"]) == (0, 1200)
         assert merged["source_subtitle_ids"] == ["S0001", "S0002"]
+
+
+def test_manual_english_surface_edit_preserves_word_identity_time_and_reload():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        before_ledger = copy.deepcopy(session.word_ledger)
+        rows = session.to_model_data(prefer_display_pages=False)
+        rows["2"]["original_subtitle"] = "out of only as."
+
+        assert session.apply_parent_model_data(rows) is True
+
+        assert len(session.word_ledger) == len(before_ledger)
+        assert [word["word_id"] for word in session.word_ledger] == [
+            word["word_id"] for word in before_ledger
+        ]
+        assert [
+            (word["start_ms"], word["end_ms"]) for word in session.word_ledger
+        ] == [
+            (word["start_ms"], word["end_ms"]) for word in before_ledger
+        ]
+        assert session.word_ledger[11]["surface"] == "only as."
+        assert session.cues[1]["original_subtitle"] == "out of only as."
+        assert session.history[-1]["operation"] == "edit_english_surface"
+
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"test-audio-placeholder")
+        paths = session.save_to_source_folder(source_media_path=source_media)
+        manual_srt = Path(paths["subtitle_path"])
+        reloaded = ManualFinalSubtitleSession.load_for_subtitle(
+            manual_srt,
+            work_dir=root / "work",
+        )
+
+        assert reloaded.word_ledger[11]["surface"] == "only as."
+        assert reloaded.cues[1]["original_subtitle"] == "out of only as."
+        rendered_cues = parse_srt(manual_srt)
+        assert attach_article_word_timing(rendered_cues, manual_srt) is True
+        assert rendered_cues[1].en == "out of only as."
+        assert rendered_cues[1].word_timing[-1]["word_id"] == 11
+        assert rendered_cues[1].word_timing[-1]["surface"] == "only as."
+
+
+def test_manual_english_surface_edit_rejects_changes_across_multiple_word_ids():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        rows = session.to_model_data(prefer_display_pages=False)
+        rows["2"]["original_subtitle"] = "entirely different sentence."
+
+        try:
+            session.apply_parent_model_data(rows)
+        except ManualFinalSubtitleEditError as exc:
+            assert "只能修改一个冻结词" in str(exc)
+        else:
+            raise AssertionError("multi-word English rewrites must be rejected")
+
+
+def test_actual_page_english_surface_edit_updates_parent_without_moving_page_range():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        rows = session.to_model_data(prefer_display_pages=True)
+        second_parent_key = next(
+            key
+            for key, row in rows.items()
+            if row.get("manual_cue_id") == "S0002"
+        )
+        before_range = (
+            rows[second_parent_key]["word_start"],
+            rows[second_parent_key]["word_end"],
+            rows[second_parent_key]["start_time"],
+            rows[second_parent_key]["end_time"],
+        )
+        rows[second_parent_key]["original_subtitle"] = "out of only as."
+
+        assert session.apply_display_page_model_data(rows) is True
+
+        refreshed = session.to_model_data(prefer_display_pages=True)
+        refreshed_row = next(
+            row
+            for row in refreshed.values()
+            if row.get("manual_cue_id") == "S0002"
+        )
+        assert refreshed_row["original_subtitle"] == "out of only as."
+        assert (
+            refreshed_row["word_start"],
+            refreshed_row["word_end"],
+            refreshed_row["start_time"],
+            refreshed_row["end_time"],
+        ) == before_range
+        assert session.cues[1]["chinese_review_required"] is True
+
+
+def test_suppress_single_cue_hides_srt_but_keeps_full_timeline_and_audio():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"test-audio-placeholder")
+        before_ledger = copy.deepcopy(session.word_ledger)
+
+        result = session.set_cue_display_suppressed("S0002", True)
+
+        assert result["changed"] is True
+        assert session.cues[1]["display_suppressed"] is True
+        assert session.word_ledger == before_ledger
+        paths = session.save_to_source_folder(source_media_path=source_media)
+        manual_srt = Path(paths["subtitle_path"])
+        rendered_cues = parse_srt(manual_srt)
+        timeline = json.loads(
+            Path(paths["artifact_dir"], "final-cue-timeline.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        assert len(rendered_cues) == 1
+        assert "out of date." not in manual_srt.read_text(encoding="utf-8-sig")
+        assert [record["subtitle_id"] for record in timeline["records"]] == [
+            "S0001",
+            "S0002",
+        ]
+        assert timeline["records"][1]["display_suppressed"] is True
+        assert attach_article_word_timing(rendered_cues, manual_srt) is True
+        assert Path(paths["source_media_path"]) == source_media.resolve()
+
+        reloaded = ManualFinalSubtitleSession.load_for_subtitle(
+            manual_srt,
+            work_dir=root / "work",
+        )
+        assert reloaded.cues[1]["display_suppressed"] is True
+        assert reloaded.set_cue_display_suppressed("S0002", False)["changed"] is True
+        assert reloaded.cues[1]["display_suppressed"] is False
+
+
+def test_suppressed_cue_does_not_invalidate_visible_actual_page_edits():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        initial_rows = session.to_model_data(prefer_display_pages=True)
+        session.apply_display_page_model_data(initial_rows)
+        before_ledger = copy.deepcopy(session.word_ledger)
+        before_hidden = copy.deepcopy(session.cues[1])
+
+        session.set_cue_display_suppressed("S0002", True)
+        rows = session.to_model_data(prefer_display_pages=True)
+        hidden_rows = [
+            row for row in rows.values() if row.get("display_suppressed")
+        ]
+        assert len(hidden_rows) == 1
+        assert hidden_rows[0]["manual_cue_id"] == "S0002"
+        assert hidden_rows[0]["display_page_id"] == ""
+
+        second_page_key = next(
+            key
+            for key, row in rows.items()
+            if row.get("display_page_id") == "S0001.P02"
+        )
+        rows[second_page_key]["original_subtitle"] = (
+            "mental model is just only as"
+        )
+        assert session.apply_display_page_model_data(rows) is True
+        assert [edit["display_page_id"] for edit in session.display_page_edits] == [
+            "S0001.P01",
+            "S0001.P02",
+        ]
+
+        moved = session.move_display_page_boundary(
+            "S0001.P01",
+            1,
+            move_to_next=True,
+        )
+        assert moved["left_page_id"] == "S0001.P01"
+        assert session.display_page_edits
+        assert [word["word_id"] for word in session.word_ledger] == [
+            word["word_id"] for word in before_ledger
+        ]
+        assert [
+            (word["start_ms"], word["end_ms"]) for word in session.word_ledger
+        ] == [
+            (word["start_ms"], word["end_ms"]) for word in before_ledger
+        ]
+        assert session.cues[1]["word_start"] == before_hidden["word_start"]
+        assert session.cues[1]["word_end"] == before_hidden["word_end"]
+        assert session.cues[1]["display_suppressed"] is True
+        assert session.word_ledger[8]["surface"] == "only as"
+        recovered = session._recover_display_page_artifact_from_complete_edits()
+        assert [
+            plan["parent_subtitle_id"]
+            for plan in recovered["render_plans"]
+        ] == ["S0001"]
+
+        restored = session.set_cue_display_suppressed("S0002", False)
+        assert restored["changed"] is True
+        restored_rows = session.to_model_data(prefer_display_pages=True)
+        assert any(
+            row.get("display_page_id") == "S0002.P01"
+            for row in restored_rows.values()
+        )
+
+
+def test_renderer_attachment_accepts_a_suppressed_middle_timeline_record():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        subtitle = root / "manual.srt"
+        subtitle.write_text(
+            """1
+00:00:00,000 --> 00:00:00,300
+Alpha.
+甲。
+
+2
+00:00:00,600 --> 00:00:00,900
+Charlie.
+丙。
+""",
+            encoding="utf-8-sig",
+        )
+        ledger = root / "word-ledger.json"
+        timeline = root / "final-cue-timeline.json"
+        _write_json(
+            ledger,
+            {
+                "words": [
+                    {"surface": "Alpha.", "start_ms": 0, "end_ms": 300},
+                    {"surface": "Bravo.", "start_ms": 300, "end_ms": 600},
+                    {"surface": "Charlie.", "start_ms": 600, "end_ms": 900},
+                ]
+            },
+        )
+        _write_json(
+            timeline,
+            {
+                "records": [
+                    {
+                        "subtitle_id": "S0001",
+                        "word_start": 0,
+                        "word_end": 0,
+                        "start_ms": 0,
+                        "end_ms": 300,
+                        "original": "Alpha.",
+                        "display_suppressed": False,
+                    },
+                    {
+                        "subtitle_id": "S0002",
+                        "word_start": 1,
+                        "word_end": 1,
+                        "start_ms": 300,
+                        "end_ms": 600,
+                        "original": "Bravo.",
+                        "display_suppressed": True,
+                    },
+                    {
+                        "subtitle_id": "S0003",
+                        "word_start": 2,
+                        "word_end": 2,
+                        "start_ms": 600,
+                        "end_ms": 900,
+                        "original": "Charlie.",
+                        "display_suppressed": False,
+                    },
+                ]
+            },
+        )
+        _write_json(
+            root / "stable-final-manifest.json",
+            {
+                "paths": {"original_top_srt": str(subtitle)},
+                "paths_sha256": {"original_top_srt": file_sha256(subtitle)},
+                "final_cue_timeline_path": str(timeline),
+                "final_cue_timeline_sha256": file_sha256(timeline),
+                "word_ledger_path": str(ledger),
+                "word_ledger_sha256": file_sha256(ledger),
+            },
+        )
+
+        cues = parse_srt(subtitle)
+
+        assert attach_article_word_timing(cues, subtitle) is True
+        assert [cue.subtitle_id for cue in cues] == ["S0001", "S0003"]
+        assert [cue.word_timing[0]["word_id"] for cue in cues] == [0, 2]
 
 
 def test_merge_display_page_with_next_keeps_parent_timeline_and_combines_chinese():
@@ -2519,6 +2918,194 @@ def test_merge_display_page_with_next_keeps_parent_timeline_and_combines_chinese
         assert session.to_model_data() == before_rows
         assert session.cues == before_cues
         assert session.word_ledger == before_ledger
+
+
+def test_split_one_display_page_preserves_every_other_page_and_parent():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        session.split_parent_into_display_pages("S0001", 2)
+        initial_rows = session.to_model_data()
+        for row in initial_rows.values():
+            row["display_page_chinese_confirmed"] = True
+        session.apply_display_page_model_data(initial_rows)
+
+        before_cue = copy.deepcopy(session.cues[0])
+        before_ledger = copy.deepcopy(session.word_ledger)
+        before_rows = list(session.to_model_data().values())
+        selected = copy.deepcopy(before_rows[0])
+        untouched = copy.deepcopy(before_rows[1])
+
+        result = session.split_display_page(str(selected["display_page_id"]))
+
+        after_rows = list(session.to_model_data().values())
+        selected_replacement = [
+            row
+            for row in after_rows
+            if int(selected["word_start"])
+            <= int(row["word_start"])
+            <= int(row["word_end"])
+            <= int(selected["word_end"])
+        ]
+        untouched_after = next(
+            row
+            for row in after_rows
+            if (int(row["word_start"]), int(row["word_end"]))
+            == (int(untouched["word_start"]), int(untouched["word_end"]))
+        )
+
+        assert result["changed"] is True
+        assert result["page_count"] == 3
+        assert len(selected_replacement) == 2
+        assert selected_replacement[0]["word_start"] == selected["word_start"]
+        assert selected_replacement[-1]["word_end"] == selected["word_end"]
+        assert all(
+            row["translated_subtitle"]
+            and row["display_page_chinese_stale"] is True
+            and row["display_page_chinese_confirmed"] is False
+            for row in selected_replacement
+        )
+        for field in (
+            "word_start",
+            "word_end",
+            "start_time",
+            "end_time",
+            "original_subtitle",
+            "translated_subtitle",
+            "display_page_chinese_confirmed",
+        ):
+            assert untouched_after[field] == untouched[field]
+        for field in (
+            "cue_id",
+            "source_subtitle_ids",
+            "word_start",
+            "word_end",
+            "start_time",
+            "end_time",
+            "original_subtitle",
+            "translated_subtitle",
+        ):
+            assert session.cues[0][field] == before_cue[field]
+        assert session.cues[0]["chinese_review_required"] is True
+        assert session.word_ledger == before_ledger
+        assert session.history[-1]["operation"] == "split_display_page"
+
+        assert session.undo() is True
+        assert session.to_model_data() == {
+            str(index): row for index, row in enumerate(before_rows, 1)
+        }
+
+
+def test_cross_parent_actual_page_merge_is_one_atomic_operation():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        before_cues = copy.deepcopy(session.cues)
+        before_rows = copy.deepcopy(session.to_model_data())
+        before_history_count = len(session.history)
+
+        result = session.merge_adjacent_display_pages(
+            "S0001.P02",
+            "S0002.P01",
+        )
+
+        rows = list(session.to_model_data().values())
+        assert result["parent_merge"] is True
+        assert result["page_count"] == 2
+        assert len(session.cues) == 1
+        assert len(rows) == 2
+        assert rows[0]["display_page_id"] == "S0001.P01"
+        assert (rows[0]["word_start"], rows[0]["word_end"]) == (0, 3)
+        assert (rows[1]["word_start"], rows[1]["word_end"]) == (4, 11)
+        assert rows[1]["translated_subtitle"] == "文一中文二"
+        assert len(session.history) == before_history_count + 1
+        assert session.history[-1]["operation"] == "merge_adjacent_display_pages"
+
+        assert session.undo() is True
+        assert session.cues == before_cues
+        assert session.to_model_data() == before_rows
+
+
+def test_cross_parent_merge_does_not_copy_the_entire_existing_history():
+    class ImmutableHistoryMarker:
+        def __deepcopy__(self, _memo):
+            raise AssertionError("existing history must remain append-only")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        marker = ImmutableHistoryMarker()
+        prior_entry = {
+            "operation": "existing_edit",
+            "before_cues": [],
+            "affected_parent_ids": ["S0001"],
+            "marker": marker,
+        }
+        session.history.append(prior_entry)
+
+        session.merge_adjacent_display_pages("S0001.P02", "S0002.P01")
+
+        assert session.history[0] is prior_entry
+        assert session.history[0]["marker"] is marker
+        assert session.history[-1]["operation"] == "merge_adjacent_display_pages"
+
+
+def test_save_snapshot_copies_current_state_but_reuses_immutable_history_entries():
+    class ImmutableHistoryMarker:
+        def __deepcopy__(self, _memo):
+            raise AssertionError("save snapshot must not duplicate history payloads")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        marker = ImmutableHistoryMarker()
+        prior_entry = {
+            "operation": "existing_edit",
+            "before_cues": [],
+            "marker": marker,
+        }
+        session.history.append(prior_entry)
+
+        snapshot = session.snapshot_for_save()
+
+        assert snapshot is not session
+        assert snapshot.history is not session.history
+        assert snapshot.history[0] is prior_entry
+        assert snapshot.history[0]["marker"] is marker
+        snapshot.cues[0]["translated_subtitle"] = "快照中文"
+        snapshot.word_ledger[0]["surface"] = "Snapshot."
+        assert session.cues[0]["translated_subtitle"] != "快照中文"
+        assert session.word_ledger[0]["surface"] != "Snapshot."
+
+
+def test_cross_parent_actual_page_merge_rolls_back_every_owner_on_failure():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        before_cues = copy.deepcopy(session.cues)
+        before_edits = copy.deepcopy(session.display_page_edits)
+        before_overrides = copy.deepcopy(session.display_page_boundary_overrides)
+        before_history = copy.deepcopy(session.history)
+        before_tail_trim = copy.deepcopy(session.tail_trim)
+
+        with patch.object(
+            session,
+            "merge_display_page_with_next",
+            side_effect=ManualFinalSubtitleEditError("injected page merge failure"),
+        ):
+            try:
+                session.merge_adjacent_display_pages(
+                    "S0001.P02",
+                    "S0002.P01",
+                )
+            except ManualFinalSubtitleEditError as exc:
+                assert "injected page merge failure" in str(exc)
+            else:
+                raise AssertionError("a partial cross-parent merge must roll back")
+
+        assert session.cues == before_cues
+        assert session.display_page_edits == before_edits
+        assert session.display_page_boundary_overrides == before_overrides
+        assert session.history == before_history
+        assert session.tail_trim == before_tail_trim
 
 
 def test_parent_merge_reflows_only_merged_pages_and_undo_restores_page_state():
@@ -2775,10 +3362,9 @@ def test_tail_trim_save_materializes_real_audio_and_reuses_exact_decision():
             saved_again = session.save_to_source_folder(
                 source_media_path=source_media
             )
-        assert (
-            Path(saved_again["source_media_path"]).resolve()
-            == derived_media.resolve()
-        )
+        second_derived_media = Path(saved_again["source_media_path"]).resolve()
+        assert second_derived_media != derived_media.resolve()
+        assert file_sha256(second_derived_media) == derived_hash
         assert file_sha256(derived_media) == derived_hash
         assert file_sha256(source_media) == source_hash
 
@@ -2921,7 +3507,7 @@ def test_save_persists_manual_override_and_synthesis_uses_it():
         assert package_artifact_dir == Path(paths["artifact_dir"])
         assert (package_artifact_dir / "translations.json").is_file()
         assert package_artifact_dir != session.artifact_dir
-        assert manual_manifest_path == override.parent / "stable-final-manifest.json"
+        assert manual_manifest_path == override.parents[2] / "stable-final-manifest.json"
         assert manual_manifest_path.parent == result_dir / "人工终稿字幕包"
         assert manual_manifest["render_blocked"] is False
         final_timeline_path = Path(manual_manifest["final_cue_timeline_path"])
@@ -2951,6 +3537,7 @@ def test_save_persists_manual_override_and_synthesis_uses_it():
             for page in page_map["pages"]
         )
         named_page_subtitle = Path(paths["display_page_srt_path"])
+        first_page_bytes = named_page_subtitle.read_bytes()
         page_session = ManualFinalSubtitleSession.load_for_subtitle(
             named_page_subtitle,
             work_dir=Path(temp_dir) / "work",
@@ -2982,10 +3569,16 @@ def test_save_persists_manual_override_and_synthesis_uses_it():
                 source_media_path=source_media
             )
         assert saved_again["manifest_path"] == paths["manifest_path"]
-        assert "人工修改" in named_page_subtitle.read_text(encoding="utf-8-sig")
-        manual_cues = parse_srt(override)
-        assert attach_article_word_timing(manual_cues, override) is True
-        assert load_article_display_page_translation_artifact(manual_cues, override) is True
+        assert named_page_subtitle.read_bytes() == first_page_bytes
+        assert "人工修改" in Path(saved_again["display_page_srt_path"]).read_text(
+            encoding="utf-8-sig"
+        )
+        latest_override = Path(saved_again["subtitle_path"])
+        manual_cues = parse_srt(latest_override)
+        assert attach_article_word_timing(manual_cues, latest_override) is True
+        assert load_article_display_page_translation_artifact(
+            manual_cues, latest_override
+        ) is True
         resolved_media, resolved_manifest = resolve_synthesis_package_inputs(
             paths["manifest_path"]
         )
@@ -3004,7 +3597,170 @@ def test_save_persists_manual_override_and_synthesis_uses_it():
             str(source_srt.with_suffix(".m4a")),
             paths["manifest_path"],
         )
-        assert Path(package_resolved) == override
+        assert Path(package_resolved) == latest_override
+
+
+def test_saved_manual_package_reopens_after_the_whole_result_directory_moves():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        session.move_suffix_to_next(0, 2)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"portable-package-audio")
+
+        paths = session.save_to_source_folder(source_media_path=source_media)
+        original_package = Path(paths["manifest_path"]).parent
+        original_result = original_package.parent
+        moved_result = root / "archive" / original_result.name
+        moved_result.parent.mkdir(parents=True)
+        shutil.move(str(original_result), str(moved_result))
+
+        moved_package = moved_result / original_package.name
+        moved_manifest = moved_package / "stable-final-manifest.json"
+        moved_manifest_payload = json.loads(
+            moved_manifest.read_text(encoding="utf-8")
+        )
+        moved_generation = moved_package / Path(
+            moved_manifest_payload["package_generation"]["relative_dir"]
+        )
+        moved_parent_srt = moved_generation / "人工终稿字幕.srt"
+        moved_page_srt = moved_generation / "人工终稿分页双语字幕.srt"
+        assert not original_package.exists()
+
+        reopened = ManualFinalSubtitleSession.load_from_manifest(moved_manifest)
+        assert reopened.subtitle_path == moved_parent_srt.resolve()
+        assert reopened.manifest_path == moved_manifest.resolve()
+        assert reopened.artifact_dir.parent == moved_generation.resolve()
+        assert reopened.cues[1]["original_subtitle"] == (
+            "just completely out of date."
+        )
+
+        reopened_from_parent = ManualFinalSubtitleSession.load_for_subtitle(
+            moved_parent_srt
+        )
+        assert reopened_from_parent.state_fingerprint() == reopened.state_fingerprint()
+
+        reopened_from_page = ManualFinalSubtitleSession.load_for_subtitle(
+            moved_page_srt
+        )
+        assert reopened_from_page.loaded_subtitle_path == moved_page_srt.resolve()
+        assert reopened_from_page.state_fingerprint() == reopened.state_fingerprint()
+
+
+def test_generation_write_failure_preserves_previous_published_package():
+    from app.core.subtitle_processor.stable_artifacts import (
+        write_json_artifact as real_write_json_artifact,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        first = session.save_to_source_folder()
+        manifest_path = Path(first["manifest_path"])
+        before_manifest = manifest_path.read_bytes()
+        before_session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+
+        def fail_generation_write(path, payload):
+            candidate = Path(path)
+            if candidate.name == "translations.json" and "generations" in candidate.parts:
+                raise OSError("injected generation write failure")
+            return real_write_json_artifact(candidate, payload)
+
+        with patch(
+            "app.core.subtitle_processor.manual_final_subtitle_editor."
+            "write_json_artifact",
+            side_effect=fail_generation_write,
+        ):
+            try:
+                before_session.save_to_source_folder()
+                assert False, "a generation write failure must abort publication"
+            except OSError as exc:
+                assert "injected generation write failure" in str(exc)
+
+        assert manifest_path.read_bytes() == before_manifest
+        recovered = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        assert recovered.state_fingerprint() == before_session.state_fingerprint()
+
+
+def test_generation_validation_failure_preserves_previous_published_package():
+    from app.core.subtitle_processor.stable_artifacts import (
+        resolve_manifest_owned_path as real_resolve_manifest_owned_path,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        first = session.save_to_source_folder()
+        manifest_path = Path(first["manifest_path"])
+        before_manifest = manifest_path.read_bytes()
+        before_session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+
+        def fail_word_ledger_validation(
+            candidate_manifest,
+            manifest,
+            declared,
+            expected_sha256="",
+            **kwargs,
+        ):
+            if (
+                ".candidate.json" in Path(candidate_manifest).name
+                and str(declared).endswith("word-ledger.json")
+            ):
+                return None
+            return real_resolve_manifest_owned_path(
+                candidate_manifest,
+                manifest,
+                declared,
+                expected_sha256,
+                **kwargs,
+            )
+
+        with patch(
+            "app.core.subtitle_processor.manual_final_subtitle_editor."
+            "resolve_manifest_owned_path",
+            side_effect=fail_word_ledger_validation,
+        ):
+            try:
+                before_session.save_to_source_folder()
+                assert False, "a failed generation validation must abort publication"
+            except ManualFinalSubtitleEditError as exc:
+                assert "word_ledger_path" in str(exc)
+
+        assert manifest_path.read_bytes() == before_manifest
+        recovered = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        assert recovered.state_fingerprint() == before_session.state_fingerprint()
+
+
+def test_root_manifest_commit_failure_preserves_previous_generation():
+    from app.core.subtitle_processor.stable_artifacts import (
+        write_json_artifact as real_write_json_artifact,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        first = session.save_to_source_folder()
+        manifest_path = Path(first["manifest_path"])
+        before_manifest = manifest_path.read_bytes()
+        before_session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+
+        def fail_root_commit(path, payload):
+            candidate = Path(path)
+            if candidate == manifest_path:
+                raise OSError("injected root manifest commit failure")
+            return real_write_json_artifact(candidate, payload)
+
+        with patch(
+            "app.core.subtitle_processor.manual_final_subtitle_editor."
+            "write_json_artifact",
+            side_effect=fail_root_commit,
+        ):
+            try:
+                before_session.save_to_source_folder()
+                assert False, "a root commit failure must abort publication"
+            except OSError as exc:
+                assert "injected root manifest commit failure" in str(exc)
+
+        assert manifest_path.read_bytes() == before_manifest
+        recovered = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        assert recovered.state_fingerprint() == before_session.state_fingerprint()
 
 
 def test_manual_package_reuses_only_exact_source_display_page_spans():
@@ -3930,6 +4686,8 @@ if __name__ == "__main__":
     test_split_parent_undoes_once_and_rejects_when_no_legal_cut_exists()
     test_manual_page_proposal_can_use_review_boundary_without_relaxing_strict_planning()
     test_model_data_uses_validated_parent_chinese_instead_of_stale_render_plan()
+    test_legacy_parent_and_translations_conflict_fails_closed()
+    test_manual_save_publishes_one_parent_chinese_record_across_artifacts()
     test_page_chinese_aggregate_detects_stale_pages_even_when_parent_copy_is_current()
     test_stale_single_page_uses_current_parent_chinese_without_confirmation()
     test_stale_page_chinese_remains_visible_but_cannot_publish_until_confirmed()
@@ -3942,8 +4700,21 @@ if __name__ == "__main__":
     test_stale_actual_page_import_opens_current_parent_package_without_reusing_old_pages()
     test_stale_actual_page_import_recovers_only_identity_matched_chinese_as_draft()
     test_move_prefix_and_undo_restore_exact_prior_boundary()
+    test_undo_redo_round_trip_and_new_edit_truncates_redo_branch()
+    test_recovery_draft_round_trip_is_atomic_and_manifest_bound()
     test_merge_only_combines_adjacent_continuous_word_ranges()
+    test_manual_english_surface_edit_preserves_word_identity_time_and_reload()
+    test_manual_english_surface_edit_rejects_changes_across_multiple_word_ids()
+    test_actual_page_english_surface_edit_updates_parent_without_moving_page_range()
+    test_suppress_single_cue_hides_srt_but_keeps_full_timeline_and_audio()
+    test_suppressed_cue_does_not_invalidate_visible_actual_page_edits()
+    test_renderer_attachment_accepts_a_suppressed_middle_timeline_record()
     test_merge_display_page_with_next_keeps_parent_timeline_and_combines_chinese()
+    test_split_one_display_page_preserves_every_other_page_and_parent()
+    test_cross_parent_actual_page_merge_is_one_atomic_operation()
+    test_cross_parent_merge_does_not_copy_the_entire_existing_history()
+    test_save_snapshot_copies_current_state_but_reuses_immutable_history_entries()
+    test_cross_parent_actual_page_merge_rolls_back_every_owner_on_failure()
     test_parent_merge_reflows_only_merged_pages_and_undo_restores_page_state()
     test_row_scoped_undo_rejects_an_unrelated_parent_without_popping_history()
     test_free_text_edit_cannot_be_used_as_a_fake_word_boundary_move()
@@ -3953,6 +4724,10 @@ if __name__ == "__main__":
     test_tail_trim_save_materializes_real_audio_and_reuses_exact_decision()
     test_reloaded_tail_trim_undo_restores_original_media_and_full_package()
     test_save_persists_manual_override_and_synthesis_uses_it()
+    test_saved_manual_package_reopens_after_the_whole_result_directory_moves()
+    test_generation_write_failure_preserves_previous_published_package()
+    test_generation_validation_failure_preserves_previous_published_package()
+    test_root_manifest_commit_failure_preserves_previous_generation()
     test_manual_package_reuses_only_exact_source_display_page_spans()
     test_manual_package_blocks_cleanly_when_page_translation_validation_returns_error()
     test_manual_package_persists_hash_bound_draft_pages_when_translation_is_required()

@@ -199,6 +199,7 @@ def main() -> int:
                 "scripts/compare_frozen_mainline_runs.py",
                 "scripts/evaluate_golden_subtitles.py",
                 "app/core/subtitle_processor/manual_final_subtitle_editor.py",
+                "app/core/subtitle_processor/authoritative_parent_chinese.py",
                 "app/core/subtitle_processor/allocation_quality.py",
                 "app/core/subtitle_processor/stable_artifacts.py",
                 "app/core/subtitle_processor/stable_english_boundaries.py",

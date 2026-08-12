@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 
 FROZEN_PIPELINE_HASH_KEYS = (
@@ -30,6 +30,34 @@ FROZEN_PIPELINE_HASH_KEYS = (
 def stable_payload_hash(payload: Any) -> str:
     """Hash a JSON-compatible payload with deterministic key ordering."""
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+WORD_LEDGER_HASH_VERSION = "canonical-word-ledger-v1"
+
+
+def canonical_word_ledger_payload(
+    ledger: Sequence[Mapping[str, Any]],
+) -> List[List[Any]]:
+    """Return the semantic identity shared by all word-ledger owners."""
+    return [
+        [
+            str(word.get("surface", word.get("token", "")) or ""),
+            str(word.get("normalized", word.get("token", "")) or ""),
+            int(word.get("start_ms", word.get("start_time", 0)) or 0),
+            int(word.get("end_ms", word.get("end_time", 0)) or 0),
+        ]
+        for word in ledger
+    ]
+
+
+def canonical_word_ledger_hash(ledger: Sequence[Mapping[str, Any]]) -> str:
+    """Hash ordered word surfaces, normalized forms, and authoritative times."""
+    raw = json.dumps(
+        canonical_word_ledger_payload(ledger),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

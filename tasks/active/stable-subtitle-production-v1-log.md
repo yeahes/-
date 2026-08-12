@@ -1,5 +1,27 @@
 # Progress Log
 
+## 2026-08-12 Authoritative Parent-Chinese Replay Gate
+
+- Added and tested the fixed-ID authoritative Chinese record contract. New
+  stable runs publish `authoritative-parent-chinese.json`; legacy schema-v2
+  packages are accepted only through an agreement-checked compatibility path.
+- Replayed only the two requested real packages in read-only mode:
+  `D:\经济学人\2026-08-08\如何停止拖延\如何停止拖延-处理结果` and
+  `D:\经济学人\2026-08-15\中国已成为世界石油强国\中国已成为世界石油强国-处理结果`.
+- Both loaded successfully and passed an in-memory undo/redo round trip. File
+  mtime, byte size, and SHA-256 snapshots were identical before and after.
+- No production subtitle, audio, video, cache, or manifest was written.
+
+### Legacy blocked-checkpoint compatibility
+
+- The first complete regression exposed that render-blocked editable checkpoints
+  can legitimately lack `translations.json` when page translation failed before
+  publication. The authority loader now permits that exact manifest state and
+  builds an in-memory legacy record from frozen parent cues; published packages
+  still require the translation artifact.
+- Video-synthesis safety and stable-publication tests pass after the fix. The
+  following full regression completes all stages without a failure line.
+
 ## 2026-08-11 Full-Strength First Vocabulary Card
 
 - Reproduced the reported pale first card as a renderer-cache interaction. The
@@ -2057,6 +2079,30 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
   stages pass in 362.2 seconds. No translation, display-page, renderer, source
   audio, or production artifact was changed during these tests.
 
+## 2026-08-11 Native Faster-Whisper Compression Recovery
+
+- `好莱坞最新热潮：姐弟恋` completed its 931-second Faster-Whisper pass, but
+  four words at 14:34 occupied 240ms. The raw SRT emitted `She realizes that
+  the` in the correct order; millisecond zero-width repair advanced `that`
+  past the same-start `the`, and the generic ASR container then time-sorted the
+  words into `She realizes the that`.
+- Zero-width repair now preserves emission order when a later nonzero word has
+  the same start. Residual native compression triggers a bounded local run with
+  `condition_on_previous_text=False` before cache and ledger freeze. Automatic
+  recovery requires unique exact anchors, identical word count and word
+  multiset, valid monotonic times, and no remaining local density failure. It
+  may restore order and timing but cannot add, remove, or substitute a word.
+- A global `condition_on_previous_text=False` run repaired the sample and was
+  faster, but was rejected as the production default because upstream documents
+  a cross-window consistency trade-off. The local fail-closed recovery changes
+  only an already-proven defective span.
+- Focused ASR trust tests pass 38/38. Read-only replay of production cache row
+  481 restored `She realizes that the sex itself`, left zero residual timing
+  issues, and did not write cache, subtitles, translation, or video artifacts.
+  Final-cue timeline and complete stable-caption rules pass. All 25 unified
+  regression stages pass in 364.5 seconds; no external ASR, LLM, translation,
+  synthesis, paid request, or production artifact write ran during tests.
+
 ## 2026-08-11 Manual Numeric Boundary Comma Fix
 
 - Reproduced the manual boundary false positive where moving `the` from
@@ -2068,3 +2114,140 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
 - Added a regression for `2026, / the` and retained the existing `740 billion`
   bidirectional protection test. The manual-editor script and the complete
   25-stage unified regression pass.
+
+## 2026-08-12 Pre-ID Overlong Contract Consistency
+
+- Replayed the failed `好莱坞最新热潮：姐弟恋` artifacts. `S0020` had a
+  correct `[243, 244]` sentence boundary after `_stable_cut_items`, but the
+  final adjacent-window rebalancer removed it as `short_dependent_tail_merged`.
+  `S0267` had a 15/4-word candidate that the formal pre-ID gate rejected as
+  `short_open_prefix_fragment`, while final validation ignored that rejection.
+- Over-limit adjacent-tail merges now require the existing shared
+  structural-overflow proof. Final validation now evaluates a proposed split
+  with its adjacent frozen cues through `_can_apply_pre_id_repair_candidate`.
+  These changes unify the planner and release gate without changing the
+  16-word limit or adding text-specific exceptions.
+- Added regressions for `... exact dynamic. / Lots of money.` and the complete
+  `If modern relationships ... lifelong partnerships,` clause. Existing
+  dependent-tail merge and structural-overflow tests remain green.
+- Production-ledger replay retains the 15/3-word sentence split and reduces
+  hard `overlong_english` findings from two to zero. The complete stable
+  caption script passes in 91.1 seconds; all 25 unified regression stages pass
+  in 368.1 seconds. External requests and production writes are zero.
+
+## 2026-08-12 Manual English Surface Correction And Cue Suppression
+
+- Traced `known literally OnlyFans Stifler's Mom` to an article-context fuzzy
+  candidate that consumed the original `only as` because the same article has
+  a later genuine `OnlyFans`. Added a generic entity gate: a fuzzy one-token
+  entity cannot collapse a multi-token phrase containing function words unless
+  their normalized forms are an exact orthographic join. The genuine entity
+  occurrence remains unchanged.
+- Added a constrained manual English surface edit from parent and actual-page
+  views. It can change exactly one frozen word ID's displayed surface while
+  preserving word identity, order, timing, and cue/page spans; broader English
+  rewrites fail closed and the affected Chinese requires confirmation.
+- Added an explicit single-row context-menu dialog, `修正当前英文（保持时间轴）`,
+  because the QFluentWidgets row-selection delegate did not reliably expose the
+  inline English editor. The dialog applies through the same session contract,
+  keeps the current page selected, and surfaces an invalid edit immediately.
+- Added `display_suppressed` for hiding an individual cue while preserving
+  source audio, frozen word coverage, subtitle ID, and final-timeline record.
+  Visible SRT and page rendering omit that cue; undo and restore are supported.
+- Focused suites pass: article correction 34/34, manual-editor direct suite,
+  stable publication/UI 61/61, and video-synthesis safety. The 25-stage unified
+  regression passes in 390.3 seconds after the explicit English-edit dialog
+  integration.
+- Read-only production replay loaded the existing 258-parent/311-page manual
+  package with 88 history operations. The two new in-memory operations hid
+  `S0021` and corrected only word ID 353 to `only as`; word ID 828 retained the
+  genuine `OnlyFans`, every word ID/time stayed exact, and no unrelated page
+  changed. No production artifact was written.
+
+## 2026-08-12 Hidden Restore Row And Multi-Token Word-Surface Compatibility
+
+- Reproduced the post-edit parent-view fallback against the real `好莱坞最新热潮：姐弟恋`
+  manual package. Two independent invalid assumptions were involved: the
+  hidden `S0021` restore row had no display-page ID and was counted as a missing
+  page, while the renderer required the number of whitespace tokens to equal
+  the number of timed-word records after `OnlyFans -> only as`.
+- Page operations now share one non-suppressed-row projection. Hidden restore
+  rows remain recoverable but do not participate in completeness, review,
+  split, merge, boundary movement, or saved page edits.
+- Article page planning, frozen-plan reflow, and frozen-artifact validation now
+  derive boundary units from verified timed-word surfaces. The joined surfaces
+  must still equal the cue English, and no word ID, range, time, or page ID can
+  change.
+- The combined regression hides one cue, applies a two-token display surface to
+  one frozen word ID in another multipage cue, moves the visible page boundary,
+  and restores the hidden cue. Manual-editor, stable publication/UI, article
+  readability, syntax compilation, and real-package temporary render-contract
+  checks pass. The real package was read only.
+- The required 25-stage unified regression exits zero in 372.9 seconds.
+
+## 2026-08-12 Preferred-Font Same-Screen Reflow
+
+- The v19 same-screen score could prefer 54px single-line text over a valid
+  56px two-line layout. The final typography owner now keeps the largest legal
+  size and falls back through 54/52/50px only after a larger size fails.
+- A read-only replay of the 310-page `好莱坞最新热潮：姐弟恋` manual package
+  changes only `S0033.P01`, `S0219.P01`, and `S0234.P01` from 54px to 56px.
+  Page IDs, word ownership, English, Chinese, timing, and all other 307 pages
+  remain unchanged. The distribution changes from 299/6/2/3 to 302/3/2/3 for
+  56/54/52/50px.
+- Article readability, manual-editor, stable-publication/UI 63/63, and all 25
+  unified regression stages pass. The full run completed in 459.2 seconds.
+
+## 2026-08-12 WhisperX Numeric Pause Preservation
+
+- Reproduced the delayed second subtitle from the authoritative ledgers. Native
+  Faster-Whisper ended `field,` at 1.080s and started `73%` at 1.560s;
+  WhisperX instead ended `field,` at 2.001s and started `73%` at 2.041s, so
+  final display began about 461ms after the spoken numeric onset.
+- Added a frozen-ledger handoff invariant for numbers, percentages, currency
+  forms, and acronyms. A trusted 200ms-or-longer pause cannot be substantially
+  erased when the resulting onset delay is at least 150ms and the preceding
+  word start does not corroborate the same local shift. Only the two boundary
+  owners can revert to trusted upstream timing.
+- Exact tests cover `field, / 73%`, unmatched `move. / 72%.`, and a
+  corroborated-shift non-regression. Complete stable-caption rules, ASR trust
+  38/38, final-cue timeline tests, and `git diff --check` pass. No production
+  subtitle, audio, video, cache, ASR, LLM, or paid request was written or run.
+- The complete 25-stage unified regression passes in 367.4 seconds.
+
+## 2026-08-13 Stable Publication Contract Repair
+
+- Reproduced `authoritative_parent_chinese_ledger_mismatch` as a semantic hash
+  ownership conflict: stable production and manual loading described the same
+  word ledger with different payloads.
+- Added `canonical-word-ledger-v1` as the shared ordered identity over surface,
+  normalized, start-ms, and end-ms fields. Stable production, manual loading,
+  manual save, and formal boundary evidence now use the same helper. Legacy
+  manual schema below version 4 retains a narrow compatibility path.
+- Made display-page export a required publication step. Export failure raises
+  `stable_display_page_export_failed`, and the discoverable root success
+  manifest is written only after display artifacts succeed.
+- Added cross-owner hash and publication-failure regression coverage. Cached
+  replay of `AI竞赛：中美殊途` succeeded from its immutable run-local subtitle
+  with 226 cues and 2,596 words.
+- Removed the abandoned pause-insensitive stranded-complement tests and false
+  completion record. That approach replaced one poor cut with another and is
+  not production behavior.
+
+## 2026-08-13 Failed AI Competition Boundary Follow-up
+
+- The fresh cached rerun failed only at `S0211 | S0212`: alignment changed the
+  trusted pause and the final gate still saw `most likely, | to manage`.
+- The first attempted fix was rejected during review because it moved the bad
+  cut to `most | likely, to manage`. The retained fix is narrower: spaCy must
+  confirm an adjacent modified predicate scope followed by a `to` auxiliary
+  headed by a bare verb. This protects `most likely, to manage` without making
+  every comma-plus-purpose-infinitive boundary a blocker.
+- Added regression coverage for the real repair, the no-parser degree-modifier
+  fallback, and an ordinary paused purpose clause. Complete stable-caption
+  tests and immutable production replay pass.
+- Direct replay of the failed checkpoint moves only boundary `2380 | 2381` to
+  `2378 | 2379`, keeps all 2,596 words and 226 cue IDs, and reduces hard
+  English boundaries from one to zero. The final 25-stage regression passes in
+  359.5 seconds; validation was offline and made no ASR, LLM, synthesis, or
+  paid request.

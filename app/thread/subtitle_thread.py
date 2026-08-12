@@ -765,6 +765,7 @@ class SubtitleThread(QThread):
         for key in (
             "final_cue_timeline_path",
             "display_page_translation_path",
+            "parent_chinese_authority_path",
             "display_boundary_evidence_path",
             "qa_review_points_srt",
             "qa_review_points_json",
@@ -1059,6 +1060,43 @@ class SubtitleThread(QThread):
             manifest.update(published_meta)
             run_manifest_path = run_dir / "stable-final-manifest.json"
             manifest_path = output_dir / "stable-final-manifest.json"
+            # The run-local manifest is a private candidate needed by the
+            # display-page exporter. The discoverable root manifest remains
+            # the publication commit point and must not be replaced yet.
+            write_json_artifact(run_manifest_path, manifest)
+
+            source_subtitle_paths = self._write_source_audio_subtitle_exports(asr_data)
+            display_page_required = (
+                str(manifest.get("display_page_translation_status") or "") == "PASS"
+                and bool(str(manifest.get("display_page_translation_path") or "").strip())
+            )
+            if display_page_required:
+                display_parent_paths = dict(source_subtitle_paths)
+                display_parent_paths.setdefault(
+                    "named_bilingual_original_top_srt",
+                    str(stable_paths["original_top_srt"]),
+                )
+                source_subtitle_paths.update(
+                    self._write_source_audio_display_page_exports(
+                        run_manifest_path,
+                        display_parent_paths,
+                    )
+                )
+            if source_subtitle_paths:
+                manifest["source_subtitle_dir"] = str(self._source_audio_report_dir())
+                manifest["source_subtitle_paths"] = source_subtitle_paths
+                manifest["source_subtitle_paths_sha256"] = {
+                    key: file_sha256(Path(value))
+                    for key, value in source_subtitle_paths.items()
+                    if value and Path(value).is_file()
+                }
+            qa_review_paths = self._write_source_audio_qc_queue(coverage_report_path)
+            if qa_review_paths:
+                manifest["qa_review_queue"] = qa_review_paths
+            summary_paths = self._write_stable_result_summary(manifest)
+            if summary_paths:
+                manifest["result_summary_paths"] = summary_paths
+
             write_json_artifact(run_manifest_path, manifest)
             write_json_artifact(manifest_path, manifest)
             published = True
@@ -1067,8 +1105,8 @@ class SubtitleThread(QThread):
                 shutil.rmtree(run_dir, ignore_errors=True)
             raise
 
-        # These are compatibility/convenience exports. The immutable run and
-        # root manifest above are already the source of truth.
+        # These are compatibility/convenience exports. They run only after
+        # the immutable run and root manifest have committed successfully.
         for key, run_path in stable_paths.items():
             compatibility_path = output_dir / run_path.name
             try:
@@ -1095,30 +1133,6 @@ class SubtitleThread(QThread):
         except Exception as exc:
             logger.warning("Stable compatibility output failed: %s", exc)
 
-        source_subtitle_paths = self._write_source_audio_subtitle_exports(asr_data)
-        if source_subtitle_paths:
-            source_subtitle_paths.update(
-                self._write_source_audio_display_page_exports(
-                    run_manifest_path,
-                    source_subtitle_paths,
-                )
-            )
-        if source_subtitle_paths:
-            manifest["source_subtitle_dir"] = str(self._source_audio_report_dir())
-            manifest["source_subtitle_paths"] = source_subtitle_paths
-            manifest["source_subtitle_paths_sha256"] = {
-                key: file_sha256(Path(value))
-                for key, value in source_subtitle_paths.items()
-                if value and Path(value).is_file()
-            }
-        qa_review_paths = self._write_source_audio_qc_queue(coverage_report_path)
-        if qa_review_paths:
-            manifest["qa_review_queue"] = qa_review_paths
-        summary_paths = self._write_stable_result_summary(manifest)
-        if summary_paths:
-            manifest["result_summary_paths"] = summary_paths
-        write_json_artifact(run_manifest_path, manifest)
-        write_json_artifact(manifest_path, manifest)
         logger.info("Stable subtitle manifest published: %s", manifest_path)
 
     def _write_source_audio_qc_queue(self, coverage_report_path: str | None) -> dict:
@@ -1374,11 +1388,11 @@ class SubtitleThread(QThread):
             or source_subtitle_paths.get("bilingual_original_top_srt")
             or ""
         )
-        try:
-            from app.core.subtitle_processor.manual_final_subtitle_editor import (
-                ManualFinalSubtitleSession,
-            )
+        from app.core.subtitle_processor.manual_final_subtitle_editor import (
+            ManualFinalSubtitleSession,
+        )
 
+        try:
             session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
             exported = session.export_display_page_subtitles(
                 source_dir / f"{source_stem}-实际分页双语字幕.srt",
@@ -1386,11 +1400,23 @@ class SubtitleThread(QThread):
                 source_parent_subtitle_path=parent_path or None,
             )
         except Exception as exc:
-            logger.warning("Source audio display-page export failed: %s", exc)
-            return {}
+            raise RuntimeError(
+                f"stable_display_page_export_failed: {exc}"
+            ) from exc
+        exported_srt = Path(str(exported.get("srt") or ""))
+        exported_map = Path(str(exported.get("map") or ""))
+        if not (
+            exported_srt.is_file()
+            and exported_srt.stat().st_size > 0
+            and exported_map.is_file()
+            and exported_map.stat().st_size > 0
+        ):
+            raise RuntimeError(
+                "stable_display_page_export_failed: missing_or_empty_export_pair"
+            )
         return {
-            "display_page_bilingual_srt": exported["srt"],
-            "display_page_map": exported["map"],
+            "display_page_bilingual_srt": str(exported_srt),
+            "display_page_map": str(exported_map),
         }
 
     def _source_audio_report_dir(self) -> Path | None:

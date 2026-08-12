@@ -16,6 +16,9 @@ from app.core.subtitle_processor.screen_editor import (
 )
 from app.core.subtitle_processor.stable_artifacts import (
     file_sha256,
+    find_stable_manifest_for_artifact,
+    manifest_generation_dir,
+    resolve_manifest_owned_path,
     validate_manifest_artifact,
 )
 from app.core.utils.logger import setup_logger
@@ -54,19 +57,40 @@ def _manual_draft_subtitle_path(manifest: dict, manifest_path: Path) -> Path:
     if not reasons or not reasons.issubset(MANUAL_DRAFT_ALLOWED_BLOCK_REASONS):
         raise RuntimeError("当前阻断不属于可人工承担的分页草稿范围，拒绝合成。")
 
-    subtitle_path = Path(str(override.get("subtitle_path") or ""))
-    if not validate_manifest_artifact(manifest, "original_top_srt", subtitle_path):
+    subtitle_path = resolve_manifest_owned_path(
+        manifest_path,
+        manifest,
+        str(override.get("subtitle_path") or ""),
+        str(override.get("subtitle_sha256") or ""),
+    )
+    if subtitle_path is None or not validate_manifest_artifact(
+        manifest,
+        "original_top_srt",
+        subtitle_path,
+        manifest_path=manifest_path,
+    ):
         raise RuntimeError("人工终稿字幕路径或清单哈希无效，拒绝合成草稿。")
     expected_hash = str(override.get("subtitle_sha256") or "")
     if not expected_hash or file_sha256(subtitle_path) != expected_hash:
         raise RuntimeError("人工终稿字幕哈希不一致，拒绝合成草稿。")
 
-    artifact_dir = Path(str(override.get("artifact_dir") or ""))
-    timeline_path = Path(str(override.get("final_cue_timeline_path") or ""))
-    ledger_path = Path(
-        str(override.get("word_ledger_path") or artifact_dir / "word-ledger.json")
+    artifact_dir = resolve_manifest_owned_path(
+        manifest_path,
+        manifest,
+        str(override.get("artifact_dir") or ""),
+        expect_directory=True,
     )
-    if not timeline_path.is_file() or not ledger_path.is_file():
+    timeline_path = resolve_manifest_owned_path(
+        manifest_path,
+        manifest,
+        str(override.get("final_cue_timeline_path") or ""),
+    )
+    ledger_path = resolve_manifest_owned_path(
+        manifest_path,
+        manifest,
+        str(override.get("word_ledger_path") or ""),
+    )
+    if artifact_dir is None or timeline_path is None or ledger_path is None:
         raise RuntimeError("人工终稿缺少最终时间轴或词级账本，拒绝合成草稿。")
     try:
         artifact_owner = artifact_dir.resolve()
@@ -86,21 +110,28 @@ def _manual_draft_subtitle_path(manifest: dict, manifest_path: Path) -> Path:
         or file_sha256(ledger_path) != ledger_sha256
     ):
         raise RuntimeError("人工终稿时间轴或词级账本哈希不一致，拒绝合成草稿。")
-    draft_page_path = Path(
-        str(manifest.get("manual_draft_page_plan_path") or "")
+    draft_page_path = resolve_manifest_owned_path(
+        manifest_path,
+        manifest,
+        str(manifest.get("manual_draft_page_plan_path") or ""),
+        str(manifest.get("manual_draft_page_plan_sha256") or ""),
     )
     draft_page_sha256 = str(
         manifest.get("manual_draft_page_plan_sha256") or ""
     )
-    override_draft_page_path = Path(
-        str(override.get("manual_draft_page_plan_path") or "")
+    override_draft_page_path = resolve_manifest_owned_path(
+        manifest_path,
+        manifest,
+        str(override.get("manual_draft_page_plan_path") or ""),
+        str(override.get("manual_draft_page_plan_sha256") or ""),
     )
     override_draft_page_sha256 = str(
         override.get("manual_draft_page_plan_sha256") or ""
     )
     try:
         draft_page_owned = (
-            draft_page_path.is_file()
+            draft_page_path is not None
+            and override_draft_page_path is not None
             and draft_page_path.resolve().parent == artifact_owner
             and draft_page_path.resolve() == override_draft_page_path.resolve()
         )
@@ -113,7 +144,13 @@ def _manual_draft_subtitle_path(manifest: dict, manifest_path: Path) -> Path:
         or file_sha256(draft_page_path) != draft_page_sha256
     ):
         raise RuntimeError("人工草稿缺少已保存且校验通过的分页计划，请重新保存字幕包。")
-    if manifest_path.parent.resolve() != subtitle_path.parent.resolve():
+    generation_dir = manifest_generation_dir(manifest_path, manifest)
+    if generation_dir is not None:
+        try:
+            subtitle_path.resolve().relative_to(generation_dir)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("人工终稿字幕不属于当前 generation，拒绝合成草稿。") from exc
+    elif manifest_path.parent.resolve() != subtitle_path.parent.resolve():
         raise RuntimeError("人工终稿字幕不属于当前清单目录，拒绝合成草稿。")
     return subtitle_path
 
@@ -125,10 +162,9 @@ def ensure_synthesis_subtitle_not_blocked(
 ) -> None:
     """Reject a blocked package even when its SRT is selected directly."""
     selected = Path(subtitle_path)
-    manifest_path = (
-        selected
-        if selected.name == "stable-final-manifest.json"
-        else selected.parent / "stable-final-manifest.json"
+    manifest_path = selected if selected.name == "stable-final-manifest.json" else (
+        find_stable_manifest_for_artifact(selected)
+        or selected.parent / "stable-final-manifest.json"
     )
     if not manifest_path.is_file():
         return
@@ -149,7 +185,7 @@ def ensure_synthesis_subtitle_not_blocked(
             if selected == draft_subtitle:
                 return
         raise RuntimeError("草稿授权只适用于当前人工终稿字幕。")
-    if _blocked_manifest_reading_speed_is_now_safe(manifest):
+    if _blocked_manifest_reading_speed_is_now_safe(manifest, manifest_path):
         return
     if selected == manifest_path:
         raise RuntimeError("稳定字幕包尚未通过检查，已阻止合成视频。")
@@ -167,7 +203,10 @@ def ensure_synthesis_subtitle_not_blocked(
         if not candidate:
             continue
         try:
-            candidate_path = Path(str(candidate)).resolve()
+            candidate_path = (
+                resolve_manifest_owned_path(manifest_path, manifest, str(candidate))
+                or Path(str(candidate)).resolve()
+            )
         except OSError:
             candidate_path = Path(str(candidate))
         if candidate_path == selected_resolved:
@@ -194,11 +233,19 @@ def resolve_synthesis_package_inputs(
         else:
             raise RuntimeError("稳定字幕包尚未通过检查，请先处理人工复核项。")
 
-    stable_path = Path(str((manifest.get("paths") or {}).get("original_top_srt") or ""))
+    stable_path = resolve_manifest_owned_path(
+        selected,
+        manifest,
+        str((manifest.get("paths") or {}).get("original_top_srt") or ""),
+        str((manifest.get("paths_sha256") or {}).get("original_top_srt") or ""),
+    )
+    if stable_path is None:
+        raise RuntimeError("稳定字幕包中的终稿路径或哈希无效。")
     if not validate_manifest_artifact(
         manifest,
         "original_top_srt",
         stable_path,
+        manifest_path=selected,
     ):
         raise RuntimeError("稳定字幕包中的终稿路径或哈希无效。")
 
@@ -210,15 +257,24 @@ def resolve_synthesis_package_inputs(
     )
     tail_trim = override.get("tail_trim") or manifest.get("tail_trim") or {}
     if tail_trim:
-        derived_media = Path(str(tail_trim.get("derived_media_path") or ""))
         expected_hash = str(tail_trim.get("derived_media_sha256") or "")
+        derived_media = resolve_manifest_owned_path(
+            selected,
+            manifest,
+            str(tail_trim.get("derived_media_path") or ""),
+            expected_hash,
+        )
         if (
-            not derived_media.is_file()
+            derived_media is None
             or not expected_hash
-            or file_sha256(derived_media) != expected_hash
             or (
                 manifest_media
-                and derived_media.resolve() != Path(manifest_media).resolve()
+                and resolve_manifest_owned_path(
+                    selected,
+                    manifest,
+                    manifest_media,
+                    expected_hash,
+                ) != derived_media
             )
         ):
             raise RuntimeError("尾部裁剪包中的派生音频路径或哈希无效。")
@@ -249,7 +305,10 @@ def synthesis_package_has_tail_trim(manifest_path: str | Path) -> bool:
     )
 
 
-def _blocked_manifest_reading_speed_is_now_safe(manifest: dict) -> bool:
+def _blocked_manifest_reading_speed_is_now_safe(
+    manifest: dict,
+    manifest_path: Path | None = None,
+) -> bool:
     """Allow an old manifest only when its sole retired blocker is revalidated.
 
     This is deliberately narrow: it never clears missing translations, timing,
@@ -261,9 +320,18 @@ def _blocked_manifest_reading_speed_is_now_safe(manifest: dict) -> bool:
     }:
         return False
 
-    stable_path = Path(
-        (manifest.get("paths") or {}).get("original_top_srt") or ""
-    )
+    declared = str((manifest.get("paths") or {}).get("original_top_srt") or "")
+    if manifest_path is not None:
+        stable_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            declared,
+            str((manifest.get("paths_sha256") or {}).get("original_top_srt") or ""),
+        )
+    else:
+        stable_path = Path(declared)
+    if stable_path is None:
+        return False
     if not stable_path.exists() or stable_path.stat().st_size <= 0:
         return False
 
@@ -298,7 +366,9 @@ def resolve_podcast_template_subtitle(
     search_dir = subtitle_path.parent
     video_stem = Path(video_file).stem
 
-    manifest_path = search_dir / "stable-final-manifest.json"
+    manifest_path = find_stable_manifest_for_artifact(subtitle_path)
+    if manifest_path is None:
+        manifest_path = search_dir / "stable-final-manifest.json"
     if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -313,14 +383,23 @@ def resolve_podcast_template_subtitle(
         if manifest.get("render_blocked"):
             if allow_manual_draft:
                 return str(_manual_draft_subtitle_path(manifest, manifest_path))
-            if _blocked_manifest_reading_speed_is_now_safe(manifest):
-                stable_path = Path(
-                    manifest.get("paths", {}).get("original_top_srt", "")
+            if _blocked_manifest_reading_speed_is_now_safe(manifest, manifest_path):
+                stable_path = resolve_manifest_owned_path(
+                    manifest_path,
+                    manifest,
+                    str(manifest.get("paths", {}).get("original_top_srt", "")),
+                    str(
+                        (manifest.get("paths_sha256") or {}).get(
+                            "original_top_srt"
+                        )
+                        or ""
+                    ),
                 )
-                if not validate_manifest_artifact(
+                if stable_path is None or not validate_manifest_artifact(
                     manifest,
                     "original_top_srt",
                     stable_path,
+                    manifest_path=manifest_path,
                 ):
                     raise RuntimeError(
                         "稳定字幕清单中的终稿路径或哈希无效，已阻止合成视频。"
@@ -336,7 +415,12 @@ def resolve_podcast_template_subtitle(
             )
         manual_override = manifest.get("manual_final_override") or {}
         manual_path_text = str(manual_override.get("subtitle_path") or "")
-        manual_path = Path(manual_path_text) if manual_path_text else None
+        manual_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            manual_path_text,
+            str(manual_override.get("subtitle_sha256") or ""),
+        )
         if manual_path is not None and manual_path.exists() and manual_path.stat().st_size > 0:
             if manual_override.get("render_blocked"):
                 raise RuntimeError(
@@ -354,13 +438,17 @@ def resolve_podcast_template_subtitle(
                 "Resolved podcast subtitle from manual final override: %s", manual_path
             )
             return str(manual_path)
-        stable_path = Path(
-            (manifest.get("paths") or {}).get("original_top_srt") or ""
+        stable_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str((manifest.get("paths") or {}).get("original_top_srt") or ""),
+            str((manifest.get("paths_sha256") or {}).get("original_top_srt") or ""),
         )
-        if validate_manifest_artifact(
+        if stable_path is not None and validate_manifest_artifact(
             manifest,
             "original_top_srt",
             stable_path,
+            manifest_path=manifest_path,
         ):
             logger.info("Resolved podcast subtitle from stable manifest: %s", stable_path)
             return str(stable_path)

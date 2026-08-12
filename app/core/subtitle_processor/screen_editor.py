@@ -22,6 +22,8 @@ from app.core.storage.cache_manager import CacheManager
 from app.core.subtitle_processor.stable_pipeline_contracts import (
     FROZEN_PIPELINE_HASH_KEYS,
     FrozenPipelineSnapshot,
+    WORD_LEDGER_HASH_VERSION,
+    canonical_word_ledger_hash,
     stable_payload_hash,
 )
 from app.core.subtitle_processor.final_cue_timeline import (
@@ -31,6 +33,11 @@ from app.core.subtitle_processor.final_cue_timeline import (
 )
 from app.core.subtitle_processor.allocation_quality import (
     compare_fixed_id_allocation_candidates,
+)
+from app.core.subtitle_processor.authoritative_parent_chinese import (
+    bind_display_page_parent_records,
+    build_authoritative_parent_chinese_artifact,
+    parent_chinese_records_by_id,
 )
 from app.core.subtitle_processor.stable_artifacts import (
     stable_artifact_dir,
@@ -580,6 +587,9 @@ class ScreenSubtitleEditor:
         self._display_page_translation_reviews: List[Dict[str, Any]] = []
         self._display_page_translation_path: str = ""
         self._display_page_translation_sha256: str = ""
+        self._parent_chinese_authority_artifact: Dict[str, Any] = {}
+        self._parent_chinese_authority_path: str = ""
+        self._parent_chinese_authority_sha256: str = ""
         self._display_boundary_evidence_artifact: Dict[str, Any] = {}
         self._display_boundary_evidence_path: str = ""
         self._display_boundary_evidence_sha256: str = ""
@@ -744,6 +754,9 @@ class ScreenSubtitleEditor:
         self._display_page_translation_reviews = []
         self._display_page_translation_path = ""
         self._display_page_translation_sha256 = ""
+        self._parent_chinese_authority_artifact = {}
+        self._parent_chinese_authority_path = ""
+        self._parent_chinese_authority_sha256 = ""
         self._display_boundary_evidence_artifact = {}
         self._display_boundary_evidence_path = ""
         self._display_boundary_evidence_sha256 = ""
@@ -2971,6 +2984,18 @@ class ScreenSubtitleEditor:
             ):
                 merged = self._merge_subtitle_items(left, right)
                 if re.search(r"[.!?][\"')\]]*\s*$", merged.original):
+                    if combined_word_count > self.max_english_words:
+                        merged_segment = ASRDataSeg(merged.original, 0, 0, "")
+                        merged_segment.word_start = merged.word_start
+                        merged_segment.word_end = merged.word_end
+                        if not self._is_allowed_structural_english_overflow(
+                            merged_segment,
+                            merged.original,
+                            combined_word_count,
+                            self.max_english_words,
+                        ):
+                            index += 1
+                            continue
                     evaluation = self._evaluate_item_pair_for_final_boundary(
                         left,
                         right,
@@ -4612,10 +4637,12 @@ class ScreenSubtitleEditor:
                 and target_boundary not in self._pre_id_boundary_pairs(window)
             ):
                 continue
+            hard_issues = set(evaluation.get("hard_issues") or [])
             allowed_long_pause_boundary = (
                 target_boundary
                 if (
-                    "right_orphaned_finite_predicate"
+                    "modified_infinitive_scope_split" in hard_issues
+                    or "right_orphaned_finite_predicate"
                     in (evaluation.get("continuation_display_issues") or [])
                     or "short_open_prefix_fragment"
                     in (evaluation.get("hard_fragment_issues") or [])
@@ -5955,6 +5982,18 @@ class ScreenSubtitleEditor:
             "display_page_translation_sha256": str(
                 getattr(self, "_display_page_translation_sha256", "") or ""
             ),
+            "parent_chinese_authority_path": str(
+                getattr(self, "_parent_chinese_authority_path", "") or ""
+            ),
+            "parent_chinese_authority_sha256": str(
+                getattr(self, "_parent_chinese_authority_sha256", "") or ""
+            ),
+            "parent_chinese_authority_hash": str(
+                (
+                    getattr(self, "_parent_chinese_authority_artifact", {}) or {}
+                ).get("artifact_hash")
+                or ""
+            ),
             "display_boundary_evidence_path": str(
                 getattr(self, "_display_boundary_evidence_path", "") or ""
             ),
@@ -7229,7 +7268,7 @@ class ScreenSubtitleEditor:
             "get", "go", "hire", "keep", "make", "move", "read", "see",
             "take", "use", "work", "write",
         }
-        return next_token in common_infinitive_verbs or next_token.endswith("e")
+        return next_token in common_infinitive_verbs
 
     @staticmethod
     def _left_boundary_takes_with_complement(left_token: str) -> bool:
@@ -7266,7 +7305,14 @@ class ScreenSubtitleEditor:
     ) -> bool:
         if pause_ms is not None and pause_ms > 180:
             return False
-        if not left_token.endswith("ly") or not right_token:
+        if not right_token:
+            return False
+        degree_modifiers = {
+            "almost", "especially", "extremely", "fairly", "highly",
+            "increasingly", "less", "more", "most", "particularly",
+            "quite", "rather", "relatively", "so", "too", "very",
+        }
+        if not left_token.endswith("ly") and left_token not in degree_modifiers:
             return False
         adjective_endings = (
             "able", "ible", "al", "ed", "ent", "ant", "ful", "ic",
@@ -7547,6 +7593,7 @@ class ScreenSubtitleEditor:
             self._protect_post_nominal_adverb_boundaries(doc, doc_to_word)
             self._protect_comma_bracketed_adverb_boundaries(doc, doc_to_word)
             self._protect_modifier_head_boundaries(doc, doc_to_word)
+            self._protect_modified_infinitive_scope_boundaries(doc, doc_to_word)
             self._protect_metalinguistic_reference_boundaries(doc, doc_to_word, protected)
 
         self._syntax_protected_cuts = protected
@@ -8872,6 +8919,59 @@ class ScreenSubtitleEditor:
                 "modifier_head_split",
             )
 
+    def _protect_modified_infinitive_scope_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep a modified predicate scope with its following infinitive.
+
+        Forced alignment may change a pause after English boundaries freeze.
+        The dependency shape remains stable: an adjacent modified adjective or
+        adverb followed by a comma and ``to`` auxiliary scopes the infinitive
+        headed by the next verb.  This excludes ordinary clause-level purpose
+        infinitives, so a long pause alone is not turned into a grammar error.
+        """
+        tokens_by_word: Dict[int, List] = {}
+        for token in doc:
+            if token.i in doc_to_word:
+                tokens_by_word.setdefault(doc_to_word[token.i], []).append(token)
+
+        for infinitive_marker in doc:
+            if (
+                self._clean_boundary_token(getattr(infinitive_marker, "text", "")) != "to"
+                or getattr(infinitive_marker, "pos_", "") != "PART"
+                or getattr(infinitive_marker, "dep_", "") not in {"aux", "mark"}
+                or infinitive_marker.i not in doc_to_word
+                or getattr(infinitive_marker.head, "pos_", "") != "VERB"
+                or getattr(infinitive_marker.head, "tag_", "") != "VB"
+            ):
+                continue
+            right = doc_to_word[infinitive_marker.i]
+            if right <= 0:
+                continue
+            left = right - 1
+            left_surface = str(self._active_word_entries[left].get("surface") or "")
+            if not re.search(r",[\"')\]]*\s*$", left_surface):
+                continue
+            scoped_heads = [
+                token
+                for token in tokens_by_word.get(left, [])
+                if getattr(token, "pos_", "") in {"ADJ", "ADV"}
+            ]
+            if not any(
+                getattr(modifier, "dep_", "") in {"advmod", "amod"}
+                and modifier.i in doc_to_word
+                and doc_to_word[modifier.i] == left - 1
+                for head in scoped_heads
+                for modifier in head.children
+            ):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [left, right],
+                "modified_infinitive_scope_split",
+            )
+
     def _record_syntax_hard_issue_for_indices(
         self,
         word_indices: Sequence[int],
@@ -9951,6 +10051,115 @@ class ScreenSubtitleEditor:
         except Exception as e:
             logger.warning("验证 JSON 保存失败 / Validation JSON save failed: %s", str(e))
 
+    def _final_parent_chinese_authority(
+        self,
+        final_segments: Sequence[ASRDataSeg],
+    ) -> Dict[str, Any]:
+        paginated_ids = {
+            str(parent.get("parent_subtitle_id") or "")
+            for parent in (
+                getattr(self, "_display_page_translation_artifact", {}) or {}
+            ).get("parents")
+            or []
+        }
+        records = []
+        for index, segment in enumerate(final_segments, 1):
+            subtitle_id = self._segment_subtitle_id(segment, index)
+            word_start = getattr(segment, "word_start", None)
+            word_end = getattr(segment, "word_end", None)
+            if not isinstance(word_start, int) or not isinstance(word_end, int):
+                raise RuntimeError(
+                    "authoritative_parent_chinese_invalid: final word span is missing"
+                )
+            is_page_projection = subtitle_id in paginated_ids
+            records.append(
+                {
+                    "subtitle_id": subtitle_id,
+                    "english": str(segment.text or ""),
+                    "chinese": str(segment.translated_text or ""),
+                    "word_start": word_start,
+                    "word_end": word_end,
+                    "provenance": {
+                        "kind": "automatic",
+                        "producer": (
+                            "display_page_translation"
+                            if is_page_projection
+                            else "fixed_id_allocation"
+                        ),
+                        "base_record_hash": "",
+                        "display_page_contract_hash": (
+                            str(
+                                (
+                                    getattr(
+                                        self,
+                                        "_display_page_translation_artifact",
+                                        {},
+                                    )
+                                    or {}
+                                ).get("contract_hash")
+                                or ""
+                            )
+                            if is_page_projection
+                            else ""
+                        ),
+                    },
+                }
+            )
+        return build_authoritative_parent_chinese_artifact(
+            records,
+            source_word_ledger_hash=self._word_ledger_hash(),
+            producer="stable_parent_chinese",
+        )
+
+    @staticmethod
+    def _translations_from_parent_chinese_authority(
+        final_segments: Sequence[ASRDataSeg],
+        records_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for index, segment in enumerate(final_segments, 1):
+            subtitle_id = str(
+                getattr(segment, "subtitle_id", "") or f"S{index:04d}"
+            )
+            record = records_by_id.get(subtitle_id)
+            if record is None:
+                raise RuntimeError(
+                    "authoritative_parent_chinese_invalid: final subtitle ID is missing"
+                )
+            rows.append(
+                {
+                    "id": index,
+                    "subtitle_id": subtitle_id,
+                    "start_ms": int(segment.start_time),
+                    "end_ms": int(segment.end_time),
+                    "text": str(segment.text or ""),
+                    "translated_text": str(record.get("chinese") or ""),
+                    "parent_source_hash": str(record.get("source_hash") or ""),
+                    "parent_record_hash": str(record.get("record_hash") or ""),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _bind_allocation_to_parent_chinese_authority(
+        allocation_payload: Sequence[Mapping[str, Any]],
+        records_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        for raw_group in allocation_payload:
+            group = dict(raw_group)
+            group["parent_chinese_records"] = {
+                subtitle_id: {
+                    "source_hash": str(records_by_id[subtitle_id]["source_hash"]),
+                    "chinese_hash": str(records_by_id[subtitle_id]["chinese_hash"]),
+                    "record_hash": str(records_by_id[subtitle_id]["record_hash"]),
+                }
+                for subtitle_id in group.get("subtitle_ids") or []
+                if subtitle_id in records_by_id
+            }
+            result.append(group)
+        return result
+
     def _write_stable_pipeline_artifacts(
         self,
         source_segments: Sequence[ASRDataSeg],
@@ -9963,12 +10172,41 @@ class ScreenSubtitleEditor:
         self._final_cue_timeline_path = ""
         self._display_page_translation_path = ""
         self._display_page_translation_sha256 = ""
+        self._parent_chinese_authority_path = ""
+        self._parent_chinese_authority_sha256 = ""
         self._display_boundary_evidence_path = ""
         self._display_boundary_evidence_sha256 = ""
         try:
             report_path = Path(self.coverage_report_path)
             artifact_dir = stable_artifact_dir(report_path)
             artifact_dir.mkdir(parents=True, exist_ok=True)
+            parent_chinese_authority = self._final_parent_chinese_authority(
+                final_segments
+            )
+            parent_chinese_by_id = parent_chinese_records_by_id(
+                parent_chinese_authority
+            )
+            raw_display_page_artifact = (
+                getattr(self, "_display_page_translation_artifact", {}) or {}
+            )
+            display_page_artifact = (
+                bind_display_page_parent_records(
+                    raw_display_page_artifact,
+                    parent_chinese_by_id,
+                )
+                if str(raw_display_page_artifact.get("status") or "") == "PASS"
+                else dict(raw_display_page_artifact)
+            )
+            self._parent_chinese_authority_artifact = parent_chinese_authority
+            self._display_page_translation_artifact = display_page_artifact
+            translation_payload = self._translations_from_parent_chinese_authority(
+                final_segments,
+                parent_chinese_by_id,
+            )
+            allocation_payload = self._bind_allocation_to_parent_chinese_authority(
+                self._final_allocation_payload(semantic_groups, subtitle_items),
+                parent_chinese_by_id,
+            )
 
             manifest = {
                 "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -10008,13 +10246,17 @@ class ScreenSubtitleEditor:
                     getattr(self, "_final_word_timing_reconciliations", []) or []
                 ),
                 "display_page_translation_status": str(
-                    (getattr(self, "_display_page_translation_artifact", {}) or {}).get("status")
+                    display_page_artifact.get("status")
                     or "NOT_BUILT"
+                ),
+                "parent_chinese_authority_hash": str(
+                    parent_chinese_authority.get("artifact_hash") or ""
                 ),
                 "artifact_schema_version": 2,
             }
             final_timeline_path = artifact_dir / "final-cue-timeline.json"
             display_page_path = artifact_dir / "display-page-translations.json"
+            parent_chinese_path = artifact_dir / "authoritative-parent-chinese.json"
             display_boundary_path = artifact_dir / "display-boundary-evidence.json"
             write_json_artifact_set(
                 artifact_dir,
@@ -10034,7 +10276,11 @@ class ScreenSubtitleEditor:
                     ),
                     (
                         "display-page-translations.json",
-                        getattr(self, "_display_page_translation_artifact", {}) or {},
+                        display_page_artifact,
+                    ),
+                    (
+                        "authoritative-parent-chinese.json",
+                        parent_chinese_authority,
                     ),
                     (
                         "display-boundary-evidence.json",
@@ -10060,10 +10306,7 @@ class ScreenSubtitleEditor:
                     ),
                     (
                         "translations.json",
-                        [
-                            self._segment_to_dict(index, seg)
-                            for index, seg in enumerate(final_segments, 1)
-                        ],
+                        translation_payload,
                     ),
                     ("llm-raw-returns.json", self._last_llm_raw_returns),
                     (
@@ -10076,7 +10319,7 @@ class ScreenSubtitleEditor:
                     ("allocation-retry-log.json", self._last_allocation_retry_log),
                     (
                         "allocation-final.json",
-                        self._final_allocation_payload(semantic_groups, subtitle_items),
+                        allocation_payload,
                     ),
                     ("allocation-unresolved.json", self._last_allocation_unresolved),
                     ("allocation-isolation-report.json", self._allocation_isolation_report),
@@ -10097,6 +10340,10 @@ class ScreenSubtitleEditor:
             self._display_page_translation_sha256 = hashlib.sha256(
                 display_page_path.read_bytes()
             ).hexdigest()
+            self._parent_chinese_authority_path = str(parent_chinese_path)
+            self._parent_chinese_authority_sha256 = hashlib.sha256(
+                parent_chinese_path.read_bytes()
+            ).hexdigest()
             self._display_boundary_evidence_path = str(display_boundary_path)
             self._display_boundary_evidence_sha256 = hashlib.sha256(
                 display_boundary_path.read_bytes()
@@ -10106,6 +10353,9 @@ class ScreenSubtitleEditor:
             self._final_cue_timeline_path = ""
             self._display_page_translation_path = ""
             self._display_page_translation_sha256 = ""
+            self._parent_chinese_authority_artifact = {}
+            self._parent_chinese_authority_path = ""
+            self._parent_chinese_authority_sha256 = ""
             self._display_boundary_evidence_path = ""
             self._display_boundary_evidence_sha256 = ""
             logger.error("稳定模式中间产物保存失败 / Stable artifacts save failed: %s", str(e))
@@ -10240,7 +10490,8 @@ class ScreenSubtitleEditor:
 
     def _word_ledger_payload(self, source_segments: Sequence[ASRDataSeg]) -> Dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
+            "hash_version": WORD_LEDGER_HASH_VERSION,
             "hash": self._word_ledger_hash(),
             "words": [
                 {
@@ -10261,17 +10512,17 @@ class ScreenSubtitleEditor:
         }
 
     def _word_ledger_hash(self) -> str:
-        payload = [
+        return canonical_word_ledger_hash(
             [
-                entry.get("surface") or entry.get("token") or "",
-                entry.get("token") or "",
-                int(entry.get("start_time") or 0),
-                int(entry.get("end_time") or 0),
+                {
+                    "surface": entry.get("surface") or entry.get("token") or "",
+                    "normalized": entry.get("token") or "",
+                    "start_ms": int(entry.get("start_time") or 0),
+                    "end_ms": int(entry.get("end_time") or 0),
+                }
+                for entry in self._active_word_entries
             ]
-            for entry in self._active_word_entries
-        ]
-        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        )
 
     def _allocation_isolation_snapshot(
         self,
@@ -10540,12 +10791,19 @@ class ScreenSubtitleEditor:
     ) -> List[Dict]:
         issues: List[Dict] = []
         hard_limit = max(int(self.max_english_words or 0), HARD_ENGLISH_WORD_LIMIT)
-        for seg in segments:
+        for index, seg in enumerate(segments):
             text = self._normalize_text(seg.text)
             word_count = self._word_count(text)
             if self._is_allowed_plus_discourse_overflow(text, word_count, hard_limit):
                 continue
-            if self._is_allowed_structural_english_overflow(seg, text, word_count, hard_limit):
+            if self._is_allowed_structural_english_overflow(
+                seg,
+                text,
+                word_count,
+                hard_limit,
+                previous_segment=segments[index - 1] if index > 0 else None,
+                next_segment=segments[index + 1] if index + 1 < len(segments) else None,
+            ):
                 continue
             if word_count <= hard_limit:
                 continue
@@ -16771,10 +17029,17 @@ class ScreenSubtitleEditor:
     ) -> List[Dict]:
         hard_limit = max(int(self.max_english_words or 0), HARD_ENGLISH_WORD_LIMIT)
         issues: List[Dict] = []
-        for seg in segments:
+        for index, seg in enumerate(segments):
             text = self._normalize_text(seg.text)
             word_count = self._word_count(text)
-            if not self._is_allowed_structural_english_overflow(seg, text, word_count, hard_limit):
+            if not self._is_allowed_structural_english_overflow(
+                seg,
+                text,
+                word_count,
+                hard_limit,
+                previous_segment=segments[index - 1] if index > 0 else None,
+                next_segment=segments[index + 1] if index + 1 < len(segments) else None,
+            ):
                 continue
             issues.append(
                 {
@@ -16795,6 +17060,8 @@ class ScreenSubtitleEditor:
         text: str,
         word_count: int,
         hard_limit: int,
+        previous_segment: Optional[ASRDataSeg] = None,
+        next_segment: Optional[ASRDataSeg] = None,
     ) -> bool:
         """Allow an audited complete cue only when no legal <=16 split exists."""
         if word_count <= hard_limit:
@@ -16826,7 +17093,35 @@ class ScreenSubtitleEditor:
         if not terminal_sentence and not protected_comma_clause and not complete_comma_main_clause:
             return False
         repaired, _ = self._safe_overlong_item_split(item)
-        return not repaired
+        if not repaired:
+            return True
+        if previous_segment is None and next_segment is None:
+            return False
+        if len(repaired) < 2:
+            return False
+
+        def neighbor_item(candidate: Optional[ASRDataSeg]) -> Optional[ScreenSubtitleItem]:
+            if candidate is None:
+                return None
+            candidate_start = getattr(candidate, "word_start", None)
+            candidate_end = getattr(candidate, "word_end", None)
+            if (
+                not isinstance(candidate_start, int)
+                or not isinstance(candidate_end, int)
+                or candidate_start < 0
+                or candidate_end < candidate_start
+                or candidate_end >= len(self._active_word_entries)
+            ):
+                return None
+            return self._item_from_word_span(candidate_start, candidate_end)
+
+        candidate_gate = self._can_apply_pre_id_repair_candidate(
+            [item],
+            repaired,
+            previous_item=neighbor_item(previous_segment),
+            next_item=neighbor_item(next_segment),
+        )
+        return not candidate_gate["accepted"]
 
     def _is_parser_confirmed_comma_subordinate_clause(self, text: str) -> bool:
         """Allow a short parser-confirmed leading subordinate clause as overflow.

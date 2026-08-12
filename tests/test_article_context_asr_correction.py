@@ -104,6 +104,69 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             ],
         )
 
+    def test_does_not_collapse_function_words_into_a_distant_article_entity(self):
+        article = (
+            "The character was known literally only as Stifler's Mom. "
+            "Later, platforms such as OnlyFans changed distribution."
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "platforms": [
+                    {
+                        "canonical_name": "OnlyFans",
+                        "aliases": [],
+                        "category": "adult content platform",
+                    }
+                ]
+            },
+            article,
+        )
+        words = [
+            "known",
+            "literally",
+            "only",
+            "as",
+            "Stifler's",
+            "Mom.",
+            "Later,",
+            "OnlyFans",
+            "changed",
+            "distribution.",
+        ]
+        raw = [
+            ASRDataSeg(word, index * 100, (index + 1) * 100)
+            for index, word in enumerate(words)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads(
+                (Path(tmp) / "correction_log.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            [segment.text.strip() for segment in corrected.segments],
+            words,
+        )
+        rejected = [
+            item
+            for item in logs
+            if item.get("original_text") == "only as"
+            and item.get("candidate_text") == "OnlyFans"
+        ]
+        self.assertTrue(rejected)
+        self.assertTrue(all(not item.get("applied") for item in rejected))
+        self.assertTrue(
+            all(
+                item.get("reason") == "candidate_would_merge_function_words"
+                for item in rejected
+            )
+        )
+
     def test_corrects_near_threshold_person_name_when_last_name_matches_article_entity(self):
         raw = [
             ASRDataSeg(

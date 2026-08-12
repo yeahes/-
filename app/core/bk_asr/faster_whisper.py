@@ -1,4 +1,5 @@
 import hashlib
+from copy import copy
 from difflib import SequenceMatcher
 import os
 import re
@@ -9,7 +10,10 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 from ..utils.logger import setup_logger
-from ..subtitle_processor.word_timing_trust import describe_word_timing_issue
+from ..subtitle_processor.word_timing_trust import (
+    describe_word_timing_issue,
+    find_implausible_word_timing_runs,
+)
 from .asr_data import ASRDataSeg, ASRData
 from .base import BaseASR
 
@@ -124,6 +128,7 @@ class FasterWhisperASR(BaseASR):
         asr_data = super().run(callback, **kwargs)
         repaired = bool(
             getattr(self, "last_internal_gap_repairs", [])
+            or getattr(self, "last_compressed_timing_repairs", [])
             or getattr(self, "last_tail_hallucination_repair", {})
         )
         if repaired and getattr(self, "use_cache", False):
@@ -235,10 +240,17 @@ class FasterWhisperASR(BaseASR):
 
             repaired_start = start
             if index > 0:
-                repaired_start = max(
-                    repaired_start,
-                    int(segments[index - 1].end_time),
+                same_start_nonzero_word_follows = any(
+                    int(candidate.start_time) == start
+                    and int(candidate.end_time) > int(candidate.start_time)
+                    for candidate in segments[index + 1 :]
                 )
+                previous_boundary = (
+                    int(segments[index - 1].start_time)
+                    if same_start_nonzero_word_follows
+                    else int(segments[index - 1].end_time)
+                )
+                repaired_start = max(repaired_start, previous_boundary)
             next_distinct_start = next(
                 (
                     int(candidate.start_time)
@@ -291,6 +303,9 @@ class FasterWhisperASR(BaseASR):
             and not getattr(self, "_skip_internal_gap_repair", False)
         ):
             filtered_segments = self._repair_suspicious_internal_gaps(
+                filtered_segments
+            )
+            filtered_segments = self._repair_suspicious_compressed_timing(
                 filtered_segments
             )
         return filtered_segments
@@ -446,6 +461,227 @@ class FasterWhisperASR(BaseASR):
             for index in range(len(words) - len(needle) + 1)
             if words[index : index + len(needle)] == needle
         ]
+
+    @classmethod
+    def _repair_compressed_timing_from_local_segments(
+        cls,
+        segments: list[ASRDataSeg],
+        *,
+        issue: dict,
+        local_segments: list[ASRDataSeg],
+    ) -> Optional[tuple[list[ASRDataSeg], dict]]:
+        issue_start = int(issue.get("start_index", -1))
+        issue_end = int(issue.get("end_index", -1))
+        if (
+            issue_start < 2
+            or issue_end < issue_start
+            or issue_end + 2 >= len(segments)
+        ):
+            return None
+
+        source_words = cls._normalized_words(segments)
+        local_words = cls._normalized_words(local_segments)
+        if any(not word for word in source_words[issue_start : issue_end + 1]):
+            return None
+        if any(not word for word in local_words):
+            return None
+
+        issue_word_count = issue_end - issue_start + 1
+        candidates = []
+        max_left_anchor = min(4, issue_start)
+        max_right_anchor = min(4, len(segments) - issue_end - 1)
+        for left_count in range(max_left_anchor, 1, -1):
+            for right_count in range(max_right_anchor, 1, -1):
+                left_anchor = source_words[issue_start - left_count : issue_start]
+                right_anchor = source_words[
+                    issue_end + 1 : issue_end + right_count + 1
+                ]
+                anchor_pairs = []
+                for left_start in cls._subsequence_starts(local_words, left_anchor):
+                    local_issue_start = left_start + left_count
+                    local_issue_end = local_issue_start + issue_word_count
+                    if local_issue_end + right_count > len(local_words):
+                        continue
+                    if local_words[
+                        local_issue_end : local_issue_end + right_count
+                    ] != right_anchor:
+                        continue
+                    anchor_pairs.append((local_issue_start, local_issue_end))
+                if len(anchor_pairs) != 1:
+                    continue
+                local_issue_start, local_issue_end = anchor_pairs[0]
+                replacement = local_segments[local_issue_start:local_issue_end]
+                if len(replacement) != issue_word_count:
+                    continue
+                replacement_words = cls._normalized_words(replacement)
+                source_issue_words = source_words[issue_start : issue_end + 1]
+                if sorted(replacement_words) != sorted(source_issue_words):
+                    continue
+                if any(
+                    int(segment.end_time) <= int(segment.start_time)
+                    for segment in replacement
+                ):
+                    continue
+
+                repaired = list(segments)
+                source_by_word = {}
+                for source_segment in segments[issue_start : issue_end + 1]:
+                    source_by_word.setdefault(
+                        cls._normalize_tail_word(source_segment.text), []
+                    ).append(source_segment)
+                reordered = []
+                for local_segment, normalized_word in zip(
+                    replacement,
+                    replacement_words,
+                ):
+                    source_segment = copy(source_by_word[normalized_word].pop(0))
+                    source_segment.start_time = int(local_segment.start_time)
+                    source_segment.end_time = int(local_segment.end_time)
+                    source_segment.timing_repair = (
+                        "context_free_local_retranscription"
+                    )
+                    reordered.append(source_segment)
+                repaired[issue_start : issue_end + 1] = reordered
+
+                check_start = max(0, issue_start - 1)
+                check_end = min(len(repaired), issue_end + 2)
+                checked = repaired[check_start:check_end]
+                if any(
+                    int(current.start_time) < int(previous.start_time)
+                    for previous, current in zip(checked, checked[1:])
+                ):
+                    continue
+                remaining_local_issue = any(
+                    int(candidate_issue["start_index"]) <= issue_end
+                    and int(candidate_issue["end_index"]) >= issue_start
+                    for candidate_issue in find_implausible_word_timing_runs(repaired)
+                )
+                if remaining_local_issue:
+                    continue
+
+                acoustic_distance = abs(
+                    int(replacement[0].start_time) - int(issue["start_ms"])
+                ) + abs(
+                    int(replacement[-1].end_time) - int(issue["end_ms"])
+                )
+                candidates.append(
+                    (
+                        -(left_count + right_count),
+                        acoustic_distance,
+                        repaired,
+                        {
+                            "code": "asr_compressed_word_timing_repaired",
+                            "start_ms": int(issue["start_ms"]),
+                            "end_ms": int(issue["end_ms"]),
+                            "word_count": issue_word_count,
+                            "source_text": " ".join(
+                                segment.text.strip()
+                                for segment in segments[issue_start : issue_end + 1]
+                            ),
+                            "repaired_text": " ".join(
+                                segment.text.strip() for segment in reordered
+                            ),
+                            "word_order_restored": (
+                                replacement_words != source_issue_words
+                            ),
+                            "local_start_ms": int(replacement[0].start_time),
+                            "local_end_ms": int(replacement[-1].end_time),
+                            "left_anchor_count": left_count,
+                            "right_anchor_count": right_count,
+                        },
+                    )
+                )
+
+        if not candidates:
+            return None
+        _, _, repaired, report = sorted(candidates, key=lambda item: item[:2])[0]
+        return repaired, report
+
+    def _repair_suspicious_compressed_timing(
+        self,
+        segments: list[ASRDataSeg],
+    ) -> list[ASRDataSeg]:
+        self.last_compressed_timing_repairs = []
+        self.last_unresolved_compressed_timing_candidates = []
+        if not segments or not self._can_run_local_gap_repair():
+            return segments
+
+        repaired = list(segments)
+        attempted = set()
+        attempts = 0
+        while attempts < self.INTERNAL_GAP_MAX_REPAIRS:
+            issues = find_implausible_word_timing_runs(repaired)
+            if not issues:
+                break
+            applied = False
+            for issue in issues:
+                if attempts >= self.INTERNAL_GAP_MAX_REPAIRS:
+                    break
+                issue_start = int(issue["start_index"])
+                issue_end = int(issue["end_index"])
+                issue_key = (
+                    int(issue["start_ms"]),
+                    int(issue["end_ms"]),
+                    tuple(
+                        self._normalized_words(repaired[issue_start : issue_end + 1])
+                    ),
+                )
+                if issue_key in attempted:
+                    continue
+                attempted.add(issue_key)
+                attempts += 1
+
+                context_start = max(
+                    0,
+                    issue_start - self.INTERNAL_GAP_CONTEXT_WORDS,
+                )
+                context_end = min(
+                    len(repaired) - 1,
+                    issue_end + self.INTERNAL_GAP_CONTEXT_WORDS,
+                )
+                window_start_ms = max(
+                    0,
+                    int(repaired[context_start].start_time)
+                    - self.INTERNAL_GAP_WINDOW_PADDING_MS,
+                )
+                window_end_ms = (
+                    int(repaired[context_end].end_time)
+                    + self.INTERNAL_GAP_WINDOW_PADDING_MS
+                )
+                local_segments = self._transcribe_local_window(
+                    window_start_ms,
+                    window_end_ms,
+                )
+                result = self._repair_compressed_timing_from_local_segments(
+                    repaired,
+                    issue=issue,
+                    local_segments=local_segments,
+                )
+                if result is not None:
+                    repaired, report = result
+                    self.last_compressed_timing_repairs.append(report)
+                    logger.warning(
+                        "Repaired Faster Whisper compressed word timing: %s",
+                        report,
+                    )
+                    applied = True
+                    break
+
+                unresolved = {
+                    **issue,
+                    "text": " ".join(
+                        segment.text.strip()
+                        for segment in repaired[issue_start : issue_end + 1]
+                    ),
+                }
+                self.last_unresolved_compressed_timing_candidates.append(unresolved)
+                logger.warning(
+                    "Skipped unanchored Faster Whisper compressed timing: %s",
+                    describe_word_timing_issue(unresolved),
+                )
+            if not applied:
+                break
+        return repaired
 
     def _repair_suspicious_internal_gaps(
         self,

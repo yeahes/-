@@ -1828,6 +1828,23 @@ def _entity_phrase_gate(original_text: str, canonical: str) -> Dict[str, Any]:
     if not original_tokens or not canonical_tokens:
         return _entity_gate_result(False, "empty_candidate")
 
+    normalized_original = [
+        _normalize_entity_gate_token(token) for token in original_tokens
+    ]
+    normalized_canonical = [
+        _normalize_entity_gate_token(token) for token in canonical_tokens
+    ]
+    if (
+        len(normalized_canonical) == 1
+        and len(normalized_original) > 1
+        and any(
+            token in _ENTITY_BLOCKING_FUNCTION_WORDS
+            for token in normalized_original
+        )
+        and "".join(normalized_original) != normalized_canonical[0]
+    ):
+        return _entity_gate_result(False, "candidate_would_merge_function_words")
+
     if _candidate_tokens_fully_align_to_canonical(original_tokens, canonical_tokens):
         return _entity_gate_result(True, "complete_source_window_maps_to_entity")
 

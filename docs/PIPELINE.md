@@ -22,6 +22,13 @@ Important rules:
   audio activity. New words are inserted only when exact text anchors match on
   both sides; an unanchored local result is diagnostic evidence and cannot
   mutate the transcript.
+- Native Faster-Whisper word timing is also checked for implausibly compressed
+  local runs before it becomes cache or ledger authority. A bounded
+  context-free retranscription may restore only the timing and acoustic order
+  of the same word multiset between unique exact anchors; it cannot add,
+  remove, or rewrite words. Millisecond zero-width repair preserves emitted
+  word order. Unanchored, text-changing, or still-compressed results remain
+  blocked, while a successful repair replaces the stale raw ASR cache value.
 - Article-assisted ASR correction runs before stable English boundaries freeze.
   Fresh, cached, and UI-supplied article analysis must all be enriched with
   source evidence in memory before either ASR correction or the translation
@@ -32,6 +39,10 @@ Important rules:
   similarity; an ordinary technical word is not a fuzzy rewrite authority.
   Correction changes token surface text only and preserves the original word
   times.
+  A multi-token source phrase containing ordinary function words cannot be
+  collapsed into a one-token named entity by fuzzy similarity alone. Exact
+  orthographic joins remain eligible, and a genuine occurrence of the same
+  named entity elsewhere remains unchanged.
   A fuzzy correction may replace only its entity-owned source span. When the
   complete canonical entity already exists inside or immediately beside a
   candidate window, the candidate cannot consume a neighbouring discourse
@@ -107,6 +118,12 @@ Rules:
   only words collapsed inside that same time envelope, restores their trusted
   upstream times, and reruns detection. An implausible upstream ledger cannot
   authorize a fallback and blocks final timeline export.
+- WhisperX may not erase a trusted pause before an expansion-sensitive written
+  token such as a number, percentage, currency form, or acronym. When the
+  aligner stretches the preceding word across a 200ms-or-longer upstream pause
+  and would delay the token onset by at least 150ms without a corroborating
+  local shift, only the two words owning that boundary revert to their trusted
+  upstream times.
 - A padding overlap may be reconciled only at a shared boundary that stays
   between the adjacent word envelopes.
 - Do not change English text, Chinese text, subtitle ID, word range, or order.
@@ -221,6 +238,16 @@ Rule:
   SRT, word ledger, final cue timeline, page translations, edit history, and a
   SHA-256-bound `stable-final-manifest.json`. It never overwrites the original
   stable package.
+- A manual English correction may replace the display surface of exactly one
+  frozen word ID while preserving that ID, its order, its time range, and the
+  cue/page word spans. The editor rejects multi-ID free rewriting and marks the
+  corresponding Chinese for confirmation. The parent/actual-page context menu
+  exposes an explicit `修正当前英文（保持时间轴）` dialog so this operation does
+  not depend on the table delegate's unreliable inline double-click editor.
+- A parent cue may be marked `display_suppressed`. Its visible SRT and page
+  plan entries are omitted, but its fixed subtitle ID, word range, word times,
+  and final-timeline record remain authoritative. This operation never trims
+  or rewrites source media.
 - Manual-final imports have explicit checkpoint semantics. Importing
   `*-人工终稿字幕.srt` continues the latest hash-bound manual package. Importing
   `*-原文在上双语字幕.srt` starts again from the immutable stable parent
@@ -437,3 +464,9 @@ Rule:
 - Interrupted-run resume records the article-ASR-correction policy version.
   A policy change recomputes only `asr_corrected.json`; the verified article
   context and raw transcription remain independently reusable.
+- Manual display suppression does not delete a cue from the authoritative word
+  ledger or final cue timeline. Its empty-ID restore row is excluded from
+  visible page completeness and page-edit operations. Renderer page boundaries
+  are indexed by authoritative timed-word records, so a one-record surface
+  correction containing whitespace remains one timed boundary unit while its
+  full display text is rendered normally.

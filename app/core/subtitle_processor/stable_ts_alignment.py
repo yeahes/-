@@ -27,6 +27,10 @@ EXPANSION_COMPRESSION_MIN_MS = 240
 EXPANSION_COMPRESSION_MAX_RATIO = 0.5
 EXPANSION_DRIFT_RECOVERY_MS = 350
 EXPANSION_FALLBACK_MAX_WORDS = 24
+EXPANSION_PAUSE_MIN_MS = 200
+EXPANSION_PAUSE_COLLAPSE_MIN_MS = 150
+EXPANSION_ONSET_DELAY_MIN_MS = 150
+EXPANSION_SHARED_SHIFT_TOLERANCE_MS = 150
 
 
 def _load_asr_classes():
@@ -596,6 +600,92 @@ def _alignment_drift_from_baseline(
     )
 
 
+def _fallback_erased_expansion_pauses(
+    source_segments: Sequence[ASRDataSeg],
+    mapped_segments: Sequence[ASRDataSeg],
+) -> List[dict]:
+    """Preserve a trusted pause before a compact written-form token.
+
+    Forced alignment may stretch the preceding ordinary word across a pause
+    when the following numeral is absent from its alignment dictionary.  The
+    effective numeral onset would then be pushed later during final ledger
+    reconciliation.  Revert only the two words that own that boundary, and
+    only when the preceding word's start does not corroborate the same shift.
+    """
+    fallbacks: List[dict] = []
+    for index in range(1, len(mapped_segments)):
+        baseline = source_segments[index]
+        if not _is_expansion_sensitive_alignment_token(
+            str(getattr(baseline, "text", "") or "")
+        ):
+            continue
+
+        previous_baseline = source_segments[index - 1]
+        previous_candidate = mapped_segments[index - 1]
+        candidate = mapped_segments[index]
+        if not any(
+            getattr(segment, "alignment_source", "") == "whisperx"
+            for segment in (previous_candidate, candidate)
+        ):
+            continue
+
+        baseline_pause = int(baseline.start_time) - int(previous_baseline.end_time)
+        if baseline_pause < EXPANSION_PAUSE_MIN_MS:
+            continue
+        candidate_pause = int(candidate.start_time) - int(previous_candidate.end_time)
+        if (
+            baseline_pause - candidate_pause
+            < EXPANSION_PAUSE_COLLAPSE_MIN_MS
+            or candidate_pause > baseline_pause * 0.5
+        ):
+            continue
+
+        effective_onset = max(
+            int(candidate.start_time),
+            int(previous_candidate.end_time),
+        )
+        effective_onset_delay = effective_onset - int(baseline.start_time)
+        if effective_onset_delay < EXPANSION_ONSET_DELAY_MIN_MS:
+            continue
+
+        previous_start_drift = (
+            int(previous_candidate.start_time) - int(previous_baseline.start_time)
+        )
+        if (
+            abs(effective_onset_delay - previous_start_drift)
+            <= EXPANSION_SHARED_SHIFT_TOLERANCE_MS
+        ):
+            continue
+
+        fallback_word_ids: List[int] = []
+        for fallback_index in (index - 1, index):
+            fallback_candidate = mapped_segments[fallback_index]
+            if getattr(fallback_candidate, "alignment_source", "") != "whisperx":
+                continue
+            fallback_baseline = source_segments[fallback_index]
+            fallback_candidate.start_time = int(fallback_baseline.start_time)
+            fallback_candidate.end_time = int(fallback_baseline.end_time)
+            fallback_candidate.alignment_source = "stable-ts-fallback"
+            fallback_candidate.whisperx_rejected_reason = (
+                "whisperx_expansion_pause_fallback"
+            )
+            fallback_word_ids.append(fallback_index)
+
+        if fallback_word_ids:
+            fallbacks.append(
+                {
+                    "code": "whisperx_expansion_pause_fallback",
+                    "trigger_word_id": index,
+                    "trigger_word": str(getattr(candidate, "text", "") or ""),
+                    "fallback_word_ids": fallback_word_ids,
+                    "baseline_pause_ms": baseline_pause,
+                    "rejected_whisperx_pause_ms": candidate_pause,
+                    "effective_onset_delay_ms": effective_onset_delay,
+                }
+            )
+    return fallbacks
+
+
 def _fallback_expansion_sensitive_whisperx_updates(
     source_segments: Sequence[ASRDataSeg],
     mapped_segments: Sequence[ASRDataSeg],
@@ -611,7 +701,10 @@ def _fallback_expansion_sensitive_whisperx_updates(
     if len(source_segments) != len(mapped_segments):
         return []
 
-    fallbacks: List[dict] = []
+    fallbacks = _fallback_erased_expansion_pauses(
+        source_segments,
+        mapped_segments,
+    )
     index = 0
     while index < len(mapped_segments):
         baseline = source_segments[index]

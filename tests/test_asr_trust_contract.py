@@ -548,6 +548,28 @@ class ASRTrustContractTests(unittest.TestCase):
             "millisecond_quantization_zero_width",
         )
 
+    def test_faster_whisper_zero_duration_repair_preserves_emitted_word_order(self):
+        source = (
+            "1\n00:14:34,160 --> 00:14:34,280\nShe\n\n"
+            "2\n00:14:34,280 --> 00:14:34,280\n realizes\n\n"
+            "3\n00:14:34,280 --> 00:14:34,280\n that\n\n"
+            "4\n00:14:34,280 --> 00:14:34,400\n the\n\n"
+            "5\n00:14:34,400 --> 00:14:34,600\n sex\n"
+        )
+        asr = object.__new__(FasterWhisperASR)
+        asr.need_word_time_stamp = True
+        asr._skip_internal_gap_repair = True
+
+        result = asr._make_validated_data(source)
+
+        self.assertEqual(
+            [segment.text.strip() for segment in result.segments],
+            ["She", "realizes", "that", "the", "sex"],
+        )
+        self.assertTrue(
+            all(segment.end_time > segment.start_time for segment in result.segments)
+        )
+
     @staticmethod
     def _missing_speech_gap_fixture():
         source_words = [
@@ -621,6 +643,7 @@ class ASRTrustContractTests(unittest.TestCase):
         asr = object.__new__(FasterWhisperASR)
         asr.use_cache = True
         asr.last_internal_gap_repairs = [{"code": "asr_internal_speech_gap_repaired"}]
+        asr.last_compressed_timing_repairs = []
         asr.last_tail_hallucination_repair = {}
         asr.cache_manager = _MemoryCache()
         asr._get_key = lambda: "repaired-key"
@@ -637,6 +660,173 @@ class ASRTrustContractTests(unittest.TestCase):
         self.assertIs(result, repaired)
         self.assertEqual(len(asr.cache_manager.writes), 1)
         self.assertIn("Which", asr.cache_manager.writes[0][2])
+
+    @staticmethod
+    def _compressed_timing_fixture():
+        words = (
+            "hits her like a ton of bricks She realizes that the sex itself "
+            "wasn't actually the point"
+        ).split()
+        local_times = [
+            (871800, 872000),
+            (872000, 872220),
+            (872220, 872440),
+            (872440, 872540),
+            (872540, 872940),
+            (872940, 873080),
+            (873080, 873400),
+            (873560, 873700),
+            (873700, 874020),
+            (874020, 874280),
+            (874280, 874400),
+            (874400, 874600),
+            (874600, 874860),
+            (874860, 875160),
+            (875160, 875340),
+            (875340, 875480),
+            (875480, 875680),
+        ]
+        local = [
+            ASRDataSeg(word, start, end)
+            for word, (start, end) in zip(words, local_times)
+        ]
+        source = [
+            ASRDataSeg(segment.text, segment.start_time, segment.end_time)
+            for segment in local
+        ]
+        issue_start = words.index("She")
+        compressed_times = [
+            (874160, 874280),
+            (874280, 874281),
+            (874280, 874281),
+            (874280, 874400),
+        ]
+        for offset, (start, end) in enumerate(compressed_times):
+            source[issue_start + offset].start_time = start
+            source[issue_start + offset].end_time = end
+
+        return source, local, issue_start
+
+    def test_faster_whisper_repairs_compressed_native_timing_from_exact_local_text(self):
+        source, local, issue_start = self._compressed_timing_fixture()
+        untouched_right = [
+            (segment.text, segment.start_time, segment.end_time)
+            for segment in source[issue_start + 4 :]
+        ]
+        asr = object.__new__(FasterWhisperASR)
+        asr._can_run_local_gap_repair = lambda: True
+        asr._transcribe_local_window = lambda *_args: local
+
+        repaired = asr._repair_suspicious_compressed_timing(source)
+
+        self.assertEqual(
+            [segment.text for segment in repaired],
+            [segment.text for segment in source],
+        )
+        self.assertEqual(
+            [
+                (segment.start_time, segment.end_time)
+                for segment in repaired[issue_start : issue_start + 4]
+            ],
+            [
+                (segment.start_time, segment.end_time)
+                for segment in local[issue_start : issue_start + 4]
+            ],
+        )
+        self.assertEqual(
+            [
+                (segment.text, segment.start_time, segment.end_time)
+                for segment in repaired[issue_start + 4 :]
+            ],
+            untouched_right,
+        )
+        self.assertEqual(find_implausible_word_timing_runs(repaired), [])
+        self.assertEqual(len(asr.last_compressed_timing_repairs), 1)
+
+    def test_faster_whisper_does_not_repair_compression_without_exact_anchors(self):
+        source, local, issue_start = self._compressed_timing_fixture()
+        local[issue_start + 4 : issue_start + 8] = [
+            ASRDataSeg("different", 874400, 874600),
+            ASRDataSeg("right", 874600, 874800),
+            ASRDataSeg("anchor", 874800, 875000),
+            ASRDataSeg("ending", 875000, 875200),
+        ]
+        asr = object.__new__(FasterWhisperASR)
+        asr._can_run_local_gap_repair = lambda: True
+        asr._transcribe_local_window = lambda *_args: local
+        before = [
+            (segment.text, segment.start_time, segment.end_time) for segment in source
+        ]
+
+        repaired = asr._repair_suspicious_compressed_timing(source)
+
+        self.assertEqual(
+            [(segment.text, segment.start_time, segment.end_time) for segment in repaired],
+            before,
+        )
+        self.assertEqual(asr.last_compressed_timing_repairs, [])
+        self.assertEqual(len(asr.last_unresolved_compressed_timing_candidates), 1)
+
+    def test_faster_whisper_restores_cached_order_only_for_the_same_word_multiset(self):
+        source, local, issue_start = self._compressed_timing_fixture()
+        source[issue_start + 2], source[issue_start + 3] = (
+            source[issue_start + 3],
+            source[issue_start + 2],
+        )
+        asr = object.__new__(FasterWhisperASR)
+        asr._can_run_local_gap_repair = lambda: True
+        asr._transcribe_local_window = lambda *_args: local
+
+        repaired = asr._repair_suspicious_compressed_timing(source)
+
+        self.assertEqual(
+            [segment.text for segment in repaired[issue_start : issue_start + 4]],
+            ["She", "realizes", "that", "the"],
+        )
+        self.assertTrue(
+            asr.last_compressed_timing_repairs[0]["word_order_restored"]
+        )
+
+        changed_local = [
+            ASRDataSeg(segment.text, segment.start_time, segment.end_time)
+            for segment in local
+        ]
+        changed_local[issue_start + 1].text = "discovers"
+        rejected_asr = object.__new__(FasterWhisperASR)
+        rejected_asr._can_run_local_gap_repair = lambda: True
+        rejected_asr._transcribe_local_window = lambda *_args: changed_local
+
+        rejected = rejected_asr._repair_suspicious_compressed_timing(source)
+
+        self.assertEqual(
+            [segment.text for segment in rejected[issue_start : issue_start + 4]],
+            ["She", "realizes", "the", "that"],
+        )
+        self.assertEqual(rejected_asr.last_compressed_timing_repairs, [])
+
+    def test_faster_whisper_persists_compressed_timing_repair_into_asr_cache(self):
+        asr = object.__new__(FasterWhisperASR)
+        asr.use_cache = True
+        asr.last_internal_gap_repairs = []
+        asr.last_compressed_timing_repairs = [
+            {"code": "asr_compressed_word_timing_repaired"}
+        ]
+        asr.last_tail_hallucination_repair = {}
+        asr.cache_manager = _MemoryCache()
+        asr._get_key = lambda: "compressed-repair-key"
+        repaired = ASRData(
+            [
+                ASRDataSeg("She", 1000, 1200),
+                ASRDataSeg("realizes", 1200, 1500),
+            ]
+        )
+
+        with patch.object(BaseASR, "run", return_value=repaired):
+            result = asr.run()
+
+        self.assertIs(result, repaired)
+        self.assertEqual(len(asr.cache_manager.writes), 1)
+        self.assertIn("realizes", asr.cache_manager.writes[0][2])
 
     def test_faster_whisper_does_not_merge_gap_without_right_anchor(self):
         source, local = self._missing_speech_gap_fixture()

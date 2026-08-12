@@ -6,8 +6,8 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import QEvent, QPointF, Qt
+from PyQt5.QtGui import QColor, QMouseEvent
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractButton,
@@ -160,6 +160,7 @@ class StablePublicationTests(unittest.TestCase):
         target = interface.model.index(row, 2)
         interface.subtitle_table.setCurrentIndex(target)
         interface.subtitle_table.selectRow(row)
+        interface.on_subtitle_clicked(target)
         app.processEvents()
 
     def _manual_boundary_button(self, interface, row, text):
@@ -427,7 +428,7 @@ class StablePublicationTests(unittest.TestCase):
             }
         )
         self.assertEqual(model.columnCount(), 4)
-        self.assertFalse(model.flags(model.index(0, 2)) & Qt.ItemIsEditable)
+        self.assertTrue(model.flags(model.index(0, 2)) & Qt.ItemIsEditable)
         self.assertTrue(model.flags(model.index(0, 3)) & Qt.ItemIsEditable)
 
         stale_model = SubtitleTableModel(
@@ -1017,6 +1018,138 @@ class StablePublicationTests(unittest.TestCase):
                 root / "节目-处理结果" / "节目-实际分页映射.json",
             )
             self.assertEqual(session.parent, parent)
+
+    def test_display_page_export_failure_is_not_silently_ignored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "audio"
+            source_dir.mkdir()
+            audio = source_dir / "节目.m4a"
+            audio.write_bytes(b"audio")
+            manifest = root / "stable-final-manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            thread = self._thread(root)
+            thread.task.source_audio_path = str(audio)
+
+            with patch.object(
+                ManualFinalSubtitleSession,
+                "load_from_manifest",
+                side_effect=ManualFinalSubtitleEditError("ledger mismatch"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "stable_display_page_export_failed: ledger mismatch",
+                ):
+                    thread._write_source_audio_display_page_exports(
+                        manifest,
+                        {},
+                    )
+
+    def test_display_page_export_requires_nonempty_srt_and_map_pair(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "audio"
+            source_dir.mkdir()
+            audio = source_dir / "节目.m4a"
+            audio.write_bytes(b"audio")
+            manifest = root / "stable-final-manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            thread = self._thread(root)
+            thread.task.source_audio_path = str(audio)
+
+            class Session:
+                def export_display_page_subtitles(self, srt_path, map_path, **_kwargs):
+                    Path(srt_path).write_text("pages", encoding="utf-8")
+                    return {"srt": str(srt_path), "map": str(map_path)}
+
+            with patch.object(
+                ManualFinalSubtitleSession,
+                "load_from_manifest",
+                return_value=Session(),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "missing_or_empty_export_pair",
+                ):
+                    thread._write_source_audio_display_page_exports(manifest, {})
+
+    def test_critical_display_page_failure_preserves_previous_root_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread = self._thread(root)
+            previous_manifest = root / "stable-final-manifest.json"
+            previous_manifest.write_bytes(b'{"stable_run_id":"previous"}')
+            runs_dir = root / "stable-runs"
+
+            with patch.object(
+                thread,
+                "_write_source_audio_display_page_exports",
+                side_effect=RuntimeError("stable_display_page_export_failed: broken"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "stable_display_page_export_failed: broken",
+                ):
+                    thread._save_stable_subtitle_outputs(
+                        self._data("New attempt."),
+                        self._config(),
+                        validation_status="passed",
+                        manifest_meta={
+                            "display_page_translation_status": "PASS",
+                            "display_page_translation_path": "display-pages.json",
+                        },
+                    )
+
+            self.assertEqual(
+                previous_manifest.read_bytes(),
+                b'{"stable_run_id":"previous"}',
+            )
+            if runs_dir.exists():
+                self.assertEqual(list(runs_dir.iterdir()), [])
+
+    def test_compatibility_source_export_failure_does_not_skip_display_pages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            thread = self._thread(root)
+            display_srt = root / "display.srt"
+            display_map = root / "display.json"
+            display_srt.write_text("pages", encoding="utf-8")
+            display_map.write_text("{}", encoding="utf-8")
+
+            with patch.object(
+                thread,
+                "_write_source_audio_subtitle_exports",
+                return_value={},
+            ), patch.object(
+                thread,
+                "_write_source_audio_display_page_exports",
+                return_value={
+                    "display_page_bilingual_srt": str(display_srt),
+                    "display_page_map": str(display_map),
+                },
+            ) as display_export:
+                thread._save_stable_subtitle_outputs(
+                    self._data(),
+                    self._config(),
+                    validation_status="passed",
+                    manifest_meta={
+                        "display_page_translation_status": "PASS",
+                        "display_page_translation_path": "display-pages.json",
+                    },
+                )
+
+            display_export.assert_called_once()
+            manifest = json.loads(
+                (root / "stable-final-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["source_subtitle_paths"]["display_page_bilingual_srt"],
+                str(display_srt),
+            )
+            self.assertEqual(
+                manifest["source_subtitle_paths"]["display_page_map"],
+                str(display_map),
+            )
 
     def test_failed_attempt_preserves_previous_success_and_writes_failure_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2093,6 +2226,47 @@ class StablePublicationTests(unittest.TestCase):
         )
         self.assertEqual(moves, [])
 
+    def test_manual_boundary_editor_opens_disarmed_and_blank_click_exits(self):
+        app, interface, _moves = self._manual_boundary_interaction_fixture()
+
+        self.assertFalse(interface._manual_boundary_row_armed)
+        self.assertTrue(
+            all(
+                interface.subtitle_table.indexWidget(interface.model.index(row, 2))
+                is None
+                for row in range(interface.model.rowCount())
+            )
+        )
+
+        self._select_manual_boundary_row(app, interface, 0)
+        self.assertTrue(interface._manual_boundary_row_armed)
+        self.assertIsNotNone(
+            interface.subtitle_table.indexWidget(interface.model.index(0, 2))
+        )
+
+        viewport = interface.subtitle_table.viewport()
+        blank_point = QPointF(viewport.width() // 2, viewport.height() - 2)
+        QApplication.sendEvent(
+            viewport,
+            QMouseEvent(
+                QEvent.MouseButtonPress,
+                blank_point,
+                Qt.LeftButton,
+                Qt.LeftButton,
+                Qt.NoModifier,
+            ),
+        )
+        app.processEvents()
+
+        self.assertFalse(interface._manual_boundary_row_armed)
+        self.assertTrue(
+            all(
+                interface.subtitle_table.indexWidget(interface.model.index(row, 2))
+                is None
+                for row in range(interface.model.rowCount())
+            )
+        )
+
     def test_manual_editor_removes_redundant_legacy_controls(self):
         _app, interface, _moves = self._manual_boundary_interaction_fixture()
 
@@ -2223,6 +2397,41 @@ class StablePublicationTests(unittest.TestCase):
         self.assertTrue(interface.translate_button.isVisible())
         self.assertEqual(interface.more_button.text(), "更多")
         self.assertEqual(interface.open_folder_action.text(), "打开输出文件夹")
+
+    def test_failed_manual_session_load_clears_previous_manual_runtime_state(self):
+        app, interface, _moves = self._manual_boundary_interaction_fixture()
+        self._select_manual_boundary_row(app, interface, 0)
+        interface._toggle_manual_boundary_edit()
+        interface._choose_manual_boundary_direction("next")
+        interface._manual_model_has_pending_edits = True
+        interface._manual_has_unsaved_changes = True
+        interface._manual_clean_state_fingerprint = "old-session"
+
+        with patch.object(
+            ManualFinalSubtitleSession,
+            "load_for_subtitle",
+            side_effect=ManualFinalSubtitleEditError("not a stable package"),
+        ):
+            interface._load_manual_final_session(Path("standalone.srt"))
+
+        self.assertIsNone(interface.manual_final_session)
+        self.assertFalse(interface._manual_model_has_pending_edits)
+        self.assertFalse(interface._manual_has_unsaved_changes)
+        self.assertEqual(interface._manual_clean_state_fingerprint, "")
+        self.assertFalse(interface._manual_boundary_row_armed)
+        self.assertFalse(interface._manual_boundary_edit_active)
+        self.assertEqual(interface._manual_boundary_move_direction, "")
+        self.assertEqual(interface._manual_boundary_index_widgets, [])
+        self.assertTrue(interface._confirm_discard_manual_edits("继续导入"))
+        for action in (
+            interface.manual_page_view_action,
+            interface.manual_final_save_action,
+            interface.manual_final_undo_action,
+            interface.manual_final_synthesis_action,
+            interface.manual_draft_synthesis_action,
+        ):
+            self.assertFalse(action.isEnabled())
+            self.assertFalse(action.isVisible())
 
     def test_open_folder_uses_manual_manifest_without_a_task(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2825,6 +3034,7 @@ class StablePublicationTests(unittest.TestCase):
         self.assertNotIn("合并相邻字幕", action_texts)
         self.assertNotIn("将末尾词移到下一条", action_texts)
         self.assertNotIn("将开头词移到上一条", action_texts)
+        self.assertIn("修正当前英文（保持时间轴）", action_texts)
 
     def test_context_menu_keeps_merge_for_contiguous_parent_rows(self):
         class Index:
@@ -2977,6 +3187,7 @@ class StablePublicationTests(unittest.TestCase):
                 pass
 
         split_calls = []
+        split_page_calls = []
         merge_page_calls = []
         confirm_calls = []
         boundary_calls = []
@@ -3007,6 +3218,7 @@ class StablePublicationTests(unittest.TestCase):
             _merge_display_page_with_next=lambda page_id: merge_page_calls.append(
                 page_id
             ),
+            _split_display_page=lambda page_id: split_page_calls.append(page_id),
             _split_parent_into_display_pages=(
                 lambda parent_id, page_count, **kwargs: split_calls.append(
                     (parent_id, page_count, kwargs.get("focus_word_id"))
@@ -3026,6 +3238,7 @@ class StablePublicationTests(unittest.TestCase):
         action_texts = [action.text for action in menus[0].actions]
         self.assertIn("整条字幕调整为 3 屏", action_texts)
         self.assertIn("整条字幕调整为 4 屏", action_texts)
+        self.assertIn("仅将当前屏拆为 2 屏", action_texts)
         self.assertIn("与下一屏合并", action_texts)
         self.assertIn("试听从当前页删除的切点", action_texts)
         self.assertIn("从当前页删除到结尾", action_texts)
@@ -3043,6 +3256,58 @@ class StablePublicationTests(unittest.TestCase):
         self.assertEqual(confirm_all_calls, [True])
         by_text["整条字幕调整为 3 屏"].triggered.callback()
         self.assertEqual(split_calls, [("S0216", 3, 100)])
+        by_text["仅将当前屏拆为 2 屏"].triggered.callback()
+        self.assertEqual(split_page_calls, ["S0216.P01"])
+
+    def test_boundary_editor_requires_an_explicit_row_click_and_can_be_disarmed(self):
+        calls = []
+
+        class Current:
+            @staticmethod
+            def row():
+                return 7
+
+        class Table:
+            @staticmethod
+            def clearSelection():
+                calls.append("selection_cleared")
+
+        interface = SimpleNamespace(
+            subtitle_table=Table(),
+            _manual_boundary_row_armed=False,
+            _manual_boundary_edit_active=True,
+            _manual_boundary_move_direction="next",
+            _clear_manual_boundary_index_widgets=lambda: calls.append(
+                "widgets_cleared"
+            ),
+            _refresh_manual_boundary_inspector=lambda row: calls.append(
+                ("refreshed", row)
+            ),
+        )
+
+        SubtitleInterface._on_subtitle_current_row_changed(
+            interface,
+            Current(),
+            None,
+        )
+        self.assertEqual(calls, ["widgets_cleared"])
+
+        interface._manual_boundary_row_armed = True
+        SubtitleInterface._on_subtitle_current_row_changed(
+            interface,
+            Current(),
+            None,
+        )
+        self.assertEqual(calls[-1], ("refreshed", 7))
+
+        SubtitleInterface._disarm_manual_boundary_editor(
+            interface,
+            clear_selection=True,
+        )
+        self.assertFalse(interface._manual_boundary_row_armed)
+        self.assertFalse(interface._manual_boundary_edit_active)
+        self.assertEqual(interface._manual_boundary_move_direction, "")
+        self.assertEqual(calls[-2:], ["widgets_cleared", "selection_cleared"])
 
     def test_merge_selected_actual_pages_uses_page_boundary_operation(self):
         calls = []
@@ -3070,7 +3335,7 @@ class StablePublicationTests(unittest.TestCase):
 
         self.assertEqual(calls, ["S0001.P01"])
 
-    def test_merge_selected_pages_from_two_parents_uses_parent_indexes(self):
+    def test_merge_selected_pages_from_two_parents_is_one_atomic_page_operation(self):
         merge_calls = []
         dirty_calls = []
         selected_rows = []
@@ -3088,8 +3353,15 @@ class StablePublicationTests(unittest.TestCase):
             ]
 
             @staticmethod
-            def merge_adjacent(first_index, last_index):
-                merge_calls.append((first_index, last_index))
+            def merge_adjacent_display_pages(left_page_id, right_page_id):
+                merge_calls.append((left_page_id, right_page_id))
+                return {
+                    "parent_subtitle_id": "S0001",
+                    "affected_parent_ids": ["S0001", "S0002"],
+                    "merged_page_id": "S0001.P02",
+                    "page_count": 2,
+                    "parent_merge": True,
+                }
 
             @staticmethod
             def has_display_page_model():
@@ -3118,13 +3390,15 @@ class StablePublicationTests(unittest.TestCase):
             _select_manual_boundary_row=lambda row: selected_rows.append(row),
             _manual_parent_boundaries_dirty=True,
             _manual_page_view=False,
+            _manual_boundary_edit_active=True,
+            _manual_boundary_move_direction="next",
             tr=lambda value: value,
         )
 
         with patch("app.view.subtitle_interface.InfoBar.success"):
             SubtitleInterface.merge_selected_rows(interface, [0, 1])
 
-        self.assertEqual(merge_calls, [(0, 1)])
+        self.assertEqual(merge_calls, [("S0001.P02", "S0002.P01")])
         self.assertEqual(dirty_calls, [{"invalidate_pages": False}])
         self.assertFalse(interface._manual_parent_boundaries_dirty)
         self.assertTrue(interface._manual_page_view)
@@ -4027,7 +4301,7 @@ class StablePublicationTests(unittest.TestCase):
             "刷新实际分页",
         )
 
-    def test_parent_english_is_read_only_while_chinese_remains_editable(self):
+    def test_manual_parent_english_and_chinese_are_editable(self):
         model = SubtitleTableModel(
             {
                 "1": {
@@ -4041,8 +4315,88 @@ class StablePublicationTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(model.flags(model.index(0, 2)) & Qt.ItemIsEditable)
+        self.assertTrue(model.flags(model.index(0, 2)) & Qt.ItemIsEditable)
         self.assertTrue(model.flags(model.index(0, 3)) & Qt.ItemIsEditable)
+
+    def test_explicit_manual_english_edit_uses_actual_page_contract(self):
+        captured = {}
+
+        class Session:
+            @staticmethod
+            def apply_display_page_model_data(rows, *, allow_incomplete_chinese):
+                captured["rows"] = rows
+                captured["allow_incomplete_chinese"] = allow_incomplete_chinese
+                return True
+
+        class Toggle:
+            def setEnabled(self, value):
+                captured["undo_enabled"] = bool(value)
+
+        class Label:
+            def setText(self, value):
+                captured["status"] = str(value)
+
+        model = SubtitleTableModel(
+            {
+                "1": {
+                    "start_time": 110494,
+                    "end_time": 117449,
+                    "original_subtitle": (
+                        "known literally OnlyFans Stifler's Mom."
+                    ),
+                    "translated_subtitle": "名叫斯蒂夫勒的妈妈。",
+                    "display_page_view": True,
+                    "display_page_id": "S0028.P02",
+                    "manual_cue_id": "S0028",
+                    "word_start": 345,
+                    "word_end": 355,
+                }
+            }
+        )
+        interface = SimpleNamespace(
+            model=model,
+            manual_final_session=Session(),
+            manual_final_undo_action=Toggle(),
+            status_label=Label(),
+            tr=lambda value: value,
+            _sync_manual_final_text_edits=lambda **kwargs: captured.setdefault(
+                "sync", kwargs
+            ),
+            _invalidate_manual_review_marks_for_parent_ids=lambda ids: captured.setdefault(
+                "invalidated", list(ids)
+            ),
+            _mark_manual_final_dirty=lambda **kwargs: captured.setdefault(
+                "dirty", kwargs
+            ),
+            _apply_manual_final_session=lambda: captured.setdefault(
+                "refreshed", True
+            ),
+            _manual_row_for_identity=lambda **kwargs: captured.setdefault(
+                "identity", kwargs
+            )
+            and 0,
+            _select_manual_boundary_row=lambda row: captured.setdefault(
+                "selected_row", row
+            ),
+        )
+
+        changed = SubtitleInterface._apply_manual_english_replacement(
+            interface,
+            0,
+            "known literally only as Stifler's Mom.",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            captured["rows"]["1"]["original_subtitle"],
+            "known literally only as Stifler's Mom.",
+        )
+        self.assertTrue(captured["allow_incomplete_chinese"])
+        self.assertEqual(captured["invalidated"], ["S0028"])
+        self.assertEqual(captured["dirty"], {"invalidate_pages": False})
+        self.assertEqual(captured["identity"]["page_id"], "S0028.P02")
+        self.assertEqual(captured["selected_row"], 0)
+        self.assertIn("词 ID 和时间轴未改变", captured["status"])
 
     def test_parent_chinese_edit_marks_local_dirty_without_invalidating_pages(self):
         class Toggle:

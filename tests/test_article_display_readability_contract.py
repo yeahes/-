@@ -1464,7 +1464,7 @@ def test_same_screen_line_wrap_keeps_atomic_language_units_hard():
     )
 
 
-def test_natural_54px_wrap_can_beat_a_high_penalty_56px_wrap():
+def test_preferred_font_wins_when_56px_has_a_valid_two_line_wrap():
     text = "Alpha bravo charlie delta echo foxtrot golf hotel india juliet."
     cue = _cue(
         text,
@@ -1498,8 +1498,28 @@ def test_natural_54px_wrap_can_beat_a_high_penalty_56px_wrap():
         )
 
     assert layout == (
-        54,
-        ["Alpha bravo charlie delta echo foxtrot", "golf hotel india juliet."],
+        56,
+        ["Alpha bravo charlie delta echo", "foxtrot golf hotel india juliet."],
+    )
+
+
+def test_short_page_keeps_56px_instead_of_shrinking_to_one_line():
+    text = "Both sides are getting exactly what they want."
+    words = text.split()
+    cue = _cue(text, "S9607")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    layout = podcast_learning_video._article_final_page_layout(
+        draw,
+        cue,
+        words,
+        0,
+        len(words),
+    )
+
+    assert layout == (
+        56,
+        ["Both sides are getting", "exactly what they want."],
     )
 
 
@@ -1600,7 +1620,7 @@ def test_same_screen_reflow_cannot_retain_an_invalid_legacy_wrap():
     }
 
 
-def test_same_screen_reflow_may_use_54px_for_a_strictly_better_break():
+def test_same_screen_reflow_keeps_valid_56px_over_a_smaller_one_line_layout():
     text = "Alpha bravo charlie delta echo foxtrot golf hotel india juliet."
     words = text.split()
     cue = _cue(
@@ -1642,6 +1662,10 @@ def test_same_screen_reflow_may_use_54px_for_a_strictly_better_break():
         podcast_learning_video,
         "_article_final_page_layout",
         return_value=(54, list(improved_lines)),
+    ), patch.object(
+        podcast_learning_video,
+        "_article_fixed_english_lines",
+        return_value=list(plan["pages"][0]["en_lines"]),
     ):
         finalized = podcast_learning_video._finalize_article_same_screen_layout(
             cue,
@@ -1649,8 +1673,8 @@ def test_same_screen_reflow_may_use_54px_for_a_strictly_better_break():
             plan,
         )
 
-    assert finalized["pages"][0]["english_font_size"] == 54
-    assert finalized["pages"][0]["en_lines"] == improved_lines
+    assert finalized["pages"][0]["english_font_size"] == 56
+    assert finalized["pages"][0]["en_lines"] == plan["pages"][0]["en_lines"]
 
 
 def test_same_screen_reflow_cannot_change_frozen_page_contract():
@@ -2167,10 +2191,11 @@ if __name__ == "__main__":
     test_line_wrap_downranks_page_syntax_without_blocking_same_screen_lines()
     test_same_screen_subject_predicate_wrap_keeps_preferred_font()
     test_same_screen_line_wrap_keeps_atomic_language_units_hard()
-    test_natural_54px_wrap_can_beat_a_high_penalty_56px_wrap()
+    test_preferred_font_wins_when_56px_has_a_valid_two_line_wrap()
+    test_short_page_keeps_56px_instead_of_shrinking_to_one_line()
     test_same_screen_reflow_does_not_shrink_without_a_better_line_break()
     test_same_screen_reflow_cannot_retain_an_invalid_legacy_wrap()
-    test_same_screen_reflow_may_use_54px_for_a_strictly_better_break()
+    test_same_screen_reflow_keeps_valid_56px_over_a_smaller_one_line_layout()
     test_same_screen_reflow_cannot_change_frozen_page_contract()
     test_frozen_artifact_same_screen_reflow_changes_only_typography()
     test_manual_page_boundary_rebuild_preserves_parent_and_rederives_pages()

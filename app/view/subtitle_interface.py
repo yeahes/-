@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from threading import Lock, Thread
 
-from PyQt5.QtCore import Qt, QTime, QUrl, QAbstractTableModel, pyqtSignal
+from PyQt5.QtCore import Qt, QEvent, QTime, QTimer, QUrl, QAbstractTableModel, pyqtSignal
 from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent
 from PyQt5.QtWidgets import (
     QAbstractItemDelegate,
@@ -84,6 +84,7 @@ from app.thread.video_synthesis_thread import (
 LOG = logging.getLogger(__name__)
 SUBTITLE_TIME_COLUMN_WIDTH = 96
 _MANUAL_FINAL_SAVE_LOCK = Lock()
+_MANUAL_RECOVERY_DRAFT_LOCK = Lock()
 _MANUAL_FINAL_SAVE_ACTIVITY_LOCK = Lock()
 _MANUAL_FINAL_SAVE_ACTIVE_COUNT = 0
 
@@ -239,8 +240,12 @@ class SubtitleTableModel(QAbstractTableModel):
 
         marks = self._marks_for_segment(segment)
         if role == Qt.BackgroundRole:
+            if segment.get("display_suppressed"):
+                return QColor(112, 112, 112, 72)
             return self._review_background(marks, col)
         if role == Qt.ToolTipRole:
+            if segment.get("display_suppressed"):
+                return self.tr("该条只隐藏字幕显示；原音频、词 ID 和时间轴仍保留。")
             review_tooltip = self._review_tooltip(marks, col)
             return review_tooltip or None
         if role == Qt.DisplayRole or role == Qt.EditRole:
@@ -332,11 +337,7 @@ class SubtitleTableModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.NoItemFlags
         segment = self._data.get(str(index.row() + 1)) or {}
-        editable_columns = (
-            [3]
-            if segment.get("display_page_view") or segment.get("manual_cue_id")
-            else [2, 3]
-        )
+        editable_columns = [2, 3]
         if index.column() in editable_columns:
             return Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
         return Qt.ItemIsEnabled | Qt.ItemIsSelectable
@@ -555,6 +556,7 @@ class SubtitleInterface(QWidget):
     review_marks_loaded = pyqtSignal(int, object, str)
     manual_final_save_finished = pyqtSignal(int, object, str)
     manual_final_save_progress = pyqtSignal(int, int, str)
+    manual_recovery_draft_finished = pyqtSignal(int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -579,6 +581,7 @@ class SubtitleInterface(QWidget):
         self._manual_boundary_index_widgets = []
         self._manual_boundary_resized_rows = {}
         self._manual_boundary_edit_active = False
+        self._manual_boundary_row_armed = False
         self._manual_boundary_move_direction = ""
         self._manual_save_request_id = 0
         self._manual_save_in_progress = False
@@ -588,10 +591,15 @@ class SubtitleInterface(QWidget):
         self._manual_has_unsaved_changes = False
         self._manual_model_has_pending_edits = False
         self._manual_clean_state_fingerprint = ""
+        self._manual_draft_request_id = 0
+        self._manual_draft_write_in_progress = False
         self.custom_prompt_text = cfg.custom_prompt_text.value
         self.setAttribute(Qt.WA_DeleteOnClose)
         self._init_ui()
         self._setup_signals()
+        self.manual_recovery_draft_finished.connect(
+            self._apply_manual_recovery_draft_result
+        )
         self._update_prompt_button_style()
         self.set_values()
 
@@ -844,6 +852,7 @@ class SubtitleInterface(QWidget):
         # 添加右键菜单支持
         self.subtitle_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.subtitle_table.customContextMenuRequested.connect(self.show_context_menu)
+        self.subtitle_table.viewport().installEventFilter(self)
 
         self.review_color_legend = CaptionLabel(
             self.tr(
@@ -855,6 +864,25 @@ class SubtitleInterface(QWidget):
         self.review_color_legend.setWordWrap(True)
         self.main_layout.addWidget(self.review_color_legend)
         self.main_layout.addWidget(self.subtitle_table, 1)
+
+    def _disarm_manual_boundary_editor(self, *, clear_selection: bool = False) -> None:
+        self._manual_boundary_row_armed = False
+        self._manual_boundary_edit_active = False
+        self._manual_boundary_move_direction = ""
+        self._clear_manual_boundary_index_widgets()
+        if clear_selection:
+            self.subtitle_table.clearSelection()
+
+    def eventFilter(self, watched, event):
+        table = getattr(self, "subtitle_table", None)
+        if (
+            table is not None
+            and watched is table.viewport()
+            and event.type() == QEvent.MouseButtonPress
+            and not table.indexAt(event.pos()).isValid()
+        ):
+            self._disarm_manual_boundary_editor(clear_selection=True)
+        return super().eventFilter(watched, event)
 
     def _apply_subtitle_table_column_layout(self) -> None:
         header = self.subtitle_table.horizontalHeader()
@@ -907,6 +935,9 @@ class SubtitleInterface(QWidget):
     def _on_subtitle_current_row_changed(self, current, _previous) -> None:
         self._manual_boundary_edit_active = False
         self._manual_boundary_move_direction = ""
+        if not getattr(self, "_manual_boundary_row_armed", False):
+            self._clear_manual_boundary_index_widgets()
+            return
         self._refresh_manual_boundary_inspector(current.row())
 
     def _toggle_manual_boundary_edit(self) -> None:
@@ -991,6 +1022,8 @@ class SubtitleInterface(QWidget):
         self.manual_boundary_right_text_label = None
         self.manual_boundary_word_count = None
         self.manual_boundary_confirm_button = None
+        self.manual_boundary_undo_button = None
+        self.manual_boundary_redo_button = None
 
     def _manual_boundary_context(self, selected_row: int | None) -> dict | None:
         session = self.manual_final_session
@@ -1200,6 +1233,24 @@ class SubtitleInterface(QWidget):
             )
             self.manual_boundary_undo_button = undo_button
             action_layout.addWidget(undo_button, 2, 1)
+            can_redo_for_parent = getattr(
+                self.manual_final_session,
+                "can_redo_for_parent",
+                None,
+            )
+            redo_button = PushButton(self.tr("重做"), widget, icon=FIF.SYNC)
+            redo_button.setEnabled(
+                bool(can_redo_for_parent(parent_id))
+                if callable(can_redo_for_parent)
+                else bool(getattr(self.manual_final_session, "redo_history", []))
+            )
+            redo_button.clicked.connect(
+                lambda _checked=False, pid=parent_id: self.redo_manual_final_edit(
+                    pid
+                )
+            )
+            self.manual_boundary_redo_button = redo_button
+            action_layout.addWidget(redo_button, 3, 1)
             action_layout.setColumnStretch(0, 1)
             action_layout.setColumnStretch(1, 1)
         else:
@@ -1424,6 +1475,11 @@ class SubtitleInterface(QWidget):
     def _refresh_manual_boundary_inspector(self, selected_row: int | None = None) -> None:
         if getattr(self, "_manual_boundary_refreshing", False):
             return
+        if not getattr(self, "_manual_boundary_row_armed", False):
+            self._manual_boundary_edit_active = False
+            self._manual_boundary_move_direction = ""
+            self._clear_manual_boundary_index_widgets()
+            return
         self._manual_boundary_refreshing = True
         try:
             self._clear_manual_boundary_index_widgets()
@@ -1577,6 +1633,95 @@ class SubtitleInterface(QWidget):
             self.manual_draft_synthesis_action,
             self.tr("当前编辑尚未保存"),
         )
+        schedule_recovery = getattr(self, "_schedule_manual_recovery_draft", None)
+        if callable(schedule_recovery):
+            schedule_recovery()
+
+    def _schedule_manual_recovery_draft(self) -> None:
+        if (
+            self.manual_final_session is None
+            or not callable(
+                getattr(self.manual_final_session, "snapshot_for_save", None)
+            )
+            or self._manual_save_in_progress
+            or QApplication.instance() is None
+        ):
+            return
+        self._manual_draft_request_id = int(
+            getattr(self, "_manual_draft_request_id", 0) or 0
+        ) + 1
+        request_id = self._manual_draft_request_id
+        QTimer.singleShot(
+            450,
+            lambda rid=request_id: self._start_manual_recovery_draft_write(rid),
+        )
+
+    def _start_manual_recovery_draft_write(self, request_id: int) -> None:
+        if (
+            request_id != self._manual_draft_request_id
+            or self.manual_final_session is None
+            or self._manual_save_in_progress
+        ):
+            return
+        if self._manual_draft_write_in_progress:
+            return
+        try:
+            if self._manual_model_has_pending_edits:
+                self._sync_manual_final_text_edits(
+                    allow_incomplete_page_chinese=True
+                )
+            snapshot = self.manual_final_session.snapshot_for_save()
+        except ManualFinalSubtitleEditError as exc:
+            LOG.warning("Unable to snapshot manual recovery draft: %s", exc)
+            return
+        self._manual_draft_write_in_progress = True
+        worker = Thread(
+            target=self._write_manual_recovery_draft_in_background,
+            args=(request_id, snapshot),
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception:
+            self._manual_draft_write_in_progress = False
+            LOG.exception("Unable to start manual recovery draft writer")
+
+    def _write_manual_recovery_draft_in_background(
+        self,
+        request_id: int,
+        snapshot: ManualFinalSubtitleSession,
+    ) -> None:
+        try:
+            with _MANUAL_RECOVERY_DRAFT_LOCK:
+                snapshot.save_recovery_draft()
+            error = ""
+        except Exception as exc:
+            LOG.exception("Unable to save manual recovery draft")
+            error = str(exc)
+        try:
+            self.manual_recovery_draft_finished.emit(request_id, error)
+        except RuntimeError:
+            LOG.info("Manual recovery draft completed after the editor was closed")
+
+    def _apply_manual_recovery_draft_result(
+        self,
+        request_id: int,
+        error: str,
+    ) -> None:
+        self._manual_draft_write_in_progress = False
+        if error and request_id == self._manual_draft_request_id:
+            LOG.warning("Manual recovery draft was not saved: %s", error)
+        if (
+            request_id < self._manual_draft_request_id
+            and self._manual_has_unsaved_changes
+            and not self._manual_save_in_progress
+        ):
+            QTimer.singleShot(
+                0,
+                lambda: self._start_manual_recovery_draft_write(
+                    self._manual_draft_request_id
+                ),
+            )
 
     def _apply_manual_boundary_move(
         self,
@@ -2007,7 +2152,17 @@ class SubtitleInterface(QWidget):
         )
         dialog.yesButton.setText(self.tr("放弃修改"))
         dialog.cancelButton.setText(self.tr("继续编辑"))
-        return bool(dialog.exec())
+        confirmed = bool(dialog.exec())
+        if confirmed:
+            self._manual_draft_request_id = int(
+                getattr(self, "_manual_draft_request_id", 0) or 0
+            ) + 1
+            session = getattr(self, "manual_final_session", None)
+            if session is not None:
+                with _MANUAL_RECOVERY_DRAFT_LOCK:
+                    session.discard_recovery_draft()
+            self._manual_has_unsaved_changes = False
+        return confirmed
 
     def can_close_with_manual_edits(self) -> bool:
         return self._confirm_discard_manual_edits(self.tr("关闭程序"))
@@ -2126,36 +2281,69 @@ class SubtitleInterface(QWidget):
         self._load_manual_final_session(Path(file_path))
         return True
 
-    def _load_manual_final_session(self, subtitle_path: Path) -> None:
-        if self._manual_save_in_progress:
-            return
+    def _reset_manual_editor_state(self) -> None:
+        """Return the table to one neutral, non-manual editor state."""
         set_manual_mode = getattr(self, "_set_manual_editor_mode", None)
         if callable(set_manual_mode):
             set_manual_mode(False)
-        self._invalidate_manual_final_save()
+        invalidate = getattr(self, "_invalidate_manual_final_save", None)
+        if callable(invalidate):
+            invalidate()
+        else:
+            SubtitleInterface._invalidate_manual_final_save(self)
+        disarm = getattr(self, "_disarm_manual_boundary_editor", None)
+        if callable(disarm):
+            disarm(clear_selection=False)
+        else:
+            self._manual_boundary_row_armed = False
+            self._manual_boundary_edit_active = False
+            self._manual_boundary_move_direction = ""
+
         self.manual_final_session = None
         self._manual_package_manifest_path = ""
         self._manual_review_mark_count = 0
         self._review_mark_rows = []
         self._manual_review_invalidated_ids = set()
-        self._review_mark_request_id += 1
+        self._review_mark_request_id = int(
+            getattr(self, "_review_mark_request_id", 0) or 0
+        ) + 1
         self._manual_parent_boundaries_dirty = False
         self._manual_pending_page_split = None
-        self.model.set_review_marks({})
-        self.next_review_action.setEnabled(False)
-        self.next_review_action.setVisible(False)
         self._manual_page_view = True
-        if hasattr(self, "manual_page_view_action"):
-            self.manual_page_view_action.setEnabled(False)
-            self.manual_page_view_action.setVisible(False)
-        self.manual_final_save_action.setEnabled(False)
-        self.manual_final_save_action.setVisible(False)
-        self.manual_final_undo_action.setEnabled(False)
-        self.manual_final_undo_action.setVisible(False)
-        self.manual_final_synthesis_action.setEnabled(False)
-        self.manual_final_synthesis_action.setVisible(False)
-        self.manual_draft_synthesis_action.setEnabled(False)
-        self.manual_draft_synthesis_action.setVisible(False)
+        self._manual_model_has_pending_edits = False
+        self._manual_has_unsaved_changes = False
+        self._manual_clean_state_fingerprint = ""
+        self._manual_draft_request_id = int(
+            getattr(self, "_manual_draft_request_id", 0) or 0
+        ) + 1
+        self._manual_boundary_kind = ""
+        self._manual_boundary_left_page_id = ""
+        self._manual_boundary_left_index_value = 0
+        self._manual_boundary_table_left_row = 0
+        self._manual_boundary_parent_left_index = 0
+        self._manual_boundary_word_count_value = 1
+
+        set_review_marks = getattr(getattr(self, "model", None), "set_review_marks", None)
+        if callable(set_review_marks):
+            set_review_marks({})
+        for action_name in (
+            "next_review_action",
+            "manual_page_view_action",
+            "manual_final_save_action",
+            "manual_final_undo_action",
+            "manual_final_synthesis_action",
+            "manual_draft_synthesis_action",
+        ):
+            action = getattr(self, action_name, None)
+            if action is None:
+                continue
+            action.setEnabled(False)
+            action.setVisible(False)
+
+    def _load_manual_final_session(self, subtitle_path: Path) -> None:
+        if self._manual_save_in_progress:
+            return
+        SubtitleInterface._reset_manual_editor_state(self)
         try:
             session = ManualFinalSubtitleSession.load_for_subtitle(
                 subtitle_path,
@@ -2169,13 +2357,23 @@ class SubtitleInterface(QWidget):
         self.manual_final_session = session
         self.subtitle_path = str(session.subtitle_path)
         self._set_manual_clean_checkpoint()
+        draft_restored = False
+        try:
+            restore_draft = getattr(session, "restore_recovery_draft", None)
+            if callable(restore_draft):
+                draft_restored = bool(restore_draft())
+        except ManualFinalSubtitleEditError as exc:
+            LOG.warning("Ignoring invalid manual recovery draft: %s", exc)
         import_notice = str(getattr(session, "import_notice", "") or "").strip()
         if import_notice and not session.has_display_page_model():
             self._manual_parent_boundaries_dirty = True
             self._manual_page_view = False
         self._load_manual_final_review_marks(session)
         self._apply_manual_final_session()
-        self._restore_saved_manual_package_actions()
+        if draft_restored:
+            self._mark_manual_final_dirty(invalidate_pages=False)
+        else:
+            self._restore_saved_manual_package_actions()
         if import_notice:
             self.status_label.setText(
                 self.tr(
@@ -2195,33 +2393,7 @@ class SubtitleInterface(QWidget):
         manifest_path = Path(output_path).parent / "stable-final-manifest.json"
         if not manifest_path.exists():
             return
-        set_manual_mode = getattr(self, "_set_manual_editor_mode", None)
-        if callable(set_manual_mode):
-            set_manual_mode(False)
-        self._invalidate_manual_final_save()
-        self.manual_final_session = None
-        self._manual_package_manifest_path = ""
-        self._manual_review_mark_count = 0
-        self._review_mark_rows = []
-        self._manual_review_invalidated_ids = set()
-        self._review_mark_request_id += 1
-        self._manual_parent_boundaries_dirty = False
-        self._manual_pending_page_split = None
-        self.model.set_review_marks({})
-        self.next_review_action.setEnabled(False)
-        self.next_review_action.setVisible(False)
-        self._manual_page_view = True
-        if hasattr(self, "manual_page_view_action"):
-            self.manual_page_view_action.setEnabled(False)
-            self.manual_page_view_action.setVisible(False)
-        self.manual_final_save_action.setEnabled(False)
-        self.manual_final_save_action.setVisible(False)
-        self.manual_final_undo_action.setEnabled(False)
-        self.manual_final_undo_action.setVisible(False)
-        self.manual_final_synthesis_action.setEnabled(False)
-        self.manual_final_synthesis_action.setVisible(False)
-        self.manual_draft_synthesis_action.setEnabled(False)
-        self.manual_draft_synthesis_action.setVisible(False)
+        SubtitleInterface._reset_manual_editor_state(self)
         try:
             session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
         except ManualFinalSubtitleEditError as exc:
@@ -2230,14 +2402,29 @@ class SubtitleInterface(QWidget):
         self.manual_final_session = session
         self.subtitle_path = str(session.subtitle_path)
         self._set_manual_clean_checkpoint()
+        draft_restored = False
+        try:
+            restore_draft = getattr(session, "restore_recovery_draft", None)
+            if callable(restore_draft):
+                draft_restored = bool(restore_draft())
+        except ManualFinalSubtitleEditError as exc:
+            LOG.warning("Ignoring invalid manual recovery draft: %s", exc)
         self._load_manual_final_review_marks(session)
         self._apply_manual_final_session()
-        self._restore_saved_manual_package_actions()
-        self.status_label.setText(
-            self.tr(
-                f"稳定终稿已就绪（{self.model.rowCount()} 条），可按词级时间手动调整边界；正在检查高优先复查点"
+        if draft_restored:
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self.status_label.setText(
+                self.tr(
+                    f"已恢复未保存草稿（{self.model.rowCount()} 条）；请检查后保存人工终稿"
+                )
             )
-        )
+        else:
+            self._restore_saved_manual_package_actions()
+            self.status_label.setText(
+                self.tr(
+                    f"稳定终稿已就绪（{self.model.rowCount()} 条），可按词级时间手动调整边界；正在检查高优先复查点"
+                )
+            )
 
     def _load_manual_failure_checkpoint_from_output(self, output_path: str) -> bool:
         if self._manual_save_in_progress:
@@ -2523,11 +2710,17 @@ class SubtitleInterface(QWidget):
     def _apply_manual_final_session(self) -> None:
         if not self.manual_final_session:
             return
+        self._manual_boundary_row_armed = False
+        self._manual_boundary_edit_active = False
+        self._manual_boundary_move_direction = ""
         set_manual_mode = getattr(self, "_set_manual_editor_mode", None)
         if callable(set_manual_mode):
             set_manual_mode(True)
         self.subtitle_table.setToolTip(
-            self.tr("选中字幕后，使用英文单元格内的按钮调整相邻边界")
+            self.tr(
+                "双击英文可修正一个冻结词的词面；词 ID 和时间不变。"
+                "选中字幕后仍可使用英文单元格内的按钮调整相邻边界。"
+            )
         )
         clear_boundary_widgets = getattr(
             self,
@@ -2656,9 +2849,6 @@ class SubtitleInterface(QWidget):
         changed_roles = set(roles or [])
         if changed_roles and Qt.EditRole not in changed_roles:
             return
-        first_row = self.model._data.get("1") or {}
-        page_view = bool(first_row.get("display_page_view"))
-        english_changed = top_left.column() <= 2 <= bottom_right.column()
         changed_parent_ids = {
             str(value)
             for row in range(top_left.row(), bottom_right.row() + 1)
@@ -2674,9 +2864,9 @@ class SubtitleInterface(QWidget):
         }
         self._invalidate_manual_review_marks_for_parent_ids(changed_parent_ids)
         self._manual_model_has_pending_edits = True
-        self._mark_manual_final_dirty(
-            invalidate_pages=not page_view and english_changed
-        )
+        # Text-only English corrections keep the same word IDs, ranges, and
+        # times, so the page geometry remains owned by the existing word spans.
+        self._mark_manual_final_dirty(invalidate_pages=False)
         self.manual_final_undo_action.setEnabled(True)
         refresh_review_rows = getattr(self, "_refresh_manual_review_rows", None)
         if callable(refresh_review_rows):
@@ -2756,6 +2946,60 @@ class SubtitleInterface(QWidget):
         except ManualFinalSubtitleEditError as exc:
             InfoBar.warning(self.tr("无法撤销"), str(exc), duration=5000, parent=self)
 
+    def redo_manual_final_edit(self, parent_subtitle_id: str = "") -> None:
+        if not self.manual_final_session:
+            return
+        expected_parent_id = (
+            str(parent_subtitle_id).strip()
+            if isinstance(parent_subtitle_id, str)
+            else ""
+        )
+        try:
+            self._sync_manual_final_text_edits()
+            redo_entry = (
+                self.manual_final_session.redo_history[-1]
+                if self.manual_final_session.redo_history
+                else {}
+            )
+            operation = str(
+                (redo_entry.get("history_entry") or {}).get("operation") or ""
+            )
+            redo_for_parent = getattr(
+                self.manual_final_session,
+                "redo_for_parent",
+                None,
+            )
+            redone = (
+                redo_for_parent(expected_parent_id)
+                if expected_parent_id and callable(redo_for_parent)
+                else self.manual_final_session.redo()
+            )
+            if not redone:
+                return
+            if operation in {
+                "move_suffix_to_next",
+                "move_prefix_to_previous",
+                "merge_adjacent",
+            }:
+                self._manual_parent_boundaries_dirty = not bool(
+                    self.manual_final_session.has_display_page_model()
+                )
+            self._manual_model_has_pending_edits = False
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self._apply_manual_final_session()
+            if expected_parent_id:
+                identity_row = SubtitleInterface._manual_row_for_identity(
+                    self,
+                    parent_id=expected_parent_id,
+                )
+                if identity_row is not None:
+                    self._select_manual_boundary_row(identity_row)
+            self.status_label.setText(
+                self.tr("已重做上一步；请重新保存人工终稿")
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(self.tr("无法重做"), str(exc), duration=5000, parent=self)
+
     def save_manual_final_output(self) -> int | None:
         if not self.manual_final_session:
             InfoBar.warning(
@@ -2804,6 +3048,9 @@ class SubtitleInterface(QWidget):
                 "request_id": request_id,
                 "refresh_requested": refresh_requested,
             }
+            self._manual_draft_request_id = int(
+                getattr(self, "_manual_draft_request_id", 0) or 0
+            ) + 1
             self._set_manual_final_save_busy(True)
             self.status_label.setText(
                 self.tr(
@@ -2913,7 +3160,12 @@ class SubtitleInterface(QWidget):
     ) -> None:
         try:
             with _MANUAL_FINAL_SAVE_LOCK:
-                session_snapshot = copy.deepcopy(session)
+                snapshot_factory = getattr(session, "snapshot_for_save", None)
+                session_snapshot = (
+                    snapshot_factory()
+                    if callable(snapshot_factory)
+                    else copy.deepcopy(session)
+                )
 
                 def report_progress(percent: int, stage: str) -> None:
                     self.manual_final_save_progress.emit(
@@ -3020,6 +3272,15 @@ class SubtitleInterface(QWidget):
             )
             return
         else:
+            previous_session = self.manual_final_session
+            if previous_session is not None:
+                discard_draft = getattr(
+                    previous_session,
+                    "discard_recovery_draft",
+                    None,
+                )
+                if callable(discard_draft):
+                    discard_draft()
             self._manual_package_manifest_path = manifest_path
             self.manual_final_session = refreshed_session
             self.subtitle_path = str(refreshed_session.subtitle_path)
@@ -3312,6 +3573,11 @@ class SubtitleInterface(QWidget):
 
     def on_subtitle_clicked(self, index):
         row = index.row()
+        if self.manual_final_session:
+            self._manual_boundary_row_armed = True
+            self._manual_boundary_edit_active = False
+            self._manual_boundary_move_direction = ""
+            self._refresh_manual_boundary_inspector(row)
         item = list(self.model._data.values())[row]
         start_time = item["start_time"]  # 毫秒
         end_time = (
@@ -3370,7 +3636,7 @@ class SubtitleInterface(QWidget):
             label = (
                 "合并所选相邻分屏"
                 if len(parent_ids) == 1
-                else "合并相邻父字幕"
+                else "合并两条父字幕并合为一屏"
             )
             merge_action = Action(FIF.LINK, self.tr(label))
             menu.addAction(merge_action)
@@ -3413,6 +3679,21 @@ class SubtitleInterface(QWidget):
                     and not row.get("display_page_unavailable")
                 )
                 current_parent_page_count = max(current_parent_page_count, 1)
+                if (
+                    current_parent_page_count < 4
+                    and int(selected.get("word_end", -1))
+                    > int(selected.get("word_start", -1))
+                ):
+                    split_current_page_action = Action(
+                        FIF.EDIT,
+                        self.tr("仅将当前屏拆为 2 屏"),
+                    )
+                    split_current_page_action.triggered.connect(
+                        lambda _checked=False, pid=str(
+                            selected.get("display_page_id") or ""
+                        ): self._split_display_page(pid)
+                    )
+                    menu.addAction(split_current_page_action)
                 focus_word_id = int(selected.get("word_start"))
                 for target_parent_page_count in range(
                     current_parent_page_count + 1,
@@ -3492,6 +3773,34 @@ class SubtitleInterface(QWidget):
         if self.manual_final_session and len(rows) == 1:
             row = rows[0]
             selected = self.model._data.get(str(row + 1)) or {}
+            parent_id = str(selected.get("manual_cue_id") or "")
+            if parent_id:
+                menu.addSeparator()
+                edit_english_action = Action(
+                    FIF.EDIT,
+                    self.tr("修正当前英文（保持时间轴）"),
+                )
+                edit_english_action.triggered.connect(
+                    lambda _checked=False, selected_row=row: (
+                        self._show_manual_english_edit_dialog(selected_row)
+                    )
+                )
+                menu.addAction(edit_english_action)
+                suppressed = bool(selected.get("display_suppressed"))
+                suppress_action = Action(
+                    FIF.VIEW if suppressed else FIF.DELETE,
+                    self.tr(
+                        "恢复显示这条字幕"
+                        if suppressed
+                        else "隐藏这条字幕（保留音频）"
+                    ),
+                )
+                suppress_action.triggered.connect(
+                    lambda _checked=False, pid=parent_id, hide=not suppressed: (
+                        self._set_manual_cue_display_suppressed(pid, hide)
+                    )
+                )
+                menu.addAction(suppress_action)
             selected_page_id = str(selected.get("display_page_id") or "")
             tail_target_available = bool(
                 selected_page_id or not selected.get("display_page_view")
@@ -3526,6 +3835,125 @@ class SubtitleInterface(QWidget):
 
         # 显示菜单
         menu.exec(self.subtitle_table.viewport().mapToGlobal(pos))
+
+    def _apply_manual_english_replacement(
+        self,
+        row: int,
+        replacement_text: str,
+    ) -> bool:
+        if not self.manual_final_session:
+            return False
+        self._sync_manual_final_text_edits(
+            allow_incomplete_page_chinese=True
+        )
+        key = str(int(row) + 1)
+        selected = self.model._data.get(key) or {}
+        parent_id = str(selected.get("manual_cue_id") or "")
+        if not parent_id:
+            raise ManualFinalSubtitleEditError("当前行没有稳定父字幕 ID。")
+        replacement = re.sub(r"\s+", " ", str(replacement_text or "")).strip()
+        if not replacement or "\n" in str(replacement_text or ""):
+            raise ManualFinalSubtitleEditError("人工英文不能为空或包含换行。")
+        if replacement == str(selected.get("original_subtitle") or ""):
+            return False
+
+        rows = copy.deepcopy(self.model._data)
+        rows[key]["original_subtitle"] = replacement
+        if selected.get("display_page_view"):
+            changed = self.manual_final_session.apply_display_page_model_data(
+                rows,
+                allow_incomplete_chinese=True,
+            )
+        else:
+            changed = self.manual_final_session.apply_parent_model_data(rows)
+        if not changed:
+            return False
+
+        page_id = str(selected.get("display_page_id") or "")
+        focus_word_id = int(selected.get("word_start") or 0)
+        self._invalidate_manual_review_marks_for_parent_ids([parent_id])
+        self._mark_manual_final_dirty(invalidate_pages=False)
+        self.manual_final_undo_action.setEnabled(True)
+        self._apply_manual_final_session()
+        target_row = self._manual_row_for_identity(
+            parent_id=parent_id,
+            page_id=page_id,
+            focus_word_id=focus_word_id,
+        )
+        if target_row is not None:
+            self._select_manual_boundary_row(target_row)
+        self.status_label.setText(
+            self.tr(f"{page_id or parent_id} 英文已修正；词 ID 和时间轴未改变")
+        )
+        return True
+
+    def _show_manual_english_edit_dialog(self, row: int) -> None:
+        selected = self.model._data.get(str(int(row) + 1)) or {}
+        if not selected or not self.manual_final_session:
+            return
+        stable_id = str(
+            selected.get("display_page_id")
+            or selected.get("manual_cue_id")
+            or ""
+        )
+        dialog = ManualEnglishEditDialog(
+            stable_id=stable_id,
+            english=str(selected.get("original_subtitle") or ""),
+            parent=self,
+        )
+        if not dialog.exec_():
+            return
+        try:
+            self._apply_manual_english_replacement(
+                row,
+                dialog.english_text(),
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法修正当前英文"),
+                str(exc),
+                duration=6000,
+                parent=self,
+            )
+
+    def _set_manual_cue_display_suppressed(
+        self,
+        parent_subtitle_id: str,
+        suppressed: bool,
+    ) -> None:
+        if not self.manual_final_session:
+            return
+        try:
+            self._sync_manual_final_text_edits(
+                allow_incomplete_page_chinese=True
+            )
+            result = self.manual_final_session.set_cue_display_suppressed(
+                parent_subtitle_id,
+                suppressed,
+            )
+            if not result.get("changed"):
+                return
+            self._invalidate_manual_review_marks_for_parent_ids(
+                [parent_subtitle_id]
+            )
+            self._manual_page_view = True
+            self._manual_parent_boundaries_dirty = False
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self._apply_manual_final_session()
+            self.status_label.setText(
+                self.tr(
+                    f"{parent_subtitle_id} 已隐藏字幕显示；原音频和时间轴未改变"
+                    if suppressed
+                    else f"{parent_subtitle_id} 已恢复字幕显示"
+                )
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法修改字幕显示状态"),
+                str(exc),
+                duration=5000,
+                parent=self,
+            )
 
     def _confirm_current_display_page_chinese(self, page_id: str) -> None:
         if not self.manual_final_session:
@@ -3663,6 +4091,67 @@ class SubtitleInterface(QWidget):
                 parent=self,
             )
 
+    def _split_display_page(self, display_page_id: str) -> None:
+        if not self.manual_final_session:
+            return
+        page_id = str(display_page_id or "").strip()
+        if not page_id:
+            return
+        try:
+            self._sync_manual_final_text_edits()
+            result = self.manual_final_session.split_display_page(page_id)
+            parent_id = str(result["parent_subtitle_id"])
+            cue = next(
+                (
+                    item
+                    for item in self.manual_final_session.cues
+                    if str(item.get("cue_id") or "") == parent_id
+                ),
+                {},
+            )
+            self._invalidate_manual_review_marks_for_parent_ids(
+                [parent_id, *(cue.get("source_subtitle_ids") or [])]
+            )
+            self._manual_boundary_edit_active = False
+            self._manual_boundary_row_armed = False
+            self._manual_boundary_move_direction = ""
+            self._manual_parent_boundaries_dirty = False
+            self._manual_page_view = True
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self._apply_manual_final_session()
+            split_page_ids = [
+                str(value) for value in result.get("split_page_ids") or []
+            ]
+            target_page_id = split_page_ids[0] if split_page_ids else ""
+            target_row = next(
+                (
+                    index
+                    for index, row in enumerate(self.model._data.values())
+                    if str(row.get("display_page_id") or "") == target_page_id
+                ),
+                0,
+            )
+            self._select_manual_boundary_row(target_row)
+            self.status_label.setText(
+                self.tr(
+                    f"只拆分了 {page_id}；{parent_id} 现为 "
+                    f"{result['page_count']} 屏"
+                )
+            )
+            InfoBar.success(
+                self.tr("当前屏已拆分"),
+                self.tr("其他屏的英文范围、中文和时间轴均未改变。"),
+                duration=4000,
+                parent=self,
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法只拆当前屏"),
+                str(exc),
+                duration=6000,
+                parent=self,
+            )
+
     def _split_parent_into_display_pages(
         self,
         parent_subtitle_id: str,
@@ -3730,6 +4219,7 @@ class SubtitleInterface(QWidget):
                 )
                 return
             self._manual_boundary_edit_active = False
+            self._manual_boundary_row_armed = False
             self._manual_boundary_move_direction = ""
             cue = next(
                 (
@@ -3971,29 +4461,65 @@ class SubtitleInterface(QWidget):
                         str(selected_data[0].get("display_page_id") or "")
                     )
                     return
-                cue_index_by_id = {
-                    str(cue.get("cue_id") or ""): index
-                    for index, cue in enumerate(self.manual_final_session.cues)
-                }
-                try:
-                    cue_indexes = [cue_index_by_id[parent_id] for parent_id in parent_ids]
-                except KeyError:
-                    cue_indexes = []
-                expected_cue_indexes = (
-                    list(range(cue_indexes[0], cue_indexes[-1] + 1))
-                    if cue_indexes
-                    else []
-                )
-                if not cue_indexes or cue_indexes != expected_cue_indexes:
+                if len(rows) != 2:
                     InfoBar.warning(
                         self.tr("无法合并父字幕"),
-                        self.tr("所选页面不属于连续相邻的父字幕。"),
+                        self.tr("每次请选择来自相邻父字幕的两个实际分页。"),
                         duration=4000,
                         parent=self,
                     )
                     return
-                first_cue_index = cue_indexes[0]
-                last_cue_index = cue_indexes[-1]
+                try:
+                    self._sync_manual_final_text_edits()
+                    result = (
+                        self.manual_final_session.merge_adjacent_display_pages(
+                            str(selected_data[0].get("display_page_id") or ""),
+                            str(selected_data[1].get("display_page_id") or ""),
+                        )
+                    )
+                    affected_parent_ids = {
+                        str(value)
+                        for value in result.get("affected_parent_ids") or []
+                        if str(value)
+                    }
+                    self._invalidate_manual_review_marks_for_parent_ids(
+                        affected_parent_ids
+                    )
+                    self._manual_boundary_edit_active = False
+                    self._manual_boundary_row_armed = False
+                    self._manual_boundary_move_direction = ""
+                    self._manual_parent_boundaries_dirty = False
+                    self._manual_page_view = True
+                    self._mark_manual_final_dirty(invalidate_pages=False)
+                    self._apply_manual_final_session()
+                    merged_page_id = str(result.get("merged_page_id") or "")
+                    target_row = next(
+                        (
+                            index
+                            for index, row in enumerate(self.model._data.values())
+                            if str(row.get("display_page_id") or "")
+                            == merged_page_id
+                        ),
+                        0,
+                    )
+                    self._select_manual_boundary_row(target_row)
+                    InfoBar.success(
+                        self.tr("合并成功"),
+                        self.tr(
+                            "两条父字幕和所选分页已一次合并；"
+                            "一次撤销即可完整恢复。"
+                        ),
+                        duration=3500,
+                        parent=self,
+                    )
+                except ManualFinalSubtitleEditError as exc:
+                    InfoBar.warning(
+                        self.tr("无法合并"),
+                        str(exc),
+                        duration=5000,
+                        parent=self,
+                    )
+                return
             else:
                 first_cue_index = rows[0]
                 last_cue_index = rows[-1]
@@ -4031,6 +4557,7 @@ class SubtitleInterface(QWidget):
                 )
                 self._manual_parent_boundaries_dirty = not pages_preserved
                 self._manual_page_view = pages_preserved
+                self._manual_boundary_row_armed = False
                 self._mark_manual_final_dirty(invalidate_pages=not pages_preserved)
                 self._apply_manual_final_session()
                 target_row = next(
@@ -4164,6 +4691,28 @@ class SubtitleInterface(QWidget):
         """处理字幕排布变更"""
         cfg.set(cfg.subtitle_layout, layout)
         self.layout_button.setText(layout)
+
+
+class ManualEnglishEditDialog(MessageBoxBase):
+    def __init__(self, *, stable_id: str, english: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(self.tr("修正当前英文"))
+        self.titleLabel = BodyLabel(
+            self.tr(f"{stable_id} 英文（词 ID 和时间轴保持不变）"),
+            self,
+        )
+        self.text_edit = TextEdit(self)
+        self.text_edit.setPlainText(str(english or ""))
+        self.text_edit.setMinimumWidth(720)
+        self.text_edit.setMinimumHeight(150)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.text_edit)
+        self.viewLayout.setSpacing(10)
+        self.yesButton.setText(self.tr("应用修正"))
+        self.cancelButton.setText(self.tr("取消"))
+
+    def english_text(self) -> str:
+        return self.text_edit.toPlainText()
 
 
 class PromptDialog(MessageBoxBase):

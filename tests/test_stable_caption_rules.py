@@ -4012,6 +4012,73 @@ def test_final_gate_allows_sentence_initial_to_me_after_punctuation():
     assert "stranded_leading_complement_split" not in evaluation["hard_issues"]
 
 
+def test_pre_id_repair_keeps_degree_modifier_and_infinitive_complement_together():
+    words = (
+        "They paused the experiments to prioritize safety, standardization, "
+        "and, well, most likely, to manage the blowback from traditional "
+        "taxi drivers whose livelihoods were immediately threatened."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    likely_index = words.index("likely,")
+    well_index = words.index("well,")
+    for entry in editor._active_word_entries[well_index:]:
+        entry["start_time"] += 440
+        entry["end_time"] += 440
+    for entry in editor._active_word_entries[likely_index + 1 :]:
+        entry["start_time"] += 540
+        entry["end_time"] += 540
+    editor._prepare_syntax_cut_hints()
+    items = [
+        _word_item(editor, 0, likely_index, 1),
+        _word_item(editor, likely_index + 1, len(words) - 1, 2),
+    ]
+
+    old_boundary_evaluation = editor._evaluate_item_pair_for_final_boundary(
+        items[0],
+        items[1],
+    )
+    assert "modified_infinitive_scope_split" in old_boundary_evaluation["hard_issues"]
+
+    repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+    assert [item.original for item in repaired] == [
+        "They paused the experiments to prioritize safety, standardization, and, well,",
+        "most likely, to manage the blowback from traditional taxi drivers whose livelihoods were immediately threatened.",
+    ]
+    assert all(
+        editor._evaluate_item_pair_for_final_boundary(left, right)["legal"]
+        for left, right in zip(repaired, repaired[1:])
+    )
+    assert editor._pre_id_boundary_repairs[-1]["old_cut_word_index"] == [
+        likely_index,
+        likely_index + 1,
+    ]
+
+
+def test_degree_modifier_fallback_blocks_most_likely_split_without_parser():
+    editor = _marker_editor(["well,", "most", "likely,", "to", "manage"])
+
+    evaluation = editor._evaluate_stable_cut_boundary(1, 2)
+
+    assert "adverb_adjective_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_modified_infinitive_scope_rule_does_not_block_ordinary_purpose_clause():
+    words = "They paused the experiments, to manage the blowback.".split()
+    editor = _marker_editor(words)
+    to_index = words.index("to")
+    for entry in editor._active_word_entries[to_index:]:
+        entry["start_time"] += 540
+        entry["end_time"] += 540
+    editor._prepare_syntax_cut_hints()
+
+    evaluation = editor._evaluate_stable_cut_boundary(to_index - 1, to_index)
+
+    assert "modified_infinitive_scope_split" not in evaluation["hard_issues"]
+    assert evaluation["legal"]
+
+
 def test_final_fragment_gate_repairs_incomplete_interrogative_fragment():
     editor = _marker_editor(["How", "on", "earth", "do", "you", "know", "this?"], max_words=14)
     items = [_word_item(editor, 0, 2, 1), _word_item(editor, 3, 6, 2)]
@@ -9432,6 +9499,53 @@ def test_complete_unsplittable_overflow_is_warning_not_overlong_error():
     assert [issue["code"] for issue in summary["warnings"]] == ["structural_english_overflow"]
 
 
+def test_context_rejected_overlong_split_is_structural_warning_not_error():
+    texts = [
+        "without having to legally tether themselves to someone who can't match "
+        "their life stage or financial success.",
+        "If modern relationships are increasingly functioning as temporary tools "
+        "for individual self-actualization and creative fuel rather than lifelong "
+        "partnerships,",
+        "what does that mean for the traditional romantic ideals you've been taught "
+        "to value all your life?",
+    ]
+    words = " ".join(texts).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+
+    ranges = []
+    cursor = 0
+    for text in texts:
+        word_count = len(text.split())
+        ranges.append((cursor, cursor + word_count - 1))
+        cursor += word_count
+    items = [_word_item(editor, start, end, 1) for start, end in ranges]
+
+    repaired, _ = editor._safe_overlong_item_split(items[1])
+    candidate_gate = editor._can_apply_pre_id_repair_candidate(
+        [items[1]],
+        repaired,
+        previous_item=items[0],
+        next_item=items[2],
+    )
+
+    assert [editor._word_count(item.original) for item in repaired] == [15, 4]
+    assert candidate_gate["accepted"] is False
+    assert "short_open_prefix_fragment" in candidate_gate["reasons"]
+
+    segments = []
+    for index, (text, (word_start, word_end)) in enumerate(zip(texts, ranges), start=1):
+        segment = ASRDataSeg(text, word_start * 200, (word_end + 1) * 200, "完整中文。")
+        segment.subtitle_id = f"S{index:04d}"
+        segment.word_start = word_start
+        segment.word_end = word_end
+        segments.append(segment)
+
+    assert editor._overlong_english_issues(segments) == []
+    structural = editor._structural_english_overflow_issues(segments)
+    assert "S0002" in [issue["subtitle_id"] for issue in structural]
+
+
 def test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned():
     text = (
         "Well we started by noting that artificial intelligence is already drafting "
@@ -9959,6 +10073,35 @@ def test_v10_adjacent_rebalance_merges_dependent_two_word_tails():
         (0, independent_words.index("enormous.")),
         (independent_words.index("A"), len(independent_words) - 1),
     ]
+
+
+def test_adjacent_rebalance_preserves_sentence_boundary_before_complete_short_tail():
+    text = (
+        "We are going to figure out why Hollywood is suddenly obsessed with this "
+        "exact dynamic. Lots of money."
+    )
+    words = text.split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    sentence_end = words.index("dynamic.")
+    items = [
+        _word_item(editor, 0, sentence_end, 1),
+        _word_item(editor, sentence_end + 1, len(words) - 1, 1),
+    ]
+
+    merged = editor._merge_subtitle_items(*items)
+    safe_split, _ = editor._safe_overlong_item_split(merged)
+    rebalanced = editor._rebalance_adjacent_pre_id_windows(items)
+
+    assert [(item.word_start, item.word_end) for item in safe_split] == [
+        (0, sentence_end),
+        (sentence_end + 1, len(words) - 1),
+    ]
+    assert [(item.word_start, item.word_end) for item in rebalanced] == [
+        (0, sentence_end),
+        (sentence_end + 1, len(words) - 1),
+    ]
+    assert editor._pre_id_boundary_repairs == []
 
 
 def test_v10_preposition_only_tail_keeps_complete_sentence_renderer_owned():
@@ -11421,6 +11564,112 @@ def test_whisperx_expansion_compression_fallback_is_local_and_opt_in():
     ]
 
 
+def test_whisperx_numeric_pause_collapse_restores_delayed_percentage_boundary():
+    """WhisperX must not stretch the prior word across a trusted numeric pause."""
+    source = [
+        ASRDataSeg("app", 500, 740),
+        ASRDataSeg("field,", 740, 1080),
+        ASRDataSeg("73%", 1560, 2500),
+        ASRDataSeg("of", 2500, 2700),
+    ]
+    aligned_words = [
+        {"text": "app", "start": 0.520, "end": 0.760},
+        {"text": "field", "start": 0.801, "end": 2.001},
+        {"text": "73%", "start": 2.041, "end": 2.722},
+        {"text": "of", "start": 2.762, "end": 2.942},
+    ]
+
+    mapped = _make_whisperx_word_segments(
+        source,
+        aligned_words,
+        reject_expansion_drift=True,
+    )
+
+    assert [
+        (segment.start_time, segment.end_time, segment.alignment_source)
+        for segment in mapped.segments
+    ] == [
+        (520, 760, "whisperx"),
+        (740, 1080, "stable-ts-fallback"),
+        (1560, 2500, "stable-ts-fallback"),
+        (2762, 2942, "whisperx"),
+    ]
+    assert mapped.whisperx_expansion_fallbacks == [
+        {
+            "code": "whisperx_expansion_pause_fallback",
+            "trigger_word_id": 2,
+            "trigger_word": "73%",
+            "fallback_word_ids": [1, 2],
+            "baseline_pause_ms": 480,
+            "rejected_whisperx_pause_ms": 40,
+            "effective_onset_delay_ms": 481,
+        }
+    ]
+
+
+def test_whisperx_numeric_pause_collapse_restores_prior_word_when_number_is_unmatched():
+    """An unmatched percentage must not be delayed by the prior WhisperX word."""
+    source = [
+        ASRDataSeg("first", 551600, 551800),
+        ASRDataSeg("move.", 551800, 552000),
+        ASRDataSeg("72%.", 552420, 552940),
+        ASRDataSeg("Why", 552940, 553180),
+    ]
+    aligned_words = [
+        {"text": "first", "start": 551.620, "end": 551.820},
+        {"text": "move", "start": 551.820, "end": 552.595},
+        # WhisperX did not return the compact written-form percentage.
+        {"text": "Why", "start": 552.960, "end": 553.200},
+    ]
+
+    mapped = _make_whisperx_word_segments(
+        source,
+        aligned_words,
+        reject_expansion_drift=True,
+    )
+
+    assert (mapped.segments[1].start_time, mapped.segments[1].end_time) == (
+        551800,
+        552000,
+    )
+    assert mapped.segments[1].alignment_source == "stable-ts-fallback"
+    assert (mapped.segments[2].start_time, mapped.segments[2].end_time) == (
+        552420,
+        552940,
+    )
+    assert mapped.whisperx_expansion_fallbacks == [
+        {
+            "code": "whisperx_expansion_pause_fallback",
+            "trigger_word_id": 2,
+            "trigger_word": "72%.",
+            "fallback_word_ids": [1],
+            "baseline_pause_ms": 420,
+            "rejected_whisperx_pause_ms": -175,
+            "effective_onset_delay_ms": 175,
+        }
+    ]
+
+
+def test_whisperx_numeric_pause_guard_keeps_corroborated_local_shift():
+    source = [
+        ASRDataSeg("field,", 740, 1080),
+        ASRDataSeg("73%", 1560, 2500),
+    ]
+    aligned_words = [
+        {"text": "field", "start": 1.140, "end": 1.740},
+        {"text": "73%", "start": 1.960, "end": 2.900},
+    ]
+
+    mapped = _make_whisperx_word_segments(
+        source,
+        aligned_words,
+        reject_expansion_drift=True,
+    )
+
+    assert mapped.whisperx_expansion_fallbacks == []
+    assert all(segment.alignment_source == "whisperx" for segment in mapped.segments)
+
+
 def test_whisperx_plain_word_density_fallback_is_local():
     words = "does this all mean for you we're stuck".split()
     source = [
@@ -11880,6 +12129,9 @@ if __name__ == "__main__":
     test_runtime_module_import_path_is_available()
     test_whisperx_alignment_mapping_preserves_source_tokens_and_local_fallback()
     test_whisperx_expansion_compression_fallback_is_local_and_opt_in()
+    test_whisperx_numeric_pause_collapse_restores_delayed_percentage_boundary()
+    test_whisperx_numeric_pause_collapse_restores_prior_word_when_number_is_unmatched()
+    test_whisperx_numeric_pause_guard_keeps_corroborated_local_shift()
     test_whisperx_plain_word_density_fallback_is_local()
     test_stable_ts_plain_word_density_fallback_keeps_valid_native_times()
     test_stable_ts_density_fallback_rejects_an_implausible_native_baseline()
@@ -11896,6 +12148,7 @@ if __name__ == "__main__":
     test_short_backchannel_stays_with_following_coordinated_clause()
     test_pre_id_validation_keeps_terminal_backchannel_out_of_previous_sentence()
     test_complete_unsplittable_overflow_is_warning_not_overlong_error()
+    test_context_rejected_overlong_split_is_structural_warning_not_error()
     test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned()
     test_overlong_repair_keeps_relative_clause_with_its_main_predicate()
     test_final_pre_id_repair_keeps_the_relative_clause_with_its_predicate()
@@ -11903,6 +12156,7 @@ if __name__ == "__main__":
     test_stable_cut_does_not_leave_terminal_prepositional_phrase()
     test_comma_terminated_parser_confirmed_subordinate_overflow_is_warning_not_error()
     test_comma_overflow_requires_parser_proof_and_no_safe_split()
+    test_adjacent_rebalance_preserves_sentence_boundary_before_complete_short_tail()
     test_visual_reading_budget_keeps_complete_13_word_cue_for_renderer_wrapping()
     test_visual_reading_budget_keeps_character_heavy_cue_for_renderer_wrapping()
     test_visual_reading_budget_never_selects_preposition_object_cut()

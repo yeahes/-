@@ -29,6 +29,8 @@ from app.core.subtitle_processor.stable_display_page_contract import (
 )
 from app.core.subtitle_processor.stable_artifacts import (
     file_sha256,
+    find_stable_manifest_for_artifact,
+    resolve_manifest_owned_path,
     validate_manifest_artifact,
 )
 from app.core.utils.json_repair import loads as repair_json_loads
@@ -237,7 +239,6 @@ LINE_BREAK_AVOID_AFTER_WORDS = {
 }
 CAPTION_HARD_BREAK_PENALTY = 12_000
 ARTICLE_LINE_SOFT_MODIFIER_PENALTY = 1_600
-ARTICLE_LINE_FONT_PIXEL_PENALTY = 2_500
 # A complete phrase that starts on the next line/page is readable, but it is
 # still slightly less desirable than a neutral boundary.  Keep this below the
 # hard threshold so callers can distinguish a review-worthy preference from a
@@ -453,6 +454,25 @@ class Cue:
     article_page_plan: dict | None = None
     display_page_translations: dict[str, str] | None = None
     display_boundary_evidence: dict[str, dict] | None = None
+
+
+def _article_boundary_words(cue: Cue) -> list[str]:
+    """Return one display surface per authoritative timed word record."""
+    timing = list(cue.word_timing or ())
+    if timing:
+        surfaces = [
+            re.sub(r"\s+", " ", str(item.get("surface") or "")).strip()
+            for item in timing
+            if isinstance(item, Mapping)
+        ]
+        if (
+            len(surfaces) == len(timing)
+            and all(surfaces)
+            and " ".join(" ".join(surfaces).split())
+            == " ".join(str(cue.en or "").split())
+        ):
+            return surfaces
+    return str(cue.en or "").split()
 
 
 class RenderStructuralOverflowError(RuntimeError):
@@ -691,29 +711,47 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         cue.display_page_translations = None
         cue.display_boundary_evidence = None
 
-    manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
-    if not manifest_path.exists():
+    manifest_path = find_stable_manifest_for_artifact(subtitle_path)
+    if manifest_path is None:
         return False
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        stable_path = Path(
-            str((manifest.get("paths") or {}).get("original_top_srt") or "")
+        stable_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str((manifest.get("paths") or {}).get("original_top_srt") or ""),
+            str((manifest.get("paths_sha256") or {}).get("original_top_srt") or ""),
         )
-        if Path(subtitle_path).resolve() != stable_path.resolve():
+        if stable_path is None or Path(subtitle_path).resolve() != stable_path.resolve():
             return False
         if not validate_manifest_artifact(
             manifest,
             "original_top_srt",
             stable_path,
+            manifest_path=manifest_path,
         ):
             return False
-        timeline_path = Path(str(manifest.get("final_cue_timeline_path") or ""))
-        if not timeline_path.is_file():
+        timeline_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str(manifest.get("final_cue_timeline_path") or ""),
+            str(manifest.get("final_cue_timeline_sha256") or ""),
+        )
+        if timeline_path is None:
             return False
         timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
-        ledger_path = timeline_path.with_name("word-ledger.json")
-        manifest_ledger_path = str(manifest.get("word_ledger_path") or "")
-        if manifest_ledger_path and Path(manifest_ledger_path).resolve() != ledger_path.resolve():
+        ledger_declared = str(manifest.get("word_ledger_path") or "")
+        ledger_path = (
+            resolve_manifest_owned_path(
+                manifest_path,
+                manifest,
+                ledger_declared,
+                str(manifest.get("word_ledger_sha256") or ""),
+            )
+            if ledger_declared
+            else timeline_path.with_name("word-ledger.json")
+        )
+        if ledger_path is None or ledger_path.parent != timeline_path.parent:
             return False
         expected_timeline_sha256 = str(
             manifest.get("final_cue_timeline_sha256") or ""
@@ -729,16 +767,18 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
             manifest.get("display_boundary_evidence_path") or ""
         )
         if boundary_path_value:
-            boundary_path = Path(boundary_path_value)
-            if not boundary_path.is_absolute():
-                boundary_path = manifest_path.parent / boundary_path
             expected_boundary_sha256 = str(
                 manifest.get("display_boundary_evidence_sha256") or ""
             )
+            boundary_path = resolve_manifest_owned_path(
+                manifest_path,
+                manifest,
+                boundary_path_value,
+                expected_boundary_sha256,
+            )
             if (
-                not boundary_path.is_file()
+                boundary_path is None
                 or not expected_boundary_sha256
-                or file_sha256(boundary_path) != expected_boundary_sha256
             ):
                 return False
             boundary_artifact = json.loads(
@@ -754,12 +794,22 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         logger.warning("Article renderer could not load frozen word timing: %s", exc)
         return False
 
-    if len(records) != len(cues) or not words:
+    visible_records = [
+        record
+        for record in records
+        if isinstance(record, Mapping) and not record.get("display_suppressed")
+    ]
+    if len(visible_records) != len(cues) or not words:
         return False
     attached: list[tuple[Cue, str, tuple[dict, ...], dict[str, dict] | None]] = []
     seen_subtitle_ids: set[str] = set()
     previous_word_end = -1
-    for cue, record in zip(cues, records):
+    visible_cue_index = 0
+    for record in records:
+        if not isinstance(record, Mapping):
+            return False
+        display_suppressed = bool(record.get("display_suppressed"))
+        cue = None if display_suppressed else cues[visible_cue_index]
         try:
             subtitle_id = str(record["subtitle_id"])
             word_start = int(record["word_start"])
@@ -774,8 +824,13 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
             or word_start != previous_word_end + 1
             or word_end < word_start
             or word_end >= len(words)
-            or abs(record_start - cue.start) > 0.005
-            or abs(record_end - cue.end) > 0.005
+            or (
+                cue is not None
+                and (
+                    abs(record_start - cue.start) > 0.005
+                    or abs(record_end - cue.end) > 0.005
+                )
+            )
         ):
             return False
         timed_words: list[dict] = []
@@ -794,20 +849,32 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
                 )
             except (KeyError, TypeError, ValueError):
                 return False
-        cue_tokens = [
-            re.sub(r"[^a-z0-9']", "", token.lower())
-            for token in cue.en.split()
+        displayed_text = (
+            str(record.get("original") or "")
+            if cue is None
+            else cue.en
+        )
+        displayed_tokens = [
+            token.casefold()
+            for token in re.findall(
+                r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*",
+                displayed_text,
+            )
         ]
         ledger_tokens = [
-            re.sub(r"[^a-z0-9']", "", word["surface"].lower())
+            token.casefold()
             for word in timed_words
+            for token in re.findall(
+                r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*",
+                str(word["surface"]),
+            )
         ]
-        if not cue_tokens or cue_tokens != ledger_tokens:
+        if not displayed_tokens or displayed_tokens != ledger_tokens:
             return False
         if (
             not timed_words
-            or float(timed_words[0]["start"]) < cue.start - 0.005
-            or float(timed_words[-1]["end"]) > cue.end + 0.005
+            or float(timed_words[0]["start"]) < record_start - 0.005
+            or float(timed_words[-1]["end"]) > record_end + 0.005
         ):
             return False
         cue_boundary_evidence: dict[str, dict] | None = None
@@ -820,11 +887,13 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
                 cue_boundary_evidence[str(boundary_word_id)] = dict(raw_boundary)
         seen_subtitle_ids.add(subtitle_id)
         previous_word_end = word_end
-        attached.append(
-            (cue, subtitle_id, tuple(timed_words), cue_boundary_evidence)
-        )
+        if cue is not None:
+            attached.append(
+                (cue, subtitle_id, tuple(timed_words), cue_boundary_evidence)
+            )
+            visible_cue_index += 1
 
-    if previous_word_end != len(words) - 1:
+    if previous_word_end != len(words) - 1 or visible_cue_index != len(cues):
         return False
 
     for cue, subtitle_id, timed_words, cue_boundary_evidence in attached:
@@ -3069,7 +3138,7 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
     soft_issues = {
         str(code) for code in item.get("soft_issues") or [] if str(code)
     }
-    words = str(cue.en or "").split()
+    words = _article_boundary_words(cue)
     previous_surface = words[split - 1] if split <= len(words) else ""
     previous = re.sub(r"[^A-Za-z']", "", previous_surface).lower()
     following = (
@@ -3901,7 +3970,7 @@ def _schedule_article_page_boundaries(
     if len(spans) <= 1:
         return [float(cue.start), float(cue.end)], ""
     words = cue.word_timing
-    if len(words) != len(str(cue.en or "").split()):
+    if len(words) != len(_article_boundary_words(cue)):
         return None, "missing_or_mismatched_word_ledger"
     configured_minimum = (
         ARTICLE_PAGE_MIN_DURATION_MS
@@ -3941,9 +4010,8 @@ def _article_final_page_layout(
     start: int,
     end: int,
 ) -> tuple[int, list[str]] | None:
-    """Choose font and line wrap together for one frozen page span."""
+    """Keep the preferred font whenever the page fits within two lines."""
     text = " ".join(words[start:end])
-    candidates: list[tuple[int, int, list[str]]] = []
     for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
         lines = _article_fixed_english_lines(
             draw,
@@ -3963,60 +4031,8 @@ def _article_final_page_layout(
             ),
         )
         if lines:
-            score = _article_same_screen_layout_score(
-                cue,
-                words,
-                start,
-                end,
-                int(font_size),
-                lines,
-            )
-            candidates.append((score, int(font_size), list(lines)))
-    if not candidates:
-        return None
-    normal_candidates = [
-        candidate
-        for candidate in candidates
-        if candidate[1] > ARTICLE_SUBTITLE_EN_MIN_SIZE
-    ]
-    if normal_candidates:
-        candidates = normal_candidates
-    _, font_size, lines = min(
-        candidates,
-        key=lambda candidate: (candidate[0], -candidate[1]),
-    )
-    return font_size, lines
-
-
-def _article_same_screen_layout_score(
-    cue: Cue,
-    words: Sequence[str],
-    start: int,
-    end: int,
-    font_size: int,
-    lines: Sequence[str],
-) -> int:
-    """Compare renderer-only layouts without changing their frozen page span."""
-    page_words = list(words[start:end])
-    split = 0
-    break_penalty = 0
-    for line in lines[:-1]:
-        split += len(str(line).split())
-        break_penalty += _article_same_screen_intrinsic_line_break_penalty(
-            cue,
-            page_words,
-            split,
-            start + split,
-        )
-        break_penalty += _article_line_boundary_penalty(
-            cue,
-            start + split,
-        )
-    return (
-        break_penalty
-        + (ARTICLE_SUBTITLE_EN_FONT_SIZE - int(font_size))
-        * ARTICLE_LINE_FONT_PIXEL_PENALTY
-    )
+            return int(font_size), list(lines)
+    return None
 
 
 def _article_planning_final_page_layout(
@@ -4049,7 +4065,7 @@ def _finalize_article_same_screen_layout(
 ) -> dict:
     """Reflow frozen pages without changing their IDs, spans, or timing."""
     finalized = dict(plan)
-    words = str(cue.en or "").split()
+    words = _article_boundary_words(cue)
     pages = [dict(page) for page in plan.get("pages") or []]
     page_fonts: list[int] = []
     for page in pages:
@@ -4089,22 +4105,6 @@ def _finalize_article_same_screen_layout(
             and previous_font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
             and " ".join(previous_lines).split() == words[start:end]
             and previous_lines == previous_valid_lines
-            and _article_same_screen_layout_score(
-                cue,
-                words,
-                start,
-                end,
-                font_size,
-                lines,
-            )
-            >= _article_same_screen_layout_score(
-                cue,
-                words,
-                start,
-                end,
-                previous_font_size,
-                previous_lines,
-            )
         ):
             font_size = previous_font_size
             lines = previous_lines
@@ -4163,7 +4163,7 @@ def reflow_article_frozen_page_plan_same_screen(
     frozen_plan: Mapping[str, object],
 ) -> dict:
     """Upgrade only the typography inside already frozen display pages."""
-    words = str(cue.en or "").split()
+    words = _article_boundary_words(cue)
     timing = list(cue.word_timing or ())
     raw_pages = list(frozen_plan.get("pages") or [])
     try:
@@ -4273,7 +4273,7 @@ def _build_article_english_page_plan(
     _return_candidates: bool = False,
 ) -> dict:
     """Freeze the English word pages before any Chinese page text is selected."""
-    words = str(cue.en or "").split()
+    words = _article_boundary_words(cue)
     if not words:
         return {
             "status": "render_structural_overflow",
@@ -5249,7 +5249,7 @@ def propose_article_manual_page_word_ranges(
 ) -> list[tuple[int, int]]:
     """Plan an explicit page count with the normal syntax/timing scorer."""
     requested = int(page_count)
-    words = str(cue.en or "").split()
+    words = _article_boundary_words(cue)
     timing = list(cue.word_timing or ())
     if (
         requested < 2
@@ -5349,7 +5349,7 @@ def rebuild_article_frozen_page_plan_from_word_ranges(
     its existing display-page IDs may change. Layout, timing, minimum duration,
     and hard-boundary checks are recomputed from the authoritative word ledger.
     """
-    words = str(cue.en or "").split()
+    words = _article_boundary_words(cue)
     timing = list(cue.word_timing or ())
     raw_pages = list(frozen_plan.get("pages") or [])
     if (
@@ -5554,7 +5554,7 @@ def _article_plan_from_frozen_artifact(
     page_translations: Mapping[str, str],
     draw: ImageDraw.ImageDraw,
 ) -> dict | None:
-    words = str(cue.en or "").split()
+    words = _article_boundary_words(cue)
     timing = list(cue.word_timing or ())
     if not words or len(words) != len(timing):
         return None
@@ -5837,15 +5837,22 @@ def load_article_display_page_translation_artifact(
     cues: Sequence[Cue],
     subtitle_path: str | Path,
 ) -> bool:
-    manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
+    manifest_path = find_stable_manifest_for_artifact(subtitle_path)
+    if manifest_path is None:
+        return False
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if str(manifest.get("display_page_translation_status") or "") != "PASS":
             return False
-        artifact_path = Path(str(manifest.get("display_page_translation_path") or ""))
-        if not artifact_path.is_file():
-            return False
         expected_sha256 = str(manifest.get("display_page_translation_sha256") or "")
+        artifact_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str(manifest.get("display_page_translation_path") or ""),
+            expected_sha256,
+        )
+        if artifact_path is None:
+            return False
         expected_contract_hash = str(
             manifest.get("display_page_translation_contract_hash") or ""
         )
@@ -5866,7 +5873,7 @@ def _manual_draft_page_boundaries(
     cue: Cue,
     spans: Sequence[tuple[int, int]],
 ) -> list[float] | None:
-    if len(cue.word_timing) != len(str(cue.en or "").split()):
+    if len(cue.word_timing) != len(_article_boundary_words(cue)):
         return None
     boundaries = [float(cue.start)]
     for start, _ in spans[1:]:
@@ -5893,7 +5900,7 @@ def build_article_manual_draft_page_plan(
     if normal.get("status") == "ok":
         english_plan = normal
     else:
-        words = str(cue.en or "").split()
+        words = _article_boundary_words(cue)
         english_plan = {}
         preferred = max(1, min(ARTICLE_VISUAL_PAGE_MAX_PAGES, article_visual_page_count(cue)))
         page_counts = list(range(preferred, ARTICLE_VISUAL_PAGE_MAX_PAGES + 1))
@@ -6227,19 +6234,38 @@ def load_article_manual_draft_page_artifact(
     cues: Sequence[Cue],
     subtitle_path: str | Path,
 ) -> bool:
-    manifest_path = Path(subtitle_path).parent / "stable-final-manifest.json"
+    manifest_path = find_stable_manifest_for_artifact(subtitle_path)
+    if manifest_path is None:
+        return False
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        artifact_path = Path(str(manifest.get("manual_draft_page_plan_path") or ""))
         expected_sha256 = str(manifest.get("manual_draft_page_plan_sha256") or "")
         override = manifest.get("manual_final_override") or {}
         if not isinstance(override, Mapping):
             return False
-        override_path = Path(str(override.get("manual_draft_page_plan_path") or ""))
         override_sha256 = str(override.get("manual_draft_page_plan_sha256") or "")
-        artifact_dir = Path(str(override.get("artifact_dir") or ""))
+        artifact_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str(manifest.get("manual_draft_page_plan_path") or ""),
+            expected_sha256,
+        )
+        override_path = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str(override.get("manual_draft_page_plan_path") or ""),
+            override_sha256,
+        )
+        artifact_dir = resolve_manifest_owned_path(
+            manifest_path,
+            manifest,
+            str(override.get("artifact_dir") or ""),
+            expect_directory=True,
+        )
         if (
-            not artifact_path.is_file()
+            artifact_path is None
+            or override_path is None
+            or artifact_dir is None
             or not expected_sha256
             or artifact_path.resolve().parent != artifact_dir.resolve()
             or artifact_path.resolve() != override_path.resolve()
