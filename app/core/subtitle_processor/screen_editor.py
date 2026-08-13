@@ -99,6 +99,7 @@ SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
 SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v4"
 SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v4"
+SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION = "semantic-full-translation-context-v1"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION = "semantic-full-translation-style-retry-v1"
 SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT_VERSION = "semantic-allocation-fragment-retry-v1"
 STABLE_CHINESE_CACHE_CONTRACT_VERSION = "stable-chinese-cache-v1"
@@ -273,6 +274,12 @@ You are a professional English-to-Simplified-Chinese translator for bilingual En
 Task:
 Translate each full English sense group into one complete, accurate, natural Simplified Chinese translation.
 
+Some payload entries include a `translation_context` object containing up to
+two preceding and two following semantic groups. These entries are read-only
+context for resolving pronouns, discourse stance, and terminology. Translate
+only the top-level target group identified by `id`; never return context groups
+or copy their translations into the target.
+
 Rules:
 - Translate the complete meaning, not the English word order.
 - Use polished magazine/documentary/finance explainer narration.
@@ -428,6 +435,11 @@ SEMANTIC_CHINESE_POLISH_PROMPT = """
 You are polishing fixed Simplified Chinese bilingual video subtitles.
 
 For each supplied high-risk sense group, improve only the existing Chinese part_translations so they read as natural, concise magazine or documentary narration.
+
+Some payload entries include a `translation_context` object with up to two
+preceding and two following semantic groups. It is read-only context for
+pronouns, discourse stance, and terminology. Return an allocation only for
+the supplied target `id`; never return or rewrite a context-only group.
 
 Hard rules:
 - English, subtitle IDs, order, timing and subtitle count are immutable.
@@ -5946,6 +5958,9 @@ class ScreenSubtitleEditor:
             "code_commit": self._current_git_commit(),
             "cache_used": self._llm_cache_used,
             "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
+            "semantic_full_translation_context_version": (
+                SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION
+            ),
             "allocation_max_concurrency": self.allocation_max_concurrency,
             "allocation_batch_size": self.allocation_batch_size,
             "stable_chinese_cache_contract": dict(
@@ -14682,6 +14697,9 @@ class ScreenSubtitleEditor:
             "semantic_full_translation_prompt_version": (
                 SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION
             ),
+            "semantic_full_translation_context_version": (
+                SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION
+            ),
             "semantic_allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
             "fixed_id_allocation_algorithm_version": (
                 FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION
@@ -15319,6 +15337,7 @@ class ScreenSubtitleEditor:
             self._chinese_polish_log = []
 
         candidates: List[tuple[int, int, Dict, List[str]]] = []
+        ordered_groups = list(groups)
         groups_by_id = {
             int(group.get("id") or 0): group
             for group in groups
@@ -15361,6 +15380,32 @@ class ScreenSubtitleEditor:
                 "full_translation": full_translations.get(group_id, ""),
                 "subtitle_parts": subtitle_parts,
             }
+            group_index = next(
+                (
+                    index
+                    for index, candidate_group in enumerate(ordered_groups)
+                    if int(candidate_group.get("id") or 0) == group_id
+                ),
+                None,
+            )
+            if group_index is not None:
+                entry["translation_context_version"] = (
+                    SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION
+                )
+                entry["translation_context"] = {
+                    "previous": self._semantic_full_translation_neighbor_entries(
+                        ordered_groups,
+                        group_index,
+                        direction=-1,
+                        radius=2,
+                    ),
+                    "next": self._semantic_full_translation_neighbor_entries(
+                        ordered_groups,
+                        group_index,
+                        direction=1,
+                        radius=2,
+                    ),
+                }
             validation = self._validate_group_chinese_allocation(entry, current)
             strong_codes = {
                 "group_allocation_information_omission",
@@ -15521,12 +15566,8 @@ class ScreenSubtitleEditor:
         self, groups: Sequence[Dict]
     ) -> Dict[int, str]:
         payload = [
-            {
-                "id": group["id"],
-                "full_english": " ".join(item.original for item in group["items"]),
-                "current_translation": self._merge_group_translation(group["items"]),
-            }
-            for group in groups
+            self._semantic_full_translation_payload_entry(groups, index)
+            for index, _group in enumerate(groups)
         ]
         prompt = self._compose_prompt(SEMANTIC_FULL_TRANSLATION_PROMPT)
         result: Dict[int, str] = {}
@@ -15605,6 +15646,72 @@ class ScreenSubtitleEditor:
                 message="LLM omitted semantic group full_translation after retry.",
             )
         return result
+
+    def _semantic_full_translation_payload_entry(
+        self,
+        groups: Sequence[Dict],
+        index: int,
+        *,
+        context_radius: int = 2,
+    ) -> Dict:
+        """Build one target translation entry with bounded read-only neighbors."""
+        group = groups[index]
+        entry = {
+            "id": int(group["id"]),
+            "full_english": " ".join(
+                item.original for item in group.get("items", [])
+            ),
+            "current_translation": self._merge_group_translation(
+                group.get("items", [])
+            ),
+            "translation_context_version": SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION,
+            "translation_context": {
+                "previous": self._semantic_full_translation_neighbor_entries(
+                    groups,
+                    index,
+                    direction=-1,
+                    radius=context_radius,
+                ),
+                "next": self._semantic_full_translation_neighbor_entries(
+                    groups,
+                    index,
+                    direction=1,
+                    radius=context_radius,
+                ),
+            },
+        }
+        return entry
+
+    def _semantic_full_translation_neighbor_entries(
+        self,
+        groups: Sequence[Dict],
+        index: int,
+        *,
+        direction: int,
+        radius: int,
+    ) -> List[Dict]:
+        neighbors: List[Dict] = []
+        for offset in range(1, max(0, int(radius)) + 1):
+            neighbor_index = index + (direction * offset)
+            if neighbor_index < 0 or neighbor_index >= len(groups):
+                break
+            group = groups[neighbor_index]
+            neighbors.append(
+                {
+                    "context_only": True,
+                    "semantic_group_id": f"G{int(group.get('id') or 0):04d}",
+                    "full_english": " ".join(
+                        item.original for item in group.get("items", [])
+                    ),
+                    "current_translation": self._merge_group_translation(
+                        group.get("items", [])
+                    ),
+                    "subtitle_ids": self._group_expected_subtitle_ids(group),
+                }
+            )
+        if direction < 0:
+            neighbors.reverse()
+        return neighbors
 
     @staticmethod
     def _full_translation_em_dash_findings(translation: str) -> List[Dict]:

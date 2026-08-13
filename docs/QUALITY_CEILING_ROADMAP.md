@@ -1,6 +1,6 @@
 # Subtitle Quality Ceiling Roadmap
 
-Status: recorded plan; not implemented by this document
+Status: in progress; context-only translation increment implemented
 Last researched: 2026-08-12
 External reference snapshot: SmartSub `27459b3fd0652bc5447ccf4ab30cb398014c35f7`
 
@@ -218,6 +218,16 @@ They are patterns to adapt, not code to copy into the Python/Qt architecture.
 - Do not bypass the stable manifest with a generic FFmpeg burn-in path.
 - Do not copy TypeScript/Electron code into Python/Qt; port the contract and
   test the behavior at the owning layer.
+
+## Implemented Since This Plan Was Recorded
+
+- Full-group translation requests now carry up to two previous and two next
+  semantic groups as `context_only` read-only entries. The target response is
+  still exact-ID validated, and neighboring text is never written back.
+- The existing selective fixed-ID Chinese polish path receives the same bounded
+  context envelope. Its candidate comparator remains the sole write gate.
+- The context contract is versioned as
+  `semantic-full-translation-context-v1` in cache metadata and manifests.
 
 ## Delivery Order
 

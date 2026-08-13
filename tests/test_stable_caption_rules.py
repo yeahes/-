@@ -7488,6 +7488,43 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
     assert editor._translation_structure_errors == []
 
 
+def test_full_translation_payload_adds_bounded_read_only_neighbor_context():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    groups = [
+        _id_group(index, index - 1, [items[index - 1]])
+        for index in range(1, 5)
+    ]
+
+    first = editor._semantic_full_translation_payload_entry(groups, 0)
+    middle = editor._semantic_full_translation_payload_entry(groups, 2)
+    last = editor._semantic_full_translation_payload_entry(groups, 3)
+
+    assert first["translation_context_version"] == (
+        "semantic-full-translation-context-v1"
+    )
+    assert first["translation_context"]["previous"] == []
+    assert [item["semantic_group_id"] for item in first["translation_context"]["next"]] == [
+        "G0002",
+        "G0003",
+    ]
+    assert [item["semantic_group_id"] for item in middle["translation_context"]["previous"]] == [
+        "G0001",
+        "G0002",
+    ]
+    assert [item["semantic_group_id"] for item in middle["translation_context"]["next"]] == [
+        "G0004",
+    ]
+    assert [item["semantic_group_id"] for item in last["translation_context"]["previous"]] == [
+        "G0002",
+        "G0003",
+    ]
+    context_entry = middle["translation_context"]["previous"][0]
+    assert context_entry["context_only"] is True
+    assert context_entry["subtitle_ids"] == ["S0001"]
+    assert "id" not in context_entry
+
+
 def test_full_translation_prompt_restrains_ordinary_chinese_em_dashes():
     from app.core.subtitle_processor.screen_editor import SEMANTIC_FULL_TRANSLATION_PROMPT
 
@@ -7921,6 +7958,11 @@ def test_chinese_polish_selects_complex_comparison_group_by_fixed_ids():
 
     def request(prompt, payload, cache_task, **kwargs):
         assert cache_task == "screen_subtitle_semantic_chinese_polish_v3"
+        assert payload[0]["translation_context_version"] == (
+            "semantic-full-translation-context-v1"
+        )
+        assert payload[0]["translation_context"]["previous"] == []
+        assert payload[0]["translation_context"]["next"] == []
         assert payload[0]["subtitle_parts"][0]["target_zh_chars"] >= 4
         return {
             "groups": [{

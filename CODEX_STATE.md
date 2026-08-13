@@ -1,9 +1,9 @@
 # Project State
 Status: complete
-Last verified: 2026-08-13 04:33:20 Asia/Shanghai
+Last verified: 2026-08-13 12:40:12 Asia/Shanghai
 Branch: main
-Verified HEAD: 223975e9a0c24cf959bea611fc2bc4f19c00bb43
-Working tree: verified post-223975e project checkpoint prepared for commit; `.workbuddy/` excluded
+Verified HEAD: 438d6068a23733545782c5c47ec8ceb53bfe2f3d
+Working tree: modified by context-only translation increment; `.workbuddy/` excluded
 
 ## Current Goal
 Preserve the reviewed post-223975e subtitle, timing, editor, publication, tests, and documentation state as a Git checkpoint.
@@ -39,6 +39,10 @@ Preserve the reviewed post-223975e subtitle, timing, editor, publication, tests,
   records were removed; that segmentation change is not active.
 - The retained boundary fix uses parser-confirmed modified-infinitive scope
   evidence; ordinary paused purpose-infinitive boundaries remain legal.
+- Full-group and selective fixed-ID translation requests now carry up to two
+  previous/next semantic groups as read-only context, versioned as
+  `semantic-full-translation-context-v1`; neighboring IDs cannot be returned
+  or written back.
 
 ## Approved Decisions
 - Local display-page edits must not invoke whole-parent replanning unless the user explicitly chooses `整条字幕调整为 N 屏`.
@@ -84,7 +88,7 @@ Preserve the reviewed post-223975e subtitle, timing, editor, publication, tests,
   359.5 seconds; `git diff --check` passes.
 
 ## Next Action
-Continue the remaining editor verification and translation-quality roadmap from this checkpoint.
+Run focused translation/publication tests, then review and commit the context-only translation increment.
 
 ## Do Not Regress
 - Preserve frozen IDs, word order, sibling page state, actual-page view, single-command rollback, ordered 56/54/52/50px overflow fallback, and local-only numeric-pause timing fallback.
