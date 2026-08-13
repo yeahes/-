@@ -100,6 +100,7 @@ SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
 SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v4"
 SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v4"
 SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION = "semantic-full-translation-context-v1"
+SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION = "semantic-full-translation-source-echo-v1"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION = "semantic-full-translation-style-retry-v1"
 SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT_VERSION = "semantic-allocation-fragment-retry-v1"
 STABLE_CHINESE_CACHE_CONTRACT_VERSION = "stable-chinese-cache-v1"
@@ -300,6 +301,7 @@ Return pure JSON only:
   "groups": [
     {
       "id": 1,
+      "source_english": "exact English copied from the payload target group",
       "full_translation": "完整自然中文"
     }
   ]
@@ -5960,6 +5962,9 @@ class ScreenSubtitleEditor:
             "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
             "semantic_full_translation_context_version": (
                 SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION
+            ),
+            "semantic_full_translation_source_echo_version": (
+                SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION
             ),
             "allocation_max_concurrency": self.allocation_max_concurrency,
             "allocation_batch_size": self.allocation_batch_size,
@@ -14700,6 +14705,9 @@ class ScreenSubtitleEditor:
             "semantic_full_translation_context_version": (
                 SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION
             ),
+            "semantic_full_translation_source_echo_version": (
+                SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION
+            ),
             "semantic_allocation_prompt_version": SEMANTIC_ALLOCATION_PROMPT_VERSION,
             "fixed_id_allocation_algorithm_version": (
                 FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION
@@ -15586,7 +15594,12 @@ class ScreenSubtitleEditor:
                 payload_chunk,
                 cache_task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
             )
-            result.update(self._semantic_full_translations_from_response(data))
+            result.update(
+                self._semantic_full_translations_from_response(
+                    data,
+                    payload=payload_chunk,
+                )
+            )
             latest = self._last_llm_raw_returns[-1] if self._last_llm_raw_returns else {}
             cache_hits += int(
                 bool(
@@ -15613,7 +15626,12 @@ class ScreenSubtitleEditor:
                 retry_payload,
                 cache_task=f"{SEMANTIC_FULL_TRANSLATION_CACHE_TASK}_retry",
             )
-            result.update(self._semantic_full_translations_from_response(data))
+            result.update(
+                self._semantic_full_translations_from_response(
+                    data,
+                    payload=retry_payload,
+                )
+            )
             self._emit_progress_event(
                 "full_translation",
                 completed=len(payload_chunks),
@@ -15665,6 +15683,8 @@ class ScreenSubtitleEditor:
                 group.get("items", [])
             ),
             "translation_context_version": SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION,
+            "source_echo_required": True,
+            "source_echo_version": SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION,
             "translation_context": {
                 "previous": self._semantic_full_translation_neighbor_entries(
                     groups,
@@ -15796,12 +15816,16 @@ class ScreenSubtitleEditor:
                 continue
             retry_payload = dict(original_payload)
             retry_payload["current_translation"] = original_translation
+            retry_payload["source_echo_required"] = False
             data = self._request_semantic_full_translation_chunk(
                 retry_prompt,
                 [retry_payload],
                 cache_task=SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK,
             )
-            candidate_translation = self._semantic_full_translations_from_response(data).get(int(group_id), "")
+            candidate_translation = self._semantic_full_translations_from_response(
+                data,
+                payload=[retry_payload],
+            ).get(int(group_id), "")
             candidate_findings = self._full_translation_em_dash_findings(candidate_translation)
             candidate_score = self._full_translation_em_dash_style_score(candidate_translation)
             regressions = self._full_translation_style_candidate_regressions(
@@ -15953,19 +15977,35 @@ class ScreenSubtitleEditor:
             logger.warning("语义组完整翻译失败: %s", str(e))
             return None
 
-    @staticmethod
+    @classmethod
     def _semantic_full_translation_response_is_cacheable(
+        cls,
         data: Optional[object],
         payload: Sequence[Dict],
     ) -> bool:
+        return not cls._semantic_full_translation_response_errors(data, payload)
+
+    @classmethod
+    def _semantic_full_translation_response_errors(
+        cls,
+        data: Optional[object],
+        payload: Sequence[Dict],
+    ) -> List[Dict]:
         groups_data = data.get("groups", []) if isinstance(data, dict) else data
         if not isinstance(groups_data, list):
-            return False
+            return [{"code": "translation_response_not_a_group_list"}]
         expected_ids = [int(entry.get("id") or 0) for entry in payload]
+        expected_by_id = {int(entry.get("id") or 0): entry for entry in payload}
         returned_ids: List[int] = []
+        errors: List[Dict] = []
         for group in groups_data:
             if not isinstance(group, dict) or not str(group.get("id", "")).isdigit():
-                return False
+                errors.append({"code": "translation_response_group_id_invalid"})
+                continue
+            group_id = int(group["id"])
+            if group_id not in expected_by_id:
+                errors.append({"code": "translation_response_group_id_unknown", "id": group_id})
+                continue
             translated = str(
                 group.get("full_translation")
                 or group.get("translation")
@@ -15973,20 +16013,55 @@ class ScreenSubtitleEditor:
                 or ""
             ).strip()
             if not translated:
-                return False
-            returned_ids.append(int(group["id"]))
-        return (
-            len(returned_ids) == len(set(returned_ids))
-            and set(returned_ids) == set(expected_ids)
-        )
+                errors.append({"code": "translation_response_translation_missing", "id": group_id})
+            expected_entry = expected_by_id[group_id]
+            if expected_entry.get("source_echo_required"):
+                source_echo = str(group.get("source_english") or "").strip()
+                expected_source = str(expected_entry.get("full_english") or "")
+                if not source_echo:
+                    errors.append({"code": "translation_source_echo_missing", "id": group_id})
+                elif cls._word_tokens(source_echo) != cls._word_tokens(expected_source):
+                    errors.append(
+                        {
+                            "code": "translation_source_echo_mismatch",
+                            "id": group_id,
+                            "expected": expected_source,
+                            "returned": source_echo,
+                        }
+                    )
+            returned_ids.append(group_id)
+        if len(returned_ids) != len(set(returned_ids)):
+            errors.append({"code": "translation_response_group_id_duplicate"})
+        if set(returned_ids) != set(expected_ids):
+            errors.append(
+                {
+                    "code": "translation_response_group_cardinality_mismatch",
+                    "expected_ids": expected_ids,
+                    "returned_ids": returned_ids,
+                }
+            )
+        return errors
 
     def _semantic_full_translations_from_response(
         self,
         data: Optional[object],
+        payload: Optional[Sequence[Dict]] = None,
     ) -> Dict[int, str]:
         if data is None:
             return {}
         groups_data = data.get("groups", []) if isinstance(data, dict) else data
+        if payload is not None:
+            invalid_ids = {
+                int(error.get("id") or 0)
+                for error in self._semantic_full_translation_response_errors(data, payload)
+                if error.get("id") is not None
+            }
+            groups_data = [
+                group
+                for group in (groups_data if isinstance(groups_data, list) else [])
+                if isinstance(group, dict)
+                and int(group.get("id") or 0) not in invalid_ids
+            ]
         return self._semantic_full_translations_from_groups_data(
             groups_data if isinstance(groups_data, list) else []
         )

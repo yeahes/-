@@ -3,7 +3,7 @@ Status: complete
 Last verified: 2026-08-13 12:40:12 Asia/Shanghai
 Branch: main
 Verified HEAD: 438d6068a23733545782c5c47ec8ceb53bfe2f3d
-Working tree: modified by context-only translation increment; `.workbuddy/` excluded
+Working tree: modified by source-echo translation increment; `.workbuddy/` excluded
 
 ## Current Goal
 Preserve the reviewed post-223975e subtitle, timing, editor, publication, tests, and documentation state as a Git checkpoint.
@@ -43,6 +43,10 @@ Preserve the reviewed post-223975e subtitle, timing, editor, publication, tests,
   previous/next semantic groups as read-only context, versioned as
   `semantic-full-translation-context-v1`; neighboring IDs cannot be returned
   or written back.
+- Full-group translation responses must echo the target frozen English as
+  `source_english`; mismatched groups are isolated for single-group retry and
+  cannot poison valid neighbors. Version:
+  `semantic-full-translation-source-echo-v1`.
 
 ## Approved Decisions
 - Local display-page edits must not invoke whole-parent replanning unless the user explicitly chooses `整条字幕调整为 N 屏`.
@@ -88,7 +92,7 @@ Preserve the reviewed post-223975e subtitle, timing, editor, publication, tests,
   359.5 seconds; `git diff --check` passes.
 
 ## Next Action
-Run focused translation/publication tests, then review and commit the context-only translation increment.
+Run the complete 25-stage regression, then review and commit the source-echo translation increment.
 
 ## Do Not Regress
 - Preserve frozen IDs, word order, sibling page state, actual-page view, single-command rollback, ordered 56/54/52/50px overflow fallback, and local-only numeric-pause timing fallback.

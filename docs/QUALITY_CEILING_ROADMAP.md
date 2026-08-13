@@ -1,6 +1,6 @@
 # Subtitle Quality Ceiling Roadmap
 
-Status: in progress; context-only translation increment implemented
+Status: in progress; context and source-echo translation increments implemented
 Last researched: 2026-08-12
 External reference snapshot: SmartSub `27459b3fd0652bc5447ccf4ab30cb398014c35f7`
 
@@ -228,12 +228,18 @@ They are patterns to adapt, not code to copy into the Python/Qt architecture.
   context envelope. Its candidate comparator remains the sole write gate.
 - The context contract is versioned as
   `semantic-full-translation-context-v1` in cache metadata and manifests.
+- Full-group translation responses now must echo the exact target group's
+  English word sequence as `source_english`. Missing or mismatched echo marks
+  only that group for single-group retry; valid neighboring groups remain
+  usable. The contract is versioned as
+  `semantic-full-translation-source-echo-v1`.
 
 ## Delivery Order
 
 1. Reproduce and fix authoritative-Chinese/manual-final synchronization.
 2. Add context-only neighbor envelopes and hit-only terminology injection.
-3. Add exact-ID source echo and local per-entry repair where missing.
+3. Add exact-ID source echo and local per-entry repair where missing. (Source
+   echo and per-group retry are now implemented for full translations.)
 4. Add selective semantic review and the editor risk queue.
 5. Add delta journal, autosave/recovery, and exact preview workflow.
 6. Add optional verbatim boundary alternatives only after the above is stable.

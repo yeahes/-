@@ -7468,10 +7468,22 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
         ids = [entry["id"] for entry in payload]
         calls.append((cache_task, ids))
         if ids == [1, 2]:
-            return {"groups": [{"id": 1, "full_translation": "full-1"}]}
+            return {
+                "groups": [
+                    {
+                        "id": 1,
+                        "source_english": payload[0]["full_english"],
+                        "full_translation": "full-1",
+                    }
+                ]
+            }
         return {
             "groups": [
-                {"id": entry["id"], "full_translation": f"full-{entry['id']}"}
+                {
+                    "id": entry["id"],
+                    "source_english": entry["full_english"],
+                    "full_translation": f"full-{entry['id']}",
+                }
                 for entry in payload
             ]
         }
@@ -7486,6 +7498,42 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
     ]
     assert full_translations == {1: "full-1", 2: "full-2", 3: "full-3"}
     assert editor._translation_structure_errors == []
+
+
+def test_full_translation_source_echo_is_required_per_generated_group():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    groups = [_id_group(1, 0, items)]
+    payload = [editor._semantic_full_translation_payload_entry(groups, 0)]
+    valid = {
+        "groups": [
+            {
+                "id": 1,
+                "source_english": "English 1. English 2.",
+                "full_translation": "完整中文。",
+            }
+        ]
+    }
+    missing_echo = {
+        "groups": [{"id": 1, "full_translation": "完整中文。"}]
+    }
+    wrong_echo = {
+        "groups": [
+            {
+                "id": 1,
+                "source_english": "English 2. English 1.",
+                "full_translation": "完整中文。",
+            }
+        ]
+    }
+
+    assert editor._semantic_full_translation_response_is_cacheable(valid, payload)
+    assert not editor._semantic_full_translation_response_is_cacheable(missing_echo, payload)
+    assert not editor._semantic_full_translation_response_is_cacheable(wrong_echo, payload)
+    assert editor._semantic_full_translations_from_response(missing_echo, payload=payload) == {}
+    assert editor._semantic_full_translations_from_response(valid, payload=payload) == {
+        1: "完整中文。"
+    }
 
 
 def test_full_translation_payload_adds_bounded_read_only_neighbor_context():
@@ -7552,13 +7600,29 @@ def test_full_translation_style_retry_only_retries_flagged_group_and_accepts_imp
         if cache_task == "screen_subtitle_semantic_full_translation_v4":
             return {
                 "groups": [
-                    {"id": 1, "full_translation": "这是一句普通陈述。"},
-                    {"id": 2, "full_translation": "这项研究得出了明确结论——"},
+                    {
+                        "id": 1,
+                        "source_english": payload[0]["full_english"],
+                        "full_translation": "这是一句普通陈述。",
+                    },
+                    {
+                        "id": 2,
+                        "source_english": payload[1]["full_english"],
+                        "full_translation": "这项研究得出了明确结论——",
+                    },
                 ]
             }
         assert cache_task == "screen_subtitle_semantic_full_translation_style_retry_v1"
         assert payload[0]["current_translation"] == "这项研究得出了明确结论——"
-        return {"groups": [{"id": 2, "full_translation": "这项研究得出了明确结论。"}]}
+        return {
+            "groups": [
+                {
+                    "id": 2,
+                    "source_english": payload[0]["full_english"],
+                    "full_translation": "这项研究得出了明确结论。",
+                }
+            ]
+        }
 
     with patch.object(editor, "_request_semantic_full_translation_chunk", side_effect=request):
         full_translations = editor._translate_semantic_group_full_translations(groups)
@@ -7593,7 +7657,15 @@ def test_full_translation_style_retry_keeps_original_when_candidate_loses_number
     with patch.object(
         editor,
         "_request_semantic_full_translation_chunk",
-        return_value={"groups": [{"id": 1, "full_translation": "该公司批准了这些提案。"}]},
+        return_value={
+            "groups": [
+                {
+                    "id": 1,
+                    "source_english": "The company did not approve 42 proposals.",
+                    "full_translation": "该公司批准了这些提案。",
+                }
+            ]
+        },
     ):
         result = editor._retry_full_translations_for_em_dash_style(
             payload_by_id={
