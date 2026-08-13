@@ -47,6 +47,9 @@ Preserve the reviewed post-223975e subtitle, timing, editor, publication, tests,
   `source_english`; mismatched groups are isolated for single-group retry and
   cannot poison valid neighbors. Version:
   `semantic-full-translation-source-echo-v1`.
+- New display-page translation requests also echo each page English and are
+  validated by exact page ID plus word sequence; legacy page artifacts remain
+  readable without the new flag.
 
 ## Approved Decisions
 - Local display-page edits must not invoke whole-parent replanning unless the user explicitly chooses `整条字幕调整为 N 屏`.

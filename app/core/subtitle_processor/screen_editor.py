@@ -55,6 +55,7 @@ from app.core.subtitle_processor.stable_display_page_contract import (
     DISPLAY_PAGE_SCHEMA_VERSION,
     DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION,
     DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION,
+    DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION,
     build_display_page_contract,
     page_translation_cache_key,
     page_translation_request_payload,
@@ -380,7 +381,7 @@ Rules:
   full_translation. Do not add explanations or commentary.
 
 Return pure JSON only:
-{"pages":[{"display_page_id":"S0001.P01","zh":"第一页中文"}]}
+{"pages":[{"display_page_id":"S0001.P01","source_english":"exact English copied from this page","zh":"第一页中文"}]}
 """
 
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT = """
@@ -1106,7 +1107,9 @@ class ScreenSubtitleEditor:
         if parents:
             try:
                 response, cache_hit = self._request_display_page_translations(contract)
-                artifact = validate_page_translation_response(contract, response)
+                artifact = validate_page_translation_response(
+                    contract, response, require_source_echo=True
+                )
                 quality_errors = self._display_page_translation_quality_errors(contract, artifact)
                 if artifact.get("status") != "PASS" or quality_errors:
                     response, retry_cache_hit = self._request_display_page_translations(
@@ -1114,7 +1117,9 @@ class ScreenSubtitleEditor:
                         retry_errors=list(artifact.get("errors") or []) + quality_errors,
                     )
                     cache_hit = cache_hit and retry_cache_hit
-                    artifact = validate_page_translation_response(contract, response)
+                    artifact = validate_page_translation_response(
+                        contract, response, require_source_echo=True
+                    )
                     quality_errors = self._display_page_translation_quality_errors(contract, artifact)
             except RuntimeError as exc:
                 failure_items = self._display_page_failure_items(
@@ -1150,7 +1155,9 @@ class ScreenSubtitleEditor:
                 raise
         else:
             cache_hit = True
-            artifact = validate_page_translation_response(contract, {"pages": []})
+            artifact = validate_page_translation_response(
+                contract, {"pages": []}, require_source_echo=True
+            )
             quality_errors = []
 
         artifact["cache"] = {
@@ -1413,7 +1420,9 @@ class ScreenSubtitleEditor:
         contract: Mapping[str, Any],
         data: Optional[object],
     ) -> bool:
-        artifact = validate_page_translation_response(contract, data)
+        artifact = validate_page_translation_response(
+            contract, data, require_source_echo=True
+        )
         if artifact.get("status") != "PASS":
             return False
         return not self._display_page_translation_quality_errors(contract, artifact)

@@ -14,7 +14,8 @@ from app.core.subtitle_processor.chinese_token_boundaries import (
 
 DISPLAY_PAGE_SCHEMA_VERSION = 2
 DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v19"
-DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v2"
+DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v3"
+DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION = "display-page-translation-source-echo-v1"
 DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v4"
 
 
@@ -415,6 +416,8 @@ def page_translation_request_payload(contract: Mapping[str, Any]) -> list[dict[s
                     {
                         "display_page_id": page.get("display_page_id"),
                         "english": page.get("english"),
+                        "source_echo_required": True,
+                        "source_echo_version": DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION,
                         "duration_ms": max(
                             0,
                             int(page.get("end_ms") or 0)
@@ -479,6 +482,8 @@ def _response_rows(response: object) -> list[Mapping[str, Any]]:
 def validate_page_translation_response(
     contract: Mapping[str, Any],
     response: object,
+    *,
+    require_source_echo: bool = False,
 ) -> dict[str, Any]:
     expected_pages = [
         page
@@ -508,6 +513,10 @@ def validate_page_translation_response(
         )
 
     by_id: dict[str, str] = {}
+    expected_english_by_id = {
+        str(page.get("display_page_id") or ""): str(page.get("english") or "")
+        for page in expected_pages
+    }
     for row in rows:
         page_id = str(row.get("display_page_id") or "").strip()
         chinese = re.sub(r"\s+", "", str(row.get("zh") or row.get("chinese") or ""))
@@ -520,6 +529,25 @@ def validate_page_translation_response(
                     "display_page_id": page_id,
                 }
             )
+        if require_source_echo:
+            source_echo = " ".join(str(row.get("source_english") or "").split())
+            expected_english = " ".join(expected_english_by_id.get(page_id, "").split())
+            if not source_echo:
+                errors.append(
+                    {
+                        "code": "page_translation_source_echo_missing",
+                        "display_page_id": page_id,
+                    }
+                )
+            elif source_echo.split() != expected_english.split():
+                errors.append(
+                    {
+                        "code": "page_translation_source_echo_mismatch",
+                        "display_page_id": page_id,
+                        "expected": expected_english,
+                        "returned": source_echo,
+                    }
+                )
         by_id[page_id] = chinese
 
     if errors:

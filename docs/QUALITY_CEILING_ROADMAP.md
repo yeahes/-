@@ -233,6 +233,10 @@ They are patterns to adapt, not code to copy into the Python/Qt architecture.
   only that group for single-group retry; valid neighboring groups remain
   usable. The contract is versioned as
   `semantic-full-translation-source-echo-v1`.
+- Display-page translation requests now carry and validate the exact page
+  English as `source_english`. Missing or mismatched page echoes invalidate
+  only the page translation response and force the existing bounded retry;
+  legacy artifacts remain readable when the new flag is not requested.
 
 ## Delivery Order
 

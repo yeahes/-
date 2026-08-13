@@ -107,6 +107,7 @@ def _response(case, *, reverse=False):
     pages = [
         {
             "display_page_id": display_page_id(case["subtitle_id"], index),
+            "source_english": page["english"],
             "zh": page["chinese"],
         }
         for index, page in enumerate(case["pages"], 1)
@@ -1147,6 +1148,28 @@ def test_invalid_page_translation_cache_is_replaced_only_after_validation():
     assert editor._display_page_external_request_count == 1
 
 
+def test_page_translation_source_echo_is_required_for_new_requests():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    valid = _response(case)
+    missing = json.loads(json.dumps(valid, ensure_ascii=False))
+    missing["pages"][0].pop("source_english")
+    mismatched = json.loads(json.dumps(valid, ensure_ascii=False))
+    mismatched["pages"][0]["source_english"] = case["pages"][1]["english"]
+
+    assert validate_page_translation_response(
+        contract, valid, require_source_echo=True
+    )["status"] == "PASS"
+    missing_result = validate_page_translation_response(
+        contract, missing, require_source_echo=True
+    )
+    mismatch_result = validate_page_translation_response(
+        contract, mismatched, require_source_echo=True
+    )
+    assert "page_translation_source_echo_missing" in _error_codes(missing_result)
+    assert "page_translation_source_echo_mismatch" in _error_codes(mismatch_result)
+
+
 def test_page_translation_rejects_page_level_chinese_speed_overflow():
     case = _cases()["s0078_reordered_chinese"]
     contract = _contract(case)
@@ -1411,6 +1434,8 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
     editor.coverage_report_path = None
 
     def mocked_request(contract, *, retry_errors=None):
+        # The production contract now validates an exact per-page source echo.
+        # This fixture returns that echo, so no retry should be necessary.
         assert retry_errors is None
         parents = list(contract.get("parents") or [])
         assert [parent["parent_subtitle_id"] for parent in parents] == [case["subtitle_id"]]
@@ -1421,6 +1446,7 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
                 "pages": [
                     {
                         "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
                         "zh": expected["chinese"],
                     }
                     for page, expected in zip(reversed(pages), reversed(case["pages"]))
