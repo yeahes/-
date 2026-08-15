@@ -239,7 +239,7 @@ def bind_display_page_parent_records(
     display_artifact: Mapping[str, Any],
     records_by_id: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Bind validated multi-page aggregates to their final parent records."""
+    """Bind a display projection to the unchanged authoritative parent record."""
     result = copy.deepcopy(dict(display_artifact))
     for parent in result.get("parents") or []:
         parent_id = str(parent.get("parent_subtitle_id") or "")
@@ -250,11 +250,15 @@ def bind_display_page_parent_records(
                 "A display-page parent has no authoritative Chinese record.",
                 subtitle_id=parent_id,
             )
-        aggregate = _normalise_chinese(parent.get("aggregate_chinese"))
-        if aggregate != _normalise_chinese(record.get("chinese")):
+        source_chinese = _normalise_chinese(parent.get("source_parent_chinese"))
+        source_chinese_hash = str(parent.get("source_parent_chinese_hash") or "")
+        if (
+            source_chinese != _normalise_chinese(record.get("chinese"))
+            or source_chinese_hash != str(record.get("chinese_hash") or "")
+        ):
             raise AuthoritativeParentChineseError(
                 "authoritative_parent_chinese_page_conflict",
-                "Display-page Chinese conflicts with the authoritative parent record.",
+                "The display projection was created from a different parent Chinese record.",
                 subtitle_id=parent_id,
             )
         if (

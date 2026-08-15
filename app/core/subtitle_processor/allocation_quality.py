@@ -14,6 +14,7 @@ HIGH_CONFIDENCE_ALLOCATION_ISSUE_CODES = frozenset(
     {
         "adjacent_chinese_semantic_duplication",
         "cross_id_semantic_leakage",
+        "cross_subtitle_predicate_break",
         "group_allocation_information_omission",
         "entity_allocation_mismatch",
         "number_allocation_mismatch",

@@ -292,8 +292,9 @@ class SettingInterface(ScrollArea):
                 "api_key_cfg": cfg.deepseek_api_key,
                 "api_base_cfg": cfg.deepseek_api_base,
                 "model_cfg": cfg.deepseek_model,
+                "full_translation_model_cfg": cfg.deepseek_full_translation_model,
                 "default_base": "https://api.deepseek.com/v1",
-                "default_models": ["deepseek-chat"],
+                "default_models": ["deepseek-v4-flash", "deepseek-v4-pro"],
             },
             LLMServiceEnum.OLLAMA: {
                 "prefix": "ollama",
@@ -389,12 +390,25 @@ class SettingInterface(ScrollArea):
 
             # 存储服务配置
             cards = [api_key_card, api_base_card, model_card]
+            full_translation_model_card = None
+            full_translation_model_cfg = config.get("full_translation_model_cfg")
+            if full_translation_model_cfg is not None:
+                full_translation_model_card = EditComboBoxSettingCard(
+                    full_translation_model_cfg,
+                    FIF.LANGUAGE,
+                    self.tr("完整翻译模型"),
+                    self.tr("稳定字幕用它翻译完整语义组；建议选择 Pro，普通分配仍使用上方模型"),
+                    config["default_models"],
+                    self.llmGroup,
+                )
+                cards.append(full_translation_model_card)
 
             self.llm_service_configs[service] = {
                 "cards": cards,
                 "api_base": api_base_card,
                 "api_key": api_key_card,
                 "model": model_card,
+                "full_translation_model": full_translation_model_card,
             }
 
         # 创建检查连接卡片
@@ -682,6 +696,11 @@ class SettingInterface(ScrollArea):
                 temp = service_config["model"].comboBox.currentText()
                 service_config["model"].setItems(models)
                 service_config["model"].comboBox.setCurrentText(temp)
+                full_model_card = service_config.get("full_translation_model")
+                if full_model_card is not None:
+                    full_temp = full_model_card.comboBox.currentText()
+                    full_model_card.setItems(models)
+                    full_model_card.comboBox.setCurrentText(full_temp)
 
             InfoBar.success(
                 self.tr("获取模型列表成功:"),

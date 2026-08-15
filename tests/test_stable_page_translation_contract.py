@@ -402,7 +402,10 @@ def test_s0078_reordered_chinese_is_bound_by_page_id():
     expected_aggregate = "".join(page["chinese"] for page in case["pages"])
     assert artifact["status"] == "PASS"
     assert artifact["errors"] == []
-    assert parent_chinese_by_id(artifact) == {case["subtitle_id"]: expected_aggregate}
+    assert artifact["parents"][0]["aggregate_chinese"] == expected_aggregate
+    assert parent_chinese_by_id(artifact) == {
+        case["subtitle_id"]: case["parent_chinese"]
+    }
     translations = _page_translations(artifact)
     page_ids = [display_page_id(case["subtitle_id"], index) for index in (1, 2)]
     first = translations[page_ids[0]]
@@ -752,9 +755,13 @@ def test_page_translation_retry_contract_contains_only_failed_parent_pages():
     )
 
     assert merged["status"] == "PASS"
+    assert (
+        merged["parents"][1]["aggregate_chinese"]
+        == "从宏观政策巨变拉回到作为个体的你内心的心理转变。"
+    )
     assert parent_chinese_by_id(merged) == {
         "S0186": "有效父字幕",
-        "S0187": "从宏观政策巨变拉回到作为个体的你内心的心理转变。",
+        "S0187": "从宏观政策巨变，拉回到作为个体的你内心的心理转变。",
     }
 
 
@@ -1566,16 +1573,16 @@ def test_renderer_fails_closed_when_paginated_page_mapping_is_missing():
     assert plan["errors"][0]["reason"] == "missing_or_invalid_display_page_translations"
 
 
-def test_page_translation_updates_parent_chinese_without_srt_structure_drift():
+def test_page_translation_preserves_parent_chinese_and_srt_structure():
     case = _cases()["s0078_reordered_chinese"]
     cue = _timed_cue(case)
     before = _immutable_parent_snapshot(cue)
     contract = _contract(case)
     artifact = validate_page_translation_response(contract, _response(case))
-    aggregate_chinese = parent_chinese_by_id(artifact)[case["subtitle_id"]]
-    cue.zh = aggregate_chinese
+    parent_chinese = parent_chinese_by_id(artifact)[case["subtitle_id"]]
+    display_chinese = artifact["parents"][0]["aggregate_chinese"]
+    cue.zh = parent_chinese
     cue.display_page_translations = _page_translations(artifact)
-    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
 
     with tempfile.TemporaryDirectory() as raw:
         old_srt_path = Path(raw) / "old.srt"
@@ -1592,17 +1599,10 @@ def test_page_translation_updates_parent_chinese_without_srt_structure_drift():
             "1\n00:05:05,025 --> 00:05:14,811\n"
             + case["english"]
             + "\n"
-            + aggregate_chinese
+            + parent_chinese
             + "\n",
             encoding="utf-8",
         )
-
-        with patch.object(
-            podcast_learning_video,
-            "_strict_split_chinese_visual_pages",
-            side_effect=AssertionError("proportional Chinese fallback is forbidden"),
-        ):
-            plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
 
         old_srt_cue = podcast_learning_video.parse_srt(old_srt_path)[0]
         updated_srt_cue = podcast_learning_video.parse_srt(updated_srt_path)[0]
@@ -1618,12 +1618,12 @@ def test_page_translation_updates_parent_chinese_without_srt_structure_drift():
             old_srt_cue.en,
         )
         assert old_srt_cue.zh == case["parent_chinese"]
-        assert updated_srt_cue.zh == aggregate_chinese
+        assert updated_srt_cue.zh == parent_chinese
 
     assert _immutable_parent_snapshot(cue) == before
-    assert cue.zh == aggregate_chinese
-    assert cue.zh != case["parent_chinese"]
-    _assert_exact_page_identity(plan, case)
+    assert cue.zh == case["parent_chinese"]
+    assert display_chinese != cue.zh
+    assert "".join(cue.display_page_translations.values()) == display_chinese
 
 
 def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
@@ -1708,9 +1708,9 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
 
     result = editor.apply_display_page_translations_after_final_timing(asr_data)
 
-    expected_chinese = "".join(page["chinese"] for page in case["pages"])
+    display_chinese = "".join(page["chinese"] for page in case["pages"])
     assert result is asr_data
-    assert paginated.translated_text == expected_chinese
+    assert paginated.translated_text == case["parent_chinese"]
     assert single_page.translated_text == old_single_chinese
     assert [
         (
@@ -1725,7 +1725,10 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
     ] == before
     artifact = editor._display_page_translation_artifact
     assert artifact["status"] == "PASS"
-    assert parent_chinese_by_id(artifact) == {case["subtitle_id"]: expected_chinese}
+    assert artifact["parents"][0]["aggregate_chinese"] == display_chinese
+    assert parent_chinese_by_id(artifact) == {
+        case["subtitle_id"]: case["parent_chinese"]
+    }
     assert [parent["parent_subtitle_id"] for parent in artifact["parents"]] == [
         case["subtitle_id"]
     ]
@@ -2514,7 +2517,7 @@ def test_parent_chinese_authority_rejects_tampered_chinese_and_identity():
         assert exc.code == "authoritative_parent_chinese_projection_mismatch"
 
 
-def test_display_page_parent_must_reference_the_same_chinese_record():
+def test_display_page_projection_must_reference_but_cannot_replace_parent_chinese():
     records = [
         {
             "subtitle_id": "S0057",
@@ -2536,9 +2539,11 @@ def test_display_page_parent_must_reference_the_same_chinese_record():
             {
                 "parent_subtitle_id": "S0057",
                 "parent_english_hash": record["english_hash"],
+                "source_parent_chinese": record["chinese"],
+                "source_parent_chinese_hash": record["chinese_hash"],
                 "word_start": 120,
                 "word_end": 123,
-                "aggregate_chinese": "一条固定中文。",
+                "aggregate_chinese": "页面可以调整语序。",
                 "pages": [],
             }
         ],
@@ -2549,11 +2554,12 @@ def test_display_page_parent_must_reference_the_same_chinese_record():
     )
     validate_display_page_parent_records(bound, {"S0057": record})
 
+    assert bound["parents"][0]["aggregate_chinese"] == "页面可以调整语序。"
     stale = copy.deepcopy(bound)
-    stale["parents"][0]["aggregate_chinese"] = "旧版分页中文。"
+    stale["parents"][0]["source_parent_chinese"] = "旧版父字幕中文。"
     try:
         validate_display_page_parent_records(stale, {"S0057": record})
-        assert False, "stale display-page Chinese must not become authoritative"
+        assert False, "a page projection from another parent translation must fail"
     except AuthoritativeParentChineseError as exc:
         assert exc.code == "authoritative_parent_chinese_page_conflict"
 
@@ -2624,7 +2630,7 @@ if __name__ == "__main__":
     test_page_level_continuation_fragment_is_review_not_blocker()
     test_renderer_uses_valid_page_mapping_without_proportional_fallback()
     test_renderer_fails_closed_when_paginated_page_mapping_is_missing()
-    test_page_translation_updates_parent_chinese_without_srt_structure_drift()
+    test_page_translation_preserves_parent_chinese_and_srt_structure()
     test_screen_editor_applies_mocked_page_response_after_final_timing_only()
     test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id()
     test_screen_editor_normalizes_page_errors_to_frozen_parent_ids()
@@ -2640,6 +2646,6 @@ if __name__ == "__main__":
     test_frozen_artifact_mismatch_reports_the_exact_single_page_parent()
     test_parent_chinese_authority_binds_exact_id_text_and_word_span()
     test_parent_chinese_authority_rejects_tampered_chinese_and_identity()
-    test_display_page_parent_must_reference_the_same_chinese_record()
+    test_display_page_projection_must_reference_but_cannot_replace_parent_chinese()
     test_word_ledger_hash_has_one_cross_module_owner()
     print("stable page translation contract tests passed")

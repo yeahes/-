@@ -1941,6 +1941,12 @@ class SubtitleThread(QThread):
                 )
                 screen_editor = ScreenSubtitleEditor(
                     model=subtitle_config.llm_model,
+                    full_translation_model=(
+                        subtitle_config.screen_subtitle_full_translation_model
+                    ),
+                    allocation_review_model=(
+                        subtitle_config.screen_subtitle_allocation_review_model
+                    ),
                     target_language=subtitle_config.target_language,
                     batch_num=max(20, subtitle_config.batch_size),
                     thread_num=min(4, max(1, subtitle_config.thread_num)),

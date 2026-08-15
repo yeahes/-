@@ -484,6 +484,56 @@ def test_screen_editor_uses_16_word_stable_hard_floor():
     assert editor.max_english_words == 16
 
 
+def test_screen_editor_routes_full_translation_and_allocation_models_by_role():
+    with patch.object(ScreenSubtitleEditor, "_init_client", return_value=None):
+        editor = ScreenSubtitleEditor(
+            model="deepseek-v4-flash",
+            full_translation_model="deepseek-v4-pro",
+            allocation_review_model="deepseek-v4-flash",
+        )
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs["model"])
+        if len(calls) == 1:
+            content = {
+                "groups": [
+                    {
+                        "id": 1,
+                        "source_english": "A complete thought.",
+                        "full_translation": "一个完整的意思。",
+                    }
+                ]
+            }
+        else:
+            content = {"groups": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(content)))]
+        )
+
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    editor.cache_manager = _NoCache()
+
+    full = editor._request_semantic_full_translation_chunk(
+        "full prompt",
+        [{"id": 1, "full_english": "A complete thought."}],
+        cache_task="test-full-role",
+    )
+    allocation, error = editor._request_semantic_translation_allocation_api_only(
+        "allocation prompt",
+        [{"id": 1}],
+        cache_task="test-allocation-role",
+        max_attempts=1,
+    )
+
+    assert full["groups"][0]["full_translation"] == "一个完整的意思。"
+    assert allocation == {"groups": []}
+    assert error == ""
+    assert calls == ["deepseek-v4-pro", "deepseek-v4-flash"]
+
+
 def test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split():
     assert TaskFactory._needs_word_timestamps_for_subtitle_pipeline(
         need_split=False,
@@ -7181,7 +7231,13 @@ def test_terminal_modifier_fragment_uses_specialized_fixed_id_retry():
     }
     calls = []
 
-    def request(prompt, payload, cache_task, expected_groups_by_id=None):
+    def request(
+        prompt,
+        payload,
+        cache_task,
+        expected_groups_by_id=None,
+        **kwargs,
+    ):
         calls.append((prompt, cache_task))
         if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
             return {

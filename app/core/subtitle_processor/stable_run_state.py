@@ -75,6 +75,8 @@ def build_stable_run_fingerprint(
         raise FileNotFoundError(f"Subtitle input does not exist: {source}")
     config_keys = (
         "llm_model",
+        "screen_subtitle_full_translation_model",
+        "screen_subtitle_allocation_review_model",
         "translator_service",
         "need_translate",
         "need_optimize",

@@ -5823,8 +5823,6 @@ def _article_plan_from_frozen_artifact(
         return None
     if min(int(page["english_font_size"]) for page in pages) != font_size:
         return None
-    if "".join(page["zh"] for page in pages) != re.sub(r"\s+", "", str(cue.zh or "")):
-        return None
     return {
         "status": "ok",
         "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
@@ -5882,8 +5880,13 @@ def apply_article_display_page_translation_artifact(
         cue = cues_by_id.get(parent_id)
         if cue is None:
             return False
+        source_parent_chinese = re.sub(
+            r"\s+", "", str(parent.get("source_parent_chinese") or "")
+        )
+        if source_parent_chinese != re.sub(r"\s+", "", str(cue.zh or "")):
+            return False
         aggregate = re.sub(r"\s+", "", str(parent.get("aggregate_chinese") or ""))
-        if aggregate != re.sub(r"\s+", "", str(cue.zh or "")):
+        if not aggregate:
             return False
         returned_pages = list(parent.get("pages") or [])
         if len(returned_pages) < 2:

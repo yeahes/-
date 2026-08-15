@@ -545,6 +545,8 @@ class SubtitleConfig:
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     llm_model: Optional[str] = None
+    screen_subtitle_full_translation_model: Optional[str] = None
+    screen_subtitle_allocation_review_model: Optional[str] = None
     deeplx_endpoint: Optional[str] = None
     # 翻译服务
     translator_service: Optional[TranslatorServiceEnum] = None

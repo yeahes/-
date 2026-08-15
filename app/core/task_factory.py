@@ -208,11 +208,25 @@ class TaskFactory:
             api_key = ""
             llm_model = ""
 
+        full_translation_model = llm_model
+        if current_service == LLMServiceEnum.DEEPSEEK:
+            configured_full_model = str(
+                getattr(
+                    getattr(cfg, "deepseek_full_translation_model", None),
+                    "value",
+                    "",
+                )
+                or ""
+            ).strip()
+            full_translation_model = configured_full_model or llm_model
+
         config = SubtitleConfig(
             # 翻译配置
             base_url=base_url,
             api_key=api_key,
             llm_model=llm_model,
+            screen_subtitle_full_translation_model=full_translation_model,
+            screen_subtitle_allocation_review_model=llm_model,
             deeplx_endpoint=cfg.deeplx_endpoint.value,
             # 翻译服务
             translator_service=cfg.translator_service.value,

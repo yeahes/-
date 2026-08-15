@@ -34,6 +34,19 @@ def test_rejects_a_candidate_that_introduces_a_high_confidence_issue():
     ]
 
 
+def test_cross_subtitle_predicate_break_is_a_high_confidence_regression():
+    result = compare_fixed_id_allocation_candidates(
+        original_validation={"issue_codes": ["number_allocation_mismatch"]},
+        candidate_validation={"issue_codes": ["cross_subtitle_predicate_break"]},
+        expected_subtitle_ids=["S0001", "S0002", "S0003"],
+        regression_reasons=[],
+    )
+
+    assert not result["accepted"]
+    assert result["decision"] == "keep_original"
+    assert result["new_issue_codes"] == ["cross_subtitle_predicate_break"]
+
+
 def test_selective_polish_can_keep_a_valid_non_regressive_candidate():
     result = compare_fixed_id_allocation_candidates(
         original_validation={"issue_codes": []},
@@ -62,6 +75,7 @@ def test_regression_evidence_always_keeps_the_original_candidate():
 if __name__ == "__main__":
     test_accepts_only_a_strict_high_confidence_improvement()
     test_rejects_a_candidate_that_introduces_a_high_confidence_issue()
+    test_cross_subtitle_predicate_break_is_a_high_confidence_regression()
     test_selective_polish_can_keep_a_valid_non_regressive_candidate()
     test_regression_evidence_always_keeps_the_original_candidate()
     print("allocation quality policy tests passed")

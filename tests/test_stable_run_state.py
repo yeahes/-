@@ -17,6 +17,8 @@ from app.thread.subtitle_thread import SubtitleThread
 
 class _Config:
     llm_model = "deepseek-v4-flash"
+    screen_subtitle_full_translation_model = "deepseek-v4-pro"
+    screen_subtitle_allocation_review_model = "deepseek-v4-flash"
     translator_service = "openai"
     need_translate = True
     need_optimize = False
@@ -120,6 +122,22 @@ def test_contract_changes_reject_resume_for_article_model_prompt_and_alignment()
             alignment_backend="whisperx-time-only",
         )
         assert not StableRunStateStore(root).plan_resume(changed_model).compatible
+
+        class ChangedFullTranslationModelConfig(_Config):
+            screen_subtitle_full_translation_model = "different-pro-model"
+
+        changed_full_translation_model = build_stable_run_fingerprint(
+            subtitle_path=source,
+            subtitle_config=ChangedFullTranslationModelConfig(),
+            article_reference_text="Reference article.",
+            article_context_data={"title": "Reference"},
+            use_article_reference_assist=True,
+            use_article_translation_terms=True,
+            alignment_backend="whisperx-time-only",
+        )
+        assert not StableRunStateStore(root).plan_resume(
+            changed_full_translation_model
+        ).compatible
 
 
 def test_tampered_or_missing_artifact_is_not_reused_and_state_stays_valid_json():

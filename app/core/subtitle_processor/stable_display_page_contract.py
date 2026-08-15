@@ -14,9 +14,9 @@ from app.core.subtitle_processor.chinese_token_boundaries import (
 
 DISPLAY_PAGE_SCHEMA_VERSION = 2
 DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v19"
-DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v3"
+DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v4"
 DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION = "display-page-translation-source-echo-v1"
-DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v4"
+DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v5"
 
 
 class DisplayPageContractError(ValueError):
@@ -601,6 +601,9 @@ def validate_page_translation_response(
                 {
                     "parent_subtitle_id": parent.get("parent_subtitle_id"),
                     "parent_english_hash": _text_hash(parent.get("english")),
+                    "source_parent_chinese": re.sub(
+                        r"\s+", "", str(parent.get("source_chinese") or "")
+                    ),
                     "source_parent_chinese_hash": _text_hash(parent.get("source_chinese")),
                     "render_parent_chinese_hash": _text_hash(aggregate_chinese),
                     "word_start": parent.get("word_start"),
@@ -645,7 +648,9 @@ def parent_chinese_by_id(artifact: Mapping[str, Any]) -> dict[str, str]:
     result: dict[str, str] = {}
     for parent in artifact.get("parents") or []:
         parent_id = str(parent.get("parent_subtitle_id") or "").strip()
-        chinese = re.sub(r"\s+", "", str(parent.get("aggregate_chinese") or ""))
+        chinese = re.sub(
+            r"\s+", "", str(parent.get("source_parent_chinese") or "")
+        )
         if not parent_id or not chinese or parent_id in result:
             raise DisplayPageContractError(
                 "page_translation_artifact_parent_invalid",

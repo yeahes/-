@@ -85,6 +85,9 @@ class Config(QConfig):
     )
 
     deepseek_model = ConfigItem("LLM", "DeepSeek_Model", "deepseek-chat")
+    deepseek_full_translation_model = ConfigItem(
+        "LLM", "DeepSeek_Full_Translation_Model", "deepseek-v4-pro"
+    )
     deepseek_api_key = ConfigItem("LLM", "DeepSeek_API_Key", "")
     deepseek_api_base = ConfigItem(
         "LLM", "DeepSeek_API_Base", "https://api.deepseek.com/v1"

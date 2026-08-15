@@ -134,6 +134,7 @@ SEMANTIC_CHINESE_POLISH_PROMPT_VERSION = "semantic-chinese-polish-v3"
 SEMANTIC_CHINESE_POLISH_CACHE_TASK = "screen_subtitle_semantic_chinese_polish_v3"
 DISPLAY_PAGE_TRANSLATION_CACHE_TASK = "screen_subtitle_display_page_translation_v2"
 DISPLAY_PAGE_TRANSLATION_RETRY_CACHE_TASK = "screen_subtitle_display_page_translation_retry_v2"
+MODEL_ROLE_POLICY_VERSION = "stable-translation-model-roles-v1"
 MAX_SELECTIVE_CHINESE_POLISH_GROUPS = 8
 # These are visual review budgets for the 1080p bilingual templates, not
 # translation or structural limits.  The existing 16-word hard contract stays
@@ -358,15 +359,19 @@ Return pure JSON only:
 """
 
 DISPLAY_PAGE_TRANSLATION_PROMPT = """
-You are assigning an authoritative Simplified Chinese subtitle to fixed visual
+You are assigning a display-only Simplified Chinese projection to fixed visual
 pages below one frozen parent subtitle ID.
 
-Version: display-page-translation-v2
+Version: display-page-translation-v4
 
 The English page IDs, English text, order, word ownership, and timing are
 immutable. Re-express the supplied full_translation as one concise Chinese
 subtitle per page so that each Chinese page describes the English meaning
 spoken on that same page.
+
+The supplied full_translation remains the authoritative parent translation.
+Your page text can adjust Chinese order for synchronization, but it must never
+be treated as a replacement parent translation.
 
 Rules:
 - Return exactly one object for every display_page_id and no other IDs.
@@ -511,9 +516,31 @@ class ScreenSubtitleEditor:
         value = getattr(target_language, "value", target_language)
         return str(value or "简体中文")
 
+    def _full_translation_model_name(self) -> str:
+        return str(
+            getattr(self, "full_translation_model", "")
+            or getattr(self, "model", "")
+            or ""
+        ).strip()
+
+    def _allocation_review_model_name(self) -> str:
+        return str(
+            getattr(self, "allocation_review_model", "")
+            or getattr(self, "model", "")
+            or ""
+        ).strip()
+
+    def _display_page_translation_model_name(self) -> str:
+        return str(
+            getattr(self, "display_page_translation_model", "")
+            or self._allocation_review_model_name()
+        ).strip()
+
     def __init__(
         self,
         model: str,
+        full_translation_model: Optional[str] = None,
+        allocation_review_model: Optional[str] = None,
         target_language: str = "简体中文",
         max_cjk_chars: int = 24,
         max_english_words: int = 16,
@@ -535,6 +562,11 @@ class ScreenSubtitleEditor:
         allocation_batch_size: int = 16,
     ):
         self.model = model
+        self.full_translation_model = str(full_translation_model or model or "").strip()
+        self.allocation_review_model = str(
+            allocation_review_model or model or ""
+        ).strip()
+        self.display_page_translation_model = self.allocation_review_model
         self.target_language = self._normalize_target_language(target_language)
         self.max_cjk_chars = max_cjk_chars
         self.max_english_words = max(HARD_ENGLISH_WORD_LIMIT, int(max_english_words or HARD_ENGLISH_WORD_LIMIT))
@@ -1127,6 +1159,21 @@ class ScreenSubtitleEditor:
                     contract, response, require_source_echo=True
                 )
                 quality_errors = self._display_page_translation_quality_errors(contract, artifact)
+                if (
+                    self._display_page_translation_model_name()
+                    != self._full_translation_model_name()
+                ):
+                    quality_errors.extend(
+                        {
+                            "code": "display_page_naturalness_review",
+                            "parent_subtitle_id": str(
+                                review.get("parent_subtitle_id") or ""
+                            ),
+                            "issue_codes": list(review.get("issue_codes") or []),
+                        }
+                        for review in self._display_page_translation_reviews
+                        if str(review.get("parent_subtitle_id") or "")
+                    )
                 if artifact.get("status") != "PASS" or quality_errors:
                     initial_errors = [
                         *list(artifact.get("errors") or []),
@@ -1284,7 +1331,7 @@ class ScreenSubtitleEditor:
             wrapped.display_page_errors = failure_items
             raise wrapped
 
-        parent_chinese = parent_chinese_by_id(artifact)
+        authoritative_parent_chinese = parent_chinese_by_id(artifact)
         before = [
             (
                 self._segment_subtitle_id(segment, index),
@@ -1297,8 +1344,15 @@ class ScreenSubtitleEditor:
             for index, segment in enumerate(asr_data.segments, 1)
         ]
         for cue in cues:
-            if cue.subtitle_id in parent_chinese:
-                cue.zh = parent_chinese[cue.subtitle_id]
+            expected_chinese = authoritative_parent_chinese.get(cue.subtitle_id)
+            if expected_chinese is None:
+                continue
+            if re.sub(r"\s+", "", str(cue.zh or "")) != re.sub(
+                r"\s+", "", expected_chinese
+            ):
+                raise RuntimeError(
+                    "display_page_translation_invalid: authoritative parent Chinese changed"
+                )
         apply_failure_items: List[Dict[str, str]] = []
         if not apply_article_display_page_translation_artifact(
             cues,
@@ -1378,9 +1432,6 @@ class ScreenSubtitleEditor:
             wrapped.display_page_errors = layout_errors
             raise wrapped
 
-        for segment, cue in zip(asr_data.segments, cues):
-            if cue.subtitle_id in parent_chinese:
-                segment.translated_text = parent_chinese[cue.subtitle_id]
         after = [
             (
                 self._segment_subtitle_id(segment, index),
@@ -1397,17 +1448,18 @@ class ScreenSubtitleEditor:
                 "display_page_translation_invalid: frozen parent cue changed"
             )
 
-        self._last_subtitle_items = [
-            ScreenSubtitleItem(
-                source_ids=list(item.source_ids),
-                original=item.original,
-                translated=parent_chinese.get(str(item.subtitle_id or ""), item.translated),
-                word_start=item.word_start,
-                word_end=item.word_end,
-                subtitle_id=item.subtitle_id,
+        for item in self._last_subtitle_items:
+            expected_chinese = authoritative_parent_chinese.get(
+                str(item.subtitle_id or "")
             )
-            for item in self._last_subtitle_items
-        ]
+            if expected_chinese is None:
+                continue
+            if re.sub(r"\s+", "", str(item.translated or "")) != re.sub(
+                r"\s+", "", expected_chinese
+            ):
+                raise RuntimeError(
+                    "display_page_translation_invalid: fixed-ID parent Chinese drifted"
+                )
         self._display_page_translation_artifact = artifact
         source_map = getattr(self, "_active_source_segments_by_id", {}) or {}
         source_segments = list(source_map.values()) if isinstance(source_map, dict) else list(source_map)
@@ -1518,6 +1570,11 @@ class ScreenSubtitleEditor:
         retry_errors: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> tuple[object, bool]:
         retry = bool(retry_errors)
+        request_model = (
+            self._full_translation_model_name()
+            if retry
+            else self._display_page_translation_model_name()
+        )
         prompt = self._compose_prompt(
             DISPLAY_PAGE_TRANSLATION_PROMPT,
             source_text=" ".join(
@@ -1539,7 +1596,7 @@ class ScreenSubtitleEditor:
         payload = page_translation_request_payload(contract)
         cache_key = page_translation_cache_key(
             contract,
-            model=self.model,
+            model=request_model,
             target_language=self.target_language,
             prompt_version=prompt_version,
             algorithm_version=DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION,
@@ -1547,7 +1604,7 @@ class ScreenSubtitleEditor:
         )
         cached = self.cache_manager.get_llm_result(
             cache_key,
-            self.model,
+            request_model,
             temperature=0.2,
             task=task,
         )
@@ -1575,7 +1632,7 @@ class ScreenSubtitleEditor:
             try:
                 self._display_page_external_request_count += 1
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=request_model,
                     messages=[
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -1591,7 +1648,7 @@ class ScreenSubtitleEditor:
                     self.cache_manager.set_llm_result(
                         cache_key,
                         json.dumps(data, ensure_ascii=False),
-                        self.model,
+                        request_model,
                         temperature=0.2,
                         task=task,
                     )
@@ -6159,7 +6216,11 @@ class ScreenSubtitleEditor:
 
     def manifest_metadata(self) -> Dict:
         metadata = {
-            "translation_model": self.model,
+            "translation_model": self._full_translation_model_name(),
+            "full_translation_model": self._full_translation_model_name(),
+            "allocation_review_model": self._allocation_review_model_name(),
+            "display_page_translation_model": self._display_page_translation_model_name(),
+            "model_role_policy_version": MODEL_ROLE_POLICY_VERSION,
             "code_commit": self._current_git_commit(),
             "cache_used": self._llm_cache_used,
             "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
@@ -10293,13 +10354,6 @@ class ScreenSubtitleEditor:
         self,
         final_segments: Sequence[ASRDataSeg],
     ) -> Dict[str, Any]:
-        paginated_ids = {
-            str(parent.get("parent_subtitle_id") or "")
-            for parent in (
-                getattr(self, "_display_page_translation_artifact", {}) or {}
-            ).get("parents")
-            or []
-        }
         records = []
         for index, segment in enumerate(final_segments, 1):
             subtitle_id = self._segment_subtitle_id(segment, index)
@@ -10309,7 +10363,6 @@ class ScreenSubtitleEditor:
                 raise RuntimeError(
                     "authoritative_parent_chinese_invalid: final word span is missing"
                 )
-            is_page_projection = subtitle_id in paginated_ids
             records.append(
                 {
                     "subtitle_id": subtitle_id,
@@ -10319,27 +10372,9 @@ class ScreenSubtitleEditor:
                     "word_end": word_end,
                     "provenance": {
                         "kind": "automatic",
-                        "producer": (
-                            "display_page_translation"
-                            if is_page_projection
-                            else "fixed_id_allocation"
-                        ),
+                        "producer": "fixed_id_allocation",
                         "base_record_hash": "",
-                        "display_page_contract_hash": (
-                            str(
-                                (
-                                    getattr(
-                                        self,
-                                        "_display_page_translation_artifact",
-                                        {},
-                                    )
-                                    or {}
-                                ).get("contract_hash")
-                                or ""
-                            )
-                            if is_page_projection
-                            else ""
-                        ),
+                        "display_page_contract_hash": "",
                     },
                 }
             )
@@ -10450,7 +10485,11 @@ class ScreenSubtitleEditor:
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "pipeline": "screen_subtitle_stable",
                 "model": self.model,
-                "translation_model": self.model,
+                "translation_model": self._full_translation_model_name(),
+                "full_translation_model": self._full_translation_model_name(),
+                "allocation_review_model": self._allocation_review_model_name(),
+                "display_page_translation_model": self._display_page_translation_model_name(),
+                "model_role_policy_version": MODEL_ROLE_POLICY_VERSION,
                 "code_commit": self._current_git_commit(),
                 "cache_used": self._llm_cache_used,
                 "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
@@ -13824,9 +13863,10 @@ class ScreenSubtitleEditor:
         temperature: float,
     ) -> Dict:
         cache_key = self._semantic_chinese_cache_key(prompt, payload, task)
+        request_model = self._full_translation_model_name()
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
-            self.model,
+            request_model,
             temperature=temperature,
             task=task,
         )
@@ -13835,7 +13875,7 @@ class ScreenSubtitleEditor:
             return json.loads(cache_result)
 
         response = self.client.chat.completions.create(
-            model=self.model,
+            model=request_model,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -13847,7 +13887,7 @@ class ScreenSubtitleEditor:
         self.cache_manager.set_llm_result(
             cache_key,
             json.dumps(data, ensure_ascii=False),
-            self.model,
+            request_model,
             temperature=temperature,
             task=task,
         )
@@ -15083,6 +15123,10 @@ class ScreenSubtitleEditor:
         self._legacy_chinese_full_english_text_hash = stable_payload_hash(english_parts)
         self._chinese_cache_contract = {
             "contract_version": STABLE_CHINESE_CACHE_CONTRACT_VERSION,
+            "model_role_policy_version": MODEL_ROLE_POLICY_VERSION,
+            "full_translation_model": self._full_translation_model_name(),
+            "allocation_review_model": self._allocation_review_model_name(),
+            "display_page_translation_model": self._display_page_translation_model_name(),
             "full_english_text_hash": stable_payload_hash([full_english_text]),
             "frozen_id_word_span_version": FROZEN_ID_WORD_SPAN_CACHE_VERSION,
             "frozen_id_word_span_hash": stable_payload_hash(
@@ -15875,6 +15919,7 @@ class ScreenSubtitleEditor:
                 payload_chunk,
                 cache_task=SEMANTIC_CHINESE_POLISH_CACHE_TASK,
                 expected_groups_by_id=groups_by_id,
+                request_model=self._full_translation_model_name(),
             )
             if data is None:
                 self._chinese_polish_log.append(
@@ -16281,9 +16326,10 @@ class ScreenSubtitleEditor:
         cache_task: str,
     ) -> Optional[object]:
         cache_key = self._semantic_chinese_cache_key(prompt, payload, cache_task)
+        request_model = self._full_translation_model_name()
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
-            self.model,
+            request_model,
             temperature=0.2,
             task=cache_task,
         )
@@ -16312,7 +16358,7 @@ class ScreenSubtitleEditor:
             ):
                 legacy_result = self.cache_manager.get_llm_result(
                     legacy_cache_key,
-                    self.model,
+                    request_model,
                     temperature=0.2,
                     task=cache_task,
                 )
@@ -16333,7 +16379,7 @@ class ScreenSubtitleEditor:
                     self.cache_manager.set_llm_result(
                         cache_key,
                         cache_result,
-                        self.model,
+                        request_model,
                         temperature=0.2,
                         task=cache_task,
                     )
@@ -16349,7 +16395,7 @@ class ScreenSubtitleEditor:
             else:
                 self._record_llm_cache_stat(cache_task, False)
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=request_model,
                     messages=[
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -16365,7 +16411,7 @@ class ScreenSubtitleEditor:
                     self.cache_manager.set_llm_result(
                         cache_key,
                         json.dumps(data, ensure_ascii=False),
-                        self.model,
+                        request_model,
                         temperature=0.2,
                         task=cache_task,
                     )
@@ -16994,9 +17040,10 @@ class ScreenSubtitleEditor:
         cache_task: str,
     ) -> Optional[AllocationBatchResult]:
         cache_key = self._semantic_chinese_cache_key(prompt, payload_chunk, cache_task)
+        request_model = self._allocation_review_model_name()
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
-            self.model,
+            request_model,
             temperature=0.2,
             task=cache_task,
         )
@@ -17043,11 +17090,12 @@ class ScreenSubtitleEditor:
         cache_task: str,
     ) -> None:
         cache_key = self._semantic_chinese_cache_key(prompt, payload_chunk, cache_task)
+        request_model = self._allocation_review_model_name()
         try:
             self.cache_manager.set_llm_result(
                 cache_key,
                 json.dumps(data, ensure_ascii=False),
-                self.model,
+                request_model,
                 temperature=0.2,
                 task=cache_task,
             )
@@ -17225,6 +17273,7 @@ class ScreenSubtitleEditor:
                 [entry],
                 cache_task=retry_cache_task,
                 expected_groups_by_id=expected_groups_by_id,
+                request_model=self._full_translation_model_name(),
             )
             if data is None:
                 self._last_allocation_retry_log.append(retry_record)
@@ -18464,11 +18513,15 @@ class ScreenSubtitleEditor:
         *,
         cache_task: str = SEMANTIC_ALLOCATION_CACHE_TASK,
         expected_groups_by_id: Optional[Dict[int, Dict]] = None,
+        request_model: Optional[str] = None,
     ) -> Optional[object]:
+        selected_model = str(
+            request_model or self._allocation_review_model_name()
+        ).strip()
         cache_key = self._semantic_chinese_cache_key(prompt, payload, cache_task)
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
-            self.model,
+            selected_model,
             temperature=0.2,
             task=cache_task,
         )
@@ -18505,6 +18558,7 @@ class ScreenSubtitleEditor:
                 prompt,
                 payload,
                 cache_task=cache_task,
+                request_model=selected_model,
             )
             if data is None:
                 return None
@@ -18519,7 +18573,7 @@ class ScreenSubtitleEditor:
                 self.cache_manager.set_llm_result(
                     cache_key,
                     json.dumps(data, ensure_ascii=False),
-                    self.model,
+                    selected_model,
                     temperature=0.2,
                     task=cache_task,
                 )
@@ -18541,13 +18595,17 @@ class ScreenSubtitleEditor:
         *,
         cache_task: str = SEMANTIC_ALLOCATION_CACHE_TASK,
         max_attempts: int = 3,
+        request_model: Optional[str] = None,
     ) -> tuple[Optional[object], str]:
+        selected_model = str(
+            request_model or self._allocation_review_model_name()
+        ).strip()
         delay_seconds = 1.0
         last_error = ""
         for attempt in range(1, max(1, max_attempts) + 1):
             try:
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=selected_model,
                     messages=[
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
