@@ -97,10 +97,18 @@ Rules:
 
 - Full group translation comes first.
 - Allocation maps the full Chinese meaning back to fixed global subtitle IDs.
+- Under the DeepSeek role policy, complete semantic-group translation uses the
+  configured full-translation model (normally Pro). Ordinary fixed-ID
+  allocation uses the configured allocation/review model (normally Flash),
+  while a deterministic high-risk quality retry escalates only its affected
+  group to the full-translation model.
 - English IDs, timing, and order are immutable during Chinese translation.
 - Missing Chinese is a validation issue.
 - LLM allocation responses must include `subtitle_id` for each returned Chinese line.
 - Returned, missing, duplicate, and unknown subtitle IDs are recorded as structure errors.
+- Chinese cache identity includes the model that owns the current request, not
+  unrelated model roles. A Flash allocation-model change therefore does not
+  invalidate verified Pro full translations.
 
 ## Stage 4: Timing and Display Stabilization
 
@@ -146,13 +154,22 @@ Rules:
 After the final word ledger and cue timeline pass, the article renderer may
 enumerate multipage display spans. Every span receives a deterministic child
 ID such as `S0078.P01`. Chinese for those spans is returned by exact child ID,
-validated, and aggregated back into the unchanged parent cue. Missing, stale,
+validated, and attached as an independent display projection. The unchanged
+parent cue remains the semantic authority; page-local Chinese may use more
+natural word order and does not write back into it. Every new page projection
+is bound to the exact source-parent Chinese text/hash that created it. A legacy
+projection without that reference is accepted only when its ordered page
+Chinese exactly reconstructs the current parent Chinese. Missing, stale,
 tampered, semantically invalid, or unschedulable page data blocks rendering;
 there is no proportional-character fallback.
 If deterministic page-Chinese validation fails, only the complete page set of
 the affected parent IDs is retried. Already validated parents remain frozen;
 the local result must pass its sub-contract and the merged response must pass
-the original full contract before any cue is updated.
+the original full contract before the page projection is attached. Under the
+DeepSeek role policy the ordinary page request uses the allocation/review model
+and a naturalness or semantic retry uses the full-translation model. A residual
+non-blocking continuation after that retry stays explicit REVIEW evidence and
+cannot replace the authoritative parent translation.
 Missing, duplicate, unknown, or cardinality-mismatched page IDs instead retry
 the complete contract: the validator intentionally exposes no partial parent
 authority for those structural failures. A retry request failure preserves the

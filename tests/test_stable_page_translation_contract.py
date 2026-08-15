@@ -1381,6 +1381,65 @@ def test_invalid_page_translation_cache_is_replaced_only_after_validation():
     assert editor._display_page_external_request_count == 1
 
 
+def test_page_translation_requests_use_flash_then_pro_for_quality_retry():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    valid = _response(case)
+    calls = []
+
+    class Cache:
+        def get_llm_result(self, *args, **kwargs):
+            return None
+
+        def set_llm_result(self, *args, **kwargs):
+            return None
+
+    def create(**kwargs):
+        calls.append(kwargs["model"])
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(valid, ensure_ascii=False))
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    initial, initial_hit = editor._request_display_page_translations(contract)
+    retry, retry_hit = editor._request_display_page_translations(
+        contract,
+        retry_errors=[
+            {
+                "code": "display_page_naturalness_review",
+                "parent_subtitle_id": case["subtitle_id"],
+            }
+        ],
+    )
+
+    assert initial == valid
+    assert retry == valid
+    assert initial_hit is False
+    assert retry_hit is False
+    assert calls == ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+
 def test_page_translation_source_echo_is_required_for_new_requests():
     case = _cases()["s0078_reordered_chinese"]
     contract = _contract(case)
@@ -1738,6 +1797,176 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
         record.get("scope") == "display_page"
         for record in post_page_audits[-1]["records"]
     )
+
+
+def test_flash_page_fragment_retries_only_parent_and_pro_residual_stays_review():
+    cases = [
+        _cases()["s0078_reordered_chinese"],
+        _cases()["s0252_monotonic_chinese"],
+    ]
+    segments = []
+    next_word_id = 0
+    for case in cases:
+        segment = ASRDataSeg(
+            case["english"],
+            int(case["start"] * 1000),
+            int(case["end"] * 1000),
+            case["parent_chinese"],
+        )
+        segment.subtitle_id = case["subtitle_id"]
+        segment.word_start = next_word_id
+        segment.word_end = next_word_id + len(segment.text.split()) - 1
+        next_word_id = segment.word_end + 1
+        segments.append(segment)
+    asr_data = ASRData(segments)
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.enable_stable_mode = True
+    editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
+    editor._active_source_segments_by_id = {}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._display_page_translation_artifact = {}
+    editor._display_page_translation_path = ""
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.coverage_report_path = None
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = SimpleNamespace(
+        get_llm_result=lambda *args, **kwargs: None,
+        set_llm_result=lambda *args, **kwargs: None,
+    )
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    request_scopes = []
+    quality_scopes = []
+    initial_second_parent = {}
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        request_scopes.append(
+            {
+                "model": kwargs["model"],
+                "parents": copy.deepcopy(payload),
+            }
+        )
+        rows = []
+        for parent_index, parent in enumerate(payload):
+            prefix = "甲" if parent["parent_subtitle_id"] == cases[0]["subtitle_id"] else "乙"
+            if kwargs["model"] == "deepseek-v4-pro":
+                prefix = "重译甲"
+            for page_index, page in enumerate(parent["pages"], 1):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": f"{prefix}{parent_index + 1}{page_index}。",
+                    }
+                )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    editor._display_page_translation_response_is_cacheable = lambda *args: True
+
+    def residual_fragment_review(contract, artifact):
+        parent_ids = [
+            str(parent.get("parent_subtitle_id") or "")
+            for parent in contract.get("parents") or []
+        ]
+        quality_scopes.append(parent_ids)
+        if len(parent_ids) == 2 and not initial_second_parent:
+            second = next(
+                parent
+                for parent in artifact.get("parents") or []
+                if parent.get("parent_subtitle_id") == cases[1]["subtitle_id"]
+            )
+            initial_second_parent.update(copy.deepcopy(second))
+        editor._display_page_translation_reviews = [
+            {
+                "code": "display_page_continuation_review",
+                "parent_subtitle_id": cases[0]["subtitle_id"],
+                "issue_codes": ["unnatural_chinese_fragment"],
+                "issues": [],
+            }
+        ]
+        return []
+
+    editor._display_page_translation_quality_errors = residual_fragment_review
+    editor._record_display_page_translation_failure = lambda *args, **kwargs: None
+    editor._report_subtitle_coverage_gaps = lambda *args, **kwargs: None
+    editor._write_stable_pipeline_artifacts = lambda *args, **kwargs: None
+
+    result = editor.apply_display_page_translations_after_final_timing(asr_data)
+
+    assert result is asr_data
+    assert [segment.translated_text for segment in segments] == [
+        case["parent_chinese"] for case in cases
+    ]
+    assert [scope["model"] for scope in request_scopes] == [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ]
+    assert [
+        parent["parent_subtitle_id"] for parent in request_scopes[0]["parents"]
+    ] == [case["subtitle_id"] for case in cases]
+    assert [
+        parent["parent_subtitle_id"] for parent in request_scopes[1]["parents"]
+    ] == [cases[0]["subtitle_id"]]
+    initial_first_pages = {
+        page["display_page_id"]
+        for page in request_scopes[0]["parents"][0]["pages"]
+    }
+    retry_pages = {
+        page["display_page_id"]
+        for page in request_scopes[1]["parents"][0]["pages"]
+    }
+    second_pages = {
+        page["display_page_id"]
+        for page in request_scopes[0]["parents"][1]["pages"]
+    }
+    assert retry_pages == initial_first_pages
+    assert retry_pages.isdisjoint(second_pages)
+    assert quality_scopes == [
+        [case["subtitle_id"] for case in cases],
+        [cases[0]["subtitle_id"]],
+        [case["subtitle_id"] for case in cases],
+    ]
+    artifact = editor._display_page_translation_artifact
+    assert artifact["status"] == "PASS"
+    assert artifact["review_count"] == 1
+    assert artifact["reviews"][0]["parent_subtitle_id"] == cases[0]["subtitle_id"]
+    final_second_parent = next(
+        parent
+        for parent in artifact["parents"]
+        if parent["parent_subtitle_id"] == cases[1]["subtitle_id"]
+    )
+    canonical = lambda value: json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert canonical(final_second_parent) == canonical(initial_second_parent)
+    assert parent_chinese_by_id(artifact) == {
+        case["subtitle_id"]: case["parent_chinese"] for case in cases
+    }
 
 
 def test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id():
@@ -2564,6 +2793,63 @@ def test_display_page_projection_must_reference_but_cannot_replace_parent_chines
         assert exc.code == "authoritative_parent_chinese_page_conflict"
 
 
+def test_legacy_page_projection_loads_only_when_aggregate_matches_parent_authority():
+    authority = build_authoritative_parent_chinese_artifact(
+        [
+            {
+                "subtitle_id": "S0058",
+                "english": "A legacy fixed English parent.",
+                "chinese": "旧分页必须完整还原父译文。",
+                "word_start": 130,
+                "word_end": 134,
+            }
+        ],
+        source_word_ledger_hash="ledger-hash",
+        producer="legacy_page_projection_test",
+    )
+    record = parent_chinese_records_by_id(authority)["S0058"]
+    legacy = {
+        "status": "PASS",
+        "parents": [
+            {
+                "parent_subtitle_id": "S0058",
+                "parent_english_hash": record["english_hash"],
+                "source_parent_chinese_hash": "legacy-pre-projection-hash",
+                "word_start": 130,
+                "word_end": 134,
+                "aggregate_chinese": "旧分页必须完整还原父译文。",
+                "pages": [],
+            }
+        ],
+    }
+
+    bound = bind_display_page_parent_records(legacy, {"S0058": record})
+
+    assert bound["parents"][0]["source_parent_chinese"] == record["chinese"]
+    assert (
+        bound["parents"][0]["source_parent_chinese_hash"]
+        == record["chinese_hash"]
+    )
+    validate_display_page_parent_records(legacy, {"S0058": record})
+    validate_display_page_parent_records(bound, {"S0058": record})
+
+    stale_reference = copy.deepcopy(legacy)
+    stale_reference["parents"][0]["parent_record_hash"] = "stale-record"
+    try:
+        validate_display_page_parent_records(stale_reference, {"S0058": record})
+        assert False, "an existing stale authority reference must fail"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_page_reference_mismatch"
+
+    stale = copy.deepcopy(legacy)
+    stale["parents"][0]["aggregate_chinese"] = "旧分页已是另一份显示译文。"
+    try:
+        bind_display_page_parent_records(stale, {"S0058": record})
+        assert False, "a legacy page projection must not invent parent authority"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_page_conflict"
+
+
 def test_word_ledger_hash_has_one_cross_module_owner():
     ledger = [
         {
@@ -2626,12 +2912,14 @@ if __name__ == "__main__":
     test_structural_exception_can_use_actual_pixel_fit_above_sixteen_words()
     test_no_partition_failure_reports_deterministic_attempt_reasons()
     test_invalid_page_translation_cache_is_replaced_only_after_validation()
+    test_page_translation_requests_use_flash_then_pro_for_quality_retry()
     test_page_translation_rejects_page_level_chinese_speed_overflow()
     test_page_level_continuation_fragment_is_review_not_blocker()
     test_renderer_uses_valid_page_mapping_without_proportional_fallback()
     test_renderer_fails_closed_when_paginated_page_mapping_is_missing()
     test_page_translation_preserves_parent_chinese_and_srt_structure()
     test_screen_editor_applies_mocked_page_response_after_final_timing_only()
+    test_flash_page_fragment_retries_only_parent_and_pro_residual_stays_review()
     test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id()
     test_screen_editor_normalizes_page_errors_to_frozen_parent_ids()
     test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_tampered()
@@ -2647,5 +2935,6 @@ if __name__ == "__main__":
     test_parent_chinese_authority_binds_exact_id_text_and_word_span()
     test_parent_chinese_authority_rejects_tampered_chinese_and_identity()
     test_display_page_projection_must_reference_but_cannot_replace_parent_chinese()
+    test_legacy_page_projection_loads_only_when_aggregate_matches_parent_authority()
     test_word_ledger_hash_has_one_cross_module_owner()
     print("stable page translation contract tests passed")

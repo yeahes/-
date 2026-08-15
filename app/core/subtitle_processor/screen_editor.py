@@ -108,7 +108,8 @@ SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION = "semantic-full-translation-context-v
 SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION = "semantic-full-translation-source-echo-v1"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION = "semantic-full-translation-style-retry-v1"
 SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT_VERSION = "semantic-allocation-fragment-retry-v1"
-STABLE_CHINESE_CACHE_CONTRACT_VERSION = "stable-chinese-cache-v1"
+STABLE_CHINESE_CACHE_CONTRACT_VERSION = "stable-chinese-cache-v2"
+LEGACY_ROLE_COUPLED_CHINESE_CACHE_CONTRACT_VERSION = "stable-chinese-cache-v1"
 FROZEN_ID_WORD_SPAN_CACHE_VERSION = "frozen-id-word-span-v1"
 FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION = "fixed-id-allocation-v5"
 # One release-compatible read path for whole-group translations.  These values
@@ -6220,6 +6221,8 @@ class ScreenSubtitleEditor:
             "full_translation_model": self._full_translation_model_name(),
             "allocation_review_model": self._allocation_review_model_name(),
             "display_page_translation_model": self._display_page_translation_model_name(),
+            "allocation_quality_retry_model": self._full_translation_model_name(),
+            "display_page_retry_model": self._full_translation_model_name(),
             "model_role_policy_version": MODEL_ROLE_POLICY_VERSION,
             "code_commit": self._current_git_commit(),
             "cache_used": self._llm_cache_used,
@@ -10489,6 +10492,8 @@ class ScreenSubtitleEditor:
                 "full_translation_model": self._full_translation_model_name(),
                 "allocation_review_model": self._allocation_review_model_name(),
                 "display_page_translation_model": self._display_page_translation_model_name(),
+                "allocation_quality_retry_model": self._full_translation_model_name(),
+                "display_page_retry_model": self._full_translation_model_name(),
                 "model_role_policy_version": MODEL_ROLE_POLICY_VERSION,
                 "code_commit": self._current_git_commit(),
                 "cache_used": self._llm_cache_used,
@@ -13862,8 +13867,13 @@ class ScreenSubtitleEditor:
         task: str,
         temperature: float,
     ) -> Dict:
-        cache_key = self._semantic_chinese_cache_key(prompt, payload, task)
         request_model = self._full_translation_model_name()
+        cache_key = self._semantic_chinese_cache_key(
+            prompt,
+            payload,
+            task,
+            request_model=request_model,
+        )
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             request_model,
@@ -15172,6 +15182,8 @@ class ScreenSubtitleEditor:
         prompt: str,
         payload: Sequence[Dict],
         cache_task: str,
+        *,
+        request_model: Optional[str] = None,
     ) -> str:
         contract = dict(getattr(self, "_chinese_cache_contract", {}) or {})
         if not contract:
@@ -15186,6 +15198,28 @@ class ScreenSubtitleEditor:
                     FIXED_ID_CHINESE_ALLOCATION_ALGORITHM_VERSION
                 ),
             }
+        selected_model = str(
+            request_model
+            or (
+                self._full_translation_model_name()
+                if (
+                    str(cache_task or "").startswith(
+                        "screen_subtitle_semantic_full_translation"
+                    )
+                    or str(cache_task or "") == SEMANTIC_CHINESE_POLISH_CACHE_TASK
+                )
+                else self._allocation_review_model_name()
+            )
+            or ""
+        ).strip()
+        for role_field in (
+            "model_role_policy_version",
+            "full_translation_model",
+            "allocation_review_model",
+            "display_page_translation_model",
+        ):
+            contract.pop(role_field, None)
+        contract["request_model"] = selected_model
         # A whole-group translation is independent of how its final Chinese
         # text is later allocated to frozen IDs.  Keep the frozen English
         # boundary fingerprint and translation prompt version, but do not
@@ -15225,8 +15259,62 @@ class ScreenSubtitleEditor:
         if not contract or not legacy_full_english_hash:
             return []
         keys: List[str] = []
+        role_coupled_contract = dict(contract)
+        role_coupled_contract["contract_version"] = (
+            LEGACY_ROLE_COUPLED_CHINESE_CACHE_CONTRACT_VERSION
+        )
+        role_coupled_contract.pop("request_model", None)
+        role_coupled_contract.pop("semantic_allocation_prompt_version", None)
+        role_coupled_contract.pop("fixed_id_allocation_algorithm_version", None)
+        role_coupled_contract["cache_task"] = str(cache_task or "")
+        role_coupled_contract["translation_prompt_version"] = (
+            self._semantic_chinese_prompt_version(cache_task)
+        )
+        keys.append(
+            self._cache_key(
+                prompt,
+                [
+                    {
+                        "stable_chinese_cache_contract": role_coupled_contract,
+                        "payload": list(payload),
+                    }
+                ],
+            )
+        )
+
+        pre_role_contract = dict(role_coupled_contract)
+        for role_field in (
+            "model_role_policy_version",
+            "full_translation_model",
+            "allocation_review_model",
+            "display_page_translation_model",
+        ):
+            pre_role_contract.pop(role_field, None)
+        keys.append(
+            self._cache_key(
+                prompt,
+                [
+                    {
+                        "stable_chinese_cache_contract": pre_role_contract,
+                        "payload": list(payload),
+                    }
+                ],
+            )
+        )
+
         for legacy_allocation_contract in LEGACY_FULL_TRANSLATION_CACHE_ALLOCATION_CONTRACTS:
             legacy_contract = dict(contract)
+            legacy_contract["contract_version"] = (
+                LEGACY_ROLE_COUPLED_CHINESE_CACHE_CONTRACT_VERSION
+            )
+            for role_field in (
+                "model_role_policy_version",
+                "full_translation_model",
+                "allocation_review_model",
+                "display_page_translation_model",
+                "request_model",
+            ):
+                legacy_contract.pop(role_field, None)
             legacy_contract.update(legacy_allocation_contract)
             legacy_contract["full_english_text_hash"] = legacy_full_english_hash
             legacy_contract["cache_task"] = str(cache_task or "")
@@ -15244,7 +15332,7 @@ class ScreenSubtitleEditor:
                     ],
                 )
             )
-        return keys
+        return list(dict.fromkeys(keys))
 
     @staticmethod
     def _cache_key(prompt: str, payload: Sequence[Dict]) -> str:
@@ -16325,8 +16413,13 @@ class ScreenSubtitleEditor:
         *,
         cache_task: str,
     ) -> Optional[object]:
-        cache_key = self._semantic_chinese_cache_key(prompt, payload, cache_task)
         request_model = self._full_translation_model_name()
+        cache_key = self._semantic_chinese_cache_key(
+            prompt,
+            payload,
+            cache_task,
+            request_model=request_model,
+        )
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             request_model,
@@ -17039,8 +17132,13 @@ class ScreenSubtitleEditor:
         batch_id: int,
         cache_task: str,
     ) -> Optional[AllocationBatchResult]:
-        cache_key = self._semantic_chinese_cache_key(prompt, payload_chunk, cache_task)
         request_model = self._allocation_review_model_name()
+        cache_key = self._semantic_chinese_cache_key(
+            prompt,
+            payload_chunk,
+            cache_task,
+            request_model=request_model,
+        )
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             request_model,
@@ -17089,8 +17187,13 @@ class ScreenSubtitleEditor:
         *,
         cache_task: str,
     ) -> None:
-        cache_key = self._semantic_chinese_cache_key(prompt, payload_chunk, cache_task)
         request_model = self._allocation_review_model_name()
+        cache_key = self._semantic_chinese_cache_key(
+            prompt,
+            payload_chunk,
+            cache_task,
+            request_model=request_model,
+        )
         try:
             self.cache_manager.set_llm_result(
                 cache_key,
@@ -18518,7 +18621,12 @@ class ScreenSubtitleEditor:
         selected_model = str(
             request_model or self._allocation_review_model_name()
         ).strip()
-        cache_key = self._semantic_chinese_cache_key(prompt, payload, cache_task)
+        cache_key = self._semantic_chinese_cache_key(
+            prompt,
+            payload,
+            cache_task,
+            request_model=selected_model,
+        )
         cache_result = self.cache_manager.get_llm_result(
             cache_key,
             selected_model,
@@ -18807,6 +18915,7 @@ class ScreenSubtitleEditor:
             prompt,
             payload,
             "screen_subtitle_semantic_translation",
+            request_model=self.model,
         )
         cache_result = self.cache_manager.get_llm_result(
             cache_key,

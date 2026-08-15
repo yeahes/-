@@ -2,6 +2,33 @@
 
 Last updated: 2026-08-15
 
+## 2026-08-15 Translation Role And Page Projection Contracts
+
+- DeepSeek translation now has explicit task owners: complete semantic-group
+  translation uses Pro; ordinary fixed-ID and display-page allocation use
+  Flash; deterministic quality retries escalate only the affected group or
+  parent page set to Pro. Stable English, subtitle IDs, word spans, word times,
+  and page geometry remain local and unchanged.
+- The authoritative parent Chinese and its display-page Chinese are separate
+  projections. Page-local Chinese may use natural Chinese order and never
+  writes back into the parent translation. Every new page artifact binds the
+  exact source-parent Chinese text/hash from which it was created.
+- Legacy schema-v2 page artifacts without an explicit source-parent reference
+  remain readable only when their ordered page Chinese exactly reconstructs
+  the current authoritative parent Chinese. A conflicting legacy artifact
+  fails closed.
+- Runtime manifests record the full, allocation, page, allocation-retry, and
+  page-retry model roles. Chinese cache keys bind only the model that owns the
+  request, so changing Flash does not invalidate verified Pro full-translation
+  cache entries. Verified older full-translation caches retain a validated
+  one-release migration path.
+- Focused model-routing, cache-ownership, two-parent scoped page-retry,
+  residual REVIEW, legacy-compatibility, syntax, and diff checks pass. The
+  complete 26-stage regression passes. Read-only production replay reopened
+  `石油市场，现在中国说了算？` (147 cues) and
+  `蜜雪冰城为何卖起了啤酒` (213 cues); recursive size, mtime, and SHA-256
+  snapshots were identical before and after loading.
+
 ## 2026-08-15 Manual Editor Performance And Compact Recovery
 
 - Parent-scoped page, Chinese, confirmation, and suppression edits now persist

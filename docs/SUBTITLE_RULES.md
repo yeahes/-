@@ -85,10 +85,14 @@
   editor preview, manual save, and synthesis must consume that frozen sequence;
   they cannot invoke another planner and replace its page spans, font size, or
   page IDs.
-- Ordered page Chinese must reconstruct the current parent Chinese exactly
-  after whitespace normalization. An older page artifact whose Chinese
-  predates parent-level polish cannot be reused merely because its English
-  page identity still matches.
+- Page Chinese is an independent display projection of the authoritative
+  parent translation. It may reorder or restate the same meaning for natural
+  page-local reading and therefore is not required to concatenate back to the
+  parent's exact surface text. Every new page artifact must carry the exact
+  source-parent Chinese text/hash that created it, and it must never overwrite
+  that parent translation. A legacy artifact without this source reference is
+  readable only when its ordered page Chinese still reconstructs the current
+  authoritative parent Chinese exactly.
 - A short comma-terminated non-finite condition at the start of a cue may move
   back to the immediately preceding clause only when local parsing confirms it
   has a clause marker but no subject or finite predicate, the following text is

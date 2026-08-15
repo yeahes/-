@@ -250,6 +250,32 @@ def bind_display_page_parent_records(
                 "A display-page parent has no authoritative Chinese record.",
                 subtitle_id=parent_id,
             )
+        source_chinese_present = "source_parent_chinese" in parent
+        source_hash_present = "source_parent_chinese_hash" in parent
+        if not source_chinese_present:
+            legacy_aggregate = _normalise_chinese(parent.get("aggregate_chinese"))
+            authoritative_chinese = _normalise_chinese(record.get("chinese"))
+            if not legacy_aggregate or legacy_aggregate != authoritative_chinese:
+                raise AuthoritativeParentChineseError(
+                    "authoritative_parent_chinese_page_conflict",
+                    "A legacy display projection does not reconstruct the authoritative parent Chinese.",
+                    subtitle_id=parent_id,
+                )
+            parent["source_parent_chinese"] = str(record.get("chinese") or "")
+            parent["source_parent_chinese_hash"] = str(
+                record.get("chinese_hash") or ""
+            )
+        elif not source_hash_present:
+            source_chinese = _normalise_chinese(parent.get("source_parent_chinese"))
+            if source_chinese != _normalise_chinese(record.get("chinese")):
+                raise AuthoritativeParentChineseError(
+                    "authoritative_parent_chinese_page_conflict",
+                    "A legacy display projection references different parent Chinese.",
+                    subtitle_id=parent_id,
+                )
+            parent["source_parent_chinese_hash"] = str(
+                record.get("chinese_hash") or ""
+            )
         source_chinese = _normalise_chinese(parent.get("source_parent_chinese"))
         source_chinese_hash = str(parent.get("source_parent_chinese_hash") or "")
         if (
@@ -286,12 +312,20 @@ def validate_display_page_parent_records(
     original_parents = list(display_artifact.get("parents") or [])
     bound_parents = list(bound.get("parents") or [])
     for original, expected in zip(original_parents, bound_parents):
-        if (
-            str(original.get("parent_source_hash") or "")
-            != str(expected.get("parent_source_hash") or "")
-            or str(original.get("parent_record_hash") or "")
-            != str(expected.get("parent_record_hash") or "")
-        ):
+        source_ref = str(original.get("parent_source_hash") or "")
+        record_ref = str(original.get("parent_record_hash") or "")
+        expected_source_ref = str(expected.get("parent_source_hash") or "")
+        expected_record_ref = str(expected.get("parent_record_hash") or "")
+        legacy_without_source = "source_parent_chinese" not in original
+        references_invalid = (
+            (bool(source_ref) and source_ref != expected_source_ref)
+            or (bool(record_ref) and record_ref != expected_record_ref)
+            or (
+                not legacy_without_source
+                and (source_ref != expected_source_ref or record_ref != expected_record_ref)
+            )
+        )
+        if references_invalid:
             raise AuthoritativeParentChineseError(
                 "authoritative_parent_chinese_page_reference_mismatch",
                 "Display-page Chinese is not bound to the current parent record.",

@@ -412,7 +412,25 @@ class SubtitleThread(QThread):
                 getattr(self, "_article_run_metadata", self._empty_article_run_metadata())
             ),
             "translation_runtime_config": {
-                "translation_model": str(getattr(screen_editor, "model", "") or ""),
+                "translation_model": str(metadata.get("translation_model", "") or ""),
+                "full_translation_model": str(
+                    metadata.get("full_translation_model", "") or ""
+                ),
+                "allocation_review_model": str(
+                    metadata.get("allocation_review_model", "") or ""
+                ),
+                "display_page_translation_model": str(
+                    metadata.get("display_page_translation_model", "") or ""
+                ),
+                "allocation_quality_retry_model": str(
+                    metadata.get("allocation_quality_retry_model", "") or ""
+                ),
+                "display_page_retry_model": str(
+                    metadata.get("display_page_retry_model", "") or ""
+                ),
+                "model_role_policy_version": str(
+                    metadata.get("model_role_policy_version", "") or ""
+                ),
                 "prompt_version": str(metadata.get("prompt_version", "") or ""),
                 "target_language": str(getattr(screen_editor, "target_language", "") or ""),
                 "max_cjk_chars": int(getattr(screen_editor, "max_cjk_chars", 0) or 0),

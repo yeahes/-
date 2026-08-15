@@ -532,6 +532,100 @@ def test_screen_editor_routes_full_translation_and_allocation_models_by_role():
     assert allocation == {"groups": []}
     assert error == ""
     assert calls == ["deepseek-v4-pro", "deepseek-v4-flash"]
+    metadata = editor.manifest_metadata()
+    assert metadata["allocation_quality_retry_model"] == "deepseek-v4-pro"
+    assert metadata["display_page_retry_model"] == "deepseek-v4-pro"
+
+
+def test_semantic_cache_identity_uses_only_the_request_owner_model():
+    editor = _id_editor()
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor._assign_global_subtitle_ids(_id_items(2))
+    prompt = "role-scoped cache"
+    payload = [{"id": 1, "full_english": "English 1. English 2."}]
+    full_task = "screen_subtitle_semantic_full_translation_v4"
+    allocation_task = "screen_subtitle_semantic_translation_allocation_v3"
+
+    full_key = editor._semantic_chinese_cache_key(prompt, payload, full_task)
+    allocation_key = editor._semantic_chinese_cache_key(
+        prompt, payload, allocation_task
+    )
+    pro_retry_key = editor._semantic_chinese_cache_key(
+        prompt,
+        payload,
+        "screen_subtitle_semantic_translation_allocation_fragment_retry_v1",
+        request_model="deepseek-v4-pro",
+    )
+    editor._chinese_cache_contract["model_role_policy_version"] = "changed-policy"
+    assert editor._semantic_chinese_cache_key(prompt, payload, full_task) == full_key
+    editor._chinese_cache_contract["model_role_policy_version"] = (
+        "stable-translation-model-roles-v1"
+    )
+
+    editor.allocation_review_model = "deepseek-v4-flash-next"
+    editor.display_page_translation_model = "deepseek-v4-flash-next"
+    assert editor._semantic_chinese_cache_key(prompt, payload, full_task) == full_key
+    assert (
+        editor._semantic_chinese_cache_key(prompt, payload, allocation_task)
+        != allocation_key
+    )
+    assert (
+        editor._semantic_chinese_cache_key(
+            prompt,
+            payload,
+            "screen_subtitle_semantic_translation_allocation_fragment_retry_v1",
+            request_model="deepseek-v4-pro",
+        )
+        == pro_retry_key
+    )
+
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro-next"
+    assert editor._semantic_chinese_cache_key(prompt, payload, full_task) != full_key
+    assert (
+        editor._semantic_chinese_cache_key(prompt, payload, allocation_task)
+        == allocation_key
+    )
+
+
+def test_screen_manifest_records_translation_model_roles_and_retry_owners():
+    thread = SubtitleThread.__new__(SubtitleThread)
+    thread._stage_timings_seconds = {}
+    thread._article_run_metadata = {}
+    editor = SimpleNamespace(
+        manifest_metadata=lambda: {
+            "translation_model": "deepseek-v4-pro",
+            "full_translation_model": "deepseek-v4-pro",
+            "allocation_review_model": "deepseek-v4-flash",
+            "display_page_translation_model": "deepseek-v4-flash",
+            "allocation_quality_retry_model": "deepseek-v4-pro",
+            "display_page_retry_model": "deepseek-v4-pro",
+            "model_role_policy_version": "stable-translation-model-roles-v1",
+            "prompt_version": "global-subtitle-id-v2",
+        },
+        model="deepseek-v4-flash",
+        target_language="简体中文",
+        max_cjk_chars=24,
+        max_english_words=16,
+        allocation_batch_size=16,
+        allocation_max_concurrency=1,
+        enable_chinese_polish=False,
+    )
+
+    runtime = thread._screen_manifest_metadata(editor)["run_comparison"][
+        "translation_runtime_config"
+    ]
+
+    assert runtime["translation_model"] == "deepseek-v4-pro"
+    assert runtime["full_translation_model"] == "deepseek-v4-pro"
+    assert runtime["allocation_review_model"] == "deepseek-v4-flash"
+    assert runtime["display_page_translation_model"] == "deepseek-v4-flash"
+    assert runtime["allocation_quality_retry_model"] == "deepseek-v4-pro"
+    assert runtime["display_page_retry_model"] == "deepseek-v4-pro"
+    assert runtime["model_role_policy_version"] == "stable-translation-model-roles-v1"
 
 
 def test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split():
@@ -12281,12 +12375,15 @@ if __name__ == "__main__":
     test_stable_chinese_cache_rejects_stale_frozen_boundary_context()
     test_semantic_full_translation_cache_survives_allocation_algorithm_change()
     test_semantic_full_translation_reads_verified_pre_v5_cache_once()
+    test_semantic_cache_identity_uses_only_the_request_owner_model()
     test_invalid_full_translation_cache_is_replaced_only_by_valid_response()
     test_invalid_allocation_cache_is_replaced_only_after_id_validation()
     test_final_time_alignment_reapplies_display_padding_to_loaded_short_subtitle()
     test_final_time_alignment_shifts_next_when_loaded_short_has_no_gap()
     test_final_time_alignment_runs_chinese_speed_repair_without_touching_english()
     test_screen_editor_uses_16_word_stable_hard_floor()
+    test_screen_editor_routes_full_translation_and_allocation_models_by_role()
+    test_screen_manifest_records_translation_model_roles_and_retry_owners()
     test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split()
     test_stable_screen_mode_skips_legacy_llm_optimization()
     test_stable_screen_mode_rejects_missing_or_unmappable_word_ledger()
