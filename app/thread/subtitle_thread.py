@@ -13,7 +13,11 @@ from PyQt5.QtCore import QSettings, QThread, pyqtSignal
 from app.common.config import cfg
 from app.core.bk_asr.asr_data import ASRData
 from app.core.entities import SubtitleConfig, SubtitleTask, TranslatorServiceEnum
-from app.core.output_paths import media_result_dir
+from app.core.output_paths import (
+    media_result_dir,
+    media_result_quality_dir,
+    media_result_subtitle_dir,
+)
 from app.core.article_context import (
     ARTICLE_ANALYSIS_META_KEY,
     ARTICLE_ASR_CORRECTION_POLICY_VERSION,
@@ -21,6 +25,7 @@ from app.core.article_context import (
     analyze_article_text,
     apply_article_asr_corrections,
     article_text_hash,
+    build_article_asr_review_artifact,
     build_article_glossary,
     build_translation_context_prompt,
     clean_article_text,
@@ -691,6 +696,70 @@ class SubtitleThread(QThread):
             logger.warning("Saving %s failed: %s", name, exc)
 
     @staticmethod
+    def _prepare_article_asr_review_artifact(
+        article_output_dir: Path,
+        frozen_asr_data: ASRData,
+        *,
+        correction_ran: bool,
+    ) -> dict:
+        """Bind uncertain corrections before an alignment backend can move time."""
+        try:
+            correction_path = article_output_dir / "correction_log.json"
+            correction_logs = []
+            source_file_hash = ""
+            if correction_ran and correction_path.is_file():
+                payload = json.loads(
+                    correction_path.read_text(encoding="utf-8-sig")
+                )
+                if isinstance(payload, list):
+                    correction_logs = payload
+                source_file_hash = file_sha256(correction_path)
+            return build_article_asr_review_artifact(
+                correction_logs,
+                frozen_asr_data.segments,
+                word_ledger_hash="",
+                source_file_hash=source_file_hash,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Article ASR review preparation unavailable; continuing without marks: %s",
+                exc,
+            )
+            return build_article_asr_review_artifact(
+                [],
+                frozen_asr_data.segments,
+                word_ledger_hash="",
+                source_file_hash="",
+            )
+
+    @staticmethod
+    def _write_article_asr_review_artifact(
+        coverage_report_path: str | None,
+        prepared_artifact: Mapping,
+    ) -> None:
+        """Publish the pre-alignment ID binding under the final ledger hash."""
+        if not coverage_report_path:
+            return
+        try:
+            artifact_dir = stable_artifact_dir(Path(coverage_report_path))
+            ledger_path = artifact_dir / "word-ledger.json"
+            ledger_payload = json.loads(
+                ledger_path.read_text(encoding="utf-8-sig")
+            )
+            word_ledger_hash = str((ledger_payload or {}).get("hash") or "")
+            review_artifact = dict(prepared_artifact or {})
+            review_artifact["word_ledger_hash"] = word_ledger_hash
+            write_json_artifact(
+                artifact_dir / "article-asr-correction-review.json",
+                review_artifact,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Article ASR review artifact unavailable; continuing without marks: %s",
+                exc,
+            )
+
+    @staticmethod
     def _srt_timestamp(ms: int) -> str:
         ms = max(0, int(ms))
         hours = ms // 3_600_000
@@ -815,12 +884,90 @@ class SubtitleThread(QThread):
         write_json_artifact(output_dir / "stable-last-failure.json", failure)
 
     @staticmethod
-    def _display_failure_is_editable(validation_summary: dict | None) -> bool:
-        return any(
-            str(issue.get("code") or "") == "display_page_translation_invalid"
-            for issue in (validation_summary or {}).get("errors", [])
-            if isinstance(issue, dict)
-        )
+    def _editable_checkpoint_contract_is_complete(
+        asr_data: ASRData,
+        *,
+        coverage_report_path: str | None,
+        manifest_meta: Mapping | None,
+    ) -> bool:
+        """Require complete frozen authority before exposing a failed result."""
+        if not asr_data or not asr_data.segments or not coverage_report_path:
+            return False
+        report_path = Path(coverage_report_path)
+        artifact_dir = stable_artifact_dir(report_path)
+        spans_path = artifact_dir / "subtitle-spans.json"
+        ledger_path = artifact_dir / "word-ledger.json"
+        timeline_path = Path(str((manifest_meta or {}).get("final_cue_timeline_path") or ""))
+        if not spans_path.is_file() or not ledger_path.is_file() or not timeline_path.is_file():
+            return False
+        try:
+            timeline_path.resolve().relative_to(artifact_dir.resolve())
+        except (OSError, ValueError):
+            return False
+        try:
+            spans = json.loads(spans_path.read_text(encoding="utf-8-sig"))
+            ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        words = list((ledger_payload or {}).get("words") or [])
+        records = list((timeline or {}).get("records") or [])
+        validation = dict((timeline or {}).get("validation") or {})
+        segments = list(asr_data.segments)
+        if (
+            not isinstance(spans, list)
+            or len(spans) != len(segments)
+            or not words
+            or len(records) != len(segments)
+            or validation.get("status") != "PASS"
+            or list(validation.get("errors") or [])
+        ):
+            return False
+        expected_ids = [f"S{index:04d}" for index in range(1, len(segments) + 1)]
+        if (
+            [str(span.get("subtitle_id") or "") for span in spans] != expected_ids
+            or [str(record.get("subtitle_id") or "") for record in records] != expected_ids
+        ):
+            return False
+        previous_word_end = -1
+        previous_cue_end = -1
+        for segment, span, record, subtitle_id in zip(
+            segments,
+            spans,
+            records,
+            expected_ids,
+        ):
+            try:
+                word_start = int(span.get("word_start"))
+                word_end = int(span.get("word_end"))
+                record_start = int(record.get("word_start"))
+                record_end = int(record.get("word_end"))
+                cue_start = int(record.get("start_ms"))
+                cue_end = int(record.get("end_ms"))
+                envelope_start = int(record.get("word_envelope_start_ms"))
+                envelope_end = int(record.get("word_envelope_end_ms"))
+                first_word_start = int(words[word_start].get("start_ms"))
+                last_word_end = int(words[word_end].get("end_ms"))
+            except (IndexError, TypeError, ValueError):
+                return False
+            if (
+                str(getattr(segment, "subtitle_id", "") or "") != subtitle_id
+                or not str(getattr(segment, "translated_text", "") or "").strip()
+                or word_start != previous_word_end + 1
+                or word_end < word_start
+                or record_start != word_start
+                or record_end != word_end
+                or envelope_start != first_word_start
+                or envelope_end != last_word_end
+                or cue_start > envelope_start
+                or cue_end < envelope_end
+                or cue_start < previous_cue_end
+                or cue_end <= cue_start
+            ):
+                return False
+            previous_word_end = word_end
+            previous_cue_end = cue_end
+        return previous_word_end == len(words) - 1
 
     @staticmethod
     def _stable_validation_summary_blocks_render(
@@ -938,6 +1085,11 @@ class SubtitleThread(QThread):
             manifest.update(published_meta)
             manifest_path = run_dir / "stable-final-manifest.json"
             write_json_artifact(manifest_path, manifest)
+            from app.core.subtitle_processor.manual_final_subtitle_editor import (
+                ManualFinalSubtitleSession,
+            )
+
+            ManualFinalSubtitleSession.load_from_manifest(manifest_path)
             return manifest_path
         except Exception:
             shutil.rmtree(run_dir, ignore_errors=True)
@@ -969,7 +1121,11 @@ class SubtitleThread(QThread):
         render_blocked = validation_status == "failed"
         if render_blocked:
             editable_checkpoint_manifest_path = None
-            if self._display_failure_is_editable(validation_summary):
+            if self._editable_checkpoint_contract_is_complete(
+                asr_data,
+                coverage_report_path=coverage_report_path,
+                manifest_meta=manifest_meta,
+            ):
                 try:
                     editable_checkpoint_manifest_path = (
                         self._write_stable_editable_checkpoint(
@@ -1083,7 +1239,7 @@ class SubtitleThread(QThread):
                     )
                 )
             if source_subtitle_paths:
-                manifest["source_subtitle_dir"] = str(self._source_audio_report_dir())
+                manifest["source_subtitle_dir"] = str(self._source_audio_subtitle_dir())
                 manifest["source_subtitle_paths"] = source_subtitle_paths
                 manifest["source_subtitle_paths_sha256"] = {
                     key: file_sha256(Path(value))
@@ -1137,9 +1293,10 @@ class SubtitleThread(QThread):
 
     def _write_source_audio_qc_queue(self, coverage_report_path: str | None) -> dict:
         """Create one concise, time-addressable review SRT beside the source audio."""
-        source_dir = self._source_audio_report_dir()
+        source_dir = self._source_audio_quality_dir()
         if source_dir is None or not coverage_report_path:
             return {}
+        source_dir.mkdir(parents=True, exist_ok=True)
         report_path = Path(coverage_report_path)
         artifact_dir = report_path.with_name(
             f"{report_path.stem.removesuffix('-coverage-report')}-artifacts"
@@ -1166,7 +1323,7 @@ class SubtitleThread(QThread):
         summary = self._build_stable_result_summary(manifest)
         if not summary:
             return {}
-        source_dir = self._source_audio_report_dir()
+        source_dir = self._source_audio_quality_dir()
         if source_dir is None:
             return {}
         paths = {"source_summary_txt": str(source_dir / "字幕处理结果摘要.txt")}
@@ -1263,6 +1420,10 @@ class SubtitleThread(QThread):
             lines.append(
                 f"- 剪映质检队列：{qa_review_queue.get('source_audio_qa_review_queue_srt')}"
             )
+        if qa_review_queue.get("source_audio_semantic_review_queue_srt"):
+            lines.append(
+                f"- 中文语义复核队列：{qa_review_queue.get('source_audio_semantic_review_queue_srt')}"
+            )
 
         if blocked or errors:
             recommendation = "建议：先处理 ERROR，不建议直接合成。"
@@ -1315,7 +1476,7 @@ class SubtitleThread(QThread):
         return unique
 
     def _source_audio_subtitle_paths(self) -> dict:
-        source_dir = self._source_audio_report_dir()
+        source_dir = self._source_audio_subtitle_dir()
         if source_dir is None:
             return {}
         source_path = Path(
@@ -1378,7 +1539,7 @@ class SubtitleThread(QThread):
                 or ""
             )
         )
-        source_dir = self._source_audio_report_dir()
+        source_dir = self._source_audio_subtitle_dir()
         if source_dir is None:
             return {}
         source_dir.mkdir(parents=True, exist_ok=True)
@@ -1437,6 +1598,14 @@ class SubtitleThread(QThread):
             source_media_text,
             output_anchor=output_anchor,
         )
+
+    def _source_audio_subtitle_dir(self) -> Path | None:
+        result_dir = self._source_audio_report_dir()
+        return media_result_subtitle_dir(result_dir) if result_dir is not None else None
+
+    def _source_audio_quality_dir(self) -> Path | None:
+        result_dir = self._source_audio_report_dir()
+        return media_result_quality_dir(result_dir) if result_dir is not None else None
 
     def _setup_api_config(self) -> SubtitleConfig:
         """设置API配置，返回SubtitleConfig"""
@@ -1786,29 +1955,20 @@ class SubtitleThread(QThread):
                     allocation_max_concurrency=subtitle_config.screen_subtitle_allocation_max_concurrency,
                     allocation_batch_size=subtitle_config.screen_subtitle_allocation_batch_size,
                     article_context_prompt=article_translation_prompt,
+                    article_context_data=article_context,
                     coverage_report_path=coverage_report_path,
                     update_callback=self.callback,
                     progress_callback=self._handle_screen_editor_progress,
                 )
                 asr_data = screen_editor.edit(asr_data, word_time_asr_data=word_time_asr_data)
-                if screen_editor.has_blocking_validation_errors():
-                    message = screen_editor.blocking_validation_message()
-                    self._save_stable_subtitle_outputs(
+                article_asr_review_artifact = (
+                    self._prepare_article_asr_review_artifact(
+                        article_output_dir,
                         asr_data,
-                        subtitle_config,
-                        coverage_report_path=coverage_report_path,
-                        validation_status="failed",
-                        validation_summary=screen_editor.last_validation_summary,
-                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                        correction_ran=article_correction_ran,
                     )
-                    raise RuntimeError(
-                        self.tr(
-                            "字幕体检发现严重问题，已停止后续合成。\n报告路径："
-                        )
-                        + coverage_report_path
-                        + "\n"
-                        + message
-                    )
+                )
+                pre_timeline_blocked = screen_editor.has_blocking_validation_errors()
                 frozen_word_ledger = screen_editor.export_frozen_word_ledger()
                 if not frozen_word_ledger.has_data():
                     raise RuntimeError(self.tr("最终时间轴构建失败：缺少冻结词级账本。"))
@@ -1865,6 +2025,14 @@ class SubtitleThread(QThread):
                     # timeline.  Later passes may alter Chinese only; they
                     # must not write a second cue timing authority.
                     preserve_aligned_timing=True,
+                    # A structurally blocked result needs only a frozen local
+                    # timeline for editing. Do not spend another LLM request
+                    # trying to compress Chinese that cannot be published yet.
+                    allow_chinese_compression=not pre_timeline_blocked,
+                )
+                self._write_article_asr_review_artifact(
+                    coverage_report_path,
+                    article_asr_review_artifact,
                 )
                 try:
                     self._require_valid_final_timeline_before_display_pages(
@@ -1902,6 +2070,24 @@ class SubtitleThread(QThread):
                         manifest_meta=self._screen_manifest_metadata(screen_editor),
                     )
                     raise
+                if pre_timeline_blocked:
+                    message = screen_editor.blocking_validation_message()
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=screen_editor.last_validation_summary,
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                    )
+                    raise RuntimeError(
+                        self.tr(
+                            "字幕体检发现严重问题，已停止后续合成。\n报告路径："
+                        )
+                        + coverage_report_path
+                        + "\n"
+                        + message
+                    )
                 try:
                     page_stage_started = self._begin_stage(
                         "display_page_translation",
@@ -2051,11 +2237,11 @@ class SubtitleThread(QThread):
                     getattr(self.task, "source_audio_path", None)
                     or self.task.video_path
                 )
-                result_dir = self._source_audio_report_dir()
-                if result_dir is None:
-                    result_dir = media_result_dir(source_media)
-                result_dir.mkdir(parents=True, exist_ok=True)
-                save_srt_path = result_dir / f"{Path(source_media).stem}.srt"
+                subtitle_dir = self._source_audio_subtitle_dir()
+                if subtitle_dir is None:
+                    subtitle_dir = media_result_subtitle_dir(source_media)
+                subtitle_dir.mkdir(parents=True, exist_ok=True)
+                save_srt_path = subtitle_dir / f"{Path(source_media).stem}.srt"
                 asr_data.to_srt(
                     save_path=str(save_srt_path), layout=subtitle_config.subtitle_layout
                 )

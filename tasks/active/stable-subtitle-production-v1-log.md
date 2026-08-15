@@ -2251,3 +2251,109 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
   English boundaries from one to zero. The final 25-stage regression passes in
   359.5 seconds; validation was offline and made no ASR, LLM, synthesis, or
   paid request.
+## 2026-08-13 Recoverable Failure Hardening
+
+- Isolated malformed optional allocation-quality retry candidates from the
+  authoritative translation structure-error list.
+- Added frozen-ledger display-duration planning in the sole final cue timeline
+  owner: 700ms soft target, 150ms hard minimum, no word-time mutation.
+- Replaced the editable-checkpoint error-code whitelist with frozen structural
+  contract validation and a real editor-loader self-check.
+- Replayed the failed 226-cue `AI竞赛：中美殊途` artifacts offline: PASS,
+  unchanged IDs/spans, `Precisely.` 700ms, `I see.` 360ms.
+- A temporary real-artifact checkpoint reopened all 226 cues through the
+  production manual editor loader without modifying source artifacts.
+- `runtime\python.exe scripts\run_regression.py` passed all 25 stages after
+  the final control-flow change in 405.4 seconds.
+
+## 2026-08-13 Chinese Validation Prompts
+
+- Added one user-facing Chinese mapping for validation, timing, translation,
+  and display-page issue codes while retaining the original machine codes in
+  artifacts and contracts.
+- Applied it to editor cell tooltips, accepted manual-boundary warnings,
+  manual-final save blockers, and blocking optimization messages. Exact
+  subtitle/page IDs remain visible when available.
+- Added direct mapping tests and included them in the unified regression. The
+  focused UI/publication tests and complete 26-stage run pass; full regression
+  time was 405.5 seconds.
+
+## 2026-08-14 Psychology Episode Failure Reduction
+
+- Reproduced the `S0187.P01` Chinese-token split, `food of oak` / `food oak`,
+  `Yuan Qingmai`, and `75元` defects from immutable production artifacts.
+- Added failed-parent-only page retry with full-contract merge validation; no
+  English, ID, word span, time, or page geometry may change.
+- Bumped article ASR correction policy to v3 and added evidence-bound local
+  term and adjacent-title person correction paths with negative regressions.
+- Added article-backed currency-unit review and an editor-compatible fixed-ID
+  Chinese suggestion. No automatic Chinese rewrite was introduced.
+- Temporary real-artifact replay changed only three `fudaoke` spans and one
+  person name through the new paths, and exposed `S0053` as a `75美元`
+  suggestion. No paid request or production artifact write ran.
+- Focused suites and `runtime\python.exe scripts\run_regression.py` pass; the
+  complete 26-stage run took 408.1 seconds.
+- Follow-up risk audit tightened the new behavior before handoff: structural
+  page ID/cardinality failures now force a full-contract retry, while a local
+  retry exception preserves initial accepted parents and exact failed-parent
+  scope. Initial and retry diagnostics are retained together.
+- Person correction now rejects generic shared mental-health descriptions;
+  the positive titled-person and local-term cases plus three adversarial
+  negatives pass all 41 article correction tests.
+- Currency review now requires local money context, a unique value occurrence,
+  and an atomic unit phrase. Count nouns, repeated values, and ambiguous
+  compound units are excluded. Parent suggestions are rejected in child-page
+  rows instead of silently applying to the first page.
+- A read-only replay of the psychology episode preserved the expected four
+  `fudaoke` surfaces, one `Yuan Chengmei`, and only the `S0053` currency review.
+  No production artifacts or paid service were used. The final complete
+  26-stage regression passed in 363.9 seconds; the subsequent retry-scope
+  evidence and user-facing label pass their owning focused suites.
+
+## 2026-08-14 Review Workflow Completion
+
+- Completed optional fixed-ID Chinese polish generation and manual application.
+  Suggestions run in a background worker, use atomic cache files, and cannot
+  overwrite an intervening cell edit, switched subtitle package, or regenerated
+  semantic-review queue. Explicit source currency units are now protected in
+  addition to numbers, negation, and article-matched terminology.
+- Added nearby display-page boundary suggestions using the authoritative word
+  ledger and frozen grammar evidence. The editor distinguishes recommended,
+  review, and blocked cuts; preview does not mutate subtitles.
+- Extended the final boundary audit to schema v2 so selected display-page edges
+  and unresolved pre-ID evidence reach the same ID-bound review layer as parent
+  cue edges. Display fallback risks stay review-only and do not become a new
+  publication blocker.
+- Added parent-scoped persistent undo/redo. A parent can be undone without
+  overwriting a later edit to another parent; cross-parent, ledger, and audio
+  tail-trim operations still require whole-document undo.
+- Read-only psychology replay preserved all 195 IDs, cue spans, 2,088 words,
+  English, and timing while current code exposed 21 review boundaries. Focused
+  tests and the complete 26-stage regression pass; the unified run took 372.3
+  seconds and `git diff --check` passes. No production output or paid request
+  was made.
+
+## 2026-08-14 Article ASR False-Rewrite And Review Projection
+
+- Replayed the raw ASR plus article context for `石油市场，现在中国说了算？`
+  and `蜜雪冰城为何卖起了啤酒` in temporary directories. Existing policy
+  reproduced `Red Sea -> Russia` and three `network(s) -> New York`
+  replacements.
+- Added root-layer entity-shape and exact-article-surface invariants. Ordinary
+  lowercase words cannot weakly expand into multiword entities, unrelated
+  capitalized multiword entities cannot collapse through phonetic similarity,
+  and an evidenced article entity cannot be overwritten by another glossary
+  owner.
+- Bumped the article ASR policy to v4 so run-state resume cannot reuse affected
+  v3 corrected ASR. Raw ASR and article-analysis caches remain reusable.
+- Added a high-signal review projection for below-threshold entity-shaped
+  candidates. It chooses one minimal-token-change suggestion per source range,
+  maps it to real frozen subtitle IDs by time overlap, records source and word
+  ledger hashes, and never changes English automatically. The editor ignores
+  stale-ledger review artifacts.
+- Real replay now rejects all four false replacements while retaining normal
+  automatic corrections and `Felugia/Fallugia -> Fulujia` review evidence.
+  Focused article/thread correction tests pass 48/48; focused review-mark and
+  syntax tests pass; the complete 26-stage regression exits zero in 352.6 seconds.
+- No production output was modified and no ASR, LLM, translation, synthesis,
+  paid request, or network-dependent operation ran.

@@ -11,17 +11,31 @@ import logging
 from pathlib import Path
 from threading import Lock, Thread
 
-from PyQt5.QtCore import Qt, QEvent, QTime, QTimer, QUrl, QAbstractTableModel, pyqtSignal
+from openai import OpenAI
+from PyQt5.QtCore import (
+    Qt,
+    QEvent,
+    QModelIndex,
+    QTime,
+    QTimer,
+    QUrl,
+    QAbstractTableModel,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent
 from PyQt5.QtWidgets import (
     QAbstractItemDelegate,
     QAbstractItemView,
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QListWidget,
+    QListWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -66,6 +80,16 @@ from app.core.subtitle_processor.subtitle_review_marks import (
     review_marks_from_payload,
     syntax_review_parser_available,
 )
+from app.core.subtitle_processor.stable_artifacts import write_json_artifact
+from app.core.subtitle_processor.translation_review_suggestions import (
+    apply_translation_review_suggestion,
+    generate_translation_review_suggestions,
+    validate_translation_review_suggestions,
+)
+from app.core.subtitle_processor.user_facing_issue_text import (
+    issue_codes_text,
+    user_facing_issue_reason,
+)
 from app.core.entities import (
     OutputSubtitleFormatEnum,
     SubtitleTask,
@@ -73,6 +97,9 @@ from app.core.entities import (
     TargetLanguageEnum,
 )
 from app.core.task_factory import TaskFactory
+from app.core.output_paths import containing_media_result_dir, media_result_dir
+from app.core.utils.json_repair import loads as repair_json_loads
+from app.core.utils.podcast_learning_video import current_llm_config
 from app.core.utils.get_subtitle_style import get_subtitle_style
 from app.thread.subtitle_thread import SubtitleThread
 from app.thread.video_synthesis_thread import (
@@ -372,16 +399,141 @@ class SubtitleTableModel(QAbstractTableModel):
         self._data = data or {}
         self.endResetModel()
 
+    @staticmethod
+    def _sequential_rows(data: dict) -> list[dict]:
+        return [
+            dict(data.get(str(index)) or {})
+            for index in range(1, len(data) + 1)
+        ]
+
+    @staticmethod
+    def _rows_to_data(rows: list[dict]) -> dict[str, dict]:
+        return {
+            str(index): row
+            for index, row in enumerate(rows, 1)
+        }
+
+    def update_incremental(self, data: dict) -> None:
+        """Apply one local editor change without resetting the whole table."""
+        new_data = data or {}
+        old_rows = self._sequential_rows(self._data)
+        new_rows = self._sequential_rows(new_data)
+        if old_rows == new_rows:
+            return
+        old_page_view = bool(old_rows and old_rows[0].get("display_page_view"))
+        new_page_view = bool(new_rows and new_rows[0].get("display_page_view"))
+        if old_page_view != new_page_view:
+            self.update_all(new_data)
+            return
+
+        prefix = 0
+        common_limit = min(len(old_rows), len(new_rows))
+        while prefix < common_limit and old_rows[prefix] == new_rows[prefix]:
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < common_limit - prefix
+            and old_rows[len(old_rows) - suffix - 1]
+            == new_rows[len(new_rows) - suffix - 1]
+        ):
+            suffix += 1
+
+        old_middle_count = len(old_rows) - prefix - suffix
+        new_middle_count = len(new_rows) - prefix - suffix
+        affected_total = max(old_middle_count, new_middle_count)
+        if (
+            max(len(old_rows), len(new_rows)) >= 80
+            and affected_total > max(len(old_rows), len(new_rows)) * 0.6
+        ):
+            self.update_all(new_data)
+            return
+
+        if old_middle_count == new_middle_count:
+            self._data = self._rows_to_data(new_rows)
+            if new_middle_count:
+                top_left = self.index(prefix, 0)
+                bottom_right = self.index(
+                    prefix + new_middle_count - 1,
+                    self.columnCount() - 1,
+                )
+                self.dataChanged.emit(
+                    top_left,
+                    bottom_right,
+                    [
+                        Qt.DisplayRole,
+                        Qt.EditRole,
+                        Qt.BackgroundRole,
+                        Qt.ToolTipRole,
+                    ],
+                )
+                self.headerDataChanged.emit(
+                    Qt.Vertical,
+                    prefix,
+                    prefix + new_middle_count - 1,
+                )
+            return
+
+        working_rows = list(old_rows)
+        if old_middle_count:
+            self.beginRemoveRows(
+                QModelIndex(),
+                prefix,
+                prefix + old_middle_count - 1,
+            )
+            del working_rows[prefix : prefix + old_middle_count]
+            self._data = self._rows_to_data(working_rows)
+            self.endRemoveRows()
+        if new_middle_count:
+            self.beginInsertRows(
+                QModelIndex(),
+                prefix,
+                prefix + new_middle_count - 1,
+            )
+            working_rows[prefix:prefix] = new_rows[
+                prefix : prefix + new_middle_count
+            ]
+            self._data = self._rows_to_data(working_rows)
+            self.endInsertRows()
+        header_end = len(new_rows) - suffix - 1
+        if prefix <= header_end:
+            self.headerDataChanged.emit(Qt.Vertical, prefix, header_end)
+
     def set_review_marks(self, marks_by_subtitle_id: dict) -> None:
-        self._review_marks_by_subtitle_id = {
+        updated = {
             str(subtitle_id): list(marks)
             for subtitle_id, marks in (marks_by_subtitle_id or {}).items()
         }
+        if updated == self._review_marks_by_subtitle_id:
+            return
+        changed_ids = {
+            subtitle_id
+            for subtitle_id in (
+                set(updated) | set(self._review_marks_by_subtitle_id)
+            )
+            if updated.get(subtitle_id)
+            != self._review_marks_by_subtitle_id.get(subtitle_id)
+        }
+        self._review_marks_by_subtitle_id = updated
         if not self._data:
             return
+        affected_rows = []
+        for row_index, segment in enumerate(self._data.values()):
+            subtitle_ids = {
+                str(value)
+                for value in [
+                    segment.get("subtitle_id"),
+                    segment.get("manual_cue_id"),
+                    *(segment.get("source_subtitle_ids") or []),
+                ]
+                if str(value)
+            }
+            if subtitle_ids & changed_ids:
+                affected_rows.append(row_index)
+        if not affected_rows:
+            return
         self.dataChanged.emit(
-            self.index(0, 0),
-            self.index(max(0, self.rowCount() - 1), self.columnCount() - 1),
+            self.index(min(affected_rows), 0),
+            self.index(max(affected_rows), self.columnCount() - 1),
             [Qt.BackgroundRole, Qt.ToolTipRole],
         )
 
@@ -476,7 +628,7 @@ class SubtitleTableModel(QAbstractTableModel):
                     target="english",
                     code=(issue_codes[0] if issue_codes else "display_page_review"),
                     reason=(
-                        "实际分页切点需要人工确认：" + ", ".join(issue_codes)
+                        "实际分页切点需要人工确认：" + issue_codes_text(issue_codes)
                         if issue_codes
                         else "实际分页切点需要人工确认。"
                     ),
@@ -545,7 +697,8 @@ class SubtitleTableModel(QAbstractTableModel):
         lines = []
         for mark in relevant:
             label = labels.get(mark.category, "字幕复查")
-            lines.append(f"[{label}] {mark.subtitle_id}: {mark.reason}")
+            reason = user_facing_issue_reason(mark.reason, code=mark.code)
+            lines.append(f"[{label}] {mark.subtitle_id}: {reason}")
         return "\n".join(lines)
 
 
@@ -557,6 +710,7 @@ class SubtitleInterface(QWidget):
     manual_final_save_finished = pyqtSignal(int, object, str)
     manual_final_save_progress = pyqtSignal(int, int, str)
     manual_recovery_draft_finished = pyqtSignal(int, str)
+    translation_review_suggestions_finished = pyqtSignal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -588,17 +742,25 @@ class SubtitleInterface(QWidget):
         self._manual_refresh_requested = False
         self._manual_active_save_context = None
         self._manual_pending_page_split = None
+        self._manual_long_caption_parent_id = ""
+        self._manual_long_caption_queue_row = 0
         self._manual_has_unsaved_changes = False
         self._manual_model_has_pending_edits = False
         self._manual_clean_state_fingerprint = ""
         self._manual_draft_request_id = 0
         self._manual_draft_write_in_progress = False
+        self._translation_review_suggestion_in_progress = False
+        self._translation_review_suggestion_context = None
+        self._translation_review_suggestion_request_id = 0
         self.custom_prompt_text = cfg.custom_prompt_text.value
         self.setAttribute(Qt.WA_DeleteOnClose)
         self._init_ui()
         self._setup_signals()
         self.manual_recovery_draft_finished.connect(
             self._apply_manual_recovery_draft_result
+        )
+        self.translation_review_suggestions_finished.connect(
+            self._apply_generated_translation_review_suggestions
         )
         self._update_prompt_button_style()
         self.set_values()
@@ -720,6 +882,24 @@ class SubtitleInterface(QWidget):
         self.manual_page_view_action.setEnabled(False)
         self.manual_page_view_action.setVisible(False)
         self.command_bar.addAction(self.manual_page_view_action)
+
+        self.manual_long_caption_queue_action = Action(
+            FIF.SEARCH,
+            self.tr("长字幕复查"),
+            triggered=self._show_manual_long_caption_queue,
+        )
+        self.manual_long_caption_queue_action.setEnabled(False)
+        self.manual_long_caption_queue_action.setVisible(False)
+        self.command_bar.addAction(self.manual_long_caption_queue_action)
+
+        self.manual_translation_review_action = Action(
+            FIF.LANGUAGE,
+            self.tr("中文复查队列"),
+            triggered=self._show_semantic_translation_review_queue,
+        )
+        self.manual_translation_review_action.setEnabled(False)
+        self.manual_translation_review_action.setVisible(False)
+        self.command_bar.addAction(self.manual_translation_review_action)
 
         self.manual_final_save_action = Action(
             FIF.SAVE, self.tr("保存人工终稿"), triggered=self.save_manual_final_output
@@ -1184,6 +1364,58 @@ class SubtitleInterface(QWidget):
             )
             self.manual_boundary_word_count = count_box
             action_layout.addWidget(count_box, 0, 1, Qt.AlignRight)
+            if is_page_boundary:
+                preview_candidates = getattr(
+                    self.manual_final_session,
+                    "preview_display_page_boundary_candidates",
+                    None,
+                )
+                candidates = (
+                    preview_candidates(context["left_page_id"])
+                    if callable(preview_candidates)
+                    else []
+                )
+                candidate_texts = []
+                for candidate in candidates:
+                    direction_text = (
+                        f"上一屏少 {candidate['word_count']} 词"
+                        if candidate.get("move_to_next")
+                        else f"上一屏多 {candidate['word_count']} 词"
+                    )
+                    pause = candidate.get("pause_ms")
+                    pause_text = f"，停顿 {pause}ms" if pause is not None else ""
+                    if candidate.get("applicable"):
+                        summary = candidate.get("boundary_explanation", {}).get(
+                            "summary_zh", "自然意群切点"
+                        )
+                        label = (
+                            self.tr("推荐")
+                            if candidate.get("recommendation") == "recommended"
+                            else self.tr("需人工确认")
+                        )
+                        candidate_texts.append(
+                            f"{label} · {direction_text}{pause_text}：{summary}"
+                        )
+                hint = CaptionLabel(
+                    self.tr("邻近切点：")
+                    + ("；".join(candidate_texts) if candidate_texts else self.tr("暂无")),
+                    widget,
+                )
+                hint.setWordWrap(True)
+                rejected = [
+                    candidate
+                    for candidate in candidates
+                    if not candidate.get("applicable")
+                ]
+                if rejected:
+                    hint.setToolTip(
+                        "\n".join(
+                            f"{candidate.get('actual_offset', 0):+d} 词："
+                            + "；".join(candidate.get("rejection_reasons") or [])
+                            for candidate in rejected
+                        )
+                    )
+                action_layout.addWidget(hint, 1, 0, 1, 2)
             move_button = PushButton(
                 self.tr(
                     "移到下一屏"
@@ -1203,17 +1435,17 @@ class SubtitleInterface(QWidget):
                 lambda: self._choose_manual_boundary_direction("next")
             )
             self.manual_boundary_move_right_button = move_button
-            action_layout.addWidget(move_button, 1, 0)
+            action_layout.addWidget(move_button, 2 if is_page_boundary else 1, 0)
             confirm_button = PrimaryPushButton(
                 self.tr(f"确认移动 {word_count} 个词"), widget, icon=FIF.ACCEPT
             )
             confirm_button.setEnabled(bool(direction) and direction_capacity_ok)
             confirm_button.clicked.connect(self._confirm_manual_boundary_move)
             self.manual_boundary_confirm_button = confirm_button
-            action_layout.addWidget(confirm_button, 1, 1)
+            action_layout.addWidget(confirm_button, 2 if is_page_boundary else 1, 1)
             cancel_button = PushButton(self.tr("取消"), widget, icon=FIF.CANCEL)
             cancel_button.clicked.connect(self._cancel_manual_boundary_edit)
-            action_layout.addWidget(cancel_button, 2, 0)
+            action_layout.addWidget(cancel_button, 3 if is_page_boundary else 2, 0)
             parent_id = str(row.get("manual_cue_id") or "")
             can_undo_for_parent = getattr(
                 self.manual_final_session,
@@ -1232,7 +1464,7 @@ class SubtitleInterface(QWidget):
                 )
             )
             self.manual_boundary_undo_button = undo_button
-            action_layout.addWidget(undo_button, 2, 1)
+            action_layout.addWidget(undo_button, 3 if is_page_boundary else 2, 1)
             can_redo_for_parent = getattr(
                 self.manual_final_session,
                 "can_redo_for_parent",
@@ -1250,7 +1482,7 @@ class SubtitleInterface(QWidget):
                 )
             )
             self.manual_boundary_redo_button = redo_button
-            action_layout.addWidget(redo_button, 3, 1)
+            action_layout.addWidget(redo_button, 4 if is_page_boundary else 3, 1)
             action_layout.setColumnStretch(0, 1)
             action_layout.setColumnStretch(1, 1)
         else:
@@ -1554,6 +1786,22 @@ class SubtitleInterface(QWidget):
         self.subtitle_table.selectRow(row)
         self.subtitle_table.scrollTo(target, QAbstractItemView.PositionAtCenter)
 
+    def _preserve_manual_row_identity(
+        self,
+        *,
+        parent_id: str = "",
+        page_id: str = "",
+        focus_word_id: int | None = None,
+    ) -> None:
+        """Re-select the same parent/page after a model rebuild."""
+        row = self._manual_row_for_identity(
+            parent_id=str(parent_id or ""),
+            page_id=str(page_id or ""),
+            focus_word_id=focus_word_id,
+        )
+        if row is not None:
+            self._select_manual_boundary_row(int(row))
+
     def _manual_row_for_identity(
         self,
         *,
@@ -1650,6 +1898,11 @@ class SubtitleInterface(QWidget):
         self._manual_draft_request_id = int(
             getattr(self, "_manual_draft_request_id", 0) or 0
         ) + 1
+        self._translation_review_suggestion_request_id = int(
+            getattr(self, "_translation_review_suggestion_request_id", 0) or 0
+        ) + 1
+        self._translation_review_suggestion_in_progress = False
+        self._translation_review_suggestion_context = None
         request_id = self._manual_draft_request_id
         QTimer.singleShot(
             450,
@@ -1879,7 +2132,7 @@ class SubtitleInterface(QWidget):
                         if str(code)
                     }
                 )
-                warning_text = ", ".join(issue_codes) or self.tr("语法或短页风险")
+                warning_text = issue_codes_text(issue_codes) or self.tr("语法或短页风险")
                 self.status_label.setText(
                     self.tr("分页边界已按人工确认更新；逐页中文待补充")
                 )
@@ -2220,19 +2473,31 @@ class SubtitleInterface(QWidget):
         manifest_path = Path(
             str(getattr(self, "_manual_package_manifest_path", "") or "")
         )
-        if manifest_path.is_file():
+        if manifest_path.is_file() and self.manual_final_session is not None:
             target_dir = manifest_path.parent
         elif self.manual_final_session is not None:
             session_subtitle = Path(self.manual_final_session.subtitle_path)
             if session_subtitle.is_file():
                 target_dir = session_subtitle.parent
+        if target_dir is None and manifest_path.is_file():
+            target_dir = containing_media_result_dir(manifest_path)
+            if target_dir is None:
+                target_dir = manifest_path.parent
         if target_dir is None and self.task is not None:
-            output_path = Path(self.task.output_path)
-            target_dir = (
-                output_path.parent
-                if output_path.exists()
-                else Path(self.task.subtitle_path).parent
+            source_media = str(
+                getattr(self.task, "source_audio_path", None)
+                or getattr(self.task, "video_path", None)
+                or ""
             )
+            if source_media:
+                target_dir = media_result_dir(source_media)
+            else:
+                output_path = Path(self.task.output_path)
+                target_dir = (
+                    output_path.parent
+                    if output_path.exists()
+                    else Path(self.task.subtitle_path).parent
+                )
         if target_dir is None and self.subtitle_path:
             subtitle_path = Path(self.subtitle_path)
             if subtitle_path.is_file():
@@ -2309,6 +2574,8 @@ class SubtitleInterface(QWidget):
         ) + 1
         self._manual_parent_boundaries_dirty = False
         self._manual_pending_page_split = None
+        self._manual_long_caption_parent_id = ""
+        self._manual_long_caption_queue_row = 0
         self._manual_page_view = True
         self._manual_model_has_pending_edits = False
         self._manual_has_unsaved_changes = False
@@ -2316,6 +2583,14 @@ class SubtitleInterface(QWidget):
         self._manual_draft_request_id = int(
             getattr(self, "_manual_draft_request_id", 0) or 0
         ) + 1
+        # Loading another package invalidates any optional translation-review
+        # request owned by the previous session.  The request id prevents a
+        # late worker result from clearing or writing into the new session.
+        self._translation_review_suggestion_request_id = int(
+            getattr(self, "_translation_review_suggestion_request_id", 0) or 0
+        ) + 1
+        self._translation_review_suggestion_in_progress = False
+        self._translation_review_suggestion_context = None
         self._manual_boundary_kind = ""
         self._manual_boundary_left_page_id = ""
         self._manual_boundary_left_index_value = 0
@@ -2333,6 +2608,7 @@ class SubtitleInterface(QWidget):
             "manual_final_undo_action",
             "manual_final_synthesis_action",
             "manual_draft_synthesis_action",
+            "manual_translation_review_action",
         ):
             action = getattr(self, action_name, None)
             if action is None:
@@ -2737,7 +3013,7 @@ class SubtitleInterface(QWidget):
                 self._manual_page_view and not boundaries_dirty
             )
         )
-        self.model.update_all(data)
+        self.model.update_incremental(data)
         self._manual_model_has_pending_edits = False
         refresh_review_rows = getattr(self, "_refresh_manual_review_rows", None)
         if callable(refresh_review_rows):
@@ -2762,6 +3038,30 @@ class SubtitleInterface(QWidget):
                     )
         self.manual_final_save_action.setEnabled(True)
         self.manual_final_save_action.setVisible(True)
+        if hasattr(self, "manual_long_caption_queue_action"):
+            queue_available = bool(
+                page_mode
+                and has_pages
+                and not boundaries_dirty
+            )
+            self.manual_long_caption_queue_action.setEnabled(queue_available)
+            self.manual_long_caption_queue_action.setVisible(queue_available)
+        if hasattr(self, "manual_translation_review_action"):
+            artifact_dir = getattr(
+                self.manual_final_session,
+                "artifact_dir",
+                None,
+            )
+            semantic_queue_path = (
+                Path(artifact_dir) / "semantic-review-queue.json"
+                if artifact_dir
+                else None
+            )
+            queue_available = bool(
+                semantic_queue_path and semantic_queue_path.is_file()
+            )
+            self.manual_translation_review_action.setEnabled(queue_available)
+            self.manual_translation_review_action.setVisible(queue_available)
         self.manual_final_undo_action.setEnabled(
             bool(self.manual_final_session.history)
             or bool(getattr(self, "_manual_model_has_pending_edits", False))
@@ -3232,6 +3532,8 @@ class SubtitleInterface(QWidget):
             if pending_for_request:
                 self._manual_pending_page_split = None
             self.status_label.setText(self.tr("人工终稿保存失败"))
+            # Keep the in-memory draft, view mode and selection intact.  A
+            # failed background publication must never make the user restart.
             InfoBar.warning(
                 self.tr("保存失败"),
                 error,
@@ -3388,16 +3690,23 @@ class SubtitleInterface(QWidget):
                 parent=self,
             )
         else:
+            render_block_reason = str(
+                paths.get("render_block_reason") or "unknown"
+            )
+            render_block_text = user_facing_issue_reason(
+                render_block_reason,
+                code=render_block_reason,
+            )
             self.status_label.setText(
                 self.tr(
                     f"编辑进度已保存；{hard_count}个结构问题仍阻止合成："
                 )
-                + str(paths.get("render_block_reason") or "unknown")
+                + render_block_text
             )
             InfoBar.warning(
                 self.tr("人工终稿仍有结构错误"),
                 self.tr("阻止原因：")
-                + str(paths.get("render_block_reason") or "unknown")
+                + render_block_text
                 + self.tr("；位置：")
                 + "、".join(
                     str(value)
@@ -3719,6 +4028,17 @@ class SubtitleInterface(QWidget):
                     )
                     menu.addAction(split_action)
 
+                candidate_action = Action(
+                    FIF.SEARCH,
+                    self.tr("查看候选分页（只改当前父字幕）"),
+                )
+                candidate_action.triggered.connect(
+                    lambda _checked=False, pid=parent_id: (
+                        self._show_display_page_candidate_workspace(pid)
+                    )
+                )
+                menu.addAction(candidate_action)
+
                 menu.addSeparator()
                 page_id = str(selected.get("display_page_id") or "")
                 confirm_chinese_action = Action(
@@ -3835,6 +4155,862 @@ class SubtitleInterface(QWidget):
 
         # 显示菜单
         menu.exec(self.subtitle_table.viewport().mapToGlobal(pos))
+
+    def _style_manual_review_dialog(
+        self,
+        dialog: QDialog,
+        listing: QListWidget,
+    ) -> None:
+        """Apply an explicit palette to native review dialogs."""
+        dialog.setObjectName("manualReviewDialog")
+        listing.setObjectName("manualReviewList")
+        listing.setWordWrap(True)
+        listing.setTextElideMode(Qt.ElideNone)
+        listing.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        if isDarkTheme():
+            background = "#202020"
+            surface = "#292929"
+            surface_hover = "#323232"
+            selected = "#31465f"
+            text = "#f2f2f2"
+            muted = "#b8b8b8"
+            border = "#454545"
+        else:
+            background = "#fafafa"
+            surface = "#ffffff"
+            surface_hover = "#f3f3f3"
+            selected = "#dcecff"
+            text = "#202020"
+            muted = "#606060"
+            border = "#d6d6d6"
+        dialog.setStyleSheet(
+            "#manualReviewDialog {"
+            f"background-color: {background}; color: {text};"
+            "}"
+            "#manualReviewDialog QLabel {"
+            f"color: {text};"
+            "}"
+            "#manualReviewList {"
+            f"background-color: {surface}; color: {text};"
+            f"border: 1px solid {border}; border-radius: 4px;"
+            "outline: none;"
+            "}"
+            "#manualReviewList::item {"
+            "padding: 9px 8px; border-bottom: 1px solid "
+            f"{border};"
+            "}"
+            "#manualReviewList::item:hover {"
+            f"background-color: {surface_hover};"
+            "}"
+            "#manualReviewList::item:selected {"
+            f"background-color: {selected}; color: {text};"
+            "}"
+            "#manualReviewDialog QPushButton {"
+            f"background-color: {surface}; color: {text};"
+            f"border: 1px solid {border}; border-radius: 4px;"
+            "padding: 6px 14px;"
+            "}"
+            "#manualReviewDialog QPushButton:hover {"
+            f"background-color: {surface_hover};"
+            "}"
+            "#manualReviewDialog QPushButton:disabled {"
+            f"color: {muted};"
+            "}"
+        )
+
+    def _manual_long_caption_initial_row(self, queue: list[dict]) -> int:
+        """Restore queue focus by stable parent ID, then by prior position."""
+        if not queue:
+            return -1
+        parent_id = str(
+            getattr(self, "_manual_long_caption_parent_id", "") or ""
+        )
+        if parent_id:
+            for index, item in enumerate(queue):
+                if str(item.get("parent_subtitle_id") or "") == parent_id:
+                    return index
+        previous_row = int(
+            getattr(self, "_manual_long_caption_queue_row", 0) or 0
+        )
+        return min(max(previous_row, 0), len(queue) - 1)
+
+    def _remember_manual_long_caption_row(
+        self,
+        row: int,
+        item: QListWidgetItem | None,
+    ) -> None:
+        if row < 0 or item is None:
+            return
+        value = item.data(Qt.UserRole) or {}
+        if not isinstance(value, dict):
+            return
+        self._manual_long_caption_queue_row = int(row)
+        self._manual_long_caption_parent_id = str(
+            value.get("parent_subtitle_id") or ""
+        )
+
+    def _show_display_page_candidate_workspace(self, parent_subtitle_id: str) -> None:
+        """Show bounded local page alternatives and apply only the selected parent."""
+        if not self.manual_final_session:
+            return
+        parent_id = str(parent_subtitle_id or "").strip()
+        try:
+            workspace = self.manual_final_session.build_display_page_candidate_workspace(
+                parent_id,
+                min_page_count=2,
+                max_page_count=4,
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法生成候选分页"), str(exc), duration=5000, parent=self
+            )
+            return
+        candidates = list(workspace.get("candidates") or [])
+        if not candidates:
+            InfoBar.info(
+                self.tr("没有可用候选"),
+                self.tr("这条父字幕没有满足当前字号、语法和时间轴约束的候选分页。"),
+                duration=4500,
+                parent=self,
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.tr(f"{parent_id} 候选分页"))
+        dialog.setMinimumSize(760, 440)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            BodyLabel(
+                self.tr(
+                    "候选只读预览。应用后只会重建当前父字幕；相同词范围的中文会保留，新增页面需人工确认。"
+                ),
+                dialog,
+            )
+        )
+        source_label = BodyLabel(str(workspace.get("english") or ""), dialog)
+        source_label.setWordWrap(True)
+        layout.addWidget(source_label)
+        listing = QListWidget(dialog)
+        self._style_manual_review_dialog(dialog, listing)
+        for candidate in candidates:
+            pages = list(candidate.get("pages") or [])
+            page_count = int(candidate.get("page_count") or len(pages))
+            font_size = int((candidate.get("plan") or {}).get("font_size", {}).get("english") or 0)
+            risks = int(candidate.get("risk_score") or 0)
+            cost = int(candidate.get("quality_cost") or 0)
+            lines = [
+                self.tr(
+                    f"{page_count} 屏 | 英文字号 {font_size} | "
+                    f"结构风险 {risks} | 综合评分 {cost}"
+                ),
+            ]
+            for index, page in enumerate(pages, 1):
+                text = str(page.get("en") or page.get("english") or "").strip()
+                word_count = len(text.split())
+                duration_ms = round(
+                    max(0.0, float(page.get("end") or 0.0) - float(page.get("start") or 0.0))
+                    * 1000
+                )
+                boundary = page.get("boundary_before") or {}
+                pause_ms = boundary.get("pause_ms")
+                evidence = (
+                    f"停顿 {int(pause_ms)}ms"
+                    if pause_ms is not None
+                    else "停顿未知"
+                )
+                explanation = (
+                    page.get("boundary_explanation")
+                    if isinstance(page.get("boundary_explanation"), dict)
+                    else {}
+                )
+                boundary_note = str(explanation.get("summary_zh") or "").strip()
+                rule_codes = ", ".join(
+                    str(code) for code in explanation.get("rule_codes") or []
+                )
+                if index == 1:
+                    boundary_note = "第一屏"
+                elif rule_codes:
+                    boundary_note = f"{boundary_note} [{rule_codes}]"
+                lines.append(
+                    self.tr(
+                        f"第 {index} 屏：{word_count}词 | {duration_ms}ms | "
+                        f"{evidence} | {boundary_note} | {text}"
+                    )
+                )
+            item = QListWidgetItem("\n".join(lines), listing)
+            item.setData(Qt.UserRole, candidate)
+            if not bool(candidate.get("applicable", True)):
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled & ~Qt.ItemIsSelectable)
+        listing.setCurrentRow(0)
+        layout.addWidget(listing, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Cancel | QDialogButtonBox.Apply,
+            parent=dialog,
+        )
+        buttons.button(QDialogButtonBox.Apply).setText(self.tr("应用此方案"))
+        buttons.clicked.connect(
+            lambda button: dialog.accept()
+            if buttons.standardButton(button) == QDialogButtonBox.Apply
+            else None
+        )
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        item = listing.currentItem()
+        candidate = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(candidate, dict):
+            return
+        if not bool(candidate.get("applicable", True)):
+            InfoBar.warning(
+                self.tr("该方案含结构性硬切"),
+                self.tr("请选择没有硬切点的候选；程序不会强行应用这一方案。"),
+                duration=5000,
+                parent=self,
+            )
+            return
+        ranges = candidate.get("global_word_ranges") or []
+        try:
+            self._sync_manual_final_text_edits()
+            result = self.manual_final_session.split_parent_into_display_pages(
+                parent_id,
+                int(candidate.get("page_count") or len(ranges)),
+                word_ranges=ranges,
+                preserve_matching_page_chinese=True,
+            )
+            if not result.get("changed"):
+                InfoBar.info(
+                    self.tr("分页没有变化"),
+                    self.tr("当前父字幕已经使用相同的词范围。"),
+                    duration=3500,
+                    parent=self,
+                )
+                return
+            self._manual_boundary_edit_active = False
+            self._manual_boundary_row_armed = False
+            self._manual_boundary_move_direction = ""
+            self._manual_page_view = True
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self._apply_manual_final_session()
+            target_row = next(
+                (
+                    index
+                    for index, row in enumerate(self.model._data.values())
+                    if str(row.get("manual_cue_id") or "") == parent_id
+                ),
+                0,
+            )
+            self._select_manual_boundary_row(target_row)
+            self.status_label.setText(
+                self.tr(f"{parent_id} 已应用候选分页；请检查中文后保存人工终稿")
+            )
+            InfoBar.success(
+                self.tr("候选分页已应用"),
+                self.tr("其他父字幕未改变；相同词范围的中文已保留。"),
+                duration=4500,
+                parent=self,
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法应用候选分页"), str(exc), duration=6000, parent=self
+            )
+
+    def _show_manual_long_caption_queue(self) -> None:
+        """Show only parent cues that have concrete page-review evidence."""
+        session = self.manual_final_session
+        if session is None:
+            return
+        if not self._manual_page_view or getattr(
+            self, "_manual_parent_boundaries_dirty", False
+        ):
+            InfoBar.info(
+                self.tr("请先打开实际分页"),
+                self.tr("长字幕复查只在实际分页且分页状态稳定时可用。"),
+                duration=3500,
+                parent=self,
+            )
+            return
+        try:
+            queue = session.build_display_page_risk_queue()
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法读取长字幕复查队列"),
+                str(exc),
+                duration=5000,
+                parent=self,
+            )
+            return
+        if not queue:
+            InfoBar.info(
+                self.tr("没有高信号长字幕"),
+                self.tr("当前实际分页没有发现超长、低字号或待确认项。"),
+                duration=3500,
+                parent=self,
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.tr("长字幕复查队列"))
+        dialog.setMinimumSize(900, 520)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            BodyLabel(
+                self.tr("这里只列出值得人工看的父字幕；双击一项可定位，不会自动修改字幕。"),
+                dialog,
+            )
+        )
+        listing = QListWidget(dialog)
+        self._style_manual_review_dialog(dialog, listing)
+        for item in queue:
+            reasons = "、".join(str(value) for value in item.get("reasons") or [])
+            pages = int(item.get("current_page_count") or 0)
+            label = (
+                f"{item.get('parent_subtitle_id', '')} | {item.get('word_count', 0)}词 | "
+                f"当前{pages}屏 | {reasons}\n{item.get('english', '')}"
+            )
+            row_item = QListWidgetItem(label, listing)
+            row_item.setData(Qt.UserRole, item)
+
+        initial_row = self._manual_long_caption_initial_row(queue)
+        listing.currentRowChanged.connect(
+            lambda row: self._remember_manual_long_caption_row(
+                row,
+                listing.item(row) if row >= 0 else None,
+            )
+        )
+
+        def focus_item(row_item: QListWidgetItem) -> None:
+            value = row_item.data(Qt.UserRole) or {}
+            parent_id = str(value.get("parent_subtitle_id") or "")
+            self._remember_manual_long_caption_row(
+                listing.row(row_item),
+                row_item,
+            )
+            target_row = next(
+                (
+                    index
+                    for index, row in enumerate(self.model._data.values())
+                    if str(row.get("manual_cue_id") or "") == parent_id
+                ),
+                None,
+            )
+            if target_row is not None:
+                self._select_manual_boundary_row(int(target_row))
+                dialog.accept()
+        listing.itemDoubleClicked.connect(focus_item)
+        layout.addWidget(listing, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        listing.setCurrentRow(initial_row)
+        dialog.exec()
+
+    def _show_semantic_translation_review_queue(self) -> None:
+        """Open the persisted semantic queue without changing stable subtitles."""
+        session = self.manual_final_session
+        if session is None:
+            return
+        queue_path = session.artifact_dir / "semantic-review-queue.json"
+        try:
+            payload = json.loads(queue_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            InfoBar.warning(
+                self.tr("无法读取中文复查队列"), str(exc), duration=5000, parent=self
+            )
+            return
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not items:
+            InfoBar.info(
+                self.tr("没有中文复查项"),
+                self.tr("当前产物没有高信号语义或翻译腔问题。"),
+                duration=3500,
+                parent=self,
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.tr("中文翻译复查队列"))
+        dialog.setMinimumSize(980, 560)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            BodyLabel(
+                self.tr(
+                    "这里只显示程序筛出的高信号问题。双击定位后可直接编辑中文；"
+                    "只有带固定 ID、原文回显和建议译文的条目才允许应用建议。"
+                ),
+                dialog,
+            )
+        )
+        listing = QListWidget(dialog)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ids = ", ".join(str(value) for value in item.get("subtitle_ids") or [])
+            context = item.get("context") or []
+            preview = " | ".join(
+                f"{row.get('subtitle_id', '')}: {row.get('chinese', '')}"
+                for row in context[:2]
+                if isinstance(row, dict)
+            )
+            details = item.get("details") if isinstance(item.get("details"), dict) else {}
+            generated = details.get("suggestions") if isinstance(details.get("suggestions"), list) else []
+            suggestion_preview = " | ".join(
+                f"建议 {value.get('subtitle_id', '')}: {value.get('suggested_chinese', '')}"
+                for value in generated
+                if isinstance(value, dict) and value.get("suggested_chinese")
+            )
+            label = (
+                f"{item.get('title', '中文复查')} | {ids}\n"
+                f"{item.get('reason', '')}\n{preview}"
+                + (f"\n{suggestion_preview}" if suggestion_preview else "")
+            )
+            row_item = QListWidgetItem(label, listing)
+            row_item.setData(Qt.UserRole, item)
+        listing.setCurrentRow(0)
+        layout.addWidget(listing, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        locate_button = buttons.addButton(
+            self.tr("定位并编辑"), QDialogButtonBox.AcceptRole
+        )
+        apply_button = buttons.addButton(
+            self.tr("应用固定 ID 建议"), QDialogButtonBox.ActionRole
+        )
+        generate_button = buttons.addButton(
+            self.tr("后台生成润色建议"), QDialogButtonBox.ActionRole
+        )
+        apply_button.setEnabled(False)
+
+        def selected_item() -> dict:
+            current = listing.currentItem()
+            value = current.data(Qt.UserRole) if current is not None else {}
+            return value if isinstance(value, dict) else {}
+
+        def refresh_apply_state() -> None:
+            item = selected_item()
+            details = item.get("details") if isinstance(item.get("details"), dict) else {}
+            suggestions = details.get("suggestions") if isinstance(details.get("suggestions"), list) else []
+            suggestion = (
+                next((value for value in suggestions if isinstance(value, dict)), None)
+                or (details.get("suggestion") if isinstance(details.get("suggestion"), dict) else None)
+                or (item.get("suggestion") if isinstance(item.get("suggestion"), dict) else None)
+            )
+            apply_button.setEnabled(isinstance(suggestion, dict) and bool(suggestion.get("suggested_chinese")))
+            generate_button.setEnabled(
+                not self._translation_review_suggestion_in_progress
+                and bool(item.get("subtitle_ids"))
+            )
+
+        def locate() -> None:
+            item = selected_item()
+            ids = [str(value) for value in item.get("subtitle_ids") or [] if str(value)]
+            if not ids:
+                return
+            target_row = next(
+                (
+                    index
+                    for index, row in enumerate(self.model._data.values())
+                    if str(row.get("manual_cue_id") or row.get("subtitle_id") or "") in ids
+                ),
+                None,
+            )
+            if target_row is not None:
+                self._select_manual_boundary_row(int(target_row))
+                dialog.accept()
+
+        def apply_suggestion() -> None:
+            item = selected_item()
+            details = item.get("details") if isinstance(item.get("details"), dict) else {}
+            suggestions = details.get("suggestions") if isinstance(details.get("suggestions"), list) else []
+            candidate_suggestions = [
+                value for value in suggestions if isinstance(value, dict)
+            ]
+            if not candidate_suggestions:
+                fallback_suggestion = details.get("suggestion")
+                if not isinstance(fallback_suggestion, dict):
+                    fallback_suggestion = item.get("suggestion")
+                if isinstance(fallback_suggestion, dict):
+                    candidate_suggestions = [fallback_suggestion]
+            if not candidate_suggestions:
+                return
+            if self._manual_page_view:
+                # Semantic suggestions are bound to the frozen parent Chinese
+                # record.  Applying one to the first child page would silently
+                # corrupt page allocation, so require the explicit parent view.
+                InfoBar.warning(
+                    self.tr("请先切换到父字幕视图"),
+                    self.tr("金额或语义建议针对整条父字幕，切换后再应用，避免只改第一页。"),
+                    duration=6000,
+                    parent=self,
+                )
+                return
+            try:
+                self._apply_fixed_id_translation_suggestions(candidate_suggestions)
+                self.status_label.setText(self.tr("已应用固定 ID 中文建议；请检查后保存人工终稿"))
+                dialog.accept()
+            except ManualFinalSubtitleEditError as exc:
+                InfoBar.warning(self.tr("无法应用中文建议"), str(exc), duration=6000, parent=self)
+
+        def generate_suggestions() -> None:
+            row = listing.currentRow()
+            item = selected_item()
+            if row < 0 or not item:
+                return
+            self._start_translation_review_suggestions(
+                queue_payload=payload,
+                queue_path=queue_path,
+                item_index=row,
+                item=item,
+                dialog=dialog,
+                listing=listing,
+                generate_button=generate_button,
+                apply_button=apply_button,
+            )
+            refresh_apply_state()
+
+        listing.currentItemChanged.connect(lambda *_: refresh_apply_state())
+        locate_button.clicked.connect(locate)
+        apply_button.clicked.connect(apply_suggestion)
+        generate_button.clicked.connect(generate_suggestions)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        refresh_apply_state()
+        dialog.exec()
+
+    @staticmethod
+    def _translation_review_article_anchors(
+        artifact_dir: Path,
+        english: str,
+    ) -> dict:
+        article_path = next(
+            (
+                parent / "article_context.json"
+                for parent in list(artifact_dir.parents)[:4]
+                if (parent / "article_context.json").is_file()
+            ),
+            None,
+        )
+        if article_path is None:
+            return {}
+        try:
+            article = json.loads(article_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        normalized_english = " ".join(str(english or "").casefold().split())
+        terms = []
+        for section in (
+            "people",
+            "companies",
+            "brands",
+            "organisations",
+            "places",
+            "technical_terms",
+        ):
+            for raw in article.get(section) or []:
+                if not isinstance(raw, dict):
+                    continue
+                source = str(raw.get("canonical_name") or "").strip()
+                target = str(raw.get("chinese_name") or "").strip()
+                candidates = [source, *[str(value or "") for value in raw.get("aliases") or []]]
+                matched = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.strip()
+                        and re.search(
+                            rf"(?<![A-Za-z0-9]){re.escape(candidate.strip().casefold())}(?![A-Za-z0-9])",
+                            normalized_english,
+                        )
+                    ),
+                    "",
+                )
+                if matched and target:
+                    terms.append({"source": matched, "target": target})
+        return {"terms": terms} if terms else {}
+
+    @staticmethod
+    def _translation_review_queue_item_key(item: dict) -> tuple:
+        return (
+            str(item.get("code") or ""),
+            tuple(str(value) for value in item.get("subtitle_ids") or []),
+            tuple(str(value) for value in item.get("semantic_group_ids") or []),
+        )
+
+    @staticmethod
+    def _translation_review_queue_item_snapshot(item: dict) -> dict:
+        snapshot = copy.deepcopy(item)
+        details = snapshot.get("details")
+        if isinstance(details, dict):
+            # Generated suggestions are the only field this workflow owns.
+            details.pop("suggestions", None)
+        return snapshot
+
+    def _apply_fixed_id_translation_suggestions(
+        self,
+        candidate_suggestions: list[dict],
+    ) -> dict:
+        """Atomically apply validated parent-ID Chinese suggestions."""
+        if self.manual_final_session is None:
+            raise ManualFinalSubtitleEditError("当前没有可编辑的人工终稿会话。")
+        if self._manual_page_view:
+            raise ManualFinalSubtitleEditError(
+                "金额或语义建议针对整条父字幕，请先切换到父字幕视图。"
+            )
+        self._sync_manual_final_text_edits(allow_incomplete_page_chinese=True)
+        expected = {}
+        for row in self.model._data.values():
+            stable_id = str(
+                row.get("manual_cue_id") or row.get("subtitle_id") or ""
+            )
+            if stable_id:
+                expected[stable_id] = {
+                    "english": str(row.get("original_subtitle") or ""),
+                    "chinese": str(row.get("translated_subtitle") or ""),
+                }
+        checked = validate_translation_review_suggestions(
+            {"suggestions": candidate_suggestions}, expected
+        )
+        if not checked.get("valid") or not checked.get("suggestions"):
+            raise ManualFinalSubtitleEditError(
+                "建议未通过固定 ID 校验："
+                + json.dumps(checked.get("errors") or [], ensure_ascii=False)
+            )
+        rows = self.model._data
+        for suggestion in checked["suggestions"]:
+            rows = apply_translation_review_suggestion(rows, suggestion)
+        self.manual_final_session.apply_parent_model_data(rows)
+        self._mark_manual_final_dirty(invalidate_pages=False)
+        self._apply_manual_final_session()
+        return checked
+
+    def _start_translation_review_suggestions(
+        self,
+        *,
+        queue_payload: dict,
+        queue_path: Path,
+        item_index: int,
+        item: dict,
+        dialog: QDialog,
+        listing: QListWidget,
+        generate_button,
+        apply_button,
+    ) -> None:
+        if self._translation_review_suggestion_in_progress:
+            return
+        session = self.manual_final_session
+        if session is None:
+            return
+        try:
+            self._sync_manual_final_text_edits(allow_incomplete_page_chinese=True)
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(self.tr("无法生成润色建议"), str(exc), duration=6000, parent=self)
+            return
+        requested_ids = [
+            str(value)
+            for value in item.get("subtitle_ids") or []
+            if str(value)
+        ]
+        cue_by_id = {
+            str(cue.get("cue_id") or ""): cue
+            for cue in session.cues
+            if str(cue.get("cue_id") or "")
+        }
+        context_rows = [
+            {
+                "subtitle_id": str(row.get("subtitle_id") or ""),
+                "english": str(row.get("english") or ""),
+                "chinese": str(row.get("chinese") or ""),
+            }
+            for row in item.get("context") or []
+            if isinstance(row, dict)
+        ]
+        expected = {}
+        for subtitle_id in requested_ids:
+            cue = cue_by_id.get(subtitle_id)
+            if cue is None:
+                continue
+            english = str(cue.get("original_subtitle") or "")
+            expected[subtitle_id] = {
+                "english": english,
+                "chinese": str(cue.get("translated_subtitle") or ""),
+                "protected_anchors": self._translation_review_article_anchors(
+                    Path(session.artifact_dir), english
+                ),
+                "review_reason": str(item.get("reason") or ""),
+                "review_context": context_rows,
+            }
+        if not expected:
+            InfoBar.warning(
+                self.tr("无法生成润色建议"),
+                self.tr("复查项中的固定字幕 ID 已不在当前终稿中。"),
+                duration=6000,
+                parent=self,
+            )
+            return
+        base_url, api_key, model = current_llm_config()
+        if not base_url or not api_key or not model:
+            InfoBar.warning(
+                self.tr("无法生成润色建议"),
+                self.tr("请先在设置中配置可用的大模型服务。"),
+                duration=6000,
+                parent=self,
+            )
+            return
+        self._translation_review_suggestion_request_id += 1
+        request_id = self._translation_review_suggestion_request_id
+        session_fingerprint = self._manual_state_fingerprint()
+        context = {
+            "request_id": request_id,
+            "session_fingerprint": session_fingerprint,
+            "artifact_dir": str(Path(session.artifact_dir).resolve()),
+            "queue_path": str(queue_path.resolve()),
+            "queue_payload": copy.deepcopy(queue_payload),
+            "item_index": int(item_index),
+            "queue_item_key": self._translation_review_queue_item_key(item),
+            "queue_item_snapshot": self._translation_review_queue_item_snapshot(item),
+            "expected": expected,
+            "groups": [list(expected)],
+            "model": model,
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+        self._translation_review_suggestion_context = context
+        self._translation_review_suggestion_in_progress = True
+        generate_button.setEnabled(False)
+        apply_button.setEnabled(False)
+        self.status_label.setText(self.tr("正在后台生成固定 ID 中文润色建议..."))
+        dialog.accept()
+        Thread(
+            target=self._generate_translation_review_suggestions_in_background,
+            args=(context,),
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _translation_review_completion(
+        request: dict,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+    ) -> dict:
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=90, max_retries=0)
+        prompt = (
+            "你是英文播客中文字幕编辑。只改善中文的准确、自然和简洁程度，不能改变事实、数字、"
+            "否定、专名或术语。每个输入 ID 必须返回一项；无需修改时 action=keep，需要修改时"
+            " action=suggest。严格回显 subtitle_id、source_english、current_chinese_hash；suggest 时"
+            "提供 suggested_chinese、reason、source_anchor_echo。source_anchor_echo 必须逐字列出"
+            " protected_anchors.terms 中的 source。只返回 JSON 对象，结构为 {\"reviews\":[...]}。\n\n"
+            + json.dumps(request, ensure_ascii=False)
+        )
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        content = response.choices[0].message.content or ""
+        parsed = repair_json_loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("模型没有返回 JSON 对象。")
+        return parsed
+
+    def _generate_translation_review_suggestions_in_background(
+        self,
+        context: dict,
+    ) -> None:
+        try:
+            result = generate_translation_review_suggestions(
+                context["expected"],
+                lambda request: self._translation_review_completion(
+                    request,
+                    base_url=context["base_url"],
+                    api_key=context["api_key"],
+                    model=context["model"],
+                ),
+                groups=context["groups"],
+                cache_dir=Path(context["artifact_dir"])
+                / "translation-review-suggestion-cache",
+                model=context["model"],
+            )
+            error = ""
+        except Exception as exc:
+            LOG.exception("Unable to generate translation review suggestions")
+            result = {"request_id": context["request_id"]}
+            error = str(exc)
+        result = {**result, "request_id": context["request_id"]}
+        self.translation_review_suggestions_finished.emit(result, error)
+
+    def _apply_generated_translation_review_suggestions(
+        self,
+        result: object,
+        error: str,
+    ) -> None:
+        context = self._translation_review_suggestion_context
+        if not isinstance(context, dict) or not isinstance(result, dict):
+            return
+        if int(result.get("request_id") or -1) != int(context.get("request_id") or -2):
+            return
+        self._translation_review_suggestion_in_progress = False
+        self._translation_review_suggestion_context = None
+        session = self.manual_final_session
+        if (
+            session is None
+            or str(Path(session.artifact_dir).resolve()) != context.get("artifact_dir")
+            or self._manual_state_fingerprint() != context.get("session_fingerprint")
+        ):
+            self.status_label.setText(self.tr("润色建议已过期；当前字幕未被修改"))
+            return
+        if error:
+            InfoBar.warning(
+                self.tr("润色建议生成失败"), error, duration=7000, parent=self
+            )
+            return
+        suggestions = result.get("suggestions") or []
+        if suggestions:
+            queue_path = Path(context["queue_path"])
+            try:
+                payload = json.loads(queue_path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError):
+                self.status_label.setText(
+                    self.tr("润色建议已过期；中文复查队列已变化")
+                )
+                return
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return
+            matching = [
+                candidate
+                for candidate in items
+                if isinstance(candidate, dict)
+                and self._translation_review_queue_item_key(candidate)
+                == tuple(context.get("queue_item_key") or ())
+            ]
+            if (
+                len(matching) != 1
+                or self._translation_review_queue_item_snapshot(matching[0])
+                != context.get("queue_item_snapshot")
+            ):
+                self.status_label.setText(
+                    self.tr("润色建议已过期；中文复查队列已变化")
+                )
+                return
+            item = matching[0]
+            details = item.setdefault("details", {})
+            details["suggestions"] = suggestions
+            write_json_artifact(queue_path, payload)
+            InfoBar.success(
+                self.tr("润色建议已生成"),
+                self.tr("重新打开中文翻译复查队列即可查看并人工应用。"),
+                duration=6000,
+                parent=self,
+            )
+            self.status_label.setText(self.tr("固定 ID 中文润色建议已生成，等待人工确认"))
+            return
+        failures = len(result.get("group_errors") or []) + len(result.get("entry_errors") or [])
+        message = self.tr("模型判断当前选中项无需修改。")
+        if failures:
+            message = self.tr("建议未通过固定 ID 或事实校验，当前字幕未被修改。")
+        InfoBar.info(self.tr("没有可应用的润色建议"), message, duration=6000, parent=self)
 
     def _apply_manual_english_replacement(
         self,

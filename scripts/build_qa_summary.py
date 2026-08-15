@@ -5,6 +5,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from app.core.subtitle_processor.translation_review_suggestions import (
+    currency_unit_review_suggestions,
+    validate_translation_review_suggestions,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -152,6 +157,7 @@ class QASummaryBuilder:
         self.translations = _load_json(artifact_dir / "translations.json", [])
         self.final_timeline = _load_json(artifact_dir / "final-cue-timeline.json", {})
         self.word_ledger = _load_json(artifact_dir / "word-ledger.json", {})
+        self.article_context = _load_json(self.subtitle_dir / "article_context.json", {})
         self.by_id = self._build_subtitle_index()
 
     def _build_subtitle_index(self) -> dict[str, dict]:
@@ -510,6 +516,126 @@ class QASummaryBuilder:
             )
         return result
 
+    def semantic_review_items(self) -> list[dict]:
+        """Return only high-signal Chinese meaning/fluency items.
+
+        This queue is intentionally narrower than the general playable QA
+        queue. It is an audit view: it never changes the stable translation or
+        its publication gate.
+        """
+        result: list[dict] = []
+        high_signal = {
+            "semantic_loss",
+            "missing_predicate",
+            "dangling_preposition",
+            "modifier_head_split",
+            "english_word_order",
+            "cross_id_semantic_leakage",
+            "group_allocation_information_omission",
+            "entity_allocation_mismatch",
+            "number_allocation_mismatch",
+            "negation_allocation_mismatch",
+            "adjacent_chinese_semantic_duplication",
+        }
+        for group in self.validation.get("warnings", []) or []:
+            code = str(group.get("code") or "")
+            entries = group.get("items") if isinstance(group.get("items"), list) else [group]
+            for entry in entries:
+                issue_codes = {str(value) for value in entry.get("rule_codes") or []}
+                if code == "chinese_semantic_group_warning" and (
+                    str(entry.get("confidence") or "").lower() == "high"
+                    or issue_codes & high_signal
+                ):
+                    result.append(
+                        self._make_item(
+                            severity="REVIEW",
+                            code="semantic_translation_review",
+                            title="中文语义复核",
+                            reason=str(entry.get("reason") or ", ".join(sorted(issue_codes))),
+                            subtitle_ids=_ids_from_payload(entry),
+                            semantic_group_ids=_group_ids_from_payload(entry),
+                            source="validation-report.json",
+                            details={"issue_codes": sorted(issue_codes), "findings": entry.get("findings") or []},
+                        )
+                    )
+                elif code == "translationese":
+                    result.append(
+                        self._make_item(
+                            severity="REVIEW",
+                            code="translation_fluency_review",
+                            title="中文翻译腔复核",
+                            reason=str(entry.get("reason") or group.get("message") or ""),
+                            subtitle_ids=_ids_from_payload(entry) or self._ids_by_english_pair(entry),
+                            source="validation-report.json",
+                            details={"original": entry.get("original", ""), "translated": entry.get("translated", "")},
+                        )
+                    )
+        for record in self.allocation_unresolved:
+            issue_codes = [str(code) for code in record.get("issue_codes") or []]
+            result.append(
+                self._make_item(
+                    severity="REVIEW",
+                    code="semantic_allocation_review",
+                    title="中文逐条对应复核",
+                    reason=f"{record.get('reason', '')}; issues={', '.join(issue_codes)}",
+                    subtitle_ids=_ids_from_payload(record.get("allocation")) or _ids_from_payload(record),
+                    semantic_group_ids=_group_ids_from_payload(record),
+                    source="allocation-unresolved.json",
+                    details={"issue_codes": issue_codes, "full_english": record.get("full_english", ""), "full_translation": record.get("full_translation", "")},
+                )
+            )
+        expected = {
+            subtitle_id: {
+                "english": str(record.get("english") or ""),
+                "chinese": str(record.get("chinese") or ""),
+            }
+            for subtitle_id, record in self.by_id.items()
+        }
+        raw_currency_suggestions = currency_unit_review_suggestions(
+            expected,
+            self.article_context,
+        )
+        validated_currency = validate_translation_review_suggestions(
+            {"suggestions": raw_currency_suggestions},
+            expected,
+        )
+        for suggestion in validated_currency.get("suggestions") or []:
+            subtitle_id = str(suggestion.get("subtitle_id") or "")
+            source = next(
+                (
+                    item
+                    for item in raw_currency_suggestions
+                    if str(item.get("subtitle_id") or "") == subtitle_id
+                ),
+                {},
+            )
+            result.append(
+                self._make_item(
+                    severity="REVIEW",
+                    code="currency_unit_conflict_review",
+                    title="金额单位复核",
+                    reason=str(source.get("reason") or "金额单位与文章证据不一致。"),
+                    subtitle_ids=[subtitle_id],
+                    source="article_context.json",
+                    details={
+                        "evidence": dict(source.get("evidence") or {}),
+                        "suggestion": {
+                            "subtitle_id": subtitle_id,
+                            "source_english": str(suggestion.get("source_english") or ""),
+                            "current_chinese_hash": str(
+                                suggestion.get("current_chinese_hash") or ""
+                            ),
+                            "suggested_chinese": str(suggestion.get("suggested_chinese") or ""),
+                        },
+                    },
+                )
+            )
+        unique: dict[tuple[str, tuple[str, ...]], dict] = {}
+        for item in result:
+            key = (item.get("code", ""), tuple(item.get("subtitle_ids") or []))
+            unique.setdefault(key, item)
+        return sorted(unique.values(), key=lambda item: _subtitle_id_sort_key((item.get("subtitle_ids") or [""])[0]))
+
     def _timeline_word_sources(self) -> dict[int, str]:
         if not isinstance(self.word_ledger, dict):
             return {}
@@ -683,6 +809,33 @@ def _review_queue_srt(
     }
 
 
+def _semantic_review_queue_srt(items: list[dict]) -> tuple[str, dict]:
+    blocks: list[str] = []
+    written: list[dict] = []
+    for item in items:
+        time_range = _review_item_time_range(item)
+        if time_range is None:
+            continue
+        start_ms, end_ms = time_range
+        lines = [
+            f"[SEMANTIC] {item.get('title', '')}",
+            f"ID: {', '.join(item.get('subtitle_ids') or []) or '-'}",
+            f"原因: {item.get('reason') or '-'}",
+        ]
+        for context in (item.get("context") or [])[:4]:
+            subtitle_id = str(context.get("subtitle_id") or "")
+            if context.get("english"):
+                lines.append(f"{subtitle_id} EN: {context['english']}")
+            if context.get("chinese"):
+                lines.append(f"{subtitle_id} ZH: {context['chinese']}")
+        blocks.append("\n".join([str(len(blocks) + 1), f"{_ms_to_srt_timestamp(start_ms)} --> {_ms_to_srt_timestamp(end_ms)}", *lines]))
+        written.append(item)
+    return "\n\n".join(blocks) + ("\n" if blocks else ""), {
+        "queue_item_count": len(written),
+        "subtitle_ids": [sid for item in written for sid in item.get("subtitle_ids") or []],
+    }
+
+
 def write_qa_review_artifacts(
     artifact_dir: Path,
     source_audio_dir: Path | None = None,
@@ -695,6 +848,8 @@ def write_qa_review_artifacts(
     md_path = artifact_dir / "qa-summary.md"
     queue_json_path = artifact_dir / "qa-review-queue.json"
     queue_srt_path = artifact_dir / "qa-review-queue.srt"
+    semantic_json_path = artifact_dir / "semantic-review-queue.json"
+    semantic_srt_path = artifact_dir / "semantic-review-queue.srt"
     _write_json(json_path, summary)
     md_path.write_text(_markdown(summary), encoding="utf-8")
     queue_srt, queue_meta = _review_queue_srt(summary, review_limit=review_limit)
@@ -711,12 +866,22 @@ def write_qa_review_artifacts(
     }
     _write_json(queue_json_path, queue_payload)
     queue_srt_path.write_text(queue_srt, encoding="utf-8-sig")
+    semantic_items = builder.semantic_review_items()
+    semantic_srt, semantic_meta = _semantic_review_queue_srt(semantic_items)
+    _write_json(
+        semantic_json_path,
+        {"schema_version": 1, "source_run": queue_payload["source_run"], "queue": semantic_meta, "items": semantic_items},
+    )
+    semantic_srt_path.write_text(semantic_srt, encoding="utf-8-sig")
 
     result = {
         "qa_summary": str(json_path),
         "qa_markdown": str(md_path),
         "qa_review_queue_json": str(queue_json_path),
         "qa_review_queue_srt": str(queue_srt_path),
+        "semantic_review_queue_json": str(semantic_json_path),
+        "semantic_review_queue_srt": str(semantic_srt_path),
+        "semantic_review_item_count": semantic_meta["queue_item_count"],
         **summary["summary"],
         **queue_meta,
     }
@@ -724,6 +889,9 @@ def write_qa_review_artifacts(
         source_path = source_audio_dir / "字幕质检队列.srt"
         source_path.write_text(queue_srt, encoding="utf-8-sig")
         result["source_audio_qa_review_queue_srt"] = str(source_path)
+        semantic_source_path = source_audio_dir / "字幕语义复核队列.srt"
+        semantic_source_path.write_text(semantic_srt, encoding="utf-8-sig")
+        result["source_audio_semantic_review_queue_srt"] = str(semantic_source_path)
     return result
 
 

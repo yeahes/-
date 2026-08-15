@@ -3607,6 +3607,71 @@ def _article_page_boundary_risk(decision: Mapping, cost: int | float) -> int:
     return risk
 
 
+ARTICLE_BOUNDARY_ISSUE_LABELS_ZH = {
+    "subject_finite_verb_split": "主语和谓语被拆开",
+    "subject_predicate_split": "主语和谓语被拆开",
+    "relative_clause_subject_verb_split": "从句主语和谓语被拆开",
+    "preposition_object_split": "介词和宾语被拆开",
+    "verb_preposition_complement_split": "动词及其介词补语被拆开",
+    "particle_or_preposition_complement_split": "短语动词或介词补语被拆开",
+    "clause_introducer_split": "从句连接处不完整",
+    "object_content_clause_split": "宾语从句被拆开",
+    "coordinated_constituent_split": "并列结构被拆开",
+    "modifier_head_split": "修饰语和中心词被拆开",
+    "determiner_head_phrase_split": "限定词和名词被拆开",
+    "dependency_phrase_entrance_split": "依存短语入口被拆开",
+    "short_verb_complement_split": "动词和补语被拆开",
+    "verb_complement_split": "动词和补语被拆开",
+    "atomic_of_complement_split": "of 固定补语被拆开",
+    "protected_syntax_cut": "命中受保护的语法结构",
+    "forced_complete_continuation_page_split": "没有完全安全的切点，使用了受控兜底",
+    "forced_subject_predicate_page_split": "没有完全安全的切点，在主谓附近使用了受控兜底",
+    "unsupported_tight_page_transition": "停顿较短，翻页衔接偏紧",
+}
+
+
+def article_display_boundary_explanation(
+    boundary: Mapping | None,
+    *,
+    left_english: str = "",
+    right_english: str = "",
+) -> dict:
+    """Turn machine boundary evidence into a stable editor-facing hint."""
+    evidence = dict(boundary or {})
+    classification = str(evidence.get("classification") or "allow")
+    rule_codes = [str(code) for code in evidence.get("issue_codes") or [] if str(code)]
+    labels = list(
+        dict.fromkeys(
+            ARTICLE_BOUNDARY_ISSUE_LABELS_ZH.get(code, f"需复核：{code}")
+            for code in rule_codes
+        )
+    )
+    forced = bool(
+        evidence.get("forced_display_continuation")
+        or evidence.get("forced_subject_predicate")
+    )
+    if forced and not any("受控兜底" in label for label in labels):
+        labels.append("没有完全安全的切点，使用了受控兜底")
+    if classification == "allow" and not labels:
+        summary = "自然意群切点"
+    elif labels:
+        summary = "；".join(labels)
+    else:
+        summary = "这个切点需要人工确认"
+    return {
+        "classification": classification,
+        "confidence": str(evidence.get("confidence") or "low"),
+        "rule_codes": rule_codes,
+        "summary_zh": summary,
+        "requires_confirmation": classification == "review" or forced,
+        "applicable": classification != "hard",
+        "pause_ms": evidence.get("pause_ms"),
+        "left_english": str(left_english or ""),
+        "right_english": str(right_english or ""),
+        "forced_fallback": forced,
+    }
+
+
 def _article_page_break_is_forbidden(
     words: list[str],
     split: int,
@@ -5238,6 +5303,51 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
         "layout_profile": article_display_page_layout_profile(),
         "parents": parents,
         "render_plans": render_plans,
+    }
+
+
+def build_article_display_page_candidate_workspace(
+    cue: Cue,
+    *,
+    min_page_count: int = 2,
+    max_page_count: int = 4,
+) -> dict:
+    """Return bounded read-only page candidates for editor inspection.
+
+    The production blueprint remains the only writer of ``article_page_plan``.
+    This helper creates no IDs, translations, timing overrides, or file output.
+    """
+    draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
+    bundle = _build_article_english_page_plan(cue, draw, _return_candidates=True)
+    if bundle.get("status") != "candidate_bundle":
+        return {
+            "status": "unavailable",
+            "parent_subtitle_id": str(cue.subtitle_id or ""),
+            "reason": "candidate_bundle_unavailable",
+            "errors": list(bundle.get("errors") or []),
+            "candidates": [],
+        }
+    lower = max(2, int(min_page_count or 2))
+    upper = min(ARTICLE_VISUAL_PAGE_MAX_PAGES, max(lower, int(max_page_count or 4)))
+    selected = [
+        candidate
+        for candidate in bundle.get("candidates") or []
+        if lower <= int(candidate.get("page_count") or 0) <= upper
+    ]
+    selected.sort(
+        key=lambda candidate: (
+            int(candidate.get("page_count") or 0),
+            float(candidate.get("quality_cost") or 0),
+        )
+    )
+    return {
+        "status": "candidate_workspace",
+        "parent_subtitle_id": str(cue.subtitle_id or ""),
+        "english": str(cue.en or ""),
+        "chinese": str(cue.zh or ""),
+        "preferred_page_count": int(bundle.get("preferred_page_count") or 1),
+        "candidate_mode": str(bundle.get("candidate_mode") or "strict"),
+        "candidates": [copy.deepcopy(candidate) for candidate in selected[: max(1, upper - lower + 1)]],
     }
 
 

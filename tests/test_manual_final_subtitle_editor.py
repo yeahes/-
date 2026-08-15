@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.config import BIN_PATH
-from app.core.output_paths import media_result_dir
+from app.core.output_paths import media_result_dir, media_result_subtitle_dir
 from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleEditError,
     ManualFinalSubtitleSession,
@@ -472,10 +472,11 @@ def _write_immutable_source_page_snapshot(
     source_media: Path,
 ) -> tuple[Path, Path]:
     result_dir = media_result_dir(source_media)
-    result_dir.mkdir(parents=True, exist_ok=True)
-    parent_path = result_dir / f"{source_media.stem}-原文在上双语字幕.srt"
-    page_path = result_dir / f"{source_media.stem}-实际分页双语字幕.srt"
-    map_path = result_dir / f"{source_media.stem}-实际分页映射.json"
+    subtitle_dir = media_result_subtitle_dir(source_media)
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    parent_path = subtitle_dir / f"{source_media.stem}-原文在上双语字幕.srt"
+    page_path = subtitle_dir / f"{source_media.stem}-实际分页双语字幕.srt"
+    map_path = subtitle_dir / f"{source_media.stem}-实际分页映射.json"
     session._write_bilingual_srt(parent_path)
     render_contract = session._write_manual_render_contract(
         result_dir / "source-page-snapshot-artifacts"
@@ -1349,6 +1350,176 @@ def test_split_parent_accepts_planner_review_boundary_without_changing_parent():
                 "translated_subtitle",
             )
         )
+
+
+def test_candidate_workspace_maps_local_pages_to_global_word_ids_without_mutation():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        before_cues = copy.deepcopy(session.cues)
+        with patch(
+            "app.core.utils.podcast_learning_video.build_article_display_page_candidate_workspace",
+            return_value={
+                "status": "candidate_workspace",
+                "parent_subtitle_id": "S0001",
+                "preferred_page_count": 2,
+                "candidate_mode": "strict",
+                "candidates": [
+                    {
+                        "page_count": 2,
+                        "quality_cost": 12,
+                        "plan": {"font_size": {"english": 56}},
+                        "pages": [
+                            {"word_start": 0, "word_end": 7, "en": "first"},
+                            {"word_start": 8, "word_end": 16, "en": "second"},
+                        ],
+                    }
+                ],
+            },
+        ):
+            workspace = session.build_display_page_candidate_workspace("S0001")
+        assert workspace["candidates"][0]["global_word_ranges"] == [
+            [0, 7],
+            [8, 16],
+        ]
+        assert session.cues == before_cues
+
+
+def test_candidate_workspace_explains_each_noninitial_boundary_in_chinese():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        with patch(
+            "app.core.utils.podcast_learning_video.build_article_display_page_candidate_workspace",
+            return_value={
+                "status": "candidate_workspace",
+                "parent_subtitle_id": "S0001",
+                "preferred_page_count": 2,
+                "candidate_mode": "forced_continuation",
+                "candidates": [
+                    {
+                        "page_count": 2,
+                        "quality_cost": 12,
+                        "plan": {"font_size": {"english": 56}},
+                        "pages": [
+                            {"word_start": 0, "word_end": 7, "en": "first"},
+                            {
+                                "word_start": 8,
+                                "word_end": 16,
+                                "en": "second",
+                                "boundary_before": {
+                                    "classification": "review",
+                                    "confidence": "high",
+                                    "issue_codes": ["subject_predicate_split"],
+                                    "forced_display_continuation": True,
+                                    "pause_ms": 120,
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        ):
+            workspace = session.build_display_page_candidate_workspace("S0001")
+
+        explanation = workspace["candidates"][0]["pages"][1][
+            "boundary_explanation"
+        ]
+        assert explanation["classification"] == "review"
+        assert explanation["requires_confirmation"] is True
+        assert "主语和谓语" in explanation["summary_zh"]
+        assert "subject_predicate_split" in explanation["rule_codes"]
+
+
+def test_nearby_boundary_candidates_are_read_only_and_explain_grammar_risk():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        with patch.object(
+            podcast_learning_video,
+            "propose_article_manual_page_word_ranges",
+            return_value=[(0, 7), (8, 16)],
+        ):
+            session.split_parent_into_display_pages("S0001", 2)
+        evidence_path = session.artifact_dir / "display-boundary-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["boundaries"]["7"].update(
+            {
+                "hard_issues": ["subject_finite_verb_split"],
+                "soft_issues": [],
+                "pause_ms": 100,
+            }
+        )
+        for right_word in (6, 9):
+            evidence["boundaries"][str(right_word)].update(
+                {"hard_issues": [], "soft_issues": [], "pause_ms": 360}
+            )
+        evidence["boundaries"]["10"].update(
+            {
+                "hard_issues": [],
+                "soft_issues": ["coordinated_constituent_split"],
+                "pause_ms": 360,
+            }
+        )
+        _write_json(evidence_path, evidence)
+        before = {
+            "cues": copy.deepcopy(session.cues),
+            "edits": copy.deepcopy(session.display_page_edits),
+            "overrides": copy.deepcopy(session.display_page_boundary_overrides),
+            "history": copy.deepcopy(session.history),
+            "redo": copy.deepcopy(session.redo_history),
+            "ledger": copy.deepcopy(session.word_ledger),
+        }
+
+        candidates = session.preview_display_page_boundary_candidates(
+            "S0001.P01",
+            minimum_duration_ms=0,
+        )
+
+        by_boundary = {item["right_word_id"]: item for item in candidates}
+        assert by_boundary[7]["applicable"] is False
+        assert by_boundary[7]["recommendation"] == "blocked"
+        assert "主语和谓语" in by_boundary[7]["rejection_reasons"][0]
+        assert by_boundary[6]["applicable"] is True
+        assert by_boundary[9]["applicable"] is True
+        assert by_boundary[6]["recommendation"] == "recommended"
+        assert by_boundary[9]["recommendation"] == "recommended"
+        assert by_boundary[10]["recommendation"] == "review"
+        assert "并列结构" in by_boundary[10]["boundary_explanation"]["summary_zh"]
+        assert by_boundary[6]["left_english"]
+        assert by_boundary[6]["right_english"]
+        assert session.cues == before["cues"]
+        assert session.display_page_edits == before["edits"]
+        assert session.display_page_boundary_overrides == before["overrides"]
+        assert session.history == before["history"]
+        assert session.redo_history == before["redo"]
+        assert session.word_ledger == before["ledger"]
+
+
+def test_applying_candidate_ranges_preserves_matching_page_chinese_only():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        session.split_parent_into_display_pages("S0001", 2)
+        rows = session.to_model_data()
+        first_row, second_row = rows["1"], rows["2"]
+        first_row["translated_subtitle"] = "第一屏已确认"
+        first_row["display_page_chinese_confirmed"] = True
+        second_row["translated_subtitle"] = "第二屏已确认"
+        second_row["display_page_chinese_confirmed"] = True
+        session.apply_display_page_model_data(rows)
+        original_ranges = [
+            [int(first_row["word_start"]), int(first_row["word_end"])],
+            [int(second_row["word_start"]), int(second_row["word_end"])],
+        ]
+        result = session.split_parent_into_display_pages(
+            "S0001",
+            2,
+            word_ranges=original_ranges,
+            preserve_matching_page_chinese=True,
+        )
+        assert result["changed"] is False
+        current = list(session.to_model_data().values())
+        assert [row["translated_subtitle"] for row in current] == [
+            "第一屏已确认",
+            "第二屏已确认",
+        ]
 
 
 def test_split_parent_blocks_unconfirmed_page_proposals_then_saves_idempotently():
@@ -2623,6 +2794,17 @@ def test_manual_english_surface_edit_preserves_word_identity_time_and_reload():
         assert session.word_ledger[11]["surface"] == "only as."
         assert session.cues[1]["original_subtitle"] == "out of only as."
         assert session.history[-1]["operation"] == "edit_english_surface"
+        assert "before_word_ledger" not in session.history[-1]
+        assert [
+            item["word_id"]
+            for item in session.history[-1]["before_word_ledger_items"]
+        ] == [11]
+
+        edited_fingerprint = session.state_fingerprint()
+        assert session.undo() is True
+        assert session.word_ledger == before_ledger
+        assert session.redo() is True
+        assert session.state_fingerprint() == edited_fingerprint
 
         source_media = source_srt.with_suffix(".m4a")
         source_media.write_bytes(b"test-audio-placeholder")
@@ -3160,6 +3342,217 @@ def test_row_scoped_undo_rejects_an_unrelated_parent_without_popping_history():
         assert session.to_model_data() == before_rows
 
 
+def test_row_scoped_undo_skips_later_unrelated_parent_without_overwriting_it():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        before = copy.deepcopy(session.to_model_data())
+
+        session.merge_display_page_with_next("S0001.P01")
+        after_first = copy.deepcopy(session.to_model_data())
+        rows = copy.deepcopy(after_first)
+        s2_key = next(
+            key
+            for key, row in rows.items()
+            if str(row.get("manual_cue_id") or "") == "S0002"
+        )
+        rows[s2_key]["translated_subtitle"] = "第二条后来人工改过"
+        session.apply_display_page_model_data(rows)
+        after_second = copy.deepcopy(session.to_model_data())
+
+        assert session.can_undo_for_parent("S0001") is True
+        assert session.undo_for_parent("S0001") is True
+        restored = session.to_model_data()
+        restored_s1 = [
+            row
+            for row in restored.values()
+            if str(row.get("manual_cue_id") or "") == "S0001"
+        ]
+        original_s1 = [
+            row
+            for row in before.values()
+            if str(row.get("manual_cue_id") or "") == "S0001"
+        ]
+        restored_s2 = next(
+            row
+            for row in restored.values()
+            if str(row.get("manual_cue_id") or "") == "S0002"
+        )
+        assert restored_s1 == original_s1
+        assert restored_s2["translated_subtitle"] == "第二条后来人工改过"
+        assert after_second != restored
+
+
+def test_row_scoped_undo_rejects_cross_parent_transactions():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        before = copy.deepcopy(session.to_model_data(prefer_display_pages=False))
+        session.merge_adjacent(0, 1)
+
+        assert session.can_undo_for_parent("S0001") is False
+        try:
+            session.undo_for_parent("S0001")
+        except ManualFinalSubtitleEditError as exc:
+            assert "跨字幕" in str(exc) or "整体撤销" in str(exc)
+        else:
+            raise AssertionError("cross-parent transaction must not be partially undone")
+        assert len(session.cues) == 1
+        assert session.undo() is True
+        assert session.to_model_data(prefer_display_pages=False) == before
+
+
+def test_row_scoped_undo_survives_recovery_draft_reload():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, manifest_path = _session_fixture(root)
+        _write_display_page_preview_artifact(session)
+        original = copy.deepcopy(session.to_model_data())
+        session.merge_display_page_with_next("S0001.P01")
+        changed = copy.deepcopy(session.to_model_data())
+        assert changed != original
+        session.save_recovery_draft()
+
+        restarted = ManualFinalSubtitleSession.load_for_subtitle(
+            source_srt,
+            work_dir=root / "work",
+            manifest_path=manifest_path,
+        )
+        assert restarted.restore_recovery_draft() is True
+        assert restarted.to_model_data() == changed
+        assert restarted.can_undo_for_parent("S0001") is True
+        assert restarted.undo_for_parent("S0001") is True
+        assert restarted.to_model_data() == original
+
+
+def test_parent_scoped_history_uses_compact_parent_state_and_round_trips():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        before = copy.deepcopy(session.to_model_data())
+
+        session.merge_display_page_with_next("S0001.P01")
+
+        entry = session.history[-1]
+        assert entry["operation"] == "merge_display_page_with_next"
+        assert set(entry["before_parent_states"]) == {"S0001"}
+        assert "before_cues" not in entry
+        assert "before_display_page_edits" not in entry
+        assert "before_display_page_boundary_overrides" not in entry
+        assert len(json.dumps(entry, ensure_ascii=False)) < 12_000
+        changed = copy.deepcopy(session.to_model_data())
+
+        assert session.undo_for_parent("S0001") is True
+        assert session.to_model_data() == before
+        assert session.redo_for_parent("S0001") is True
+        assert session.to_model_data() == changed
+
+
+def test_legacy_parent_scoped_history_is_compacted_without_losing_undo():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        before = copy.deepcopy(session.to_model_data())
+        session.merge_display_page_with_next("S0001.P01")
+        compact_entry = session.history[-1]
+        parent_state = compact_entry["before_parent_states"]["S0001"]
+        legacy_entry = {
+            key: copy.deepcopy(value)
+            for key, value in compact_entry.items()
+            if key not in {"before_parent_states", "history_schema_version"}
+        }
+        legacy_entry.update(
+            {
+                "before_cues": [copy.deepcopy(parent_state["cue"])],
+                "before_display_page_edits": copy.deepcopy(
+                    parent_state["display_page_edits"]
+                ),
+                "before_display_page_boundary_overrides": (
+                    {
+                        "S0001": copy.deepcopy(
+                            parent_state["display_page_boundary_override"]
+                        )
+                    }
+                    if parent_state[
+                        "has_display_page_boundary_override"
+                    ]
+                    else {}
+                ),
+                "before_recovered_stale_page_drafts": copy.deepcopy(
+                    parent_state["recovered_stale_page_drafts"]
+                ),
+                "before_tail_trim": {},
+            }
+        )
+        session.history = [legacy_entry]
+
+        assert session.compact_parent_scoped_history() == 1
+        assert "before_parent_states" in session.history[0]
+        assert "before_cues" not in session.history[0]
+        assert session.undo_for_parent("S0001") is True
+        assert session.to_model_data() == before
+
+
+def test_legacy_english_history_is_compacted_to_changed_word_ids():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        before_ledger = copy.deepcopy(session.word_ledger)
+        rows = session.to_model_data(prefer_display_pages=False)
+        rows["2"]["original_subtitle"] = "out of only as."
+        assert session.apply_parent_model_data(rows) is True
+        edited_fingerprint = session.state_fingerprint()
+        entry = copy.deepcopy(session.history[-1])
+        entry.pop("before_word_ledger_items", None)
+        entry["before_word_ledger"] = before_ledger
+        session.history = [entry]
+
+        assert session.compact_english_surface_history() == 1
+        compact = session.history[0]
+        assert "before_word_ledger" not in compact
+        assert [
+            item["word_id"]
+            for item in compact["before_word_ledger_items"]
+        ] == [11]
+        assert session.undo() is True
+        assert session.word_ledger == before_ledger
+        assert session.redo() is True
+        assert session.state_fingerprint() == edited_fingerprint
+
+
+def test_mixed_legacy_and_compact_english_history_migrates_in_order():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        original_ledger = copy.deepcopy(session.word_ledger)
+        first_rows = session.to_model_data(prefer_display_pages=False)
+        first_rows["2"]["original_subtitle"] = "out of only as."
+        assert session.apply_parent_model_data(first_rows) is True
+        after_first_ledger = copy.deepcopy(session.word_ledger)
+        first_entry = copy.deepcopy(session.history[0])
+        first_entry.pop("before_word_ledger_items", None)
+        first_entry["before_word_ledger"] = original_ledger
+
+        second_rows = session.to_model_data(prefer_display_pages=False)
+        second_rows["1"]["original_subtitle"] = second_rows["1"][
+            "original_subtitle"
+        ].replace("Right.", "Correct.", 1)
+        assert session.apply_parent_model_data(second_rows) is True
+        second_entry = copy.deepcopy(session.history[1])
+        session.history = [first_entry, second_entry]
+
+        assert session.compact_english_surface_history() == 1
+        assert [
+            item["word_id"]
+            for item in session.history[0]["before_word_ledger_items"]
+        ] == [11]
+        assert [
+            item["word_id"]
+            for item in session.history[1]["before_word_ledger_items"]
+        ] == [0]
+        assert session.undo() is True
+        assert session.word_ledger == after_first_ledger
+        assert session.undo() is True
+        assert session.word_ledger == original_ledger
+
+
 def test_free_text_edit_cannot_be_used_as_a_fake_word_boundary_move():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
@@ -3274,7 +3667,14 @@ def test_actual_page_tail_trim_keeps_prior_page_and_undo_restores_all():
         assert [row["display_page_id"] for row in kept_pages] == ["S0001.P01"]
         assert kept_pages[0]["word_end"] == 3
 
-        assert session.undo_for_parent("S0001") is True
+        assert session.can_undo_for_parent("S0001") is False
+        try:
+            session.undo_for_parent("S0001")
+        except ManualFinalSubtitleEditError as exc:
+            assert "音频" in str(exc) or "整体撤销" in str(exc)
+        else:
+            raise AssertionError("tail trim must remain a document/audio-scoped undo")
+        assert session.undo() is True
         assert session.cues == before_cues
         assert session.word_ledger == before_ledger
         assert session.to_model_data() == before_rows
@@ -3462,9 +3862,10 @@ def test_save_persists_manual_override_and_synthesis_uses_it():
         source_media = source_srt.with_suffix(".m4a")
         source_media.write_bytes(b"test-audio-placeholder")
         result_dir = media_result_dir(source_media)
-        result_dir.mkdir(parents=True, exist_ok=True)
+        subtitle_dir = media_result_subtitle_dir(source_media)
+        subtitle_dir.mkdir(parents=True, exist_ok=True)
         named_source_subtitle = (
-            result_dir / f"{source_media.stem}-原文在上双语字幕.srt"
+            subtitle_dir / f"{source_media.stem}-原文在上双语字幕.srt"
         )
         shutil.copyfile(source_srt, named_source_subtitle)
         named_source_before = named_source_subtitle.read_bytes()
@@ -4654,6 +5055,74 @@ def test_numeric_clause_comma_does_not_absorb_the_following_article():
     ) == 1
 
 
+def test_long_caption_risk_queue_is_read_only_and_parent_scoped():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        before = session.state_fingerprint()
+        queue = session.build_display_page_risk_queue()
+
+        assert queue
+        item = queue[0]
+        assert item["parent_subtitle_id"] == "S0001"
+        assert item["word_count"] > 16
+        assert item["reasons"]
+        assert item["candidate_count"] == 0
+        assert session.state_fingerprint() == before
+
+
+def test_long_caption_risk_queue_plans_candidates_only_for_lightweight_risks():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        long_cue = copy.deepcopy(session.cues[0])
+        short_cues = [
+            {
+                **copy.deepcopy(long_cue),
+                "cue_id": f"S{index:04d}",
+                "word_start": index * 2,
+                "word_end": index * 2 + 1,
+                "start_time": index * 1000,
+                "end_time": index * 1000 + 900,
+                "original_subtitle": f"Safe caption {index}.",
+                "translated_subtitle": f"普通字幕{index}。",
+            }
+            for index in range(2, 202)
+        ]
+        session.cues = [long_cue, *short_cues]
+        page_rows = {
+            "1": {
+                "manual_cue_id": "S0001",
+                "display_page_id": "S0001.P01",
+                "translated_subtitle": "甲，乙，丙",
+                "english_font_size": 56,
+                "display_page_review_required": False,
+                "display_page_chinese_confirmed": True,
+                "display_page_chinese_stale": False,
+            }
+        }
+        for index in range(2, 202):
+            page_rows[str(index)] = {
+                "manual_cue_id": f"S{index:04d}",
+                "display_page_id": f"S{index:04d}.P01",
+                "translated_subtitle": f"普通字幕{index}。",
+                "english_font_size": 56,
+                "display_page_review_required": False,
+                "display_page_chinese_confirmed": True,
+                "display_page_chinese_stale": False,
+            }
+        candidate_calls = []
+        def tracked_workspace(parent_id, **kwargs):
+            candidate_calls.append(parent_id)
+            raise AssertionError("risk queue must not eagerly plan candidates")
+
+        session._display_page_model_data = lambda: copy.deepcopy(page_rows)
+        session.build_display_page_candidate_workspace = tracked_workspace
+
+        queue = session.build_display_page_risk_queue()
+
+        assert candidate_calls == []
+        assert [item["parent_subtitle_id"] for item in queue] == ["S0001"]
+
+
 if __name__ == "__main__":
     test_manual_page_export_requires_matching_complete_boundary_evidence()
     test_legacy_package_recovers_omitted_saved_cue_boundary_across_move_and_undo()
@@ -4675,6 +5144,7 @@ if __name__ == "__main__":
     test_complete_page_edits_recover_when_blocked_checkpoint_lost_page_artifact()
     test_split_parent_into_two_three_four_pages_preserves_frozen_parent()
     test_split_parent_accepts_planner_review_boundary_without_changing_parent()
+    test_nearby_boundary_candidates_are_read_only_and_explain_grammar_risk()
     test_split_parent_blocks_unconfirmed_page_proposals_then_saves_idempotently()
     test_repeating_same_page_count_preserves_confirmed_page_chinese()
     test_confirm_one_display_page_chinese_is_scoped_and_persists_after_reload()
@@ -4741,4 +5211,6 @@ if __name__ == "__main__":
     test_numeric_phrase_moves_as_one_unit_in_both_directions()
     test_numeric_sentence_end_does_not_absorb_the_next_sentence()
     test_numeric_clause_comma_does_not_absorb_the_following_article()
+    test_long_caption_risk_queue_is_read_only_and_parent_scoped()
+    test_long_caption_risk_queue_plans_candidates_only_for_lightweight_risks()
     print("Manual final subtitle editor tests passed.")

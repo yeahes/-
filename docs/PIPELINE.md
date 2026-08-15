@@ -43,6 +43,13 @@ Important rules:
   collapsed into a one-token named entity by fuzzy similarity alone. Exact
   orthographic joins remain eligible, and a genuine occurrence of the same
   named entity elsewhere remains unchanged.
+  A one-token Chinese/local/transliterated term has one narrower exception: a
+  two- or three-token phonetic ASR surface may be corrected only when the
+  article evidences the canonical term and an explanatory alias, and local
+  definition or article-description context agrees. General technical words
+  and a window already containing the canonical term are excluded. A person
+  title may come from the immediately preceding word only when an
+  article-supported title alias and descriptive context agree.
   A fuzzy correction may replace only its entity-owned source span. When the
   complete canonical entity already exists inside or immediately beside a
   candidate window, the candidate cannot consume a neighbouring discourse
@@ -126,6 +133,12 @@ Rules:
   upstream times.
 - A padding overlap may be reconciled only at a shared boundary that stays
   between the adjacent word envelopes.
+- The final cue timeline also owns short display-range repair. It first
+  preserves a 150ms hard minimum for every internal cue, then uses only
+  non-word time between adjacent word envelopes to approach a 700ms soft
+  target. Word timestamps never change; if the hard minimum cannot be met
+  without overlap or cutting speech, final export fails with an explicit
+  timeline error.
 - Do not change English text, Chinese text, subtitle ID, word range, or order.
 - Missing, duplicate, unknown, or synthetic final timeline IDs are ERRORs and
   block export.
@@ -136,6 +149,14 @@ ID such as `S0078.P01`. Chinese for those spans is returned by exact child ID,
 validated, and aggregated back into the unchanged parent cue. Missing, stale,
 tampered, semantically invalid, or unschedulable page data blocks rendering;
 there is no proportional-character fallback.
+If deterministic page-Chinese validation fails, only the complete page set of
+the affected parent IDs is retried. Already validated parents remain frozen;
+the local result must pass its sub-contract and the merged response must pass
+the original full contract before any cue is updated.
+Missing, duplicate, unknown, or cardinality-mismatched page IDs instead retry
+the complete contract: the validator intentionally exposes no partial parent
+authority for those structural failures. A retry request failure preserves the
+initial accepted parents and records its exact parent scope for manual review.
 
 ## Stage 5: Validation and Artifacts
 
@@ -169,18 +190,30 @@ Run-state rules:
   fingerprint match; otherwise the normal stage executes.
 - Existing LLM batch caches may be reused under their current cache keys, but
   completion order never controls translation or subtitle writeback order.
+- A malformed optional allocation-quality retry is rejected locally. The
+  original complete fixed-ID allocation remains authoritative, while the
+  failed candidate and unresolved quality issue remain review evidence. This
+  does not relax initial allocation or final fixed-ID validation.
 
 Validation checks:
 
 - English coverage gaps.
-- Whole-file English boundary audit: `hard` atomic splits with no contrary
-  timing/speaker evidence must be repaired before IDs; residual `hard` items
-  block export. Ambiguous `review` items are retained for human verification;
-  independently supported `allow` boundaries remain untouched.
+- Whole-file English boundary audit v2 projects parent cue edges, selected
+  display-page edges, and unresolved pre-ID evidence from the same frozen word
+  ledger. Parent `hard` atomic splits with no contrary timing/speaker evidence
+  must be repaired before IDs and block export. Final display-page fallback
+  risks remain `review` evidence for the editor; independently supported
+  `allow` boundaries remain untouched.
 - Missing Chinese.
 - Overlong English.
 - Translation ID mismatch, missing ID, duplicate ID, unknown ID, or group cardinality mismatch.
 - Suspicious cuts.
+- Exact numeric currency-unit conflicts supported by article evidence are
+  emitted as ID-bound semantic review suggestions only for a unique number in
+  explicit money context with one complete unit occurrence. Repeated values,
+  count nouns, and ambiguous compound units remain manual review. Suggestions
+  never auto-mutate authoritative Chinese; parent-ID suggestions are applied
+  in parent view, not to an arbitrary child page.
 - Timing gaps and very short displays through audit scripts.
 
 ## Stage 6: Stable Final Subtitle Outputs
@@ -197,6 +230,11 @@ Rule:
 
 - Video synthesis should use the manifest path first.
 - Do not rely on fuzzy localized file-name search when a manifest exists.
+- A render-blocked result is exposed as an editable checkpoint only when its
+  complete frozen ID order, subtitle spans, word ledger, Chinese parents, and
+  final cue timeline pass the same structural contracts used by the editor.
+  The newly written checkpoint is opened once by the real loader before its
+  path is published. Corrupt or incomplete authority remains unavailable.
 
 ### Manual final checkpoint
 
@@ -209,6 +247,13 @@ Rule:
   semantic loss, unresolved fixed-ID allocation, and high-risk visual page
   boundaries. Routine reading-speed warnings and low-confidence parser guesses
   are not editor marks.
+- High-signal Chinese review items may start an optional background model
+  request. The response is suggestion-only and bound to fixed IDs, exact
+  English source echo, current-Chinese hash, and protected fact/term anchors.
+  The active table editor is committed before the hash is revalidated, and the
+  complete selected suggestion set applies atomically or not at all. Loading a
+  different package or changing the review queue invalidates an in-flight
+  result; a stale worker cannot overwrite current rows or queue items.
 - The table, pending page edits, and published package have separate ownership.
   Table text is committed into one in-memory session before any structural
   action. Repeated page splits and page-Chinese edits remain in that session;
@@ -302,13 +347,23 @@ Rule:
   `<output-anchor-parent>/<source-media-stem>-处理结果/`. In the interactive
   Home workflow the output anchor is the source media itself, so this is a
   sibling of the original audio. Isolated E2E callers may keep their separate
-  report anchor while retaining the original media name. Stable publication writes the
-  bilingual, English-only, Chinese-only, actual-page, page-map, QA queue,
-  summary, and compatibility SRT files there. Manual-final save writes
-  `人工终稿字幕包/` inside that same directory, while formal and manual-draft
-  videos use distinct names in the directory root. Internal work directories,
-  immutable stable-run artifacts, and source media stay in place. Existing
-  loose legacy files are not moved or deleted.
+  report anchor while retaining the original media name. New publications use
+  four explicit child directories:
+
+  ```text
+  <source-media-stem>-处理结果/
+    字幕文件/            # bilingual, language-only, actual-page, map, compatibility SRT
+    质检报告/            # summary, QA queue, semantic-review queue
+    视频成片/            # formal and manual-draft rendered videos
+    人工终稿字幕包/      # root manifest and immutable generations
+  ```
+
+  Internal work directories, immutable stable-run artifacts, and source media
+  stay in place. Existing loose legacy files are not moved or deleted. Legacy
+  flat result directories remain readable. A subtitle under `字幕文件/` may
+  discover the sibling manual-final package only when its exact path or SHA-256
+  is declared by that package manifest; an unrelated SRT cannot inherit the
+  package word ledger or synthesis authority.
 - The manifest binds the discoverable output paths and SHA-256 digests; the
   page map binds every page ID to its parent ID, continuous word span, time
   range, English, and Chinese. Legacy source-folder subtitles remain readable
@@ -337,6 +392,11 @@ draft keeps formal synthesis blocked.
   direction resets the count to one word and previews the exact source words.
   Only `confirm move` changes the ledger-backed boundary. Cancel and undo do not
   create a second timing implementation.
+- The actual-page boundary inspector shows nearby word-ledger cuts as
+  `recommended`, `review`, or `blocked`. Soft grammar-risk cuts remain an
+  explicit human choice; hard syntax, insufficient duration, and too-short
+  pages cannot be applied as automatic recommendations. Candidate preview
+  never changes page state.
 - A display-page row may request two, three, or four pages. The normal syntax,
   pause, word-time, fixed-font, and 900ms minimum-page planner must find the
   complete partition. Parent subtitle ID, English, word range, and parent timing
@@ -364,6 +424,10 @@ draft keeps formal synthesis blocked.
   `tail-trim.json`, hashes, and the shortened ledger/timeline into the manual
   package. It never overwrites the source audio, and an identical saved decision
   reuses the derived file.
+- Row-scoped undo restores only one parent and can skip unrelated later parent
+  edits without overwriting them. Operations that change multiple parents, the
+  authoritative word ledger, or tail-trimmed audio remain whole-document undo;
+  partial row restoration is rejected rather than desynchronizing media.
 
 ## Stage 7: Video Synthesis
 

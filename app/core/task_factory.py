@@ -4,7 +4,7 @@ from typing import Optional
 
 from app.common.config import cfg
 from app.config import MODEL_PATH, SUBTITLE_STYLE_PATH
-from app.core.output_paths import media_result_dir
+from app.core.output_paths import media_result_video_dir
 from app.core.entities import (
     LANGUAGES,
     FullProcessTask,
@@ -276,7 +276,7 @@ class TaskFactory:
         manual_draft_mode: bool = False,
     ) -> SynthesisTask:
         """创建视频合成任务"""
-        output_dir = media_result_dir(video_path)
+        output_dir = media_result_video_dir(video_path)
         if cfg.podcast_learning_template.value:
             template_name = cfg.podcast_template_style.value or "暗色播客"
             english_only = bool(cfg.podcast_template_english_only.value)

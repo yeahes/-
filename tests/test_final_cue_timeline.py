@@ -84,6 +84,81 @@ def test_padding_overlap_is_reconciled_without_cutting_either_word_envelope():
     assert timeline["validation"]["status"] == "PASS"
 
 
+def test_short_response_uses_available_silence_for_target_display_duration():
+    words = _words(
+        (400000, 405430),
+        (405580, 405700),
+        (406240, 408000),
+    )
+    timeline = derive_final_cue_timeline(
+        [
+            {"subtitle_id": "S0001", "word_start": 0, "word_end": 0},
+            {"subtitle_id": "S0002", "word_start": 1, "word_end": 1},
+            {"subtitle_id": "S0003", "word_start": 2, "word_end": 2},
+        ],
+        words,
+        expected_subtitle_ids=["S0001", "S0002", "S0003"],
+        lead_in_ms=40,
+        tail_padding_ms=260,
+    )
+
+    short = timeline["records"][1]
+    assert short["end_ms"] - short["start_ms"] >= 700
+    assert short["start_ms"] <= 405580
+    assert short["end_ms"] >= 405700
+    assert timeline["validation"]["status"] == "PASS"
+    assert [(word["start_ms"], word["end_ms"]) for word in words] == [
+        (400000, 405430),
+        (405580, 405700),
+        (406240, 408000),
+    ]
+
+
+def test_short_response_keeps_best_safe_duration_when_target_is_impossible():
+    words = _words(
+        (800000, 802380),
+        (802380, 802500),
+        (802380, 802500),
+        (802740, 805000),
+    )
+    timeline = derive_final_cue_timeline(
+        [
+            {"subtitle_id": "S0001", "word_start": 0, "word_end": 0},
+            {"subtitle_id": "S0002", "word_start": 1, "word_end": 2},
+            {"subtitle_id": "S0003", "word_start": 3, "word_end": 3},
+        ],
+        words,
+        expected_subtitle_ids=["S0001", "S0002", "S0003"],
+        lead_in_ms=40,
+        tail_padding_ms=260,
+    )
+
+    short = timeline["records"][1]
+    assert 150 <= short["end_ms"] - short["start_ms"] < 700
+    assert short["start_ms"] <= 802380
+    assert short["end_ms"] <= 802740
+    assert timeline["validation"]["status"] == "PASS"
+
+
+def test_short_response_without_hard_minimum_room_blocks_final_timeline():
+    words = _words((0, 1000), (1000, 1100), (1100, 2000))
+    timeline = derive_final_cue_timeline(
+        [
+            {"subtitle_id": "S0001", "word_start": 0, "word_end": 0},
+            {"subtitle_id": "S0002", "word_start": 1, "word_end": 1},
+            {"subtitle_id": "S0003", "word_start": 2, "word_end": 2},
+        ],
+        words,
+        expected_subtitle_ids=["S0001", "S0002", "S0003"],
+        lead_in_ms=40,
+        tail_padding_ms=260,
+    )
+
+    codes = {item["code"] for item in timeline["validation"]["errors"]}
+    assert "final_timeline_display_duration_invalid" in codes
+    assert timeline["validation"]["status"] == "ERROR"
+
+
 def test_overlapping_word_envelopes_fail_instead_of_truncating_a_cue():
     words = _words((1000, 1500), (1400, 1800))
     timeline = derive_final_cue_timeline(
@@ -261,6 +336,9 @@ if __name__ == "__main__":
     test_final_timeline_cue_covers_its_last_frozen_word()
     test_final_timeline_cue_covers_its_first_frozen_word()
     test_padding_overlap_is_reconciled_without_cutting_either_word_envelope()
+    test_short_response_uses_available_silence_for_target_display_duration()
+    test_short_response_keeps_best_safe_duration_when_target_is_impossible()
+    test_short_response_without_hard_minimum_room_blocks_final_timeline()
     test_overlapping_word_envelopes_fail_instead_of_truncating_a_cue()
     test_adjacent_word_overlap_is_reconciled_in_the_ledger_before_cue_building()
     test_missing_or_synthetic_subtitle_id_blocks_final_timeline()

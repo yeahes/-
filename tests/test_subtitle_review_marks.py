@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import tempfile
@@ -220,6 +221,76 @@ def test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only():
         assert "S0008" not in marks
 
 
+def test_semantic_review_queue_is_loaded_as_id_bound_read_only_marks():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        _write_json(
+            artifact_dir / "semantic-review-queue.json",
+            {
+                "items": [
+                    {
+                        "code": "translation_fluency_review",
+                        "title": "中文翻译腔复核",
+                        "reason": "语义表达不自然",
+                        "subtitle_ids": ["S0002"],
+                    },
+                    {"code": "bad", "subtitle_ids": ["not-an-id"]},
+                ]
+            },
+        )
+        marks = load_subtitle_review_marks(artifact_dir)
+        assert _marks_for(marks, "S0002") == {
+            (
+                "REVIEW",
+                "chinese_allocation",
+                "chinese",
+                "translation_fluency_review",
+            )
+        }
+        assert "not-an-id" not in marks
+
+
+def test_article_asr_review_marks_require_matching_frozen_ledger_hash():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        _write_json(
+            artifact_dir / "word-ledger.json",
+            {"hash": "current-ledger", "words": []},
+        )
+        _write_json(
+            artifact_dir / "article-asr-correction-review.json",
+            {
+                "word_ledger_hash": "current-ledger",
+                "items": [
+                    {
+                        "candidate_id": "candidate-1",
+                        "subtitle_ids": ["S0012"],
+                        "original_text": "Felugia",
+                        "suggested_text": "Fulujia",
+                        "action": "review_only",
+                    }
+                ],
+            },
+        )
+
+        marks = load_subtitle_review_marks(artifact_dir)
+
+        assert (
+            "REVIEW",
+            "asr_correction",
+            "english",
+            "article_asr_correction_review",
+        ) in _marks_for(marks, "S0012")
+        assert "Felugia" in marks["S0012"][0].reason
+        assert "Fulujia" in marks["S0012"][0].reason
+
+        _write_json(
+            artifact_dir / "word-ledger.json",
+            {"hash": "different-ledger", "words": []},
+        )
+        assert "S0012" not in load_subtitle_review_marks(artifact_dir)
+
+
 def test_display_page_blueprint_failure_marks_exact_frozen_subtitle_id():
     with tempfile.TemporaryDirectory() as temp_dir:
         artifact_dir = Path(temp_dir)
@@ -301,7 +372,8 @@ def test_table_marks_only_the_relevant_english_or_chinese_column():
     expected_english_color = "#24364a" if isDarkTheme() else "#eaf4ff"
     assert model.data(english, Qt.BackgroundRole).name() == expected_english_color
     assert model.data(chinese, Qt.BackgroundRole) is None
-    assert "subject_finite_verb_split" in model.data(english, Qt.ToolTipRole)
+    assert "主语和谓语被切开" in model.data(english, Qt.ToolTipRole)
+    assert "subject_finite_verb_split" not in model.data(english, Qt.ToolTipRole)
 
 
 def test_review_marks_include_final_timeline_fallback_for_matching_subtitle_id():
@@ -372,6 +444,98 @@ def test_table_model_reset_reloads_imported_bilingual_rows():
     assert model.data(model.index(0, 3), Qt.DisplayRole) == "中文译文。"
 
 
+def test_table_model_incremental_update_changes_only_the_affected_rows():
+    def row(parent_id: str, page_id: str, english: str):
+        return {
+            "start_time": 0,
+            "end_time": 1000,
+            "original_subtitle": english,
+            "translated_subtitle": "中文",
+            "manual_cue_id": parent_id,
+            "display_page_id": page_id,
+            "display_page_view": True,
+            "word_start": 0,
+            "word_end": 1,
+        }
+
+    model = SubtitleTableModel(
+        {
+            "1": row("S0001", "S0001.P01", "One."),
+            "2": row("S0002", "S0002.P01", "Two."),
+            "3": row("S0003", "S0003.P01", "Three."),
+        }
+    )
+    resets = []
+    changed = []
+    inserted = []
+    removed = []
+    model.modelReset.connect(lambda: resets.append(True))
+    model.dataChanged.connect(
+        lambda top, bottom, _roles: changed.append((top.row(), bottom.row()))
+    )
+    model.rowsInserted.connect(
+        lambda _parent, first, last: inserted.append((first, last))
+    )
+    model.rowsRemoved.connect(
+        lambda _parent, first, last: removed.append((first, last))
+    )
+
+    same_count = copy.deepcopy(model._data)
+    same_count["2"]["translated_subtitle"] = "第二条已修改"
+    model.update_incremental(same_count)
+
+    assert resets == []
+    assert changed == [(1, 1)]
+    assert model.data(model.index(1, 3), Qt.DisplayRole) == "第二条已修改"
+
+    split = {
+        "1": copy.deepcopy(same_count["1"]),
+        "2": row("S0002", "S0002.P01", "Two first."),
+        "3": row("S0002", "S0002.P02", "Two second."),
+        "4": copy.deepcopy(same_count["3"]),
+    }
+    model.update_incremental(split)
+
+    assert resets == []
+    assert removed == [(1, 1)]
+    assert inserted == [(1, 2)]
+    assert model.rowCount() == 4
+    assert model.data(model.index(3, 2), Qt.DisplayRole) == "Three."
+
+
+def test_reapplying_identical_review_marks_does_not_repaint_the_table():
+    model = SubtitleTableModel(
+        {
+            "1": {
+                "start_time": 0,
+                "end_time": 1000,
+                "original_subtitle": "English.",
+                "translated_subtitle": "中文。",
+                "manual_cue_id": "S0001",
+            }
+        }
+    )
+    marks = {
+        "S0001": [
+            SubtitleReviewMark(
+                subtitle_id="S0001",
+                severity="REVIEW",
+                category="english_cut",
+                target="english",
+                code="syntax_boundary_audit",
+                reason="subject_finite_verb_split",
+            )
+        ]
+    }
+    changed = []
+    model.dataChanged.connect(lambda *_args: changed.append(True))
+
+    model.set_review_marks(marks)
+    assert changed == [True]
+    model.set_review_marks(marks)
+    assert changed == [True]
+
+
 def test_review_mark_payload_round_trip_preserves_global_subtitle_ids():
     original = {
         "S0118": [
@@ -414,11 +578,14 @@ def test_manual_english_boundary_edit_marks_only_its_chinese_cell():
 
 if __name__ == "__main__":
     test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only()
+    test_semantic_review_queue_is_loaded_as_id_bound_read_only_marks()
     test_display_page_blueprint_failure_marks_exact_frozen_subtitle_id()
     test_corrupt_structure_error_artifact_is_not_silently_treated_as_no_marks()
     test_table_marks_only_the_relevant_english_or_chinese_column()
     test_review_marks_include_final_timeline_fallback_for_matching_subtitle_id()
     test_table_model_reset_reloads_imported_bilingual_rows()
+    test_table_model_incremental_update_changes_only_the_affected_rows()
+    test_reapplying_identical_review_marks_does_not_repaint_the_table()
     test_review_mark_payload_round_trip_preserves_global_subtitle_ids()
     test_manual_english_boundary_edit_marks_only_its_chinese_cell()
     print("subtitle review mark tests passed")

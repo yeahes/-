@@ -207,6 +207,23 @@ def _page_starts(plan):
     return {page["word_start"] for page in plan["pages"][1:]}
 
 
+def test_candidate_workspace_is_read_only_and_bounded():
+    cue = _cue(
+        "S0007",
+        "The domestic alternative has improved at a staggering rate, especially in the last decade.",
+    )
+    before = deepcopy(cue.__dict__)
+    workspace = podcast_learning_video.build_article_display_page_candidate_workspace(
+        cue,
+        min_page_count=2,
+        max_page_count=4,
+    )
+    assert workspace["status"] == "candidate_workspace"
+    assert 0 < len(workspace["candidates"]) <= 3
+    assert all(2 <= candidate["page_count"] <= 4 for candidate in workspace["candidates"])
+    assert cue.__dict__ == before
+
+
 def _production_word_timing(words, word_ids, start_ms, end_ms):
     assert len(words) == len(word_ids) == len(start_ms) == len(end_ms)
     return tuple(

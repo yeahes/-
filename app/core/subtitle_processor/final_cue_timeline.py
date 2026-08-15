@@ -17,6 +17,8 @@ from app.core.subtitle_processor.word_timing_trust import (
 
 
 SUBTITLE_ID_RE = re.compile(r"S\d{4}")
+TARGET_DISPLAY_DURATION_MS = 700
+HARD_MIN_DISPLAY_DURATION_MS = 150
 
 
 def reconcile_frozen_word_ledger(words: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -173,6 +175,12 @@ def derive_final_cue_timeline(
             records.append(record)
 
     boundary_repairs = _resolve_display_padding_overlaps(records, errors)
+    boundary_repairs.extend(
+        _extend_short_display_ranges(
+            records,
+            target_duration_ms=TARGET_DISPLAY_DURATION_MS,
+        )
+    )
     validation = validate_final_cue_timeline(
         records,
         expected_subtitle_ids=expected_ids,
@@ -345,6 +353,16 @@ def validate_final_cue_timeline(
                     "code": "final_timeline_time_invalid",
                     "subtitle_id": subtitle_id,
                     "cue_range": [start, end],
+                }
+            )
+        elif end - start < HARD_MIN_DISPLAY_DURATION_MS:
+            errors.append(
+                {
+                    "code": "final_timeline_display_duration_invalid",
+                    "subtitle_id": subtitle_id,
+                    "cue_range": [start, end],
+                    "duration_ms": end - start,
+                    "minimum_duration_ms": HARD_MIN_DISPLAY_DURATION_MS,
                 }
             )
         if previous_end > start:
@@ -529,6 +547,77 @@ def _resolve_display_padding_overlaps(
                 "new_boundary_ms": boundary,
             }
         )
+    return repairs
+
+
+def _extend_short_display_ranges(
+    records: List[Dict[str, Any]],
+    *,
+    target_duration_ms: int,
+) -> List[Dict[str, Any]]:
+    """Use only non-word time to improve short cue display duration.
+
+    A neighboring cue keeps its own word envelope and up to the same soft
+    display target.  The function may move a shared display boundary, but it
+    never changes word times or creates overlapping cue ranges.
+    """
+    repairs: List[Dict[str, Any]] = []
+    soft_target = max(HARD_MIN_DISPLAY_DURATION_MS, int(target_duration_ms))
+    for target in dict.fromkeys((HARD_MIN_DISPLAY_DURATION_MS, soft_target)):
+        for index, record in enumerate(records):
+            old_start = int(record["start_ms"])
+            old_end = int(record["end_ms"])
+            duration = old_end - old_start
+            if duration >= target:
+                continue
+
+            needed = target - duration
+            right_limit = old_end + needed
+            if index + 1 < len(records):
+                right = records[index + 1]
+                right_duration = int(right["end_ms"]) - int(right["start_ms"])
+                right_preserve = max(
+                    HARD_MIN_DISPLAY_DURATION_MS,
+                    min(target, max(0, right_duration)),
+                )
+                right_limit = min(
+                    int(right["word_envelope_start_ms"]),
+                    int(right["end_ms"]) - right_preserve,
+                )
+            new_end = min(old_end + needed, max(old_end, right_limit))
+            if index + 1 < len(records) and new_end > int(records[index + 1]["start_ms"]):
+                records[index + 1]["start_ms"] = new_end
+            record["end_ms"] = new_end
+            needed -= new_end - old_end
+
+            if needed > 0:
+                left_limit = max(0, old_start - needed)
+                if index > 0:
+                    left = records[index - 1]
+                    left_duration = int(left["end_ms"]) - int(left["start_ms"])
+                    left_preserve = max(
+                        HARD_MIN_DISPLAY_DURATION_MS,
+                        min(target, max(0, left_duration)),
+                    )
+                    left_limit = max(
+                        int(left["word_envelope_end_ms"]),
+                        int(left["start_ms"]) + left_preserve,
+                    )
+                new_start = max(old_start - needed, min(old_start, left_limit))
+                if index > 0 and new_start < int(records[index - 1]["end_ms"]):
+                    records[index - 1]["end_ms"] = new_start
+                record["start_ms"] = new_start
+
+            if int(record["start_ms"]) != old_start or int(record["end_ms"]) != old_end:
+                repairs.append(
+                    {
+                        "code": "final_timeline_short_display_extended",
+                        "subtitle_id": str(record.get("subtitle_id") or ""),
+                        "old_range_ms": [old_start, old_end],
+                        "new_range_ms": [int(record["start_ms"]), int(record["end_ms"])],
+                        "target_duration_ms": target,
+                    }
+                )
     return repairs
 
 

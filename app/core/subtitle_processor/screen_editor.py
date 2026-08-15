@@ -68,6 +68,10 @@ from app.core.subtitle_processor.text_metrics import (
     word_count,
     word_tokens,
 )
+from app.core.subtitle_processor.user_facing_issue_text import (
+    user_facing_issue_reason,
+)
+from app.core.article_context import build_translation_context_prompt
 from app.core.utils import json_repair
 from app.core.utils.logger import setup_logger
 
@@ -521,6 +525,7 @@ class ScreenSubtitleEditor:
         enable_quality_check: bool = False,
         coverage_report_path: Optional[str] = None,
         article_context_prompt: str = "",
+        article_context_data: Optional[Dict[str, Any]] = None,
         update_callback: Optional[Callable[[Dict], None]] = None,
         progress_callback: Optional[Callable[[Dict], None]] = None,
         enable_safe_auto_repair: bool = False,
@@ -541,6 +546,7 @@ class ScreenSubtitleEditor:
         self.enable_quality_check = enable_quality_check
         self.coverage_report_path = coverage_report_path
         self.article_context_prompt = (article_context_prompt or "").strip()
+        self.article_context_data = dict(article_context_data or {})
         self.update_callback = update_callback
         self.progress_callback = progress_callback
         self.enable_safe_auto_repair = bool(enable_safe_auto_repair)
@@ -611,10 +617,18 @@ class ScreenSubtitleEditor:
         self._display_page_external_request_count: int = 0
         self.last_validation_summary: Optional[Dict] = None
 
-    def _compose_prompt(self, base_prompt: str) -> str:
-        if not self.article_context_prompt:
+    def _compose_prompt(self, base_prompt: str, *, source_text: str = "") -> str:
+        article_context_data = getattr(self, "article_context_data", None)
+        if article_context_data:
+            context_prompt = build_translation_context_prompt(
+                article_context_data,
+                source_text=source_text,
+            )
+        else:
+            context_prompt = self.article_context_prompt
+        if not context_prompt:
             return base_prompt
-        return f"{base_prompt}\n\n{self.article_context_prompt}"
+        return f"{base_prompt}\n\n{context_prompt}"
 
     def _emit_progress_event(self, phase: str, **details: Any) -> None:
         """Report main-thread pipeline progress without mutating subtitle data."""
@@ -862,6 +876,7 @@ class ScreenSubtitleEditor:
         asr_data: ASRData,
         *,
         preserve_aligned_timing: Optional[bool] = None,
+        allow_chinese_compression: bool = True,
     ) -> ASRData:
         """Final local pass after WhisperX/frozen time mapping.
 
@@ -888,11 +903,12 @@ class ScreenSubtitleEditor:
         # Display reconciliation is the last owner that may adjust cue times.
         # Select Chinese compression only after those durations are final, or a
         # cue can newly exceed the CPS gate after its speed was evaluated.
-        segments = self._compress_fast_chinese_segments(
-            segments,
-            semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
-            subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
-        )
+        if allow_chinese_compression:
+            segments = self._compress_fast_chinese_segments(
+                segments,
+                semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
+                subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
+            )
         asr_data.segments = list(segments)
         self.refresh_final_cue_timeline_artifact(asr_data.segments)
         if source_segments:
@@ -1112,15 +1128,92 @@ class ScreenSubtitleEditor:
                 )
                 quality_errors = self._display_page_translation_quality_errors(contract, artifact)
                 if artifact.get("status") != "PASS" or quality_errors:
-                    response, retry_cache_hit = self._request_display_page_translations(
-                        contract,
-                        retry_errors=list(artifact.get("errors") or []) + quality_errors,
+                    initial_errors = [
+                        *list(artifact.get("errors") or []),
+                        *quality_errors,
+                    ]
+                    # A missing/duplicate/unknown page is a contract-wide
+                    # cardinality failure.  A scoped retry cannot reconstruct
+                    # the accepted pages because the validator intentionally
+                    # returns no parents for that response.  Retry the full
+                    # contract in that case; only semantic/page-quality
+                    # failures use failed-parent scope.
+                    retry_contract = (
+                        contract
+                        if self._display_page_errors_require_full_retry(initial_errors)
+                        else self._display_page_retry_contract(contract, initial_errors)
                     )
-                    cache_hit = cache_hit and retry_cache_hit
-                    artifact = validate_page_translation_response(
-                        contract, response, require_source_echo=True
-                    )
-                    quality_errors = self._display_page_translation_quality_errors(contract, artifact)
+                    try:
+                        response, retry_cache_hit = self._request_display_page_translations(
+                            retry_contract,
+                            retry_errors=initial_errors,
+                        )
+                        cache_hit = cache_hit and retry_cache_hit
+                        retry_artifact = validate_page_translation_response(
+                            retry_contract, response, require_source_echo=True
+                        )
+                        retry_quality_errors = self._display_page_translation_quality_errors(
+                            retry_contract, retry_artifact
+                        )
+                    except RuntimeError as retry_exc:
+                        retry_parent_ids = [
+                            str(parent.get("parent_subtitle_id") or "")
+                            for parent in retry_contract.get("parents") or []
+                        ]
+                        artifact = {
+                            **dict(artifact),
+                            "status": "ERROR",
+                            "contract_hash": contract.get("contract_hash"),
+                            "render_plans": [
+                                dict(plan)
+                                for plan in contract.get("render_plans") or []
+                            ],
+                            "errors": [
+                                *initial_errors,
+                                {
+                                    "code": "display_page_translation_retry_failed",
+                                    "message": str(retry_exc),
+                                    "parent_subtitle_ids": retry_parent_ids,
+                                },
+                            ],
+                        }
+                        quality_errors = []
+                    else:
+                        if (
+                            retry_artifact.get("status") == "PASS"
+                            and not retry_quality_errors
+                        ):
+                            artifact = self._merge_display_page_translation_artifacts(
+                                contract,
+                                artifact,
+                                retry_artifact,
+                            )
+                            quality_errors = self._display_page_translation_quality_errors(
+                                contract, artifact
+                            )
+                        else:
+                            retry_parent_ids = [
+                                str(parent.get("parent_subtitle_id") or "")
+                                for parent in retry_contract.get("parents") or []
+                            ]
+                            artifact = {
+                                **dict(artifact),
+                                "status": "ERROR",
+                                "contract_hash": contract.get("contract_hash"),
+                                "render_plans": [
+                                    dict(plan)
+                                    for plan in contract.get("render_plans") or []
+                                ],
+                                "errors": [
+                                    *initial_errors,
+                                    *list(retry_artifact.get("errors") or []),
+                                    {
+                                        "code": "display_page_translation_retry_invalid",
+                                        "parent_subtitle_ids": retry_parent_ids,
+                                    },
+                                ],
+                            }
+                            quality_errors = retry_quality_errors
             except RuntimeError as exc:
                 failure_items = self._display_page_failure_items(
                     [],
@@ -1327,6 +1420,97 @@ class ScreenSubtitleEditor:
         )
         return asr_data
 
+    @staticmethod
+    def _display_page_errors_require_full_retry(
+        errors: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        structural_codes = {
+            "page_translation_id_duplicate",
+            "page_translation_id_missing",
+            "page_translation_id_unknown",
+            "page_translation_cardinality_mismatch",
+        }
+        return any(
+            str(error.get("code") or "") in structural_codes
+            for error in errors
+            if isinstance(error, Mapping)
+        )
+
+    @staticmethod
+    def _display_page_retry_contract(
+        contract: Mapping[str, Any],
+        errors: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        parent_ids = {
+            str(error.get("parent_subtitle_id") or "").strip()
+            for error in errors
+            if str(error.get("parent_subtitle_id") or "").strip()
+        }
+        for error in errors:
+            page_ids = [str(error.get("display_page_id") or "").strip()]
+            page_ids.extend(str(value or "").strip() for value in error.get("ids") or [])
+            parent_ids.update(
+                page_id.split(".P", 1)[0]
+                for page_id in page_ids
+                if ".P" in page_id
+            )
+        known_parent_ids = {
+            str(parent.get("parent_subtitle_id") or "")
+            for parent in contract.get("parents") or []
+        }
+        parent_ids &= known_parent_ids
+        if not parent_ids:
+            parent_ids = known_parent_ids
+
+        parents = []
+        for parent in contract.get("parents") or []:
+            if str(parent.get("parent_subtitle_id") or "") not in parent_ids:
+                continue
+            restored = dict(parent)
+            restored["chinese"] = str(parent.get("source_chinese") or "")
+            parents.append(restored)
+        render_plans = [
+            dict(plan)
+            for plan in contract.get("render_plans") or []
+            if str(plan.get("parent_subtitle_id") or "") in parent_ids
+        ]
+        return build_display_page_contract(
+            parents,
+            layout_profile=contract.get("layout_profile") or {},
+            planner_version=str(contract.get("planner_version") or ""),
+            render_plans=render_plans,
+        )
+
+    @staticmethod
+    def _merge_display_page_translation_artifacts(
+        contract: Mapping[str, Any],
+        baseline_artifact: Mapping[str, Any],
+        retry_artifact: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        retry_parent_ids = {
+            str(parent.get("parent_subtitle_id") or "")
+            for parent in retry_artifact.get("parents") or []
+        }
+        rows: List[Dict[str, str]] = []
+        for artifact in (baseline_artifact, retry_artifact):
+            for parent in artifact.get("parents") or []:
+                parent_id = str(parent.get("parent_subtitle_id") or "")
+                if artifact is baseline_artifact and parent_id in retry_parent_ids:
+                    continue
+                for page in parent.get("pages") or []:
+                    rows.append(
+                        {
+                            "display_page_id": str(page.get("display_page_id") or ""),
+                            "source_english": str(page.get("english") or ""),
+                            "zh": str(page.get("zh") or ""),
+                        }
+                    )
+        return validate_page_translation_response(
+            contract,
+            {"pages": rows},
+            require_source_echo=True,
+        )
+
     def _request_display_page_translations(
         self,
         contract: Mapping[str, Any],
@@ -1334,7 +1518,14 @@ class ScreenSubtitleEditor:
         retry_errors: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> tuple[object, bool]:
         retry = bool(retry_errors)
-        prompt = self._compose_prompt(DISPLAY_PAGE_TRANSLATION_PROMPT)
+        prompt = self._compose_prompt(
+            DISPLAY_PAGE_TRANSLATION_PROMPT,
+            source_text=" ".join(
+                str(page.get("english") or page.get("full_english") or "")
+                for parent in contract.get("parents") or []
+                for page in parent.get("pages") or []
+            ),
+        )
         prompt_version = DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION
         task = DISPLAY_PAGE_TRANSLATION_CACHE_TASK
         if retry:
@@ -1596,6 +1787,9 @@ class ScreenSubtitleEditor:
             listed_subtitle_ids = error.get("subtitle_ids")
             if isinstance(listed_subtitle_ids, list):
                 direct_subtitle_ids.extend(str(value) for value in listed_subtitle_ids)
+            scoped_parent_ids = error.get("parent_subtitle_ids")
+            if isinstance(scoped_parent_ids, list):
+                direct_subtitle_ids.extend(str(value) for value in scoped_parent_ids)
             listed_ids = error.get("ids")
             if isinstance(listed_ids, list):
                 for value in listed_ids:
@@ -5975,6 +6169,11 @@ class ScreenSubtitleEditor:
             "semantic_full_translation_source_echo_version": (
                 SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION
             ),
+            "article_translation_context_prompt_version": (
+                "article-translation-context-v2-hit-only"
+                if getattr(self, "article_context_data", None)
+                else "legacy-explicit-prompt"
+            ),
             "allocation_max_concurrency": self.allocation_max_concurrency,
             "allocation_batch_size": self.allocation_batch_size,
             "stable_chinese_cache_contract": dict(
@@ -9628,7 +9827,17 @@ class ScreenSubtitleEditor:
         )
         if not errors:
             return ""
-        messages = [str(error.get("message") or error.get("code") or "未知错误") for error in errors]
+        messages = [
+            user_facing_issue_reason(
+                str(error.get("message") or error.get("code") or ""),
+                code=str(error.get("code") or ""),
+                positions=[
+                    str(error.get("subtitle_id") or ""),
+                    *[str(value) for value in error.get("subtitle_ids") or []],
+                ],
+            )
+            for error in errors
+        ]
         return "；".join(messages)
 
     def _validation_summary(
@@ -9952,27 +10161,27 @@ class ScreenSubtitleEditor:
     @staticmethod
     def _validation_review_reason(code: str, severity: str) -> str:
         reasons = {
-            "missing_translation": "Chinese text is missing for one or more frozen subtitle IDs.",
-            "overlong_english": "English text exceeds the hard subtitle word limit.",
-            "structural_english_overflow": "A complete English sentence has no safe internal cut within the normal word limit.",
-            "invalid_timing": "Subtitle timestamps are invalid or overlapping.",
-            "subtitle_duration_invalid": "Subtitle duration is below the hard display limit.",
-            "translation_id_missing": "LLM allocation omitted an expected subtitle ID.",
-            "translation_id_duplicate": "LLM allocation returned the same subtitle ID more than once.",
-            "translation_id_unknown": "LLM allocation returned a subtitle ID outside the frozen set.",
-            "translation_group_cardinality_mismatch": "Returned allocation ID set differs from the expected group ID set.",
-            "final_translation_id_mismatch": "Final writeback ID set differs from frozen English subtitle IDs.",
-            "final_cue_timeline_invalid": "Final cue timing does not match the frozen subtitle ID and word-ledger contract.",
-            "hard_english_boundary": "A high-confidence English boundary survived the pre-ID automatic repair stage.",
-            "allocation_quality_unresolved": "A high-confidence allocation issue remained after retry or retry was rejected.",
-            "reading_speed_error": "A subtitle likely needs manual shortening or timing review.",
-            "suspicious_cut": "English boundary may split a phrase unnaturally.",
-            "syntax_boundary_audit": "A syntax-aware boundary rule flagged this cut.",
-            "chinese_semantic_group_warning": "Chinese group audit found a possible semantic or fluency issue.",
-            "asr_suspicious": "ASR text contains a suspicious token pattern.",
-            "duplicate_chinese": "Adjacent Chinese subtitles may repeat the same content.",
+            "missing_translation": "一条或多条英文字幕缺少中文字幕。",
+            "overlong_english": "英文字幕超过硬性长度上限，需要检查切分。",
+            "structural_english_overflow": "完整英文长句在正常长度内没有安全切点。",
+            "invalid_timing": "字幕时间无效或相邻字幕发生重叠。",
+            "subtitle_duration_invalid": "字幕显示时间低于安全下限。",
+            "translation_id_missing": "中文分配结果缺少预期的固定字幕编号。",
+            "translation_id_duplicate": "中文分配结果重复返回了同一个字幕编号。",
+            "translation_id_unknown": "中文分配结果包含固定集合之外的字幕编号。",
+            "translation_group_cardinality_mismatch": "中文分配返回的字幕编号集合与预期不一致。",
+            "final_translation_id_mismatch": "最终中文编号与固定英文字幕编号不一致。",
+            "final_cue_timeline_invalid": "最终字幕时间与固定编号和词账本不一致。",
+            "hard_english_boundary": "自动修复后仍残留高置信英文切分错误。",
+            "allocation_quality_unresolved": "重试后中文逐条对应仍有高置信问题，或重试候选被拒绝。",
+            "reading_speed_error": "字幕阅读速度过快，可能需要缩短文字或检查时间。",
+            "suspicious_cut": "英文切点可能拆开了紧密短语。",
+            "syntax_boundary_audit": "语法检查认为此英文切点需要人工确认。",
+            "chinese_semantic_group_warning": "中文语义组可能有信息缺失或表达不顺。",
+            "asr_suspicious": "英文转录中含可疑词语，需要结合音频确认。",
+            "duplicate_chinese": "相邻中文字幕可能重复表达同一内容。",
         }
-        return reasons.get(code, f"{severity} validation item; inspect the grouped evidence.")
+        return reasons.get(code, "发现未分类的字幕检查项，请查看标记位置。")
 
     @staticmethod
     def _validation_affected_subtitle_ids(payload) -> List[str]:
@@ -10900,8 +11109,8 @@ class ScreenSubtitleEditor:
             for classification in ("hard", "review", "allow")
         }
         return {
-            "schema_version": 1,
-            "policy_version": "formal-boundary-evidence-v1",
+            "schema_version": 2,
+            "policy_version": "formal-boundary-evidence-v2",
             "word_ledger_hash": self._word_ledger_hash(),
             "summary": {
                 "boundary_count": len(records),
@@ -10924,6 +11133,7 @@ class ScreenSubtitleEditor:
             item.subtitle_id or f"S{index:04d}": item
             for index, item in enumerate(getattr(self, "_last_subtitle_items", []) or [], 1)
         }
+        unresolved_pre_id = self._unresolved_pre_id_boundary_evidence()
         records: List[Dict] = []
         for index, (previous, current) in enumerate(zip(segments, segments[1:]), 1):
             previous_text = self._normalize_text(previous.text)
@@ -11012,18 +11222,47 @@ class ScreenSubtitleEditor:
                 confidence_score = 0.2
                 recommended_action = "keep"
 
+            right_word_id = (
+                int(right_item.word_start) if word_continuity else None
+            )
+            pre_id_evidence = unresolved_pre_id.get(right_word_id or -1, [])
+            if pre_id_evidence:
+                pre_id_codes = list(
+                    dict.fromkeys(
+                        code
+                        for evidence in pre_id_evidence
+                        for code in evidence.get("rule_codes") or []
+                    )
+                )
+                rule_codes = list(dict.fromkeys([*rule_codes, *pre_id_codes]))
+                # The pre-ID owner already tried and could not find a legal
+                # replacement. Keep the frozen cue usable, but never erase the
+                # original high-confidence evidence from human review.
+                if classification == "allow":
+                    classification = "review"
+                    confidence = "high"
+                    confidence_score = 0.86
+                    recommended_action = "manual_review"
+
             previous_last = self._clean_boundary_token(previous_text.split()[-1])
             current_first = self._clean_boundary_token(current_text.split()[0])
             legacy_reasons = self._bad_cut_reasons(previous_last, current_first)
             records.append(
                 {
                     "index": index,
+                    "scope": "parent_cue",
+                    "source": (
+                        "stable_evaluator+pre_id_fragment"
+                        if pre_id_evidence
+                        else "stable_evaluator"
+                    ),
                     "left_subtitle_id": left_id,
                     "right_subtitle_id": right_id,
                     "classification": classification,
                     "recommended_action": recommended_action,
                     "reason": "; ".join(rule_codes) or "boundary supported by context",
                     "rule_codes": rule_codes,
+                    "pre_id_unresolved_evidence": pre_id_evidence,
                     "confidence": confidence,
                     "confidence_score": confidence_score,
                     "evidence": {
@@ -11051,6 +11290,152 @@ class ScreenSubtitleEditor:
                     "boundary": f"{previous_text} | {current_text}",
                 }
             )
+        records.extend(self._display_page_boundary_audit_records(unresolved_pre_id))
+        for record_index, record in enumerate(records, 1):
+            record["index"] = record_index
+        return records
+
+    def _unresolved_pre_id_boundary_evidence(self) -> Dict[int, List[Dict[str, Any]]]:
+        by_right_word: Dict[int, List[Dict[str, Any]]] = {}
+        for repair in getattr(self, "_pre_id_boundary_repairs", []) or []:
+            if not repair.get("unresolved_hard_issue"):
+                continue
+            cut = repair.get("old_cut_word_index") or repair.get("old_boundary")
+            if not isinstance(cut, (list, tuple)) or len(cut) != 2:
+                continue
+            try:
+                left_word, right_word = int(cut[0]), int(cut[1])
+            except (TypeError, ValueError):
+                continue
+            if right_word != left_word + 1:
+                continue
+            rule_codes = list(
+                dict.fromkeys(
+                    [
+                        *[str(value) for value in repair.get("hard_issues") or []],
+                        *[
+                            str(value)
+                            for value in repair.get("hard_fragment_issues") or []
+                        ],
+                    ]
+                )
+            )
+            if not rule_codes:
+                continue
+            by_right_word.setdefault(right_word, []).append(
+                {
+                    "source": str(repair.get("repaired_by") or "pre_id_finalizer"),
+                    "rule_codes": rule_codes,
+                    "fragment_type": str(repair.get("fragment_type") or ""),
+                    "repair_reason": str(repair.get("repair_reason") or ""),
+                    "repair_attempted": bool(repair.get("repair_attempted")),
+                    "repair_succeeded": bool(repair.get("repair_succeeded")),
+                    "original_classification": "hard",
+                }
+            )
+        return by_right_word
+
+    def _display_page_boundary_audit_records(
+        self,
+        unresolved_pre_id: Mapping[int, Sequence[Mapping[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        artifact = dict(
+            getattr(self, "_display_page_translation_artifact", {}) or {}
+        )
+        evidence_by_word = dict(
+            (getattr(self, "_display_boundary_evidence_artifact", {}) or {}).get(
+                "boundaries"
+            )
+            or {}
+        )
+        records: List[Dict[str, Any]] = []
+        for plan in artifact.get("render_plans") or []:
+            if not isinstance(plan, Mapping):
+                continue
+            parent_id = str(plan.get("parent_subtitle_id") or "")
+            pages = [
+                page for page in plan.get("pages") or [] if isinstance(page, Mapping)
+            ]
+            for left_page, right_page in zip(pages, pages[1:]):
+                right_word = int(right_page.get("word_start") or 0)
+                boundary = dict(right_page.get("boundary_before") or {})
+                raw = dict(evidence_by_word.get(str(right_word)) or {})
+                raw_hard = [str(value) for value in raw.get("hard_issues") or []]
+                raw_soft = [str(value) for value in raw.get("soft_issues") or []]
+                pre_id_evidence = list(unresolved_pre_id.get(right_word) or [])
+                rule_codes = list(
+                    dict.fromkeys(
+                        [
+                            *[str(value) for value in boundary.get("issue_codes") or []],
+                            *raw_hard,
+                            *raw_soft,
+                            *[
+                                str(code)
+                                for evidence in pre_id_evidence
+                                for code in evidence.get("rule_codes") or []
+                            ],
+                        ]
+                    )
+                )
+                classification = str(boundary.get("classification") or "allow")
+                if classification == "allow" and (raw_hard or pre_id_evidence):
+                    classification = "review"
+                if classification == "allow" and not rule_codes:
+                    continue
+                left_english = self._normalize_text(left_page.get("english") or "")
+                right_english = self._normalize_text(right_page.get("english") or "")
+                records.append(
+                    {
+                        "scope": "display_page",
+                        "source": "renderer_plan+stable_evaluator",
+                        "left_subtitle_id": parent_id,
+                        "right_subtitle_id": parent_id,
+                        "left_display_page_id": str(
+                            left_page.get("display_page_id") or ""
+                        ),
+                        "right_display_page_id": str(
+                            right_page.get("display_page_id") or ""
+                        ),
+                        "right_word_id": right_word,
+                        "classification": classification,
+                        "original_classification": (
+                            "hard" if raw_hard else classification
+                        ),
+                        "recommended_action": "manual_review",
+                        "reason": "; ".join(rule_codes)
+                        or "display boundary requires review",
+                        "rule_codes": rule_codes,
+                        "confidence": str(
+                            boundary.get("confidence")
+                            or ("high" if raw_hard else "medium")
+                        ),
+                        "confidence_score": 0.9 if raw_hard else 0.7,
+                        "pre_id_unresolved_evidence": pre_id_evidence,
+                        "evidence": {
+                            "word_continuity": True,
+                            "word_boundary": [right_word - 1, right_word],
+                            "pause_ms": raw.get("pause_ms"),
+                            "renderer_classification": str(
+                                boundary.get("classification") or "allow"
+                            ),
+                            "raw_hard_issues": raw_hard,
+                            "raw_soft_issues": raw_soft,
+                        },
+                        "duplicates_legacy_bad_cut": False,
+                        "legacy_rule_codes": [],
+                        "start": self._format_ms(
+                            int(left_page.get("start_ms") or 0)
+                        ),
+                        "end": self._format_ms(
+                            int(right_page.get("end_ms") or 0)
+                        ),
+                        "previous": left_english,
+                        "current": right_english,
+                        "previous_english": left_english,
+                        "current_english": right_english,
+                        "boundary": f"{left_english} | {right_english}",
+                    }
+                )
         return records
 
     def _has_ellipted_nonfinite_result_clause_evidence(
@@ -11767,6 +12152,7 @@ class ScreenSubtitleEditor:
                     "code": code,
                     "level": "ERROR" if is_error else "WARNING",
                     "index": index,
+                    "subtitle_id": self._segment_subtitle_id(seg, index),
                     "start": self._format_ms(seg.start_time),
                     "end": self._format_ms(seg.end_time),
                     "duration_ms": duration_ms,
@@ -13965,7 +14351,8 @@ class ScreenSubtitleEditor:
                 target_language=self.target_language,
                 max_cjk_chars=self.max_cjk_chars,
                 max_english_words=self.max_english_words,
-            )
+            ),
+            source_text=" ".join(str(seg.text or "") for _, seg in chunk),
         )
         cache_key = self._cache_key(prompt, payload)
         cache_result = self.cache_manager.get_llm_result(
@@ -15476,7 +15863,12 @@ class ScreenSubtitleEditor:
             )
 
         result = {group_id: dict(value) for group_id, value in allocations.items()}
-        prompt = self._compose_prompt(SEMANTIC_CHINESE_POLISH_PROMPT)
+        prompt = self._compose_prompt(
+            SEMANTIC_CHINESE_POLISH_PROMPT,
+            source_text=" ".join(
+                str(entry.get("full_english") or "") for entry in payload
+            ),
+        )
         for payload_chunk in self._semantic_allocation_payload_chunks(payload):
             data = self._request_semantic_translation_allocation(
                 prompt,
@@ -15586,7 +15978,6 @@ class ScreenSubtitleEditor:
             self._semantic_full_translation_payload_entry(groups, index)
             for index, _group in enumerate(groups)
         ]
-        prompt = self._compose_prompt(SEMANTIC_FULL_TRANSLATION_PROMPT)
         result: Dict[int, str] = {}
         payload_chunks = self._semantic_allocation_payload_chunks(payload)
         cache_hits = 0
@@ -15598,6 +15989,12 @@ class ScreenSubtitleEditor:
             retries=0,
         )
         for batch_index, payload_chunk in enumerate(payload_chunks, 1):
+            prompt = self._compose_prompt(
+                SEMANTIC_FULL_TRANSLATION_PROMPT,
+                source_text=" ".join(
+                    str(entry.get("full_english") or "") for entry in payload_chunk
+                ),
+            )
             data = self._request_semantic_full_translation_chunk(
                 prompt,
                 payload_chunk,
@@ -15630,8 +16027,12 @@ class ScreenSubtitleEditor:
         payload_by_id = {int(entry["id"]): entry for entry in payload}
         for group_id in missing_ids:
             retry_payload = [payload_by_id[group_id]]
+            retry_prompt = self._compose_prompt(
+                SEMANTIC_FULL_TRANSLATION_PROMPT,
+                source_text=str(retry_payload[0].get("full_english") or ""),
+            )
             data = self._request_semantic_full_translation_chunk(
-                prompt,
+                retry_prompt,
                 retry_payload,
                 cache_task=f"{SEMANTIC_FULL_TRANSLATION_CACHE_TASK}_retry",
             )
@@ -15812,7 +16213,7 @@ class ScreenSubtitleEditor:
             self._last_full_translation_style_retry_log = []
 
         result = dict(full_translations)
-        retry_prompt = self._compose_prompt(SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT)
+        retry_base_prompt = SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT
         for group_id in sorted(result):
             original_translation = result[group_id]
             original_findings = self._full_translation_em_dash_findings(original_translation)
@@ -15823,6 +16224,10 @@ class ScreenSubtitleEditor:
             original_payload = payload_by_id.get(int(group_id))
             if not original_payload:
                 continue
+            retry_prompt = self._compose_prompt(
+                retry_base_prompt,
+                source_text=str(original_payload.get("full_english") or ""),
+            )
             retry_payload = dict(original_payload)
             retry_payload["current_translation"] = original_translation
             retry_payload["source_echo_required"] = False
@@ -16200,11 +16605,9 @@ class ScreenSubtitleEditor:
             for group in groups
             if str(group.get("id", "")).isdigit()
         }
-        prompt = self._compose_prompt(SEMANTIC_TRANSLATION_ALLOCATION_PROMPT)
         payload_chunks = self._semantic_allocation_payload_chunks(payload)
         if self.allocation_max_concurrency > 1 and len(payload_chunks) > 1:
             result.update(self._allocate_semantic_group_translations_concurrent(
-                prompt,
                 payload_chunks,
                 expected_groups_by_id,
             ))
@@ -16234,6 +16637,12 @@ class ScreenSubtitleEditor:
             actual_workers=1,
         )
         for batch_id, payload_chunk in enumerate(payload_chunks, 1):
+            prompt = self._compose_prompt(
+                SEMANTIC_TRANSLATION_ALLOCATION_PROMPT,
+                source_text=" ".join(
+                    str(entry.get("full_english") or "") for entry in payload_chunk
+                ),
+            )
             chunk_result, complete, data = self._request_and_parse_allocation_chunk(
                 prompt,
                 payload_chunk,
@@ -16283,7 +16692,6 @@ class ScreenSubtitleEditor:
 
     def _allocate_semantic_group_translations_concurrent(
         self,
-        prompt: str,
         payload_chunks: Sequence[Sequence[Dict]],
         expected_groups_by_id: Dict[int, Dict],
     ) -> Dict[int, Dict[str, str]]:
@@ -16291,8 +16699,14 @@ class ScreenSubtitleEditor:
         pending: List[tuple[int, Sequence[Dict]]] = []
 
         for batch_id, payload_chunk in enumerate(payload_chunks, 1):
+            chunk_prompt = self._compose_prompt(
+                SEMANTIC_TRANSLATION_ALLOCATION_PROMPT,
+                source_text=" ".join(
+                    str(entry.get("full_english") or "") for entry in payload_chunk
+                ),
+            )
             cached = self._load_cached_allocation_batch(
-                prompt,
+                chunk_prompt,
                 payload_chunk,
                 expected_groups_by_id,
                 batch_id=batch_id,
@@ -16333,7 +16747,13 @@ class ScreenSubtitleEditor:
                 futures = {
                     executor.submit(
                         self._request_and_parse_allocation_chunk_uncached,
-                        prompt,
+                        self._compose_prompt(
+                            SEMANTIC_TRANSLATION_ALLOCATION_PROMPT,
+                            source_text=" ".join(
+                                str(entry.get("full_english") or "")
+                                for entry in payload_chunk
+                            ),
+                        ),
                         payload_chunk,
                         expected_groups_by_id,
                         batch_id=batch_id,
@@ -16359,7 +16779,13 @@ class ScreenSubtitleEditor:
                         )
                     if batch_result.data is not None and batch_result.complete:
                         self._store_allocation_batch_cache(
-                            prompt,
+                            self._compose_prompt(
+                                SEMANTIC_TRANSLATION_ALLOCATION_PROMPT,
+                                source_text=" ".join(
+                                    str(entry.get("full_english") or "")
+                                    for entry in payload_chunk
+                                ),
+                            ),
                             payload_chunk,
                             batch_result.data,
                             cache_task=SEMANTIC_ALLOCATION_CACHE_TASK,
@@ -16393,10 +16819,16 @@ class ScreenSubtitleEditor:
 
         merged: Dict[int, Dict[str, str]] = {}
         for batch_id, payload_chunk in enumerate(payload_chunks, 1):
+            chunk_prompt = self._compose_prompt(
+                SEMANTIC_TRANSLATION_ALLOCATION_PROMPT,
+                source_text=" ".join(
+                    str(entry.get("full_english") or "") for entry in payload_chunk
+                ),
+            )
             batch_result = results_by_batch.get(batch_id)
             if batch_result is None or batch_result.data is None:
                 retry_result, retry_complete = self._retry_incomplete_allocation_chunk(
-                    prompt,
+                    chunk_prompt,
                     payload_chunk,
                     expected_groups_by_id,
                 )
@@ -16442,7 +16874,7 @@ class ScreenSubtitleEditor:
                     batch_id=batch_id,
                 )
                 retry_result, retry_complete = self._retry_incomplete_allocation_chunk(
-                    prompt,
+                    chunk_prompt,
                     payload_chunk,
                     expected_groups_by_id,
                 )
@@ -16459,7 +16891,7 @@ class ScreenSubtitleEditor:
                     chunk_result,
                 )
             quality_retry = self._retry_quality_failed_group_allocations(
-                prompt,
+                chunk_prompt,
                 payload_chunk,
                 expected_groups_by_id,
                 chunk_result,
@@ -16769,10 +17201,16 @@ class ScreenSubtitleEditor:
                 "attempted": True,
                 "success": False,
             }
-            retry_prompt = prompt
+            retry_prompt = self._compose_prompt(
+                SEMANTIC_TRANSLATION_ALLOCATION_PROMPT,
+                source_text=str(entry.get("full_english") or ""),
+            )
             retry_cache_task = SEMANTIC_ALLOCATION_RETRY_CACHE_TASK
             if "unnatural_chinese_fragment" in set(validation.get("issue_codes") or []):
-                retry_prompt = self._compose_prompt(SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT)
+                retry_prompt = self._compose_prompt(
+                    SEMANTIC_FRAGMENT_ALLOCATION_RETRY_PROMPT,
+                    source_text=str(entry.get("full_english") or ""),
+                )
                 retry_cache_task = SEMANTIC_FRAGMENT_ALLOCATION_RETRY_CACHE_TASK
             self._emit_progress_event(
                 "allocation_retry",
@@ -16806,7 +17244,11 @@ class ScreenSubtitleEditor:
                 data,
             )
             if not group_complete:
-                self._translation_structure_errors.extend(errors)
+                self._record_allocation_structure_attempt(
+                    errors,
+                    stage="quality_retry",
+                    expected_group_ids=[group_id],
+                )
                 self._last_allocation_retry_log.append(retry_record)
                 self._record_allocation_quality_unresolved(entry, allocation, validation, "retry_structure_failed")
                 continue
@@ -18297,7 +18739,12 @@ class ScreenSubtitleEditor:
             }
             for group in groups
         ]
-        prompt = self._compose_prompt(SEMANTIC_SUBTITLE_TRANSLATION_PROMPT)
+        prompt = self._compose_prompt(
+            SEMANTIC_SUBTITLE_TRANSLATION_PROMPT,
+            source_text=" ".join(
+                str(entry.get("full_english") or "") for entry in payload
+            ),
+        )
         cache_key = self._semantic_chinese_cache_key(
             prompt,
             payload,

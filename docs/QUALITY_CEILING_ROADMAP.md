@@ -1,6 +1,6 @@
 # Subtitle Quality Ceiling Roadmap
 
-Status: in progress; context and source-echo translation increments implemented
+Status: in progress; fixed-ID review suggestions, nearby cut evidence, and parent-scoped undo implemented
 Last researched: 2026-08-12
 External reference snapshot: SmartSub `27459b3fd0652bc5447ccf4ab30cb398014c35f7`
 
@@ -237,6 +237,19 @@ They are patterns to adapt, not code to copy into the Python/Qt architecture.
   English as `source_english`. Missing or mismatched page echoes invalidate
   only the page translation response and force the existing bounded retry;
   legacy artifacts remain readable when the new flag is not requested.
+- Article-derived glossary terms are injected only when a canonical term or
+  supported alias matches the current translation source window. Title and
+  summary remain read-only context; unrelated terms are omitted.
+- The QA builder writes a separate semantic-review queue for high-signal
+  Chinese semantic, allocation, and translationese findings. This queue is
+  audit-only and does not rewrite or block a valid stable manifest.
+- The editor can generate cached model suggestions for selected high-signal
+  items and apply them only after fixed-ID, source-echo, current-Chinese hash,
+  number, explicit currency, negation, and terminology validation. Suggestions
+  remain optional and human-approved.
+- Nearby actual-page word boundaries now carry stable grammar, pause, duration,
+  and recommendation evidence. Parent-scoped undo/redo survives recovery and
+  does not overwrite later edits to unrelated parents.
 
 ## Delivery Order
 
@@ -244,7 +257,9 @@ They are patterns to adapt, not code to copy into the Python/Qt architecture.
 2. Add context-only neighbor envelopes and hit-only terminology injection.
 3. Add exact-ID source echo and local per-entry repair where missing. (Source
    echo and per-group retry are now implemented for full translations.)
-4. Add selective semantic review and the editor risk queue.
+4. Add selective semantic review and the editor risk queue. (The deterministic
+   semantic-review artifact queue is implemented; model-backed replacement
+   suggestions and focused editor navigation remain.)
 5. Add delta journal, autosave/recovery, and exact preview workflow.
 6. Add optional verbatim boundary alternatives only after the above is stable.
 7. Run cached regressions, then blind unseen-audio E2E before raising the

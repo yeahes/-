@@ -15,6 +15,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
+from app.core.subtitle_processor.user_facing_issue_text import (
+    issue_codes_text,
+    user_facing_issue_reason,
+)
+
 
 _SUBTITLE_ID_RE = re.compile(r"S\d{4}")
 _TERMINAL_SENTENCE_RE = re.compile(r"[.!?][\"'”’\)\]]*$")
@@ -56,9 +61,12 @@ def load_subtitle_review_marks(
             target="english" if is_visual_page else "both",
             code=code,
             reason=(
-                str(error.get("message") or "自动视觉分页失败，需要人工处理。")
+                user_facing_issue_reason(
+                    str(error.get("message") or ""),
+                    code=code,
+                )
                 if is_visual_page
-                else "中文返回结构与冻结 subtitle_id 不一致。"
+                else "中文返回结构与固定字幕编号不一致。"
             ),
         )
 
@@ -83,6 +91,8 @@ def load_subtitle_review_marks(
     marks.extend(_high_confidence_chinese_marks(validation))
     marks.extend(_allocation_unresolved_marks(directory))
     marks.extend(_visual_page_review_marks(directory))
+    marks.extend(_semantic_review_queue_marks(directory))
+    marks.extend(_article_asr_correction_review_marks(directory))
 
     return _group_marks(marks)
 
@@ -185,13 +195,15 @@ def _normalise_ids(values: Iterable[Any]) -> List[str]:
 
 
 def _reason(payload: Mapping[str, Any], group: Mapping[str, Any] | None) -> str:
+    code = str(payload.get("code") or (group or {}).get("code") or "")
     reason = str(payload.get("reason") or "").strip()
     if reason:
-        return reason
+        return user_facing_issue_reason(reason, code=code)
     codes = [str(code) for code in _as_list(payload.get("rule_codes"))]
     if codes:
-        return ", ".join(codes)
-    return str((group or {}).get("message") or "需要人工复核")
+        return issue_codes_text(codes)
+    message = str((group or {}).get("message") or "需要人工复核")
+    return user_facing_issue_reason(message, code=code)
 
 
 def _append_marks(
@@ -365,7 +377,10 @@ def _allocation_unresolved_marks(directory: Path) -> List[SubtitleReviewMark]:
             category="chinese_allocation",
             target="chinese",
             code="allocation_unresolved",
-            reason=str(entry.get("reason") or ", ".join(sorted(issue_codes))),
+            reason=user_facing_issue_reason(
+                str(entry.get("reason") or issue_codes_text(sorted(issue_codes))),
+                code="allocation_unresolved",
+            ),
         )
     return marks
 
@@ -428,6 +443,70 @@ def _visual_page_review_marks(directory: Path) -> List[SubtitleReviewMark]:
                 reason=f"视觉分页可能切开紧密语法单元：{boundary}。",
             )
             break
+    return marks
+
+
+def _semantic_review_queue_marks(directory: Path) -> List[SubtitleReviewMark]:
+    """Expose the persisted semantic queue as read-only editor marks."""
+    payload = _read_json(directory / "semantic-review-queue.json", {})
+    items = payload.get("items") if isinstance(payload, Mapping) else None
+    if not isinstance(items, list):
+        return []
+    marks: List[SubtitleReviewMark] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        subtitle_ids = _normalise_ids(item.get("subtitle_ids") or [])
+        if not subtitle_ids:
+            continue
+        reason = str(item.get("reason") or item.get("title") or "中文语义复核")
+        code = str(item.get("code") or "semantic_translation_review")
+        _append_marks(
+            marks,
+            subtitle_ids,
+            severity="REVIEW",
+            category="chinese_allocation",
+            target="chinese",
+            code=code,
+            reason=reason,
+        )
+    return marks
+
+
+def _article_asr_correction_review_marks(
+    directory: Path,
+) -> List[SubtitleReviewMark]:
+    """Load only review candidates bound to the current frozen word ledger."""
+    payload = _read_json(directory / "article-asr-correction-review.json", {})
+    ledger = _read_json(directory / "word-ledger.json", {})
+    if not isinstance(payload, Mapping) or not isinstance(ledger, Mapping):
+        return []
+    expected_hash = str(payload.get("word_ledger_hash") or "")
+    current_hash = str(ledger.get("hash") or "")
+    if not expected_hash or expected_hash != current_hash:
+        return []
+
+    marks: List[SubtitleReviewMark] = []
+    for item in _as_list(payload.get("items")):
+        if not isinstance(item, Mapping) or item.get("action") != "review_only":
+            continue
+        subtitle_ids = _normalise_ids(item.get("subtitle_ids") or [])
+        original = str(item.get("original_text") or "").strip()
+        suggested = str(item.get("suggested_text") or "").strip()
+        if not subtitle_ids or not original or not suggested:
+            continue
+        _append_marks(
+            marks,
+            subtitle_ids,
+            severity="REVIEW",
+            category="asr_correction",
+            target="english",
+            code="article_asr_correction_review",
+            reason=(
+                f"疑似转录词“{original}”；文章术语建议“{suggested}”，"
+                "请结合音频确认。"
+            ),
+        )
     return marks
 
 

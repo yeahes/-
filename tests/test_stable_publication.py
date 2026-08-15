@@ -11,16 +11,18 @@ from PyQt5.QtGui import QColor, QMouseEvent
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractButton,
+    QDialog,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QTableView,
 )
 from qfluentwidgets import isDarkTheme
 
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.entities import SubtitleConfig, SubtitleTask
-from app.core.output_paths import media_result_dir
+from app.core.output_paths import media_result_dir, media_result_subtitle_dir
 from app.core.task_factory import TaskFactory
 from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleEditError,
@@ -28,6 +30,9 @@ from app.core.subtitle_processor.manual_final_subtitle_editor import (
 )
 from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
 from app.core.subtitle_processor.subtitle_review_marks import SubtitleReviewMark
+from app.core.subtitle_processor.translation_review_suggestions import (
+    current_chinese_hash,
+)
 from app.core.utils import podcast_learning_video
 from app.thread.subtitle_thread import SubtitleThread
 from app.thread.video_synthesis_thread import resolve_podcast_template_subtitle
@@ -680,10 +685,308 @@ class StablePublicationTests(unittest.TestCase):
                 draft_enabled,
             )
             if state["render_block_reason"] == "final_timeline_invalid":
-                self.assertIn("final_timeline_invalid", interface.status_label.text())
+                self.assertIn("最终字幕时间轴未通过检查", interface.status_label.text())
+                self.assertNotIn("final_timeline_invalid", interface.status_label.text())
                 warning_text = str(warning.call_args.args[1])
-                self.assertIn("final_timeline_invalid", warning_text)
+                self.assertIn("最终字幕时间轴未通过检查", warning_text)
+                self.assertNotIn("final_timeline_invalid", warning_text)
                 self.assertIn("S0003.P02", warning_text)
+
+    def test_manual_translation_review_action_tracks_queue_artifact(self):
+        class Session:
+            history = []
+
+            def __init__(self, artifact_dir: Path | None = None):
+                if artifact_dir is not None:
+                    self.artifact_dir = artifact_dir
+
+            @staticmethod
+            def has_display_page_model():
+                return True
+
+            @staticmethod
+            def to_model_data(*, prefer_display_pages=False):
+                return {
+                    "1": {
+                        "start_time": 0,
+                        "end_time": 1000,
+                        "original_subtitle": "English",
+                        "translated_subtitle": "中文",
+                        "display_page_view": bool(prefer_display_pages),
+                        "display_page_id": (
+                            "S0001.P01" if prefer_display_pages else ""
+                        ),
+                        "manual_cue_id": "S0001",
+                        "parent_cue_index": 0,
+                        "word_start": 0,
+                        "word_end": 0,
+                    }
+                }
+
+        interface = SubtitleInterface()
+        interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+        interface._refresh_manual_boundary_inspector = lambda *args: None
+        interface._manual_page_view = True
+        interface._manual_parent_boundaries_dirty = False
+        self.addCleanup(
+            lambda: (interface.close(), self._qt_app.processEvents())
+        )
+
+        interface.manual_final_session = Session()
+        interface._apply_manual_final_session()
+        self.assertFalse(interface.manual_translation_review_action.isVisible())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            (artifact_dir / "semantic-review-queue.json").write_text(
+                json.dumps({"schema_version": 1, "items": []}),
+                encoding="utf-8",
+            )
+            interface.manual_final_session = Session(artifact_dir)
+            interface._apply_manual_final_session()
+            self.assertTrue(interface.manual_translation_review_action.isVisible())
+            self.assertTrue(interface.manual_translation_review_action.isEnabled())
+
+    def test_fixed_id_translation_suggestion_rejects_an_active_new_chinese_edit(self):
+        captured = {}
+        model = SubtitleTableModel(
+            {
+                "1": {
+                    "manual_cue_id": "S0001",
+                    "subtitle_id": "S0001",
+                    "start_time": 100,
+                    "end_time": 900,
+                    "word_start": 3,
+                    "word_end": 7,
+                    "original_subtitle": "The old sentence.",
+                    "translated_subtitle": "旧译文",
+                    "display_page_view": False,
+                },
+                "2": {
+                    "manual_cue_id": "S0002",
+                    "subtitle_id": "S0002",
+                    "start_time": 1000,
+                    "end_time": 1800,
+                    "word_start": 8,
+                    "word_end": 11,
+                    "original_subtitle": "The untouched sentence.",
+                    "translated_subtitle": "未改译文",
+                    "display_page_view": False,
+                },
+            }
+        )
+
+        class Session:
+            @staticmethod
+            def apply_parent_model_data(_rows):
+                captured["applied"] = True
+
+        interface = SimpleNamespace(
+            model=model,
+            manual_final_session=Session(),
+            _manual_page_view=False,
+            _sync_manual_final_text_edits=lambda **_kwargs: model._data["1"].__setitem__(
+                "translated_subtitle", "用户刚输入的新译文"
+            ),
+            _mark_manual_final_dirty=lambda **_kwargs: captured.setdefault("dirty", True),
+            _apply_manual_final_session=lambda: captured.setdefault("refreshed", True),
+        )
+
+        with self.assertRaisesRegex(
+            ManualFinalSubtitleEditError,
+            "suggestion_current_chinese_mismatch",
+        ):
+            SubtitleInterface._apply_fixed_id_translation_suggestions(
+                interface,
+                [
+                    {
+                        "subtitle_id": "S0001",
+                        "source_english": "The old sentence.",
+                        "current_chinese_hash": current_chinese_hash("旧译文"),
+                        "suggested_chinese": "旧建议",
+                    }
+                ],
+            )
+
+        self.assertNotIn("applied", captured)
+        self.assertEqual(
+            model._data["1"]["translated_subtitle"],
+            "用户刚输入的新译文",
+        )
+        self.assertEqual(model._data["2"]["translated_subtitle"], "未改译文")
+
+    def test_reset_manual_editor_invalidates_translation_review_worker(self):
+        class Toggle:
+            def setEnabled(self, _value):
+                pass
+
+            def setVisible(self, _value):
+                pass
+
+        model = SubtitleTableModel({})
+        interface = SimpleNamespace(
+            model=model,
+            manual_final_session=SimpleNamespace(),
+            _manual_save_in_progress=False,
+            _translation_review_suggestion_request_id=7,
+            _translation_review_suggestion_in_progress=True,
+            _translation_review_suggestion_context={"request_id": 7},
+            _manual_draft_request_id=0,
+            _review_mark_request_id=0,
+            _invalidate_manual_final_save=lambda: None,
+            _disarm_manual_boundary_editor=lambda **_kwargs: None,
+            _set_manual_editor_mode=lambda _value: None,
+        )
+        for name in (
+            "next_review_action",
+            "manual_page_view_action",
+            "manual_final_save_action",
+            "manual_final_undo_action",
+            "manual_final_synthesis_action",
+            "manual_draft_synthesis_action",
+            "manual_translation_review_action",
+        ):
+            setattr(interface, name, Toggle())
+
+        SubtitleInterface._reset_manual_editor_state(interface)
+
+        self.assertEqual(interface._translation_review_suggestion_request_id, 8)
+        self.assertFalse(interface._translation_review_suggestion_in_progress)
+        self.assertIsNone(interface._translation_review_suggestion_context)
+
+    def test_translation_review_result_merges_only_the_unchanged_queue_item(self):
+        class Label:
+            def __init__(self):
+                self.value = ""
+
+            def setText(self, value):
+                self.value = str(value)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            queue_path = root / "semantic-review-queue.json"
+            target = {
+                "code": "translation_fluency_review",
+                "subtitle_ids": ["S0001"],
+                "reason": "翻译腔",
+                "details": {},
+            }
+            other = {
+                "code": "semantic_translation_review",
+                "subtitle_ids": ["S0002"],
+                "reason": "语义复核",
+                "details": {"kept": True},
+            }
+            payload = {"schema_version": 1, "items": [target, other]}
+            queue_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            key = SubtitleInterface._translation_review_queue_item_key(target)
+            snapshot = SubtitleInterface._translation_review_queue_item_snapshot(target)
+            status = Label()
+            interface = SimpleNamespace(
+                manual_final_session=SimpleNamespace(artifact_dir=root),
+                _translation_review_suggestion_context={
+                    "request_id": 3,
+                    "artifact_dir": str(root.resolve()),
+                    "queue_path": str(queue_path.resolve()),
+                    "queue_item_key": key,
+                    "queue_item_snapshot": snapshot,
+                    "session_fingerprint": "same-state",
+                },
+                _translation_review_suggestion_in_progress=True,
+                _manual_state_fingerprint=lambda: "same-state",
+                _translation_review_queue_item_key=(
+                    SubtitleInterface._translation_review_queue_item_key
+                ),
+                _translation_review_queue_item_snapshot=(
+                    SubtitleInterface._translation_review_queue_item_snapshot
+                ),
+                status_label=status,
+                tr=lambda value: value,
+            )
+            suggestion = {
+                "subtitle_id": "S0001",
+                "source_english": "English.",
+                "current_chinese_hash": current_chinese_hash("旧译文"),
+                "suggested_chinese": "新译文",
+            }
+            with patch("app.view.subtitle_interface.InfoBar.success"):
+                SubtitleInterface._apply_generated_translation_review_suggestions(
+                    interface,
+                    {"request_id": 3, "suggestions": [suggestion]},
+                    "",
+                )
+
+            stored = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                stored["items"][0]["details"]["suggestions"], [suggestion]
+            )
+            self.assertEqual(stored["items"][1], other)
+            self.assertFalse(interface._translation_review_suggestion_in_progress)
+
+    def test_translation_review_result_does_not_overwrite_a_changed_queue_item(self):
+        class Label:
+            def __init__(self):
+                self.value = ""
+
+            def setText(self, value):
+                self.value = str(value)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            queue_path = root / "semantic-review-queue.json"
+            original = {
+                "code": "translation_fluency_review",
+                "subtitle_ids": ["S0001"],
+                "reason": "旧原因",
+                "details": {},
+            }
+            changed = {**original, "reason": "后台期间重新生成的新原因"}
+            queue_path.write_text(
+                json.dumps({"items": [changed]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            status = Label()
+            interface = SimpleNamespace(
+                manual_final_session=SimpleNamespace(artifact_dir=root),
+                _translation_review_suggestion_context={
+                    "request_id": 4,
+                    "artifact_dir": str(root.resolve()),
+                    "queue_path": str(queue_path.resolve()),
+                    "queue_item_key": SubtitleInterface._translation_review_queue_item_key(original),
+                    "queue_item_snapshot": SubtitleInterface._translation_review_queue_item_snapshot(original),
+                    "session_fingerprint": "same-state",
+                },
+                _translation_review_suggestion_in_progress=True,
+                _manual_state_fingerprint=lambda: "same-state",
+                _translation_review_queue_item_key=(
+                    SubtitleInterface._translation_review_queue_item_key
+                ),
+                _translation_review_queue_item_snapshot=(
+                    SubtitleInterface._translation_review_queue_item_snapshot
+                ),
+                status_label=status,
+                tr=lambda value: value,
+            )
+
+            SubtitleInterface._apply_generated_translation_review_suggestions(
+                interface,
+                {
+                    "request_id": 4,
+                    "suggestions": [
+                        {
+                            "subtitle_id": "S0001",
+                            "suggested_chinese": "不应写入",
+                        }
+                    ],
+                },
+                "",
+            )
+
+            stored = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertEqual(stored, {"items": [changed]})
+            self.assertIn("队列已变化", status.value)
 
     def test_restore_saved_blocked_package_requires_valid_draft_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1011,11 +1314,11 @@ class StablePublicationTests(unittest.TestCase):
 
             self.assertEqual(
                 Path(paths["display_page_bilingual_srt"]),
-                root / "节目-处理结果" / "节目-实际分页双语字幕.srt",
+                root / "节目-处理结果" / "字幕文件" / "节目-实际分页双语字幕.srt",
             )
             self.assertEqual(
                 Path(paths["display_page_map"]),
-                root / "节目-处理结果" / "节目-实际分页映射.json",
+                root / "节目-处理结果" / "字幕文件" / "节目-实际分页映射.json",
             )
             self.assertEqual(session.parent, parent)
 
@@ -1234,7 +1537,36 @@ class StablePublicationTests(unittest.TestCase):
             )
             timeline = artifact_dir / "final-cue-timeline.json"
             timeline.write_text(
-                json.dumps({"validation": {"status": "PASS"}}),
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "subtitle_id": "S0001",
+                                "word_start": 0,
+                                "word_end": 2,
+                                "word_envelope_start_ms": 0,
+                                "word_envelope_end_ms": 600,
+                                "start_ms": 0,
+                                "end_ms": 600,
+                            },
+                            {
+                                "subtitle_id": "S0002",
+                                "word_start": 3,
+                                "word_end": 4,
+                                "word_envelope_start_ms": 600,
+                                "word_envelope_end_ms": 1000,
+                                "start_ms": 600,
+                                "end_ms": 1000,
+                            },
+                        ],
+                        "validation": {
+                            "status": "PASS",
+                            "errors": [],
+                            "expected_subtitle_ids": ["S0001", "S0002"],
+                            "returned_subtitle_ids": ["S0001", "S0002"],
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
             (artifact_dir / "translation-structure-errors.json").write_text(
@@ -1305,97 +1637,260 @@ class StablePublicationTests(unittest.TestCase):
                 [cue["cue_id"] for cue in session.cues],
                 ["S0001", "S0002"],
             )
-
-            class Toggle:
-                def __init__(self):
-                    self.enabled = False
-                    self.visible = False
-                    self.tooltip = ""
-
-                def setEnabled(self, value):
-                    self.enabled = bool(value)
-
-                def setVisible(self, value):
-                    self.visible = bool(value)
-
-                def setToolTip(self, value):
-                    self.tooltip = str(value)
-
-            class StatusLabel:
-                def __init__(self):
-                    self.text = ""
-
-                def setText(self, value):
-                    self.text = str(value)
-
-            interface = SimpleNamespace(
-                manual_final_session=None,
-                _manual_package_manifest_path="",
-                _manual_save_in_progress=False,
-                _manual_review_mark_count=0,
-                _review_mark_rows=[],
-                _review_mark_request_id=0,
-                _active_subtitle_attempt_id=failure["attempt_id"],
-                model=SubtitleTableModel({}),
-                next_review_action=Toggle(),
-                manual_final_save_action=Toggle(),
-                manual_final_undo_action=Toggle(),
-                manual_final_synthesis_action=Toggle(),
-                manual_draft_synthesis_action=Toggle(),
-                subtitle_table=Toggle(),
-                subtitle_path="",
-                status_label=StatusLabel(),
-                tr=lambda value: value,
-                _load_manual_final_review_marks=lambda _session: None,
-            )
-            interface._apply_manual_final_session = MethodType(
-                SubtitleInterface._apply_manual_final_session,
-                interface,
-            )
-            interface._manual_state_fingerprint = MethodType(
-                SubtitleInterface._manual_state_fingerprint,
-                interface,
-            )
-            interface._set_manual_clean_checkpoint = MethodType(
-                SubtitleInterface._set_manual_clean_checkpoint,
-                interface,
-            )
-            interface._invalidate_manual_final_save = MethodType(
-                SubtitleInterface._invalidate_manual_final_save,
-                interface,
+            self._assert_blocked_checkpoint_ui_loads(
+                root,
+                failure,
+                checkpoint_path,
             )
 
-            loaded = SubtitleInterface._load_manual_failure_checkpoint_from_output(
+    def test_duration_failure_uses_same_structural_editable_checkpoint_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report = root / "source-coverage-report.txt"
+            report.write_text("PASS", encoding="utf-8")
+            artifact_dir = root / "source-artifacts"
+            artifact_dir.mkdir()
+            (artifact_dir / "word-ledger.json").write_text(
+                json.dumps(
+                    {
+                        "words": [
+                            {
+                                "word_id": 0,
+                                "surface": "Precisely.",
+                                "start_ms": 1000,
+                                "end_ms": 1120,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (artifact_dir / "subtitle-spans.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "subtitle_id": "S0001",
+                            "word_start": 0,
+                            "word_end": 0,
+                            "original": "Precisely.",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            timeline = artifact_dir / "final-cue-timeline.json"
+            timeline.write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "subtitle_id": "S0001",
+                                "word_start": 0,
+                                "word_end": 0,
+                                "word_envelope_start_ms": 1000,
+                                "word_envelope_end_ms": 1120,
+                                "start_ms": 960,
+                                "end_ms": 1220,
+                            }
+                        ],
+                        "validation": {
+                            "status": "PASS",
+                            "errors": [],
+                            "expected_subtitle_ids": ["S0001"],
+                            "returned_subtitle_ids": ["S0001"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            data = ASRData([ASRDataSeg("Precisely.", 960, 1220, "正是如此。")])
+            data.segments[0].subtitle_id = "S0001"
+            data.segments[0].word_start = 0
+            data.segments[0].word_end = 0
+
+            thread = self._thread(root)
+            thread._save_stable_subtitle_outputs(
+                data,
+                self._config(),
+                coverage_report_path=str(report),
+                validation_status="failed",
+                validation_summary={
+                    "status": "ERROR",
+                    "errors": [{"code": "subtitle_duration_invalid"}],
+                },
+                manifest_meta={"final_cue_timeline_path": str(timeline)},
+            )
+
+            failure_path = root / "stable-last-failure.json"
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            self.assertIn("editable_checkpoint_manifest_path", failure)
+            session = ManualFinalSubtitleSession.load_from_failure_record(failure_path)
+            self.assertEqual([cue["cue_id"] for cue in session.cues], ["S0001"])
+
+    def test_invalid_final_timeline_never_becomes_an_editable_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report = root / "source-coverage-report.txt"
+            report.write_text("PASS", encoding="utf-8")
+            artifact_dir = root / "source-artifacts"
+            artifact_dir.mkdir()
+            (artifact_dir / "word-ledger.json").write_text(
+                json.dumps(
+                    {
+                        "words": [
+                            {
+                                "word_id": 0,
+                                "surface": "English",
+                                "start_ms": 0,
+                                "end_ms": 500,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (artifact_dir / "subtitle-spans.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "subtitle_id": "S0001",
+                            "word_start": 0,
+                            "word_end": 0,
+                            "original": "English",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            timeline = artifact_dir / "final-cue-timeline.json"
+            timeline.write_text(
+                json.dumps(
+                    {
+                        "records": [],
+                        "validation": {
+                            "status": "ERROR",
+                            "errors": [{"code": "final_timeline_subtitle_id_missing"}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            thread = self._thread(root)
+            thread._save_stable_subtitle_outputs(
+                self._data("English"),
+                self._config(),
+                coverage_report_path=str(report),
+                validation_status="failed",
+                validation_summary={
+                    "status": "ERROR",
+                    "errors": [{"code": "subtitle_duration_invalid"}],
+                },
+                manifest_meta={"final_cue_timeline_path": str(timeline)},
+            )
+
+            failure = json.loads(
+                (root / "stable-last-failure.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("editable_checkpoint_manifest_path", failure)
+
+    def _assert_blocked_checkpoint_ui_loads(
+        self,
+        root: Path,
+        failure: dict,
+        checkpoint_path: Path,
+    ) -> None:
+
+        class Toggle:
+            def __init__(self):
+                self.enabled = False
+                self.visible = False
+                self.tooltip = ""
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+            def setVisible(self, value):
+                self.visible = bool(value)
+
+            def setToolTip(self, value):
+                self.tooltip = str(value)
+
+        class StatusLabel:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, value):
+                self.text = str(value)
+
+        interface = SimpleNamespace(
+            manual_final_session=None,
+            _manual_package_manifest_path="",
+            _manual_save_in_progress=False,
+            _manual_review_mark_count=0,
+            _review_mark_rows=[],
+            _review_mark_request_id=0,
+            _active_subtitle_attempt_id=failure["attempt_id"],
+            model=SubtitleTableModel({}),
+            next_review_action=Toggle(),
+            manual_final_save_action=Toggle(),
+            manual_final_undo_action=Toggle(),
+            manual_final_synthesis_action=Toggle(),
+            manual_draft_synthesis_action=Toggle(),
+            subtitle_table=Toggle(),
+            subtitle_path="",
+            status_label=StatusLabel(),
+            tr=lambda value: value,
+            _load_manual_final_review_marks=lambda _session: None,
+        )
+        interface._apply_manual_final_session = MethodType(
+            SubtitleInterface._apply_manual_final_session,
+            interface,
+        )
+        interface._manual_state_fingerprint = MethodType(
+            SubtitleInterface._manual_state_fingerprint,
+            interface,
+        )
+        interface._set_manual_clean_checkpoint = MethodType(
+            SubtitleInterface._set_manual_clean_checkpoint,
+            interface,
+        )
+        interface._invalidate_manual_final_save = MethodType(
+            SubtitleInterface._invalidate_manual_final_save,
+            interface,
+        )
+
+        loaded = SubtitleInterface._load_manual_failure_checkpoint_from_output(
                 interface,
                 str(root / "output.srt"),
             )
 
-            self.assertTrue(loaded)
-            self.assertEqual(interface.model.rowCount(), 2)
-            self.assertEqual(
-                [
-                    interface.model._data[str(index)]["source_subtitle_ids"]
-                    for index in (1, 2)
-                ],
-                [["S0001"], ["S0002"]],
-            )
-            self.assertFalse(interface.manual_final_synthesis_action.enabled)
-            self.assertTrue(interface.manual_final_synthesis_action.visible)
-            self.assertFalse(interface.manual_draft_synthesis_action.enabled)
-            self.assertTrue(interface.manual_draft_synthesis_action.visible)
+        self.assertTrue(loaded)
+        self.assertEqual(interface.model.rowCount(), 2)
+        self.assertEqual(
+            [
+                interface.model._data[str(index)]["source_subtitle_ids"]
+                for index in (1, 2)
+            ],
+            [["S0001"], ["S0002"]],
+        )
+        self.assertFalse(interface.manual_final_synthesis_action.enabled)
+        self.assertTrue(interface.manual_final_synthesis_action.visible)
+        self.assertFalse(interface.manual_draft_synthesis_action.enabled)
+        self.assertTrue(interface.manual_draft_synthesis_action.visible)
 
-            interface._active_subtitle_attempt_id = "different-attempt"
-            self.assertFalse(
-                SubtitleInterface._load_manual_failure_checkpoint_from_output(
-                    interface,
-                    str(root / "output.srt"),
-                )
+        interface._active_subtitle_attempt_id = "different-attempt"
+        self.assertFalse(
+            SubtitleInterface._load_manual_failure_checkpoint_from_output(
+                interface,
+                str(root / "output.srt"),
             )
-            with self.assertRaisesRegex(RuntimeError, "阻止.*合成"):
-                resolve_podcast_template_subtitle(
-                    str(root / "audio.m4a"),
-                    str(checkpoint_path),
-                )
+        )
+        with self.assertRaisesRegex(RuntimeError, "阻止.*合成"):
+            resolve_podcast_template_subtitle(
+                str(root / "audio.m4a"),
+                str(checkpoint_path),
+            )
 
     def test_manifest_hash_mismatch_blocks_synthesis_resolution(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2267,6 +2762,24 @@ class StablePublicationTests(unittest.TestCase):
             )
         )
 
+    def test_inline_undo_is_bound_to_the_selected_parent_subtitle(self):
+        app, interface, _moves = self._manual_boundary_interaction_fixture()
+        calls = []
+        interface.manual_final_session.can_undo_for_parent = (
+            lambda parent_id: parent_id == "S0001"
+        )
+        interface.undo_manual_final_edit = lambda parent_id="": calls.append(parent_id)
+
+        self._select_manual_boundary_row(app, interface, 0)
+        self._manual_boundary_button(interface, 0, "调整与下一屏边界").click()
+        app.processEvents()
+        undo = self._manual_boundary_button(interface, 0, "撤销")
+        self.assertTrue(undo.isEnabled())
+        undo.click()
+        app.processEvents()
+
+        self.assertEqual(calls, ["S0001"])
+
     def test_manual_editor_removes_redundant_legacy_controls(self):
         _app, interface, _moves = self._manual_boundary_interaction_fixture()
 
@@ -2451,6 +2964,26 @@ class StablePublicationTests(unittest.TestCase):
                 SubtitleInterface.on_open_folder_clicked(interface)
 
             open_folder.assert_called_once_with(str(package_dir))
+
+    def test_open_folder_uses_result_root_outside_manual_editor(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_dir = Path(temp_dir) / "episode-处理结果"
+            package_dir = result_dir / "人工终稿字幕包"
+            package_dir.mkdir(parents=True)
+            manifest_path = package_dir / "stable-final-manifest.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            interface = SimpleNamespace(
+                task=None,
+                manual_final_session=None,
+                subtitle_path="",
+                _manual_package_manifest_path=str(manifest_path),
+                tr=lambda value: value,
+            )
+
+            with patch("app.view.subtitle_interface.os.startfile") as open_folder:
+                SubtitleInterface.on_open_folder_clicked(interface)
+
+            open_folder.assert_called_once_with(str(result_dir))
 
     def test_manual_boundary_entry_widget_paints_opaque_theme_background(self):
         app, interface, _ = self._manual_boundary_interaction_fixture()
@@ -3258,6 +3791,67 @@ class StablePublicationTests(unittest.TestCase):
         self.assertEqual(split_calls, [("S0216", 3, 100)])
         by_text["仅将当前屏拆为 2 屏"].triggered.callback()
         self.assertEqual(split_page_calls, ["S0216.P01"])
+
+    def test_long_caption_queue_restores_parent_identity_or_nearest_row(self):
+        interface = SimpleNamespace(
+            _manual_long_caption_parent_id="S0106",
+            _manual_long_caption_queue_row=2,
+        )
+        queue = [
+            {"parent_subtitle_id": "S0005"},
+            {"parent_subtitle_id": "S0106"},
+            {"parent_subtitle_id": "S0147"},
+        ]
+
+        self.assertEqual(
+            SubtitleInterface._manual_long_caption_initial_row(interface, queue),
+            1,
+        )
+
+        interface._manual_long_caption_parent_id = "S0093"
+        self.assertEqual(
+            SubtitleInterface._manual_long_caption_initial_row(interface, queue),
+            2,
+        )
+
+        interface._manual_long_caption_queue_row = 99
+        self.assertEqual(
+            SubtitleInterface._manual_long_caption_initial_row(interface, queue),
+            2,
+        )
+        self.assertEqual(
+            SubtitleInterface._manual_long_caption_initial_row(interface, []),
+            -1,
+        )
+
+    def test_manual_review_dialog_uses_dark_native_widget_palette(self):
+        interface = SubtitleInterface()
+        interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+        dialog = QDialog(interface)
+        listing = QListWidget(dialog)
+        self.addCleanup(
+            lambda: (
+                dialog.close(),
+                interface.close(),
+                self._qt_app.processEvents(),
+            )
+        )
+
+        with patch("app.view.subtitle_interface.isDarkTheme", return_value=True):
+            interface._style_manual_review_dialog(dialog, listing)
+
+        style = dialog.styleSheet()
+        self.assertEqual(dialog.objectName(), "manualReviewDialog")
+        self.assertEqual(listing.objectName(), "manualReviewList")
+        self.assertTrue(listing.wordWrap())
+        self.assertEqual(listing.textElideMode(), Qt.ElideNone)
+        self.assertEqual(
+            listing.horizontalScrollBarPolicy(),
+            Qt.ScrollBarAlwaysOff,
+        )
+        self.assertIn("background-color: #202020", style)
+        self.assertIn("background-color: #292929", style)
+        self.assertIn("color: #f2f2f2", style)
 
     def test_boundary_editor_requires_an_explicit_row_click_and_can_be_disarmed(self):
         calls = []

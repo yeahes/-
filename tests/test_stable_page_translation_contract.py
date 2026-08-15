@@ -597,6 +597,232 @@ def test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages():
     ]
 
 
+def test_page_translation_retry_contract_contains_only_failed_parent_pages():
+    parents = [
+        {
+            "parent_subtitle_id": "S0186",
+            "english": "A valid parent with two pages",
+            "chinese": "有效父字幕",
+            "word_start": 0,
+            "word_end": 5,
+            "pages": [
+                {
+                    "display_page_id": "S0186.P01",
+                    "word_start": 0,
+                    "word_end": 2,
+                    "english": "A valid parent",
+                },
+                {
+                    "display_page_id": "S0186.P02",
+                    "word_start": 3,
+                    "word_end": 5,
+                    "english": "with two pages",
+                },
+            ],
+        },
+        {
+            "parent_subtitle_id": "S0187",
+            "english": "back from policy changes to the shift within you",
+            "chinese": "从宏观政策巨变，拉回到作为个体的你内心的心理转变。",
+            "word_start": 6,
+            "word_end": 14,
+            "pages": [
+                {
+                    "display_page_id": "S0187.P01",
+                    "word_start": 6,
+                    "word_end": 9,
+                    "english": "back from policy changes",
+                },
+                {
+                    "display_page_id": "S0187.P02",
+                    "word_start": 10,
+                    "word_end": 14,
+                    "english": "to the shift within you",
+                },
+            ],
+        },
+    ]
+    render_plans = []
+    for parent in parents:
+        render_plans.append(
+            {
+                "parent_subtitle_id": parent["parent_subtitle_id"],
+                "english": parent["english"],
+                "chinese": parent["chinese"],
+                "word_start": parent["word_start"],
+                "word_end": parent["word_end"],
+                "english_font_size": 56,
+                "pages": [
+                    {
+                        **dict(page),
+                        "start_ms": int(page["word_start"]) * 1000,
+                        "end_ms": (int(page["word_end"]) + 1) * 1000,
+                        "english_lines": [page["english"]],
+                        "english_font_size": 56,
+                        "english_width": 100,
+                    }
+                    for page in parent["pages"]
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        render_plans=render_plans,
+    )
+
+    retry_contract = ScreenSubtitleEditor._display_page_retry_contract(
+        contract,
+        [
+            {
+                "code": "page_translation_chinese_token_split",
+                "parent_subtitle_id": "S0187",
+                "display_page_id": "S0187.P01",
+            }
+        ],
+    )
+
+    assert [
+        parent["parent_subtitle_id"] for parent in retry_contract["parents"]
+    ] == ["S0187"]
+    assert [
+        plan["parent_subtitle_id"] for plan in retry_contract["render_plans"]
+    ] == ["S0187"]
+    assert [
+        page["display_page_id"]
+        for page in retry_contract["parents"][0]["pages"]
+    ] == ["S0187.P01", "S0187.P02"]
+
+    baseline = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0186.P01",
+                    "source_english": "A valid parent",
+                    "zh": "有效",
+                },
+                {
+                    "display_page_id": "S0186.P02",
+                    "source_english": "with two pages",
+                    "zh": "父字幕",
+                },
+                {
+                    "display_page_id": "S0187.P01",
+                    "source_english": "back from policy changes",
+                    "zh": "从宏观政策巨变，拉回",
+                },
+                {
+                    "display_page_id": "S0187.P02",
+                    "source_english": "to the shift within you",
+                    "zh": "到作为个体的你内心的心理转变。",
+                },
+            ]
+        },
+        require_source_echo=True,
+    )
+    assert baseline["status"] == "ERROR"
+    assert [parent["parent_subtitle_id"] for parent in baseline["parents"]] == [
+        "S0186"
+    ]
+    retry_artifact = validate_page_translation_response(
+        retry_contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0187.P01",
+                    "source_english": "back from policy changes",
+                    "zh": "从宏观政策巨变",
+                },
+                {
+                    "display_page_id": "S0187.P02",
+                    "source_english": "to the shift within you",
+                    "zh": "拉回到作为个体的你内心的心理转变。",
+                },
+            ]
+        },
+        require_source_echo=True,
+    )
+    assert retry_artifact["status"] == "PASS"
+
+    merged = ScreenSubtitleEditor._merge_display_page_translation_artifacts(
+        contract,
+        baseline,
+        retry_artifact,
+    )
+
+    assert merged["status"] == "PASS"
+    assert parent_chinese_by_id(merged) == {
+        "S0186": "有效父字幕",
+        "S0187": "从宏观政策巨变拉回到作为个体的你内心的心理转变。",
+    }
+
+
+def test_structural_page_response_forces_full_contract_retry():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": case["subtitle_id"],
+                "english": case["english"],
+                "chinese": case["parent_chinese"],
+                "word_start": case["word_start"],
+                "word_end": case["word_end"],
+                "pages": [
+                    {
+                        "display_page_id": display_page_id(case["subtitle_id"], index),
+                        "word_start": page["word_start"],
+                        "word_end": page["word_end"],
+                        "english": page["english"],
+                    }
+                    for index, page in enumerate(case["pages"], 1)
+                ],
+            },
+            {
+                "parent_subtitle_id": "S0187",
+                "english": "A second parent",
+                "chinese": "第二条父字幕",
+                "word_start": 20,
+                "word_end": 22,
+                "pages": [
+                    {
+                        "display_page_id": "S0187.P01",
+                        "word_start": 20,
+                        "word_end": 20,
+                        "english": "A",
+                    },
+                    {
+                        "display_page_id": "S0187.P02",
+                        "word_start": 21,
+                        "word_end": 22,
+                        "english": "second parent",
+                    },
+                ],
+            },
+        ],
+        layout_profile={"template": "article"},
+    )
+    structural_errors = [
+        {"code": "page_translation_id_missing", "ids": ["S0001.P02"]},
+        {"code": "page_translation_cardinality_mismatch"},
+    ]
+    full_retry = ScreenSubtitleEditor._display_page_errors_require_full_retry(
+        structural_errors
+    )
+    assert full_retry
+    retry = (
+        contract
+        if full_retry
+        else ScreenSubtitleEditor._display_page_retry_contract(
+            contract, structural_errors
+        )
+    )
+    assert [parent["parent_subtitle_id"] for parent in retry["parents"]] == [
+        case["subtitle_id"],
+        "S0187",
+    ]
+
+
 def test_page_translation_cache_key_invalidates_semantic_page_contract_changes():
     case = _cases()["s0078_reordered_chinese"]
     contract = _contract(case)
@@ -1459,7 +1685,13 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
     editor._display_page_translation_quality_errors = lambda contract, artifact: []
     editor._record_display_page_translation_failure = lambda *args, **kwargs: None
     editor._report_subtitle_coverage_gaps = lambda *args, **kwargs: None
-    editor._write_stable_pipeline_artifacts = lambda *args, **kwargs: None
+    post_page_audits = []
+
+    def capture_post_page_artifacts(*args, **kwargs):
+        audit = editor._english_boundary_audit_payload(kwargs["final_segments"])
+        post_page_audits.append(audit)
+
+    editor._write_stable_pipeline_artifacts = capture_post_page_artifacts
 
     before = [
         (
@@ -1497,6 +1729,12 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
     assert [parent["parent_subtitle_id"] for parent in artifact["parents"]] == [
         case["subtitle_id"]
     ]
+    assert post_page_audits
+    assert post_page_audits[-1]["schema_version"] == 2
+    assert any(
+        record.get("scope") == "display_page"
+        for record in post_page_audits[-1]["records"]
+    )
 
 
 def test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id():
@@ -2365,6 +2603,8 @@ if __name__ == "__main__":
     test_s0252_monotonic_translation_remains_page_aligned()
     test_page_translation_rejects_missing_duplicate_and_unknown_page_ids()
     test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages()
+    test_page_translation_retry_contract_contains_only_failed_parent_pages()
+    test_structural_page_response_forces_full_contract_retry()
     test_page_translation_cache_key_invalidates_semantic_page_contract_changes()
     test_page_contract_and_cache_identity_include_frozen_font_and_boundary_evidence()
     test_article_english_font_fallback_has_a_strict_50px_floor()

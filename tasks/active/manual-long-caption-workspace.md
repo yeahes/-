@@ -1,7 +1,7 @@
 # Task: Manual Long-Caption Workspace
 
 Status: in_progress
-Last reviewed: 2026-08-12 04:21:11 Asia/Shanghai
+Last reviewed: 2026-08-15 00:26:59 Asia/Shanghai
 
 ## Goal
 
@@ -89,6 +89,14 @@ Subtitle Edit patterns to adapt:
 - Inspectable history and explicit rollback.
 - Recoverable local auto-backups.
 
+## 2026-08-13 Translation Review Increment
+
+- Article terminology uses hit-only injection in the current translation source
+  window; the full glossary is no longer repeated for unrelated batches.
+- The stable QA summary writes a separate semantic-review queue for high-signal
+  Chinese semantic and fluency findings. This is read-only evidence and does
+  not mutate the production package.
+
 ## Planned Stages
 
 ### 1. Read-only candidate API
@@ -101,6 +109,9 @@ Subtitle Edit patterns to adapt:
 - Add focused fixtures derived from accepted and rejected real boundaries;
   do not commit private production journals.
 
+Status: completed. The core helper returns bounded candidates and global
+word-ledger ranges without mutating production state.
+
 ### 2. Parent-local workspace
 
 - Add a focused queue for dense, low-font, overflow, review, or unconfirmed
@@ -110,6 +121,40 @@ Subtitle Edit patterns to adapt:
 - Keep split, merge, and boundary experiments in a parent-local draft.
 - Allow undo/redo inside that draft and commit the parent as one atomic edit.
 - Preserve selection and scroll position when applying or rejecting a draft.
+
+Status: partially completed. The actual-page context menu now opens a local
+candidate dialog and applies one selected candidate to only the current parent,
+preserving matching page Chinese. Exact rendered previews, word chips, and
+delta-journal recovery remain follow-up work.
+
+2026-08-14 increment: the row-level boundary inspector now previews nearby
+word-ledger cuts and distinguishes recommended, manual-review, and blocked
+options. Soft subject/predicate or coordination risks remain visible instead
+of being labelled safe; hard grammar, duration, and minimum-page constraints
+remain blocked. Preview is read-only.
+
+2026-08-13 increment: the actual-page editor now exposes a read-only parent
+risk queue and candidate rows show word count, duration, and pause evidence.
+The queue does not mutate page plans or apply candidates automatically.
+
+Real-package acceptance: a temporary byte-identical copy of the 283-parent,
+353-page `如何停止拖延` manual-final package completed local page split,
+boundary move, page merge, undo, redo, exact initial-state restoration,
+single-page Chinese edit, save, manifest reload, parent/actual-page projection,
+and synthesis-manifest resolution. All 15 source-package files retained their
+original size and SHA-256. This validates the core session workflow without
+claiming a full mouse-driven Qt walkthrough.
+
+Queue responsiveness follow-up: opening the queue no longer runs the renderer
+candidate planner for every risk parent. The real package now builds 34
+high-signal queue items in 0.020 seconds instead of 45.89 seconds; candidate
+planning is deferred until the user opens one parent's focused workspace.
+
+Queue continuity follow-up: native long-caption and candidate dialogs now use
+the current application light/dark palette. The queue also restores focus by
+frozen parent ID after the user edits an item and reopens the queue; when that
+item is no longer risky it selects the nearest remaining row. This state is
+session-local and is reset when another subtitle package is loaded.
 
 ### 3. ID-bound page-Chinese suggestions
 
@@ -122,6 +167,13 @@ Subtitle Edit patterns to adapt:
   model, and prompt version.
 - Suggestions remain visibly unconfirmed until edited or accepted by the user.
 
+2026-08-14 increment: the semantic-review queue can generate cached suggestions
+in a background worker and manually apply them by exact fixed parent ID. Source
+echo, current-Chinese hash, numbers, explicit currency units, negation, and
+article-matched terms are validated before atomic writeback. Session switches,
+queue changes, and intervening Chinese edits invalidate stale results. Page-ID
+suggestions and exact rendered preview remain follow-up scope.
+
 ### 4. Delta journal and recovery
 
 - Introduce a backward-compatible edit-journal schema that records affected
@@ -130,6 +182,22 @@ Subtitle Edit patterns to adapt:
 - Atomically auto-save the working draft without publishing a formal manifest.
 - Offer recovery after close or crash and keep formal publication as the
   existing explicit manual-final save.
+
+Status: completed for the high-frequency local editor path. Parent-scoped
+undo/redo now persists only the affected parent, survives recovery-draft
+reload, and skips unrelated later parent edits. Legacy full snapshots migrate
+in memory when loaded. English surface history stores changed frozen-word
+records instead of a complete word ledger, and recovery drafts use compact
+atomic JSON. Cross-parent, formal cue-boundary, and audio-tail operations
+remain whole-document transactions by design.
+
+2026-08-15 performance acceptance: the real 119-operation Mixue manual-final
+history fell from 20.7 MB to 2.5 MB and its recovery draft from 32.8 MB to
+3.1 MB. Draft hash/write time fell from roughly 222/1299 ms to 31/138 ms.
+Local Qt edits now emit data-row changes or row insertion/removal rather than a
+model reset; full reset remains reserved for imports and view-mode switches.
+Read-only replay on two real packages preserved unrelated parents across edit,
+split, undo, and redo. The final complete regression passed in 346.3 seconds.
 
 ### 5. Optional AI boundary fallback
 

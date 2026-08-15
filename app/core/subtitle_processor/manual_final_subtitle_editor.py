@@ -25,7 +25,12 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 from app.core.bk_asr.asr_data import ASRData
 from app.config import BIN_PATH
 from app.core.entities import SupportedAudioFormats, SupportedVideoFormats
-from app.core.output_paths import media_result_dir
+from app.core.output_paths import (
+    MEDIA_RESULT_MANUAL_PACKAGE_DIR,
+    containing_media_result_dir,
+    media_result_dir,
+    media_result_manual_package_dir,
+)
 from app.core.subtitle_processor.stable_artifacts import (
     file_sha256,
     find_stable_manifest_for_artifact,
@@ -950,6 +955,15 @@ class ManualFinalSubtitleSession:
         candidates.extend(
             subtitle_path.parent.glob("*-人工终稿字幕包/stable-final-manifest.json")
         )
+        result_root = containing_media_result_dir(subtitle_path)
+        if result_root is not None:
+            nested_portable = (
+                result_root
+                / MEDIA_RESULT_MANUAL_PACKAGE_DIR
+                / "stable-final-manifest.json"
+            )
+            if nested_portable.is_file():
+                candidates.append(nested_portable)
         legacy_portable = (
             subtitle_path.parent / "人工终稿字幕包" / "stable-final-manifest.json"
         )
@@ -1407,6 +1421,8 @@ class ManualFinalSubtitleSession:
         )
         session._validate_cues()
         session._validate_display_page_boundary_overrides()
+        session.compact_english_surface_history()
+        session.compact_parent_scoped_history()
         session._remember_known_formal_boundary_evidence()
         recovered_count = session._recover_identity_matched_history_page_drafts()
         if recovered_count:
@@ -1500,6 +1516,153 @@ class ManualFinalSubtitleSession:
                 for right_word in range(word_start + 1, word_end + 1)
             },
         )
+
+    def build_display_page_candidate_workspace(
+        self,
+        parent_subtitle_id: str,
+        *,
+        min_page_count: int = 2,
+        max_page_count: int = 4,
+    ) -> Dict[str, Any]:
+        """Build read-only page alternatives for one frozen parent cue.
+
+        Candidate planning is deliberately separate from the mutable page
+        edits.  The returned ranges are global word-ledger IDs and can be
+        applied later as one parent-scoped edit.
+        """
+        parent_id = str(parent_subtitle_id or "").strip()
+        cue_index = next(
+            (
+                index
+                for index, cue in enumerate(self.cues)
+                if str(cue.get("cue_id") or "") == parent_id
+            ),
+            -1,
+        )
+        if cue_index < 0:
+            raise ManualFinalSubtitleEditError("找不到要查看候选分页的父字幕。")
+        cue = self.cues[cue_index]
+        self._ensure_unmodified_english(cue)
+        boundary_payload = self._validated_display_boundary_evidence()
+        from app.core.utils.podcast_learning_video import (
+            article_display_boundary_explanation,
+            build_article_display_page_candidate_workspace,
+        )
+
+        workspace = build_article_display_page_candidate_workspace(
+            self._article_render_cue(
+                cue_index,
+                dict(boundary_payload.get("boundaries") or {}),
+            ),
+            min_page_count=min_page_count,
+            max_page_count=max_page_count,
+        )
+        first_word = int(cue["word_start"])
+        for candidate in workspace.get("candidates") or []:
+            plan = candidate.get("plan") or {}
+            pages = []
+            source_pages = list(plan.get("pages") or candidate.get("pages") or [])
+            for page_index, page in enumerate(source_pages):
+                local_start = int(page.get("word_start"))
+                local_end = int(page.get("word_end"))
+                previous_page = source_pages[page_index - 1] if page_index else {}
+                boundary = dict(page.get("boundary_before") or {})
+                pages.append(
+                    {
+                        **dict(page),
+                        "word_start": first_word + local_start,
+                        "word_end": first_word + local_end,
+                        "boundary_explanation": article_display_boundary_explanation(
+                            boundary,
+                            left_english=str(previous_page.get("en") or ""),
+                            right_english=str(page.get("en") or ""),
+                        ),
+                    }
+                )
+            candidate["global_word_ranges"] = [
+                [int(page["word_start"]), int(page["word_end"])]
+                for page in pages
+            ]
+            candidate["pages"] = pages
+            candidate["applicable"] = all(
+                bool(page.get("boundary_explanation", {}).get("applicable", True))
+                for page in pages[1:]
+            )
+        return workspace
+
+    def build_display_page_risk_queue(
+        self,
+        *,
+        min_page_count: int = 2,
+        max_page_count: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Return a read-only queue of parents worth human page review.
+
+        The queue is an editor aid only.  It never changes the frozen parent
+        cues or calls the mutating page-edit methods.  A parent is included
+        when its current pages carry a concrete density, font, boundary, or
+        confirmation signal. Candidate planning is deliberately lazy: the
+        focused workspace computes alternatives only after the user selects
+        one parent, rather than blocking the Qt thread for the entire file.
+        """
+        page_rows = self._visible_display_page_rows(self._display_page_model_data())
+        rows_by_parent: Dict[str, List[Dict[str, Any]]] = {}
+        for row in page_rows:
+            parent_id = str(row.get("manual_cue_id") or "").strip()
+            if parent_id:
+                rows_by_parent.setdefault(parent_id, []).append(dict(row))
+
+        queue: List[Dict[str, Any]] = []
+        for cue in self.cues:
+            parent_id = str(cue.get("cue_id") or "").strip()
+            if not parent_id or cue.get("display_suppressed"):
+                continue
+            word_count = int(cue.get("word_end", -1)) - int(cue.get("word_start", 0)) + 1
+            current_rows = rows_by_parent.get(parent_id, [])
+            reasons: List[str] = []
+            if word_count > 16:
+                reasons.append("英文超过16词")
+            font_sizes = [
+                int(row.get("english_font_size") or 0)
+                for row in current_rows
+                if str(row.get("english_font_size") or "").strip()
+            ]
+            if font_sizes and min(font_sizes) < 56:
+                reasons.append(f"字号降到{min(font_sizes)}")
+            if any(bool(row.get("display_page_review_required")) for row in current_rows):
+                reasons.append("分页边界待复核")
+            if any(
+                str(row.get("translated_subtitle") or "").strip()
+                and not bool(row.get("display_page_chinese_confirmed"))
+                for row in current_rows
+            ):
+                reasons.append("分页中文待确认")
+            if any(bool(row.get("display_page_chinese_stale")) for row in current_rows):
+                reasons.append("分页中文是旧草稿")
+
+            if not reasons:
+                continue
+            queue.append(
+                {
+                    "parent_subtitle_id": parent_id,
+                    "english": str(cue.get("original_subtitle") or ""),
+                    "word_count": word_count,
+                    "start_time": int(cue.get("start_time") or 0),
+                    "end_time": int(cue.get("end_time") or 0),
+                    "reasons": list(dict.fromkeys(reasons)),
+                    "current_page_count": len(current_rows),
+                    "candidate_count": 0,
+                    "best_candidate": {},
+                }
+            )
+        queue.sort(
+            key=lambda item: (
+                -int(item.get("word_count") or 0),
+                -len(item.get("reasons") or []),
+                str(item.get("parent_subtitle_id") or ""),
+            )
+        )
+        return queue
 
     def _ensure_unmodified_english(self, cue: Mapping[str, Any]) -> None:
         expected = self._words_text(self.word_ledger, int(cue["word_start"]), int(cue["word_end"]))
@@ -1633,24 +1796,61 @@ class ManualFinalSubtitleSession:
             self.word_ledger
         )
 
-    def _record_history(self, operation: str, before: Sequence[Mapping[str, Any]], **details: Any) -> None:
+    def _record_history(
+        self,
+        operation: str,
+        before: Sequence[Mapping[str, Any]],
+        **details: Any,
+    ) -> None:
         self._remember_formal_boundary_evidence(self.cues)
         self._remember_formal_boundary_evidence(before)
-        self.history.append(
-            {
-                "operation": operation,
-                "at": datetime.now().isoformat(timespec="seconds"),
-                "before_cues": copy.deepcopy(list(before)),
-                "before_display_page_edits": copy.deepcopy(
-                    self.display_page_edits
+        entry = {
+            "operation": operation,
+            "at": datetime.now().isoformat(timespec="seconds"),
+            **details,
+        }
+        affected = self._history_affected_parent_ids(entry)
+        if (
+            operation in self._PARENT_SCOPED_HISTORY_OPERATIONS
+            and len(affected) == 1
+        ):
+            parent_id = next(iter(affected))
+            parent_state = self._capture_parent_runtime_state(parent_id)
+            before_cue = next(
+                (
+                    copy.deepcopy(dict(cue))
+                    for cue in before
+                    if str(cue.get("cue_id") or "").strip() == parent_id
                 ),
-                "before_display_page_boundary_overrides": copy.deepcopy(
-                    self.display_page_boundary_overrides
-                ),
-                "before_tail_trim": copy.deepcopy(self.tail_trim),
-                **details,
-            }
-        )
+                None,
+            )
+            if before_cue is not None:
+                parent_state["cue"] = before_cue
+            entry.update(
+                {
+                    "history_schema_version": 2,
+                    "before_parent_states": {parent_id: parent_state},
+                }
+            )
+        else:
+            entry.setdefault("before_cues", copy.deepcopy(list(before)))
+            entry.setdefault(
+                "before_display_page_edits",
+                copy.deepcopy(self.display_page_edits),
+            )
+            entry.setdefault(
+                "before_display_page_boundary_overrides",
+                copy.deepcopy(self.display_page_boundary_overrides),
+            )
+            entry.setdefault(
+                "before_recovered_stale_page_drafts",
+                copy.deepcopy(self.recovered_stale_page_drafts),
+            )
+            entry.setdefault(
+                "before_tail_trim",
+                copy.deepcopy(self.tail_trim),
+            )
+        self.history.append(entry)
         self.redo_history.clear()
 
     @staticmethod
@@ -1696,6 +1896,15 @@ class ManualFinalSubtitleSession:
             before = entry.get("before_cues") or []
             if isinstance(before, list):
                 self._remember_formal_boundary_evidence(before)
+            parent_states = entry.get("before_parent_states") or {}
+            if isinstance(parent_states, Mapping):
+                compact_cues = [
+                    state.get("cue")
+                    for state in parent_states.values()
+                    if isinstance(state, Mapping)
+                    and isinstance(state.get("cue"), Mapping)
+                ]
+                self._remember_formal_boundary_evidence(compact_cues)
 
     def _validate_cues(self) -> None:
         previous_word_end = -1
@@ -1770,9 +1979,17 @@ class ManualFinalSubtitleSession:
         if self.display_page_edits or self.display_page_boundary_overrides:
             return
         for entry in reversed(self.history):
+            compact_states = entry.get("before_parent_states") or {}
+            compact_page_state = any(
+                bool(state.get("display_page_edits"))
+                or bool(state.get("display_page_boundary_override"))
+                for state in compact_states.values()
+                if isinstance(state, Mapping)
+            ) if isinstance(compact_states, Mapping) else False
             if (
                 entry.get("before_display_page_edits")
                 or entry.get("before_display_page_boundary_overrides")
+                or compact_page_state
             ):
                 raise ManualFinalSubtitleEditError(
                     "检测到人工分页状态异常归零，已拒绝保存；"
@@ -1905,7 +2122,7 @@ class ManualFinalSubtitleSession:
                 "redo_history": self.redo_history,
             }
         )
-        write_json_artifact(draft_path, payload)
+        write_json_artifact(draft_path, payload, compact=True)
         return draft_path
 
     def restore_recovery_draft(self) -> bool:
@@ -1939,6 +2156,8 @@ class ManualFinalSubtitleSession:
         candidate._restore_runtime_state(state)
         candidate.history = history
         candidate.redo_history = redo_history
+        candidate.compact_english_surface_history()
+        candidate.compact_parent_scoped_history()
         embedded_hash = candidate._semantic_word_ledger_hash(candidate.word_ledger)
         accepted_hashes = {
             embedded_hash,
@@ -1947,7 +2166,7 @@ class ManualFinalSubtitleSession:
         if candidate.source_word_ledger_hash not in accepted_hashes:
             raise ManualFinalSubtitleEditError("人工恢复草稿的词账本哈希不一致。")
         self._restore_runtime_state(state)
-        self.history = history
+        self.history = candidate.history
         self.redo_history = redo_history
         self.import_notice = "已恢复上次未保存的人工字幕草稿。"
         return True
@@ -1994,7 +2213,17 @@ class ManualFinalSubtitleSession:
         for history_entry in self.history:
             if not isinstance(history_entry, Mapping):
                 continue
-            for raw_edit in history_entry.get("before_display_page_edits") or []:
+            history_edits = list(
+                history_entry.get("before_display_page_edits") or []
+            )
+            compact_states = history_entry.get("before_parent_states") or {}
+            if isinstance(compact_states, Mapping):
+                for state in compact_states.values():
+                    if isinstance(state, Mapping):
+                        history_edits.extend(
+                            state.get("display_page_edits") or []
+                        )
+            for raw_edit in history_edits:
                 if not isinstance(raw_edit, Mapping):
                     continue
                 page_id = str(raw_edit.get("display_page_id") or "").strip()
@@ -2198,22 +2427,42 @@ class ManualFinalSubtitleSession:
                 chinese_updates.append((cue, chinese))
         if not chinese_updates and not english_plans:
             return False
-        before = copy.deepcopy(self.cues)
+        affected_parent_ids = sorted(
+            english_parent_ids
+            | {
+                str(cue.get("cue_id") or "")
+                for cue, _chinese in chinese_updates
+            }
+        )
+        before = (
+            copy.deepcopy(self.cues)
+            if english_plans or len(affected_parent_ids) != 1
+            else ()
+        )
         self._record_history(
             "edit_english_surface" if english_plans else "edit_parent_chinese",
             before,
-            affected_parent_ids=sorted(
-                english_parent_ids
-                | {
-                    str(cue.get("cue_id") or "")
-                    for cue, _chinese in chinese_updates
-                }
-            ),
-            before_word_ledger=(
-                copy.deepcopy(self.word_ledger) if english_plans else []
+            affected_parent_ids=affected_parent_ids,
+            before_word_ledger_items=(
+                [
+                    {
+                        "word_id": word_id,
+                        "word": copy.deepcopy(self.word_ledger[word_id]),
+                    }
+                    for word_id in sorted(
+                        {int(plan["word_id"]) for plan in english_plans}
+                    )
+                ]
+                if english_plans
+                else []
             ),
             before_source_word_ledger_hash=(
                 self.source_word_ledger_hash if english_plans else ""
+            ),
+            before_formal_word_ledger_hash=(
+                self._formal_word_ledger_hash(self.word_ledger)
+                if english_plans
+                else ""
             ),
         )
         if english_plans:
@@ -2444,10 +2693,9 @@ class ManualFinalSubtitleSession:
         ) <= 1:
             raise ManualFinalSubtitleEditError("至少需要保留一条可显示字幕。")
 
-        before = copy.deepcopy(self.cues)
         self._record_history(
             "set_display_suppressed",
-            before,
+            (),
             affected_parent_ids=[parent_id],
             parent_subtitle_id=parent_id,
             suppressed=target,
@@ -2497,19 +2745,335 @@ class ManualFinalSubtitleSession:
 
     def can_undo_for_parent(self, parent_subtitle_id: str) -> bool:
         parent_id = str(parent_subtitle_id or "").strip()
-        return bool(
-            parent_id
-            and self.history
-            and parent_id
-            in self._history_affected_parent_ids(self.history[-1])
-        )
+        entry = self._latest_history_entry_for_parent(parent_id)
+        return bool(entry and self._history_is_parent_scoped(entry, parent_id))
 
     def undo_for_parent(self, parent_subtitle_id: str) -> bool:
-        if not self.can_undo_for_parent(parent_subtitle_id):
+        parent_id = str(parent_subtitle_id or "").strip()
+        found = self._latest_history_entry_for_parent(parent_id, with_index=True)
+        if found is None:
             raise ManualFinalSubtitleEditError(
-                "当前字幕没有可撤销的最新调整；不能跳过后续修改单独回滚。"
+                "当前字幕没有可撤销的最新调整；分页或中文历史可能已不存在。"
             )
-        return self.undo()
+        history_index, entry = found
+        if not self._history_is_parent_scoped(entry, parent_id):
+            raise ManualFinalSubtitleEditError(
+                "这次操作同时影响了跨字幕边界、词账本或音频，不能只撤销一行；"
+                "请使用整体撤销。"
+            )
+        return self._undo_parent_scoped_history_entry(history_index, parent_id)
+
+    _PARENT_SCOPED_HISTORY_OPERATIONS = {
+        "edit_parent_chinese",
+        "edit_display_page_chinese",
+        "set_display_suppressed",
+        "move_display_page_boundary",
+        "split_parent_into_display_pages",
+        "split_display_page",
+        "merge_display_page_with_next",
+        "confirm_display_page_boundary",
+        "confirm_all_nonblocking_display_page_reviews",
+    }
+
+    def _latest_history_entry_for_parent(
+        self,
+        parent_subtitle_id: str,
+        *,
+        with_index: bool = False,
+    ) -> Any:
+        parent_id = str(parent_subtitle_id or "").strip()
+        if not parent_id:
+            return None
+        for index in range(len(self.history) - 1, -1, -1):
+            entry = self.history[index]
+            if parent_id in self._history_affected_parent_ids(entry):
+                return (index, entry) if with_index else entry
+        return None
+
+    @classmethod
+    def _history_is_parent_scoped(
+        cls,
+        entry: Mapping[str, Any],
+        parent_subtitle_id: str,
+    ) -> bool:
+        affected = cls._history_affected_parent_ids(entry)
+        return bool(
+            str(entry.get("operation") or "")
+            in cls._PARENT_SCOPED_HISTORY_OPERATIONS
+            and affected == {str(parent_subtitle_id or "").strip()}
+        )
+
+    @staticmethod
+    def _parent_page_items(
+        values: Sequence[Mapping[str, Any]],
+        parent_subtitle_id: str,
+    ) -> List[Dict[str, Any]]:
+        parent_id = str(parent_subtitle_id or "").strip()
+        return [
+            copy.deepcopy(dict(value))
+            for value in values
+            if str(value.get("parent_subtitle_id") or "").strip() == parent_id
+        ]
+
+    def _capture_parent_runtime_state(self, parent_subtitle_id: str) -> Dict[str, Any]:
+        parent_id = str(parent_subtitle_id or "").strip()
+        cue = next(
+            (
+                copy.deepcopy(dict(value))
+                for value in self.cues
+                if str(value.get("cue_id") or "").strip() == parent_id
+            ),
+            None,
+        )
+        drafts = {
+            str(page_id): copy.deepcopy(dict(value))
+            for page_id, value in self.recovered_stale_page_drafts.items()
+            if str(page_id).startswith(f"{parent_id}.P")
+        }
+        return {
+            "parent_subtitle_id": parent_id,
+            "cue": cue,
+            "display_page_edits": self._parent_page_items(
+                self.display_page_edits, parent_id
+            ),
+            "has_display_page_boundary_override": (
+                parent_id in self.display_page_boundary_overrides
+            ),
+            "display_page_boundary_override": copy.deepcopy(
+                self.display_page_boundary_overrides.get(parent_id) or []
+            ),
+            "recovered_stale_page_drafts": drafts,
+        }
+
+    def _parent_runtime_state_before_history(
+        self,
+        entry: Mapping[str, Any],
+        parent_subtitle_id: str,
+    ) -> Dict[str, Any]:
+        parent_id = str(parent_subtitle_id or "").strip()
+        compact_states = entry.get("before_parent_states") or {}
+        if isinstance(compact_states, Mapping):
+            compact_state = compact_states.get(parent_id)
+            if isinstance(compact_state, Mapping):
+                return copy.deepcopy(dict(compact_state))
+        cue = next(
+            (
+                copy.deepcopy(dict(value))
+                for value in entry.get("before_cues") or []
+                if str(value.get("cue_id") or "").strip() == parent_id
+            ),
+            None,
+        )
+        overrides = entry.get("before_display_page_boundary_overrides") or {}
+        drafts = entry.get("before_recovered_stale_page_drafts") or {}
+        return {
+            "parent_subtitle_id": parent_id,
+            "cue": cue,
+            "display_page_edits": self._parent_page_items(
+                entry.get("before_display_page_edits") or [], parent_id
+            ),
+            "has_display_page_boundary_override": parent_id in overrides,
+            "display_page_boundary_override": copy.deepcopy(
+                overrides.get(parent_id) or []
+            ),
+            "recovered_stale_page_drafts": {
+                str(page_id): copy.deepcopy(dict(value))
+                for page_id, value in drafts.items()
+                if str(page_id).startswith(f"{parent_id}.P")
+            },
+        }
+
+    def compact_parent_scoped_history(self) -> int:
+        """Migrate legacy full-document entries to parent-sized undo commands."""
+        compacted = 0
+        migrated: List[Dict[str, Any]] = []
+        full_state_keys = {
+            "before_cues",
+            "before_display_page_edits",
+            "before_display_page_boundary_overrides",
+            "before_recovered_stale_page_drafts",
+            "before_tail_trim",
+        }
+        for raw_entry in self.history:
+            entry = dict(raw_entry)
+            affected = self._history_affected_parent_ids(entry)
+            if (
+                entry.get("before_parent_states")
+                or not self._history_is_parent_scoped(
+                    entry,
+                    next(iter(affected)) if len(affected) == 1 else "",
+                )
+            ):
+                migrated.append(raw_entry)
+                continue
+            parent_id = next(iter(affected))
+            parent_state = self._parent_runtime_state_before_history(
+                entry,
+                parent_id,
+            )
+            if not isinstance(parent_state.get("cue"), Mapping):
+                migrated.append(raw_entry)
+                continue
+            compact_entry = {
+                key: copy.deepcopy(value)
+                for key, value in entry.items()
+                if key not in full_state_keys
+            }
+            compact_entry["history_schema_version"] = 2
+            compact_entry["before_parent_states"] = {
+                parent_id: parent_state
+            }
+            migrated.append(compact_entry)
+            compacted += 1
+        if compacted:
+            self.history = migrated
+        return compacted
+
+    def compact_english_surface_history(self) -> int:
+        """Replace legacy full-ledger English undo payloads with word deltas."""
+        compacted = 0
+        rolling_ledger = copy.deepcopy(self.word_ledger)
+        migrated_reversed: List[Dict[str, Any]] = []
+        for raw_entry in reversed(self.history):
+            entry = dict(raw_entry)
+            before_ledger = entry.get("before_word_ledger")
+            before_items = list(entry.get("before_word_ledger_items") or [])
+            if (
+                str(entry.get("operation") or "") == "edit_english_surface"
+                and isinstance(before_ledger, list)
+                and len(before_ledger) == len(rolling_ledger)
+            ):
+                changed_word_ids = [
+                    word_id
+                    for word_id, (before_word, after_word) in enumerate(
+                        zip(before_ledger, rolling_ledger)
+                    )
+                    if before_word != after_word
+                ]
+                if changed_word_ids:
+                    compact_entry = {
+                        key: copy.deepcopy(value)
+                        for key, value in entry.items()
+                        if key != "before_word_ledger"
+                    }
+                    compact_entry["before_word_ledger_items"] = [
+                        {
+                            "word_id": word_id,
+                            "word": copy.deepcopy(before_ledger[word_id]),
+                        }
+                        for word_id in changed_word_ids
+                    ]
+                    compact_entry["before_formal_word_ledger_hash"] = (
+                        self._formal_word_ledger_hash(before_ledger)
+                    )
+                    entry = compact_entry
+                    compacted += 1
+                rolling_ledger = copy.deepcopy(before_ledger)
+            elif (
+                str(entry.get("operation") or "") == "edit_english_surface"
+                and before_items
+            ):
+                for item in before_items:
+                    try:
+                        word_id = int(item.get("word_id", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    word = item.get("word")
+                    if 0 <= word_id < len(rolling_ledger) and isinstance(
+                        word, Mapping
+                    ):
+                        rolling_ledger[word_id] = copy.deepcopy(dict(word))
+            elif (
+                isinstance(before_ledger, list)
+                and before_ledger
+                and str(entry.get("operation") or "") == "trim_tail_from_cue"
+            ):
+                rolling_ledger = copy.deepcopy(before_ledger)
+            migrated_reversed.append(entry)
+        if compacted:
+            self.history = list(reversed(migrated_reversed))
+        return compacted
+
+    def _restore_parent_runtime_state(self, state: Mapping[str, Any]) -> None:
+        parent_id = str(state.get("parent_subtitle_id") or "").strip()
+        cue = state.get("cue")
+        cue_index = next(
+            (
+                index
+                for index, value in enumerate(self.cues)
+                if str(value.get("cue_id") or "").strip() == parent_id
+            ),
+            -1,
+        )
+        if cue_index < 0 or not isinstance(cue, Mapping):
+            raise ManualFinalSubtitleEditError(
+                "当前字幕身份已变化，无法安全恢复这条字幕的历史。"
+            )
+        self.cues[cue_index] = copy.deepcopy(dict(cue))
+        other_edits = [
+            copy.deepcopy(dict(value))
+            for value in self.display_page_edits
+            if str(value.get("parent_subtitle_id") or "").strip() != parent_id
+        ]
+        restored_edits = [
+            copy.deepcopy(dict(value))
+            for value in state.get("display_page_edits") or []
+        ]
+        cue_order = {
+            str(value.get("cue_id") or ""): index
+            for index, value in enumerate(self.cues)
+        }
+        self.display_page_edits = sorted(
+            [*other_edits, *restored_edits],
+            key=lambda value: (
+                cue_order.get(str(value.get("parent_subtitle_id") or ""), 10**9),
+                int(value.get("word_start", 10**9)),
+                str(value.get("display_page_id") or ""),
+            ),
+        )
+        if state.get("has_display_page_boundary_override"):
+            self.display_page_boundary_overrides[parent_id] = [
+                int(value)
+                for value in state.get("display_page_boundary_override") or []
+            ]
+        else:
+            self.display_page_boundary_overrides.pop(parent_id, None)
+        self.recovered_stale_page_drafts = {
+            page_id: value
+            for page_id, value in self.recovered_stale_page_drafts.items()
+            if not str(page_id).startswith(f"{parent_id}.P")
+        }
+        self.recovered_stale_page_drafts.update(
+            {
+                str(page_id): copy.deepcopy(dict(value))
+                for page_id, value in (
+                    state.get("recovered_stale_page_drafts") or {}
+                ).items()
+            }
+        )
+        self._display_page_preview_cache.pop(parent_id, None)
+        self._validate_cues()
+        self._validate_display_page_boundary_overrides()
+
+    def _undo_parent_scoped_history_entry(
+        self,
+        history_index: int,
+        parent_subtitle_id: str,
+    ) -> bool:
+        entry = self.history[history_index]
+        parent_id = str(parent_subtitle_id or "").strip()
+        after = self._capture_parent_runtime_state(parent_id)
+        before = self._parent_runtime_state_before_history(entry, parent_id)
+        self._restore_parent_runtime_state(before)
+        self.history.pop(history_index)
+        self.redo_history.append(
+            {
+                "history_entry": copy.deepcopy(entry),
+                "parent_scoped_after": after,
+                "affected_parent_ids": [parent_id],
+            }
+        )
+        return True
 
     def _capture_runtime_state(self) -> Dict[str, Any]:
         return {
@@ -2532,6 +3096,54 @@ class ManualFinalSubtitleSession:
             ),
             "artifact_dir": str(self.artifact_dir),
         }
+
+    def _capture_english_history_state(
+        self,
+        history_entry: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        word_ids: set[int] = set()
+        for item in history_entry.get("before_word_ledger_items") or []:
+            try:
+                word_id = int(item.get("word_id", -1))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if 0 <= word_id < len(self.word_ledger):
+                word_ids.add(word_id)
+        return {
+            "word_ledger_items": [
+                {
+                    "word_id": word_id,
+                    "word": copy.deepcopy(self.word_ledger[word_id]),
+                }
+                for word_id in sorted(word_ids)
+            ],
+            "cues": copy.deepcopy(self.cues),
+            "source_word_ledger_hash": self.source_word_ledger_hash,
+            "display_page_edits": copy.deepcopy(self.display_page_edits),
+        }
+
+    def _restore_english_history_state(
+        self,
+        state: Mapping[str, Any],
+    ) -> None:
+        for item in state.get("word_ledger_items") or []:
+            word_id = int(item.get("word_id", -1))
+            word = item.get("word")
+            if not 0 <= word_id < len(self.word_ledger) or not isinstance(
+                word, Mapping
+            ):
+                raise ManualFinalSubtitleEditError(
+                    "人工英文撤销记录引用了无效的冻结词。"
+                )
+            self.word_ledger[word_id] = copy.deepcopy(dict(word))
+        self.cues = copy.deepcopy(list(state.get("cues") or []))
+        self.source_word_ledger_hash = str(
+            state.get("source_word_ledger_hash") or ""
+        )
+        self.display_page_edits = copy.deepcopy(
+            list(state.get("display_page_edits") or [])
+        )
+        self._validate_cues()
 
     def _restore_runtime_state(self, state: Mapping[str, Any]) -> None:
         self.word_ledger = copy.deepcopy(list(state.get("word_ledger") or []))
@@ -2583,6 +3195,41 @@ class ManualFinalSubtitleSession:
             return False
         redo_entry = self.redo_history.pop()
         history_entry = copy.deepcopy(dict(redo_entry.get("history_entry") or {}))
+        parent_scoped_after = redo_entry.get("parent_scoped_after")
+        if isinstance(parent_scoped_after, Mapping):
+            parent_id = str(parent_scoped_after.get("parent_subtitle_id") or "")
+            if not self._history_is_parent_scoped(history_entry, parent_id):
+                self.redo_history.append(redo_entry)
+                return False
+            before = self._capture_parent_runtime_state(parent_id)
+            try:
+                self._restore_parent_runtime_state(parent_scoped_after)
+            except Exception:
+                self._restore_parent_runtime_state(before)
+                self.redo_history.append(redo_entry)
+                raise
+            self.history.append(history_entry)
+            return True
+        after_english_state = redo_entry.get("after_english_state")
+        if isinstance(after_english_state, Mapping):
+            if (
+                not history_entry
+                or str(history_entry.get("operation") or "")
+                != "edit_english_surface"
+            ):
+                self.redo_history.append(redo_entry)
+                return False
+            before_english_state = self._capture_english_history_state(
+                history_entry
+            )
+            try:
+                self._restore_english_history_state(after_english_state)
+            except Exception:
+                self._restore_english_history_state(before_english_state)
+                self.redo_history.append(redo_entry)
+                raise
+            self.history.append(history_entry)
+            return True
         after_state = redo_entry.get("after_state") or {}
         if not history_entry or not after_state:
             return False
@@ -2599,8 +3246,25 @@ class ManualFinalSubtitleSession:
     def undo(self) -> bool:
         if not self.history:
             return False
+        top_entry = self.history[-1]
+        affected = self._history_affected_parent_ids(top_entry)
+        if len(affected) == 1:
+            parent_id = next(iter(affected))
+            if self._history_is_parent_scoped(top_entry, parent_id):
+                return self._undo_parent_scoped_history_entry(
+                    len(self.history) - 1,
+                    parent_id,
+                )
         self._remember_known_formal_boundary_evidence()
-        after_state = self._capture_runtime_state()
+        compact_english_history = bool(
+            str(top_entry.get("operation") or "") == "edit_english_surface"
+            and top_entry.get("before_word_ledger_items")
+        )
+        after_state = (
+            self._capture_english_history_state(top_entry)
+            if compact_english_history
+            else self._capture_runtime_state()
+        )
         entry = self.history.pop()
         before = list(entry.get("before_cues") or [])
         if not before:
@@ -2622,9 +3286,21 @@ class ManualFinalSubtitleSession:
             self.cues = before
         elif entry["operation"] == "edit_english_surface":
             self.cues = before
-            self.word_ledger = copy.deepcopy(
-                list(entry.get("before_word_ledger") or [])
-            )
+            before_items = list(entry.get("before_word_ledger_items") or [])
+            if before_items:
+                for item in before_items:
+                    word_id = int(item.get("word_id", -1))
+                    word = item.get("word")
+                    if not 0 <= word_id < len(self.word_ledger) or not isinstance(
+                        word, Mapping
+                    ):
+                        self.history.append(entry)
+                        return False
+                    self.word_ledger[word_id] = copy.deepcopy(dict(word))
+            else:
+                self.word_ledger = copy.deepcopy(
+                    list(entry.get("before_word_ledger") or [])
+                )
             self.source_word_ledger_hash = str(
                 entry.get("before_source_word_ledger_hash") or ""
             )
@@ -2669,15 +3345,16 @@ class ManualFinalSubtitleSession:
         self.tail_trim = dict(entry.get("before_tail_trim") or {})
         self._validate_cues()
         self._validate_display_page_boundary_overrides()
-        self.redo_history.append(
-            {
-                "history_entry": copy.deepcopy(entry),
-                "after_state": after_state,
-                "affected_parent_ids": sorted(
-                    self._history_affected_parent_ids(entry)
-                ),
-            }
-        )
+        redo_entry = {
+            "history_entry": copy.deepcopy(entry),
+            "affected_parent_ids": sorted(
+                self._history_affected_parent_ids(entry)
+            ),
+        }
+        redo_entry[
+            "after_english_state" if compact_english_history else "after_state"
+        ] = after_state
+        self.redo_history.append(redo_entry)
         return True
 
     def to_model_data(
@@ -3084,16 +3761,35 @@ class ManualFinalSubtitleSession:
                 self.display_page_edits = edits
             return False
 
-        before = copy.deepcopy(self.cues)
+        before = (
+            copy.deepcopy(self.cues)
+            if english_plans or len(changed_parent_ids) != 1
+            else ()
+        )
         self._record_history(
             "edit_english_surface" if english_plans else "edit_display_page_chinese",
             before,
             affected_parent_ids=sorted(changed_parent_ids),
-            before_word_ledger=(
-                copy.deepcopy(self.word_ledger) if english_plans else []
+            before_word_ledger_items=(
+                [
+                    {
+                        "word_id": word_id,
+                        "word": copy.deepcopy(self.word_ledger[word_id]),
+                    }
+                    for word_id in sorted(
+                        {int(plan["word_id"]) for plan in english_plans}
+                    )
+                ]
+                if english_plans
+                else []
             ),
             before_source_word_ledger_hash=(
                 self.source_word_ledger_hash if english_plans else ""
+            ),
+            before_formal_word_ledger_hash=(
+                self._formal_word_ledger_hash(self.word_ledger)
+                if english_plans
+                else ""
             ),
         )
         if english_plans:
@@ -3212,10 +3908,9 @@ class ManualFinalSubtitleSession:
             raise ManualFinalSubtitleEditError("结构性硬错误不能用人工确认跳过。")
         if not target.get("display_page_review_required"):
             return {"changed": False, "display_page_id": str(page_id)}
-        before = copy.deepcopy(self.cues)
         self._record_history(
             "confirm_display_page_boundary",
-            before,
+            (),
             display_page_id=str(page_id),
         )
         edits = [
@@ -3292,6 +3987,119 @@ class ManualFinalSubtitleSession:
             "chinese_count": len(chinese_ids),
             "boundary_count": len(boundary_ids),
         }
+
+    def preview_display_page_boundary_candidates(
+        self,
+        left_page_id: str,
+        *,
+        offsets: Sequence[int] = (-2, -1, 1, 2),
+        minimum_words: int = 4,
+        minimum_duration_ms: int = 900,
+    ) -> List[Dict[str, Any]]:
+        """Return nearby word-ledger cut suggestions without mutating the session."""
+        rows = self._visible_display_page_rows(self._display_page_model_data())
+        try:
+            left_position = next(
+                index
+                for index, row in enumerate(rows)
+                if str(row.get("display_page_id") or "") == str(left_page_id)
+            )
+        except StopIteration:
+            return []
+        if left_position + 1 >= len(rows):
+            return []
+        left = rows[left_position]
+        right = rows[left_position + 1]
+        parent_id = str(left.get("manual_cue_id") or "")
+        if not parent_id or parent_id != str(right.get("manual_cue_id") or ""):
+            return []
+        left_start = int(left["word_start"])
+        left_end = int(left["word_end"])
+        right_start = int(right["word_start"])
+        right_end = int(right["word_end"])
+        if right_start != left_end + 1:
+            return []
+        boundary_items = dict(
+            self._validated_display_boundary_evidence().get("boundaries") or {}
+        )
+        from app.core.utils.podcast_learning_video import (
+            article_display_boundary_explanation,
+        )
+
+        results: List[Dict[str, Any]] = []
+        seen_boundaries: set[int] = set()
+        for raw_offset in offsets:
+            offset = int(raw_offset)
+            if not offset:
+                continue
+            move_to_next = offset < 0
+            requested = abs(offset)
+            count = self.expanded_manual_boundary_word_count(
+                left_word_start=left_start,
+                left_word_end=left_end,
+                right_word_start=right_start,
+                right_word_end=right_end,
+                requested_word_count=requested,
+                move_to_next=move_to_next,
+            )
+            boundary = left_end - count + 1 if move_to_next else right_start + count
+            if boundary in seen_boundaries or boundary <= left_start or boundary > right_end:
+                continue
+            seen_boundaries.add(boundary)
+            actual_offset = boundary - right_start
+            left_count = boundary - left_start
+            right_count = right_end - boundary + 1
+            left_duration = self._word_end_time(boundary - 1) - self._word_start_time(left_start)
+            right_duration = self._word_end_time(right_end) - self._word_start_time(boundary)
+            evidence = dict(boundary_items.get(str(boundary)) or {})
+            hard = [str(value) for value in evidence.get("hard_issues") or []]
+            soft = [str(value) for value in evidence.get("soft_issues") or []]
+            classification = "hard" if hard else ("review" if soft else "allow")
+            explanation = article_display_boundary_explanation(
+                {
+                    "classification": classification,
+                    "issue_codes": [*hard, *soft],
+                    "confidence": "high" if hard else ("medium" if soft else "low"),
+                    "pause_ms": evidence.get("pause_ms"),
+                },
+                left_english=self._words_text(self.word_ledger, left_start, boundary - 1),
+                right_english=self._words_text(self.word_ledger, boundary, right_end),
+            )
+            rejection_reasons = []
+            if left_count < minimum_words or right_count < minimum_words:
+                rejection_reasons.append("一侧少于 4 个词")
+            if left_duration < minimum_duration_ms or right_duration < minimum_duration_ms:
+                rejection_reasons.append("一侧显示不足 0.9 秒")
+            if hard:
+                rejection_reasons.append(explanation["summary_zh"])
+            recommendation = (
+                "blocked"
+                if rejection_reasons
+                else ("review" if classification == "review" else "recommended")
+            )
+            results.append(
+                {
+                    "left_page_id": str(left_page_id),
+                    "parent_subtitle_id": parent_id,
+                    "requested_offset": offset,
+                    "actual_offset": actual_offset,
+                    "move_to_next": move_to_next,
+                    "word_count": abs(actual_offset),
+                    "right_word_id": boundary,
+                    "left_word_count": left_count,
+                    "right_word_count": right_count,
+                    "left_duration_ms": left_duration,
+                    "right_duration_ms": right_duration,
+                    "left_english": explanation["left_english"],
+                    "right_english": explanation["right_english"],
+                    "pause_ms": evidence.get("pause_ms"),
+                    "boundary_explanation": explanation,
+                    "recommendation": recommendation,
+                    "applicable": not rejection_reasons,
+                    "rejection_reasons": rejection_reasons,
+                }
+            )
+        return results
 
     def move_display_page_boundary(
         self,
@@ -3537,10 +4345,9 @@ class ManualFinalSubtitleSession:
                     self._unchanged_display_page_edit_from_model_row(row)
                 )
 
-        before = copy.deepcopy(self.cues)
         self._record_history(
             "move_display_page_boundary",
-            before,
+            (),
             parent_subtitle_id=parent_id,
             left_page_id=str(left_page_id),
             word_count=int(word_count),
@@ -3765,7 +4572,7 @@ class ManualFinalSubtitleSession:
 
         self._record_history(
             "merge_display_page_with_next",
-            copy.deepcopy(self.cues),
+            (),
             parent_subtitle_id=parent_id,
             left_page_id=page_id,
             removed_boundary_word_id=int(right["word_start"]),
@@ -4180,10 +4987,9 @@ class ManualFinalSubtitleSession:
                 "当前实际分页没有覆盖所选父字幕。"
             )
 
-        before = copy.deepcopy(self.cues)
         self._record_history(
             "split_display_page",
-            before,
+            (),
             parent_subtitle_id=parent_id,
             display_page_id=selected_page_id,
             page_count=len(rebuilt_pages),
@@ -4212,6 +5018,9 @@ class ManualFinalSubtitleSession:
         self,
         parent_subtitle_id: str,
         page_count: int,
+        *,
+        word_ranges: Sequence[Sequence[int]] | None = None,
+        preserve_matching_page_chinese: bool = False,
     ) -> Dict[str, Any]:
         """Replace one parent's display-page count without changing the parent cue."""
         parent_id = str(parent_subtitle_id or "").strip()
@@ -4256,11 +5065,37 @@ class ManualFinalSubtitleSession:
             dict(boundary_payload.get("boundaries") or {}),
         )
         try:
-            ranges = propose_article_manual_page_word_ranges(
-                render_cue,
-                requested,
-                allow_review_boundary=True,
-            )
+            if word_ranges is None:
+                ranges = propose_article_manual_page_word_ranges(
+                    render_cue,
+                    requested,
+                    allow_review_boundary=True,
+                )
+            else:
+                ranges = [
+                    (int(raw[0]), int(raw[1]))
+                    for raw in word_ranges
+                    if len(raw) >= 2
+                ]
+                if len(ranges) != requested:
+                    raise RenderStructuralOverflowError(
+                        [{"reason": "manual_page_candidate_cardinality_invalid"}]
+                    )
+                expected_start = int(cue["word_start"])
+                expected_end = int(cue["word_end"])
+                if (
+                    not ranges
+                    or ranges[0][0] != expected_start
+                    or ranges[-1][1] != expected_end
+                    or any(
+                        start > end
+                        or (index and start != ranges[index - 1][1] + 1)
+                        for index, (start, end) in enumerate(ranges)
+                    )
+                ):
+                    raise RenderStructuralOverflowError(
+                        [{"reason": "manual_page_candidate_word_coverage_invalid"}]
+                    )
             new_page_ids = [
                 display_page_id(parent_id, index + 1)
                 for index in range(requested)
@@ -4330,6 +5165,14 @@ class ManualFinalSubtitleSession:
                 "changed": False,
             }
 
+        existing_by_range = {
+            (
+                int(row.get("word_start", -1)),
+                int(row.get("word_end", -1)),
+            ): row
+            for row in current_parent_rows
+            if preserve_matching_page_chinese
+        }
         new_edits: List[Dict[str, Any]] = []
         inserted_parent = False
         for row in current_rows:
@@ -4338,27 +5181,38 @@ class ManualFinalSubtitleSession:
                 if inserted_parent:
                     continue
                 for page in rebuilt_pages:
-                    new_edits.append(
-                        {
+                    word_range = (
+                        int(page["word_start"]),
+                        int(page["word_end"]),
+                    )
+                    previous = existing_by_range.get(word_range)
+                    edit = {
                             "display_page_id": str(page["display_page_id"]),
                             "parent_subtitle_id": parent_id,
-                            "word_start": int(page["word_start"]),
-                            "word_end": int(page["word_end"]),
+                            "word_start": word_range[0],
+                            "word_end": word_range[1],
                             "english": str(page.get("english") or ""),
-                            "chinese": "",
-                            "chinese_review_required": True,
+                            "chinese": (
+                                str(previous.get("translated_subtitle") or "").strip()
+                                if previous is not None
+                                else ""
+                            ),
+                            "chinese_review_required": previous is None,
                         }
-                    )
+                    if previous is not None:
+                        edit["chinese_review_acknowledged"] = bool(
+                            previous.get("display_page_chinese_confirmed")
+                        )
+                    new_edits.append(edit)
                 inserted_parent = True
                 continue
             new_edits.append(self._unchanged_display_page_edit_from_model_row(row))
         if not inserted_parent:
             raise ManualFinalSubtitleEditError("当前实际分页没有覆盖所选父字幕。")
 
-        before = copy.deepcopy(self.cues)
         self._record_history(
             "split_parent_into_display_pages",
-            before,
+            (),
             parent_subtitle_id=parent_id,
             page_count=requested,
         )
@@ -5327,9 +6181,9 @@ class ManualFinalSubtitleSession:
             user_media_path = media_path
         result_dir = media_result_dir(user_media_path) if user_media_path else None
         preferred_package_dir = (
-            result_dir / "人工终稿字幕包"
+            media_result_manual_package_dir(user_media_path)
             if result_dir is not None
-            else source_dir / "人工终稿字幕包"
+            else source_dir / MEDIA_RESULT_MANUAL_PACKAGE_DIR
         )
         current_manifest = self._read_json(self.manifest_path)
         current_override = current_manifest.get("manual_final_override") or {}
@@ -6025,6 +6879,9 @@ class ManualFinalSubtitleSession:
                 str(self.tail_trim.get("source_formal_word_ledger_hash") or "")
             )
         for entry in self.history:
+            accepted_source_hashes.add(
+                str(entry.get("before_formal_word_ledger_hash") or "")
+            )
             before_ledger = entry.get("before_word_ledger") or []
             if isinstance(before_ledger, list) and before_ledger:
                 accepted_source_hashes.add(

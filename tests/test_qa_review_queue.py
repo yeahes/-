@@ -9,6 +9,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.build_qa_summary import write_qa_review_artifacts
+from app.core.subtitle_processor.translation_review_suggestions import (
+    current_chinese_hash,
+)
 
 
 def _write_json(path: Path, payload) -> None:
@@ -99,6 +102,9 @@ def test_review_queue_uses_final_times_and_excludes_invalid_audit_mapping():
         assert "S0002 EN: Second line." in queue_text
         assert "audit_mapping_invalid" not in queue_text
         assert source_queue_text == queue_text
+        semantic_queue = Path(result["semantic_review_queue_srt"]).read_text(encoding="utf-8-sig")
+        assert result["semantic_review_item_count"] == 0
+        assert semantic_queue == ""
 
 
 def test_review_queue_marks_only_cues_with_final_timeline_fallback_words():
@@ -283,9 +289,111 @@ def test_review_queue_keeps_all_actionable_items_by_default():
         assert len(limited_payload["items"]) == 12
 
 
+def test_semantic_queue_suggests_currency_unit_only_with_article_evidence():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        subtitle_dir = Path(temp_dir) / "subtitle"
+        artifact_dir = subtitle_dir / "sample-artifacts"
+        artifact_dir.mkdir(parents=True)
+        _write_json(artifact_dir / "run-manifest.json", {"subtitle_count": 1})
+        _write_json(
+            artifact_dir / "subtitle-spans.json",
+            [
+                {
+                    "subtitle_id": "S0053",
+                    "original": "You get these women paying 75 a session in secret.",
+                    "translated": "这些女性偷偷付费咨询，每次75元。",
+                    "start_ms": 1000,
+                    "end_ms": 4000,
+                }
+            ],
+        )
+        for filename, payload in (
+            ("translations.json", []),
+            ("translation-structure-errors.json", []),
+            ("allocation-unresolved.json", []),
+            ("allocation-retry-log.json", []),
+        ):
+            _write_json(artifact_dir / filename, payload)
+        _write_json(artifact_dir / "validation-report.json", {"errors": [], "warnings": []})
+        _write_json(artifact_dir / "word-ledger.json", {"words": []})
+        _write_json(artifact_dir / "final-cue-timeline.json", {"records": []})
+        _write_json(
+            subtitle_dir / "article_context.json",
+            {
+                "numbers_and_dates": [
+                    {
+                        "canonical_name": "500 yuan ($75)",
+                        "chinese_name": "500元（75美元）",
+                        "aliases": ["500 yuan", "$75"],
+                        "category": "currency amount",
+                        "canonical_in_article": True,
+                        "evidence": {
+                            "evidence_sentence": "A session costs 500 yuan, or 75 U.S. dollars."
+                        },
+                    }
+                ]
+            },
+        )
+
+        result = write_qa_review_artifacts(artifact_dir)
+        payload = json.loads(
+            Path(result["semantic_review_queue_json"]).read_text(encoding="utf-8")
+        )
+
+        assert result["semantic_review_item_count"] == 1
+        item = payload["items"][0]
+        assert item["code"] == "currency_unit_conflict_review"
+        assert item["subtitle_ids"] == ["S0053"]
+        assert item["details"]["suggestion"] == {
+            "subtitle_id": "S0053",
+            "source_english": "You get these women paying 75 a session in secret.",
+            "current_chinese_hash": current_chinese_hash(
+                "这些女性偷偷付费咨询，每次75元。"
+            ),
+            "suggested_chinese": "这些女性偷偷付费咨询，每次75美元。",
+        }
+
+
+def test_semantic_queue_does_not_guess_bare_number_currency_without_evidence():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        subtitle_dir = Path(temp_dir) / "subtitle"
+        artifact_dir = subtitle_dir / "sample-artifacts"
+        artifact_dir.mkdir(parents=True)
+        _write_json(artifact_dir / "run-manifest.json", {"subtitle_count": 1})
+        _write_json(
+            artifact_dir / "subtitle-spans.json",
+            [
+                {
+                    "subtitle_id": "S0001",
+                    "original": "The service costs 75 a session.",
+                    "translated": "这项服务每次75元。",
+                    "start_ms": 1000,
+                    "end_ms": 3000,
+                }
+            ],
+        )
+        for filename, payload in (
+            ("translations.json", []),
+            ("translation-structure-errors.json", []),
+            ("allocation-unresolved.json", []),
+            ("allocation-retry-log.json", []),
+        ):
+            _write_json(artifact_dir / filename, payload)
+        _write_json(artifact_dir / "validation-report.json", {"errors": [], "warnings": []})
+        _write_json(artifact_dir / "word-ledger.json", {"words": []})
+        _write_json(artifact_dir / "final-cue-timeline.json", {"records": []})
+        _write_json(subtitle_dir / "article_context.json", {"numbers_and_dates": []})
+
+        result = write_qa_review_artifacts(artifact_dir)
+
+        assert result["semantic_review_item_count"] == 0
+
+
 if __name__ == "__main__":
     test_review_queue_uses_final_times_and_excludes_invalid_audit_mapping()
     test_review_queue_marks_only_cues_with_final_timeline_fallback_words()
     test_review_queue_does_not_create_timing_review_for_full_whisperx_alignment()
     test_review_queue_keeps_all_actionable_items_by_default()
+    test_semantic_queue_suggests_currency_unit_only_with_article_evidence()
+    test_semantic_queue_does_not_guess_bare_number_currency_without_evidence()
     print("qa review queue tests passed")

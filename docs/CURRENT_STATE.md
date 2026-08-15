@@ -1,6 +1,122 @@
 # Current State
 
-Last updated: 2026-08-13
+Last updated: 2026-08-15
+
+## 2026-08-15 Manual Editor Performance And Compact Recovery
+
+- Parent-scoped page, Chinese, confirmation, and suppression edits now persist
+  only the affected parent cue, pages, boundary override, and stale drafts in
+  undo history. Existing full-snapshot packages are compacted in memory when
+  loaded; their source files are not rewritten until the user explicitly
+  saves a new manual-final generation.
+- English surface edits retain only the changed frozen word records plus the
+  prior formal-ledger hash. Undo, redo, boundary-evidence validation, word IDs,
+  word times, and fixed cue spans remain unchanged. Cross-parent edits, formal
+  cue-boundary changes, and audio tail trimming remain whole-document
+  transactions because their ownership is not parent-local.
+- Manual recovery drafts use the same atomic replace path but compact JSON.
+  The full current state remains present for crash recovery; only repeated
+  historical snapshots were removed. Legacy draft and edit-journal payloads
+  remain readable.
+- The Qt table keeps full model resets for imports and parent/actual-page view
+  switches. Local Chinese, split, merge, boundary, undo, and redo changes use
+  row updates/inserts/removals, and identical review marks no longer repaint
+  the full table.
+- On the real 211-parent, 2,355-word, 119-operation `蜜雪冰城为何卖起了啤酒`
+  package, in-memory history fell from 20.7 MB to 2.5 MB and a recovery draft
+  from 32.8 MB to 3.1 MB. Hashing fell from about 222 ms to 31 ms and compact
+  atomic writing from about 1.30 s to 0.14 s. Read-only replay on that package
+  and `石油市场，现在中国说了算？` preserved every unrelated parent through
+  Chinese edit, split, undo, and redo.
+- Focused manual-editor, review-mark, stable-artifact, and 79-case publication
+  tests pass. The final complete regression passed in 346.3 seconds and
+  `git diff --check` passes. A mouse-driven GUI pass remains the final
+  user-perceived latency check.
+
+## 2026-08-14 Evidence-Bound Failure Reduction
+
+- Display-page Chinese retry now distinguishes local parent-quality failures
+  from contract-wide ID/cardinality failures. Local failures retry only the
+  affected complete parent page sets; missing, duplicate, or unknown page IDs
+  retry the complete contract because no partial parent artifact is safe.
+- A failed local retry retains the initial diagnostics and accepted parent
+  records, and records the exact retry parent IDs for the editor checkpoint.
+  It never changes English, fixed IDs, word spans, word times, or page geometry.
+- Article-backed ASR correction v3 supports the evidenced local term
+  `fudaoke` and a titled person only when article and nearby audio share an
+  informative continuous description. Generic mental-health topic words are
+  insufficient, so uncertain names remain review-only.
+- Currency suggestions require one unambiguous numeric occurrence, explicit
+  money context, and one complete unit occurrence. Count nouns, repeated
+  numbers, and ambiguous compound Chinese units are not auto-suggested.
+  Parent-ID suggestions may be applied only in parent view; the lower-level
+  helper also rejects ambiguous parent IDs in child-page rows.
+- Read-only replay of `心理治疗，中国社会的奢侈品` changed the evidenced ASR
+  surfaces to four `fudaoke` occurrences and one `Yuan Chengmei`, and emitted
+  only `S0053: 75元 -> 75美元` as a manual Chinese suggestion. Source artifacts
+  were not modified and no paid request ran.
+- Focused article, page-contract, QA-queue, suggestion, syntax, and diff checks
+  pass. The final complete 26-stage regression passed in 363.9 seconds;
+  subsequent retry-scope evidence passed its owning focused suites.
+
+## 2026-08-13 Real Manual-Final Workflow Acceptance
+
+- A byte-identical temporary copy of the real `如何停止拖延` manual-final
+  package loaded 283 frozen parent cues, 353 display pages, 3,126 ledger words,
+  and 97 existing history entries. The source package remained read-only.
+- The temporary copy completed the actual workflow: split `S0001.P02`, move
+  its new internal boundary, merge the two new pages, undo, redo, then undo all
+  three operations back to the exact initial session fingerprint.
+- A one-page parent Chinese edit was saved without a render blocker, reloaded
+  from the newly published manifest, and retained all parent IDs, cue word
+  spans, cue times, word IDs, word surfaces, and word times. The synthesis
+  resolver accepted that same manual-final manifest as authority.
+- Recursive size and SHA-256 records for all 15 production-package files were
+  identical before and after the acceptance run. No production subtitle,
+  audio, video, cache, or manifest was written.
+- This validates the session and publication path against a real package. It
+  is not a claim that the Qt candidate dialog has received a full mouse-driven
+  walkthrough or that model-backed Chinese suggestions are implemented.
+- After the queue and concurrent-prompt follow-up, the complete 25-stage
+  regression passes in 397.5 seconds and `git diff --check` passes.
+
+## 2026-08-13 Manual Long-Caption Candidate Workspace
+
+- The stable article renderer now exposes a read-only candidate bundle for a
+  single frozen parent cue. Candidates include page count, global word ranges,
+  page English, font size, risk score, and quality cost; the helper does not
+  mutate IDs, Chinese, timing, or production page artifacts.
+- The subtitle editor's actual-page context menu can open these alternatives
+  and apply one selected plan to only the current parent subtitle. Matching
+  page word ranges keep their existing Chinese; new ranges remain visibly
+  unconfirmed until the user edits/confirms them and saves the manual final.
+- This is intentionally local and synchronous. It does not call an LLM, rerun
+  ASR, refresh the whole document, or change automatic pagination for other
+  parents.
+- The high-signal queue is now a cheap index over existing page state; it no
+  longer precomputes two-to-four-page candidate bundles for every listed
+  parent on the Qt thread. The real 283-parent package improved from 45.89
+  seconds to 0.020 seconds and retained 34 overlong, low-font, boundary-review,
+  or Chinese-review items. Candidate planning remains available on demand for
+  one selected parent.
+
+## 2026-08-13 Hit-Only Terminology And Semantic Review Queue
+
+- Article-derived glossary terms are filtered against the current translation
+  source window before prompt construction. A canonical term or supported alias
+  must be present as a token/phrase; unrelated terms are omitted. Article title
+  and summary remain read-only context.
+- Prompt/cache fingerprints differ by the matched terminology in each batch.
+  Frozen English boundaries, fixed IDs, word ledger, timing, page geometry, and
+  synthesis resolution are unchanged.
+- QA output includes `semantic-review-queue.json` and
+  `semantic-review-queue.srt` in the artifact directory, plus
+  `字幕语义复核队列.srt` beside source audio. It is a shortlist for high-signal
+  semantic loss, allocation mismatch, translationese, and related Chinese
+  issues; it does not auto-rewrite or block a valid stable manifest.
+- Focused task-context, QA-queue, stable-caption, page-translation, syntax,
+  and `git diff --check` verification pass. The complete 25-stage regression
+  also passes after this increment.
 
 ## 2026-08-13 English Boundary Gate Repair
 
@@ -26,6 +142,23 @@ Last updated: 2026-08-13
 - SmartSub findings are pinned to commit
   `27459b3fd0652bc5447ccf4ab30cb398014c35f7`; read the roadmap before
   re-opening the external repository.
+
+## 2026-08-13 Manual Review Workflow Increment
+
+- The editor now exposes a read-only `长字幕复查` queue in stable actual-page
+  mode. It groups concrete evidence by frozen parent ID: over-16-word cues,
+  reduced font, page-boundary review, and stale/unconfirmed page Chinese.
+  Double-clicking an item only locates that parent.
+- Candidate pagination rows show word count, page duration, and pause evidence
+  before application. Candidate selection still changes only the selected parent
+  and preserves matching page Chinese.
+- Optional Chinese review suggestions now have a standalone fixed-ID validator
+  in `translation_review_suggestions.py`. Source echo, exact IDs, Chinese
+  presence, numbers, negation, and existing confirmed Chinese anchors are
+  checked before a human can apply a suggestion. The validator is copy-on-write
+  and does not change stable artifacts automatically.
+- Focused manual-editor and translation-suggestion tests pass. The complete
+  25-stage regression also passes after the UI queue increment.
 
 ## 2026-08-13 Stable Publication Contract Repair
 
@@ -2625,3 +2758,163 @@ Result:
 - `tests/test_video_synthesis_safety.py` and `tests/test_stable_publication.py`
   pass after the fix. The subsequent full regression reports no failed stage and
   ends with `Regression command completed.`; `git diff --check` passes.
+
+## 2026-08-13 User Result Directory Layout
+
+- Newly generated `<media-stem>-处理结果/` directories are separated into
+  `字幕文件/`, `质检报告/`, `视频成片/`, and `人工终稿字幕包/`. Subtitle text,
+  IDs, page plans, word timing, font selection, and rendered content are
+  unchanged; only user-facing output locations changed.
+- Existing flat result directories are neither migrated nor deleted and retain
+  their legacy read paths. New subtitles can find a sibling manual-final
+  manifest only when the selected path or SHA-256 is explicitly recorded by
+  that manifest, so an unrelated SRT cannot acquire a package word ledger.
+- Normal `打开输出文件夹` opens the result root. An active manual-final editor
+  retains its separate `打开终稿文件夹` behavior and opens the manifest-owned
+  package. No extra loose copy of `人工终稿字幕.srt` is created.
+- A temporary copy of the real `AI竞赛：中美殊途-处理结果` schema-4 package
+  reopened 226 parent cues and 265 display pages from its manifest. Both legacy
+  root subtitle entry points resolved the same package, synthesis input
+  resolution passed, and all 21 source files retained their original size.
+- Focused task-context tests pass 8/8, stable publication/UI tests pass 70/70,
+  syntax checks and `git diff --check` pass, and the complete 25-stage
+  regression passes in 354.6 seconds.
+
+## 2026-08-13 Recoverable Failure And Short-Timing Hardening
+
+- An optional Chinese allocation quality retry can no longer turn a complete
+  original fixed-ID allocation into a global `translation_id_unknown`
+  failure. A malformed candidate is retained as attempt evidence and an
+  unresolved review item; initial allocation and final fixed-ID errors still
+  block publication.
+- The frozen-ledger final timeline is now the only owner of short subtitle
+  display repair. It borrows only non-word time, keeps every word timestamp,
+  ID, English text, word span, and order unchanged, targets 700ms, and blocks
+  export if even a 150ms display cannot be represented safely.
+- Offline replay of the failed `AI竞赛：中美殊途` artifacts passed for all 226
+  cues with unchanged ID/word ranges and no timeline errors. `S0105` changed
+  from 120ms to 700ms and `S0198` from 120ms to 360ms; the resulting minimum
+  cue duration was 360ms.
+- Failed results are no longer made editable by an error-code whitelist. A
+  checkpoint requires complete ordered spans, a complete word ledger, Chinese
+  for every frozen parent ID, and a PASS final cue timeline. The written
+  manifest must also reopen through `ManualFinalSubtitleSession`; damaged
+  authority remains fail-closed.
+- A temporary replay of the same 226-cue artifacts produced a render-blocked
+  checkpoint which reopened all cues through the real manual editor loader;
+  no source production artifact was changed.
+- Focused retry, timeline, checkpoint, syntax, and real-loader tests pass. The
+  final complete 25-stage regression passes in 405.4 seconds without network
+  calls.
+
+## 2026-08-13 Chinese Validation Prompts
+
+- Stable English error codes remain unchanged in JSON artifacts, manifests,
+  caches, and validation contracts. A single presentation helper now converts
+  those codes and English diagnostic reasons into concise Chinese text at the
+  manual-editor boundary.
+- Table tooltips, manual page-boundary warnings, manual-final render blockers,
+  and blocking optimization messages now explain what happened, what the user
+  should check, and the affected subtitle/page ID when available. Legacy
+  artifacts receive the same conversion when reopened.
+- Unknown future codes display a generic Chinese review instruction instead of
+  leaking an unexplained internal identifier. This is presentation-only: mark
+  severity, review counts, subtitle data, timing, page plans, and publication
+  gates are unchanged.
+- Focused prompt, review-mark, and stable-publication tests pass; the complete
+  26-stage regression passes in 405.5 seconds, and `git diff --check` passes.
+
+## 2026-08-13 Manual Review Dialog Theme And Queue Focus
+
+- The long-caption review queue and parent-local candidate dialog now apply an
+  explicit light/dark palette to their native Qt dialog, list, selection, and
+  button surfaces. This is presentation-only and does not change candidate
+  generation, page boundaries, subtitle text, timing, or render contracts.
+- The long-caption queue remembers the selected frozen parent subtitle ID for
+  the current editor session. Reopening selects the same item; if an edit
+  removes that parent from the risk queue, selection stays at the nearest
+  remaining row instead of returning to the first item. Loading another
+  subtitle session clears this remembered identity.
+
+## 2026-08-14 Evidence-Bound Recovery And Review
+
+- Display-page Chinese recovery keeps every validated parent from the first
+  response and retries only the complete page set of failed parent IDs. A
+  successful local retry is merged by page ID and revalidated against the
+  original full contract before writeback. The `S0187` failure in
+  `心理治疗，中国社会的奢侈品` no longer sends all 26 multi-page parents through
+  a second request.
+- Article ASR correction policy v3 adds conservative evidence paths for
+  one-word Chinese/local/transliterated terms and adjacent person titles.
+  Canonical and alias article evidence plus local context must agree; ordinary
+  technical terms and already-correct canonical surfaces remain protected.
+- The semantic review queue now detects exact numeric currency-unit conflicts
+  supported by article evidence. It writes an ID-bound manual suggestion and
+  never silently changes authoritative Chinese; bare numbers receive no
+  guessed currency.
+- Read-only production replay applied only three `fudaoke` corrections and one
+  `Yuan Chengmei` correction through the new paths, and produced the `S0053`
+  suggestion `每次75美元`. It wrote no production artifact. The complete
+  26-stage regression passes in 408.1 seconds.
+
+## 2026-08-14 Fixed-ID Review And Page-Boundary Completion
+
+- High-signal semantic-review items can now request optional Chinese polish in
+  a background worker. Results are cached by fixed IDs, exact English, current
+  Chinese hash, context, protected anchors, model, and prompt version. They are
+  never applied automatically.
+- Manual application first commits the active table editor, then validates the
+  complete selected suggestion set again. A stale Chinese hash, source echo,
+  number, explicit currency unit, negation, person, or terminology mismatch
+  rejects the result before any row changes.
+- Loading another subtitle package invalidates the previous review worker. A
+  completed worker merges only into the same unchanged review-queue item; it
+  cannot overwrite a regenerated or reordered queue.
+- Nearby actual-page cuts are now presented as `recommended`, `review`, or
+  `blocked`. Soft grammar risks such as a coordinated-constituent split remain
+  manually selectable but are no longer described as safe; hard grammar,
+  sub-900ms, and too-short-page candidates stay blocked.
+- The final English-boundary audit schema is v2 and projects parent cue edges,
+  final display-page edges, and unresolved pre-ID evidence. Display-page and
+  frozen fallback risks become high-confidence editor review marks without
+  changing publication or renderer authority.
+- Parent-local undo restores only the chosen parent and survives recovery while
+  preserving unrelated later edits. Cross-parent edits, word-ledger changes,
+  and tail trimming remain whole-document undo because partial restoration
+  would desynchronize subtitles or audio.
+- Read-only replay of the existing psychology episode preserved 195 parent
+  IDs, cue spans, 2,088 words, English, and timing. Current code projects 208
+  audited boundaries: 187 allow and 21 review. No production artifact or paid
+  service was used.
+- Focused UI, suggestion, queue, boundary, publication, and manual-editor tests
+  pass. The complete 26-stage regression passes in 372.3 seconds and
+  `git diff --check` passes.
+
+## 2026-08-14 Article ASR Correction Scope V4
+
+- Production logs reproduced two article-assisted false rewrites:
+  `Red Sea -> Russia` and three `network(s) -> New York` replacements.
+  The first collapsed an already entity-shaped multiword source using only
+  phonetic similarity; the second treated an ordinary lowercase word as a
+  complete multiword entity.
+- Policy v4 rejects weak lowercase one-token expansion and unrelated
+  multiword-entity contraction before fuzzy article correction. An evidenced
+  exact canonical name or alias is also protected from a different glossary
+  owner. Valid compact/split corrections such as
+  `MixueBingcheng -> Mixue Bingcheng` and `A Drift -> Adrift` remain
+  covered by regression tests.
+- Candidates below the automatic threshold are not applied. Only high-signal,
+  entity-shaped review candidates are deduplicated, mapped by timestamp to
+  frozen subtitle IDs, and written as
+  `article-asr-correction-review.json`. The editor loads them as read-only
+  English review marks only when the artifact word-ledger hash matches the
+  current package.
+- Read-only replay of `石油市场，现在中国说了算？` and
+  `蜜雪冰城为何卖起了啤酒` preserved `Red Sea` and all three
+  `network(s)` surfaces. `Felugia/Fallugia -> Fulujia` remains review-only.
+  The correction policy version bump invalidates reusable v3 correction output
+  while preserving raw-ASR and article-analysis caches.
+- All 48 focused article/thread correction tests, focused review-mark tests, syntax checks,
+  `git diff --check`, and the complete 26-stage regression pass. The unified
+  run took 352.6 seconds. No ASR, LLM, translation, synthesis, paid request, or
+  production artifact write was performed.

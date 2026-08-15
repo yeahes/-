@@ -100,6 +100,104 @@ def _entries(text):
     return entries
 
 
+def test_formal_boundary_audit_projects_display_pages_and_unresolved_pre_id_evidence():
+    editor = _editor(max_words=16)
+    editor._active_word_entries = _entries(
+        "Today we explain this example clearly. Another simple sentence starts right here."
+    )
+    editor._last_subtitle_items = [
+        ScreenSubtitleItem(
+            [1],
+            "Today we explain this example clearly.",
+            "第一条",
+            0,
+            5,
+            "S0001",
+        ),
+        ScreenSubtitleItem(
+            [2], "Another simple sentence starts right here.", "第二条", 6, 11, "S0002"
+        ),
+    ]
+    editor._display_boundary_evidence_artifact = {
+        "boundaries": {
+            "3": {
+                "hard_issues": ["subject_finite_verb_split"],
+                "soft_issues": [],
+                "pause_ms": 80,
+            }
+        }
+    }
+    editor._display_page_translation_artifact = {
+        "status": "PASS",
+        "render_plans": [
+            {
+                "parent_subtitle_id": "S0001",
+                "pages": [
+                    {
+                        "display_page_id": "S0001.P01",
+                        "word_start": 0,
+                        "word_end": 2,
+                        "start_ms": 0,
+                        "end_ms": 400,
+                        "english": "Today we explain",
+                        "boundary_before": {"classification": "allow", "issue_codes": []},
+                    },
+                    {
+                        "display_page_id": "S0001.P02",
+                        "word_start": 3,
+                        "word_end": 5,
+                        "start_ms": 400,
+                        "end_ms": 800,
+                        "english": "this example clearly.",
+                        "boundary_before": {
+                            "classification": "review",
+                            "confidence": "high",
+                            "issue_codes": ["subject_finite_verb_split"],
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    editor._pre_id_boundary_repairs = [
+        {
+            "old_cut_word_index": [5, 6],
+            "unresolved_hard_issue": True,
+            "repair_attempted": True,
+            "repair_succeeded": False,
+            "repaired_by": "_validate_and_repair_final_pre_id_boundaries",
+            "repair_reason": "unresolved_hard_issue",
+            "hard_issues": ["right_orphaned_finite_predicate"],
+        }
+    ]
+    segments = [
+        ASRDataSeg("Today we explain this example clearly.", 0, 800, "第一条"),
+        ASRDataSeg("Another simple sentence starts right here.", 800, 1200, "第二条"),
+    ]
+    for subtitle_id, word_start, word_end, segment in (
+        ("S0001", 0, 5, segments[0]),
+        ("S0002", 6, 11, segments[1]),
+    ):
+        segment.subtitle_id = subtitle_id
+        segment.word_start = word_start
+        segment.word_end = word_end
+
+    payload = editor._english_boundary_audit_payload(segments)
+
+    assert payload["schema_version"] == 2
+    assert payload["summary"]["boundary_count"] == 2
+    parent = next(record for record in payload["records"] if record["scope"] == "parent_cue")
+    display = next(record for record in payload["records"] if record["scope"] == "display_page")
+    assert parent["classification"] == "review"
+    assert parent["confidence"] == "high"
+    assert "right_orphaned_finite_predicate" in parent["rule_codes"]
+    assert display["right_display_page_id"] == "S0001.P02"
+    assert display["right_word_id"] == 3
+    assert display["classification"] == "review"
+    assert display["original_classification"] == "hard"
+    assert "subject_finite_verb_split" in display["rule_codes"]
+
+
 def _split_text(text, max_words=14):
     editor = _editor(max_words=max_words)
     editor._active_word_entries = _entries(text)
@@ -193,6 +291,26 @@ def test_final_time_alignment_runs_chinese_speed_repair_without_touching_english
     assert repaired.segments[0].text == "can't spell to save his life."
     assert getattr(repaired.segments[0], "subtitle_id") == "S0001"
     assert repaired.segments[0].translated_text == "它来自一个平时拼写很差的人"
+
+
+def test_blocked_checkpoint_timeline_skips_chinese_compression_api_work():
+    editor = _editor()
+    asr_data = ASRData([ASRDataSeg("Precisely.", 1000, 1120, "正是如此。")])
+    asr_data.segments[0].subtitle_id = "S0001"
+    editor._last_semantic_groups = [{"id": 1, "items": []}]
+    editor._last_subtitle_items = []
+    editor._compress_fast_chinese_segments = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("blocked checkpoint must not run Chinese compression")
+    )
+    editor._write_coverage_report = lambda *args, **kwargs: None
+
+    repaired = editor.repair_after_final_time_alignment(
+        asr_data,
+        allow_chinese_compression=False,
+    )
+
+    assert repaired.segments[0].text == "Precisely."
+    assert repaired.segments[0].translated_text == "正是如此。"
 
 
 def test_final_time_alignment_checks_chinese_speed_after_display_reconciliation():
@@ -1730,6 +1848,7 @@ def test_very_short_subtitle_has_dedicated_duration_error():
 
     assert issues
     assert issues[0]["code"] == "subtitle_duration_invalid"
+    assert issues[0]["subtitle_id"] == "S0001"
     assert issues[0]["duration_ms"] == 100
 
 
@@ -7865,6 +7984,135 @@ def test_allocation_concurrency_retries_one_failed_batch_without_dropping_comple
     assert editor._translation_structure_errors == []
 
 
+def test_allocation_concurrency_keeps_hit_only_context_for_cache_api_and_retry():
+    editor = _id_editor()
+    editor.allocation_batch_size = 1
+    editor.allocation_max_concurrency = 2
+    editor.article_context_data = {
+        "summary": "Allocation context.",
+        "technical_terms": [
+            {
+                "canonical_name": "AlphaTerm",
+                "chinese_name": "甲术语",
+                "aliases": [],
+                "category": "term",
+            },
+            {
+                "canonical_name": "BetaTerm",
+                "chinese_name": "乙术语",
+                "aliases": [],
+                "category": "term",
+            },
+        ],
+    }
+    items = editor._assign_global_subtitle_ids(
+        [
+            ScreenSubtitleItem([1], "AlphaTerm starts.", "", 0, 1),
+            ScreenSubtitleItem([2], "AlphaTerm continues.", "", 2, 3),
+            ScreenSubtitleItem([3], "BetaTerm starts.", "", 4, 5),
+            ScreenSubtitleItem([4], "BetaTerm continues.", "", 6, 7),
+        ]
+    )
+    groups = [
+        _id_group(1, 0, items[:2]),
+        _id_group(2, 2, items[2:]),
+    ]
+    full_translations = {1: "甲组完整翻译", 2: "乙组完整翻译"}
+    cache_load_prompts = []
+    api_prompts = []
+    cache_store_prompts = []
+    retry_prompts = []
+
+    def load_cache(prompt, payload, expected, **kwargs):
+        cache_load_prompts.append((tuple(entry["id"] for entry in payload), prompt))
+        return None
+
+    def request_api(prompt, payload, **kwargs):
+        ids = tuple(entry["id"] for entry in payload)
+        api_prompts.append((ids, prompt))
+        if ids == (1,):
+            return None, "timeout"
+        return (
+            {
+                "groups": [
+                    {
+                        "id": entry["id"],
+                        "part_translations": [
+                            {
+                                "subtitle_id": part["subtitle_id"],
+                                "zh": f"译文-{part['subtitle_id']}",
+                            }
+                            for part in entry["subtitle_parts"]
+                        ],
+                    }
+                    for entry in payload
+                ]
+            },
+            "",
+        )
+
+    def store_cache(prompt, payload, data, **kwargs):
+        cache_store_prompts.append((tuple(entry["id"] for entry in payload), prompt))
+
+    def retry_request(prompt, payload, **kwargs):
+        retry_prompts.append((tuple(entry["id"] for entry in payload), prompt))
+        return {
+            "groups": [
+                {
+                    "id": entry["id"],
+                    "part_translations": [
+                        {
+                            "subtitle_id": part["subtitle_id"],
+                            "zh": f"重试-{part['subtitle_id']}",
+                        }
+                        for part in entry["subtitle_parts"]
+                    ],
+                }
+                for entry in payload
+            ]
+        }
+
+    with patch.object(
+        editor,
+        "_load_cached_allocation_batch",
+        side_effect=load_cache,
+    ), patch.object(
+        editor,
+        "_request_semantic_translation_allocation_api_only",
+        side_effect=request_api,
+    ), patch.object(
+        editor,
+        "_store_allocation_batch_cache",
+        side_effect=store_cache,
+    ), patch.object(
+        editor,
+        "_request_semantic_translation_allocation",
+        side_effect=retry_request,
+    ):
+        allocated = editor._allocate_semantic_group_translations(
+            groups,
+            full_translations,
+        )
+
+    assert set(allocated) == {1, 2}
+    prompt_records = [
+        *cache_load_prompts,
+        *api_prompts,
+        *cache_store_prompts,
+        *retry_prompts,
+    ]
+    assert prompt_records
+    for ids, prompt in prompt_records:
+        if ids == (1,):
+            assert "AlphaTerm -> 甲术语" in prompt
+            assert "BetaTerm -> 乙术语" not in prompt
+        elif ids == (2,):
+            assert "BetaTerm -> 乙术语" in prompt
+            assert "AlphaTerm -> 甲术语" not in prompt
+        else:
+            raise AssertionError(f"unexpected allocation batch: {ids}")
+
+
 def test_allocation_concurrency_records_duplicate_and_unknown_ids_after_retry_failure():
     editor = _id_editor()
     editor.batch_num = 2
@@ -8245,6 +8493,63 @@ def test_allocation_quality_retries_information_leaked_to_previous_id():
     assert any("number_allocation_mismatch" in item["issue_codes"] for item in editor._last_allocation_validation)
     assert editor._last_allocation_retry_log[-1]["success"] is True
     assert editor._translation_structure_errors == []
+
+
+def test_malformed_optional_quality_retry_keeps_valid_original_allocation_local():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2))
+    items[0].original = "The value will not be swallowed up"
+    items[1].original = "by Silicon Valley tech giants."
+    group = _id_group(180, 0, items)
+    full_translations = {
+        180: "这些价值不会只被硅谷的少数科技巨头吞掉。",
+    }
+
+    def request(prompt, payload, cache_task, **kwargs):
+        if cache_task == "screen_subtitle_semantic_translation_allocation_v3":
+            return {
+                "groups": [{
+                    "id": 180,
+                    "part_translations": [
+                        {"subtitle_id": "S0001", "zh": "这些价值不会只被科技巨头吞掉"},
+                        {"subtitle_id": "S0002", "zh": "尤其是硅谷的。"},
+                    ],
+                }]
+            }
+        return {
+            "groups": [{
+                "id": 1,
+                "part_translations": [
+                    {"subtitle_id": "S0001", "zh": "错误重试一"},
+                    {"subtitle_id": "S0002", "zh": "错误重试二"},
+                ],
+            }]
+        }
+
+    with patch.object(
+        editor,
+        "_request_semantic_translation_allocation",
+        side_effect=request,
+    ):
+        allocated = editor._allocate_semantic_group_translations(
+            [group],
+            full_translations,
+        )
+
+    assert allocated[180] == {
+        "S0001": "这些价值不会只被科技巨头吞掉",
+        "S0002": "尤其是硅谷的。",
+    }
+    assert editor._translation_structure_errors == []
+    attempts = [
+        record
+        for record in editor._last_allocation_validation
+        if record.get("record_type") == "allocation_structure_attempt"
+    ]
+    assert attempts[-1]["stage"] == "quality_retry"
+    assert attempts[-1]["expected_semantic_group_ids"] == [180]
+    assert editor._last_allocation_retry_log[-1]["success"] is False
+    assert editor._last_allocation_unresolved[-1]["reason"] == "retry_structure_failed"
 
 
 def test_allocation_quality_retries_displaced_main_clause_before_causal_id():
@@ -10584,6 +10889,29 @@ def test_non_structural_validation_errors_do_not_block_render_gate():
     assert editor.blocking_validation_message() == ""
 
 
+def test_blocking_timeline_message_is_chinese_and_keeps_subtitle_position():
+    editor = _id_editor()
+    editor._translation_structure_errors = []
+    editor._final_cue_timeline = {
+        "validation": {
+            "status": "ERROR",
+            "errors": [
+                {
+                    "code": "final_timeline_display_duration_invalid",
+                    "subtitle_id": "S0019",
+                    "message": "Final cue display duration is below the hard minimum.",
+                }
+            ],
+        }
+    }
+
+    message = editor.blocking_validation_message()
+
+    assert "字幕太短" in message
+    assert "S0019" in message
+    assert "Final cue" not in message
+
+
 def test_final_segment_count_mismatch_is_structural_error():
     editor = _id_editor()
     editor._assign_global_subtitle_ids(_id_items(4))
@@ -11262,13 +11590,13 @@ def test_passed_validation_writes_final_output_and_manifest_metadata():
         assert (output_dir / "output.srt").exists()
         assert not (output_dir / "字幕处理结果摘要.txt").exists()
         result_dir = source_dir / "sample-处理结果"
-        summary_path = result_dir / "字幕处理结果摘要.txt"
+        summary_path = result_dir / "质检报告" / "字幕处理结果摘要.txt"
         assert summary_path.exists()
         summary = summary_path.read_text(encoding="utf-8-sig")
         assert "结论：通过" in summary
         assert "字幕数量：1" in summary
         assert all(
-            Path(path).parent == result_dir
+            Path(path).parent == result_dir / "字幕文件"
             for path in manifest["source_subtitle_paths"].values()
         )
 
@@ -11402,10 +11730,11 @@ def test_user_subtitle_exports_are_saved_to_media_result_folder():
         )
 
         result_dir = source_dir / "sample-audio-处理结果"
-        bilingual = result_dir / "双语字幕.srt"
-        named_bilingual = result_dir / "sample-audio-原文在上双语字幕.srt"
-        chinese = result_dir / "中文字幕.srt"
-        english = result_dir / "英文字幕.srt"
+        subtitle_dir = result_dir / "字幕文件"
+        bilingual = subtitle_dir / "双语字幕.srt"
+        named_bilingual = subtitle_dir / "sample-audio-原文在上双语字幕.srt"
+        chinese = subtitle_dir / "中文字幕.srt"
+        english = subtitle_dir / "英文字幕.srt"
         assert bilingual.exists()
         assert named_bilingual.exists()
         assert chinese.exists()
@@ -11892,6 +12221,7 @@ def test_stable_ts_density_fallback_stops_on_an_unmappable_empty_token():
 
 
 if __name__ == "__main__":
+    test_formal_boundary_audit_projects_display_pages_and_unresolved_pre_id_evidence()
     test_stable_chinese_cache_rejects_stale_frozen_boundary_context()
     test_semantic_full_translation_cache_survives_allocation_algorithm_change()
     test_semantic_full_translation_reads_verified_pre_v5_cache_once()
@@ -12217,6 +12547,7 @@ if __name__ == "__main__":
     test_cross_id_leakage_requires_target_id_to_be_degraded()
     test_cross_id_leakage_flags_when_target_id_is_consumed_and_empty()
     test_allocation_quality_keeps_out_of_order_return_by_subtitle_id()
+    test_allocation_concurrency_keeps_hit_only_context_for_cache_api_and_retry()
     test_allocation_quality_failed_group_does_not_shift_following_100_ids()
     test_compression_quality_regression_restores_previous_group_allocation()
     test_speed_compression_cannot_accept_number_omission_for_shorter_chinese()
@@ -12225,6 +12556,7 @@ if __name__ == "__main__":
     test_failed_validation_does_not_write_final_output_file()
     test_invalid_final_timeline_blocks_before_display_page_translation()
     test_non_structural_validation_errors_do_not_block_render_gate()
+    test_blocking_timeline_message_is_chinese_and_keeps_subtitle_position()
     test_final_segment_count_mismatch_is_structural_error()
     test_merge_preserves_ids_when_order_changes_before_final_write()
     test_repair_only_modifies_the_target_subtitle_id()

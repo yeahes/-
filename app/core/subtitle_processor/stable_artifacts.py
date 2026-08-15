@@ -11,6 +11,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Tuple
 
+from app.core.output_paths import (
+    MEDIA_RESULT_MANUAL_PACKAGE_DIR,
+    containing_media_result_dir,
+)
+
 
 def stable_artifact_dir(report_path: Path) -> Path:
     """Return the stable artifact directory paired with one coverage report."""
@@ -27,7 +32,12 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def write_json_artifact(path: Path, payload: Any) -> None:
+def write_json_artifact(
+    path: Path,
+    payload: Any,
+    *,
+    compact: bool = False,
+) -> None:
     """Atomically write one UTF-8 JSON artifact in the established format."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary_name = tempfile.mkstemp(
@@ -37,13 +47,15 @@ def write_json_artifact(path: Path, payload: Any) -> None:
     )
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(
-                payload,
-                stream,
-                ensure_ascii=False,
-                indent=2,
-                default=_json_default,
-            )
+            dump_options = {
+                "ensure_ascii": False,
+                "default": _json_default,
+            }
+            if compact:
+                dump_options["separators"] = (",", ":")
+            else:
+                dump_options["indent"] = 2
+            json.dump(payload, stream, **dump_options)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_name, path)
@@ -207,6 +219,45 @@ def find_stable_manifest_for_artifact(artifact_path: str | Path) -> Path | None:
             return candidate.resolve()
         if len(parent.parts) + 4 < len(anchor.parts):
             break
+    result_root = containing_media_result_dir(path)
+    if result_root is not None:
+        manual_manifest = (
+            result_root
+            / MEDIA_RESULT_MANUAL_PACKAGE_DIR
+            / "stable-final-manifest.json"
+        )
+        if manual_manifest.is_file():
+            try:
+                manifest = json.loads(manual_manifest.read_text(encoding="utf-8-sig"))
+                selected = path.resolve()
+                selected_hash = file_sha256(selected) if selected.is_file() else ""
+                override = manifest.get("manual_final_override") or {}
+                declared_paths = [
+                    *(manifest.get("paths") or {}).values(),
+                    *(manifest.get("source_subtitle_paths") or {}).values(),
+                    override.get("subtitle_path"),
+                    override.get("display_page_srt_path"),
+                ]
+                declared_hashes = {
+                    str(value or "").lower()
+                    for value in (
+                        *(manifest.get("paths_sha256") or {}).values(),
+                        *(manifest.get("source_subtitle_paths_sha256") or {}).values(),
+                        override.get("subtitle_sha256"),
+                        override.get("display_page_srt_sha256"),
+                    )
+                    if isinstance(value, str) and value
+                }
+                exact_path = any(
+                    isinstance(value, str)
+                    and value
+                    and Path(value).resolve() == selected
+                    for value in declared_paths
+                )
+                if exact_path or (selected_hash and selected_hash.lower() in declared_hashes):
+                    return manual_manifest.resolve()
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return None
     return None
 
 
