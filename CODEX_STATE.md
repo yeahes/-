@@ -1,39 +1,40 @@
 # Project State
 Status: complete
-Last verified: 2026-08-15 00:38:38 Asia/Shanghai
+Last verified: 2026-08-15 19:53:09 Asia/Shanghai
 Branch: main
-Verified HEAD: 167514dcbe0cc14fdb56b38a499b00190e241f02
-Working tree: modified by verified editor, translation, recovery, ASR-correction, and review increments; `.workbuddy/` remains untracked and excluded
+Verified HEAD: fe3d2832831a7d75a0a6f1b220644f1ac6a4103b
+Working tree: only untracked `.workbuddy/`, intentionally excluded
 
 ## Current Goal
-Remove high-frequency manual-editor stalls without changing subtitle, timing, translation, or rendering behavior.
+Harden Pro/Flash translation ownership and keep parent Chinese separate from display-page Chinese.
 
 ## Confirmed Facts
-- Parent-local edit history stores only one parent state; legacy full snapshots compact in memory without rewriting source packages.
-- English word-surface undo stores changed frozen words plus the prior formal-ledger hash; IDs, times, cue spans, and boundary validation are preserved.
-- Recovery drafts remain atomic and complete but use compact JSON. The real 119-operation draft fell from 32.8 MB to 3.1 MB; hash/write fell from about 222/1299 ms to 31/138 ms.
-- Local table changes use row updates/inserts/removals; imports and parent/page view switches still use a full reset.
-- Read-only replay of two real packages preserved all unrelated parents through Chinese edit, split, undo, and redo.
-- The final complete regression passed in 346.3 seconds; focused manual-editor, publication, review-mark, artifact, syntax, and diff checks pass.
+- Full semantic-group translation uses Pro; ordinary fixed-ID and page allocation use Flash; quality retry sends only the affected complete scope to Pro.
+- Cache contract v2 binds the actual request model, with a validated one-release read path for older full-translation caches.
+- Parent Chinese is authoritative; page Chinese is an independent display projection and cannot overwrite it.
+- Legacy schema-v2 pages load only when aggregate Chinese equals current parent authority; stale authority refs fail closed.
+- Two-parent integration coverage proves unaffected page projections remain byte-equivalent through a scoped Pro retry.
+- The complete 26-stage regression passes at `fe3d283`; focused caption/page suites and `git diff --check` pass.
+- Read-only replay reopened the 147-cue oil and 213-cue Mixue packages with identical recursive size, mtime, and SHA-256 snapshots.
 
 ## Approved Decisions
-- Preserve fixed English IDs, word order, authoritative word ledger, timing, and render geometry.
-- Keep cross-parent, formal-boundary, and audio-tail operations whole-document transactions.
-- Do not include `.workbuddy/` in a project commit.
+- Preserve fixed English, subtitle IDs, word spans, timing, page geometry, and the current rendering path.
+- Keep `.workbuddy/` untracked and out of commits.
 
 ## Relevant Paths
-- `app/core/subtitle_processor/manual_final_subtitle_editor.py`
-- `app/core/subtitle_processor/stable_artifacts.py`; `app/view/subtitle_interface.py`
-- `tasks/active/manual-long-caption-workspace.md`
+- `app/core/subtitle_processor/screen_editor.py`
+- `app/core/subtitle_processor/authoritative_parent_chinese.py`
+- `app/thread/subtitle_thread.py`
+- `docs/CURRENT_STATE.md`
 
 ## Last Verification
-- Focused suites and `runtime\python.exe scripts\run_regression.py` pass; two real artifact replays were read only and wrote no production artifact.
+- Commit `fe3d283`; full regression, focused suites, syntax, diff, and two real-package read-only replays pass.
 
 ## Next Action
-Restart the GUI, reopen an existing manual-final subtitle, and verify split, boundary move, Chinese edit, undo, and automatic draft recovery feel responsive.
+Restart the GUI and run one fresh article-assisted audio to measure real Pro/Flash translation quality and latency.
 
 ## Do Not Regress
-- Keep English text/IDs/timing deterministic; never trade crash recovery or undo correctness for UI speed.
+- Page Chinese must never write back into parent Chinese; LLM output must never change English, IDs, word spans, timing, or page geometry.
 
 ## Unknowns
-- A mouse-driven GUI pass is still required to measure perceived latency with the user's normal editing cadence.
+- No paid Pro/Flash blind run was made during this offline verification.
