@@ -13,7 +13,7 @@ from app.core.subtitle_processor.chinese_token_boundaries import (
 
 
 DISPLAY_PAGE_SCHEMA_VERSION = 2
-DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v19"
+DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v22"
 DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v4"
 DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION = "display-page-translation-source-echo-v1"
 DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v5"

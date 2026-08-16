@@ -18,7 +18,10 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFo
 
 from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
 from app.core.entities import LLMServiceEnum
-from app.core.subtitle_processor.stable_display_planner import plan_word_page_spans
+from app.core.subtitle_processor.stable_display_planner import (
+    plan_word_page_span_frontier,
+    plan_word_page_spans,
+)
 from app.core.subtitle_processor.chinese_token_boundaries import (
     chinese_token_boundaries,
 )
@@ -155,7 +158,7 @@ VOCAB_MIN_CARDS_PER_EPISODE = 3
 VOCAB_MAX_CARDS_PER_EPISODE = 22
 VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 3
 ARTICLE_SUBTITLE_EN_FONT_SIZE = 56
-ARTICLE_SUBTITLE_ZH_FONT_SIZE = 46
+ARTICLE_SUBTITLE_ZH_FONT_SIZE = 48
 ARTICLE_SUBTITLE_EN_FALLBACK_SIZES = (56, 54, 52, 50)
 ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES: tuple[int, ...] = ()
 ARTICLE_SUBTITLE_EN_ALLOWED_SIZES = (
@@ -165,6 +168,7 @@ ARTICLE_SUBTITLE_EN_ALLOWED_SIZES = (
 ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE = min(ARTICLE_SUBTITLE_EN_FALLBACK_SIZES)
 ARTICLE_SUBTITLE_EN_MIN_SIZE = min(ARTICLE_SUBTITLE_EN_ALLOWED_SIZES)
 ARTICLE_SUBTITLE_ZH_MIN_SIZE = ARTICLE_SUBTITLE_ZH_FONT_SIZE
+ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH = 1100
 ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH = 1260
 ARTICLE_SUBTITLE_EN_WIDTH = 1455
 # A cue may use the full safe panel width while retaining the preferred font.
@@ -172,7 +176,7 @@ ARTICLE_SUBTITLE_EN_WIDTH = 1455
 ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH = 1498
 ARTICLE_SUBTITLE_ZH_WIDTH = 1455
 ARTICLE_PAGE_MIN_DURATION_MS = 900
-ARTICLE_PAGE_COMFORTABLE_MAX_DURATION_MS = 6500
+ARTICLE_PAGE_COMFORTABLE_MAX_DURATION_MS = 5200
 ARTICLE_PAGE_LEAD_IN_MS = 70
 ARTICLE_PAGE_TAIL_HOLD_MS = 120
 ARTICLE_PAGE_PAUSE_PREFERENCE_MS = 220
@@ -184,6 +188,26 @@ ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS = 180
 ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT = 4
 ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS = 6
 ARTICLE_PAGE_SECONDARY_REVIEW_STRONG_PAUSE_MS = 500
+ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA = 0.22
+ARTICLE_PAGE_PRESSURE_TRANSITION_PENALTY = 3_000
+ARTICLE_PAGE_FONT_TRANSITION_PENALTY = 40
+ARTICLE_PAGE_LINE_COUNT_TRANSITION_PENALTY = 30
+ARTICLE_PAGE_INCOMPLETE_REVIEW_PENALTY = 800
+ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT = 4
+ARTICLE_PAGE_TWO_LINE_BALANCE_FREE_RATIO = 0.82
+ARTICLE_PAGE_TWO_LINE_BALANCE_PENALTY = 4_000
+ARTICLE_PAGE_50PX_LAST_RESORT_PENALTY = 1_200
+ARTICLE_PAGE_ATOMIC_BOUNDARY_ISSUES = frozenset(
+    {
+        "modifier_head_split",
+        "modifier_noun_head_split",
+        "post_noun_participial_modifier_split",
+        "subject_predicate_split",
+        "subject_finite_verb_split",
+        "verb_object_split",
+        "to_infinitive_split",
+    }
+)
 # A long frozen cue remains one subtitle ID and one timing envelope, but the
 # article template may paginate it inside that envelope.  These are render
 # budgets, not segmentation or translation limits.
@@ -192,6 +216,7 @@ ARTICLE_PAGE_SECONDARY_REVIEW_STRONG_PAUSE_MS = 500
 # This is a preference, not a feasibility rule. Proportional-font pixel fit,
 # grammar evidence, and page timing decide whether a page is renderable.
 ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS = 16
+ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS = 14
 ARTICLE_VISUAL_PAGE_PREFERRED_WORDS = 12
 ARTICLE_VISUAL_PAGE_MIN_WORDS = 4
 ARTICLE_VISUAL_PAGE_MAX_PAGES = 4
@@ -2994,7 +3019,7 @@ def _article_fixed_english_lines(
     # Keep ordinary lines within a comfortable reading measure. The wider
     # profiles remain controlled fallbacks when a natural two-line wrap is not
     # available; they are not the first-choice one-line target.
-    if text_w(draw, text, fnt) <= acx(ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH):
+    if text_w(draw, text, fnt) <= acx(ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH):
         return [text]
     minimum_word_candidates = (
         (3, 2)
@@ -3004,50 +3029,58 @@ def _article_fixed_english_lines(
         )
         else (3,)
     )
-    for minimum_line_words in minimum_word_candidates:
-        for width in (
-            ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
-            ARTICLE_SUBTITLE_EN_WIDTH,
-            ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
-        ):
-            max_width = acx(width)
-            lines = wrap_en_preserving_highlight(
-                draw,
-                text,
-                fnt,
-                max_width,
-                key,
-                minimum_line_words=minimum_line_words,
-                boundary_penalty=boundary_penalty,
-                intrinsic_penalty=score_intrinsic,
-            )
-            max_lines = 3 if font_size == ARTICLE_SUBTITLE_EN_MIN_SIZE else 2
-            if (
-                not lines
-                or len(lines) > max_lines
-                or any(text_w(draw, line, fnt) > max_width for line in lines)
-                or (
-                    len(lines) > 1
-                    and any(
-                        len(line.split()) < minimum_line_words
-                        for line in lines
-                    )
+    width_profiles = (
+        ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH,
+        ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
+        ARTICLE_SUBTITLE_EN_WIDTH,
+        ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
+    )
+    max_line_candidates = (
+        (2, 3)
+        if font_size == ARTICLE_SUBTITLE_EN_MIN_SIZE
+        else (2,)
+    )
+    for max_lines in max_line_candidates:
+        for minimum_line_words in minimum_word_candidates:
+            for width in width_profiles:
+                max_width = acx(width)
+                lines = wrap_en_preserving_highlight(
+                    draw,
+                    text,
+                    fnt,
+                    max_width,
+                    key,
+                    minimum_line_words=minimum_line_words,
+                    boundary_penalty=boundary_penalty,
+                    intrinsic_penalty=score_intrinsic,
                 )
-                or (
-                    font_size != ARTICLE_SUBTITLE_EN_MIN_SIZE
-                    and _has_discouraged_caption_break(
-                        text,
-                        lines,
-                        boundary_penalty=boundary_penalty,
-                        intrinsic_penalty=score_intrinsic,
+                if (
+                    not lines
+                    or len(lines) > max_lines
+                    or any(text_w(draw, line, fnt) > max_width for line in lines)
+                    or (
+                        len(lines) > 1
+                        and any(
+                            len(line.split()) < minimum_line_words
+                            for line in lines
+                        )
                     )
-                )
-            ):
-                continue
-            # Two-word lines are an article-template fallback only. They avoid
-            # silent font shrinking when no legal three-word layout fits; a
-            # one-word orphan and every hard lexical break remain forbidden.
-            return lines
+                    or (
+                        font_size != ARTICLE_SUBTITLE_EN_MIN_SIZE
+                        and _has_discouraged_caption_break(
+                            text,
+                            lines,
+                            boundary_penalty=boundary_penalty,
+                            intrinsic_penalty=score_intrinsic,
+                        )
+                    )
+                ):
+                    continue
+                # Two-word lines and a third 50px line are last-resort
+                # fallbacks. Every two-line width is exhausted before the
+                # three-line pass. The existing 50px emergency syntax review
+                # remains unchanged and is still audited downstream.
+                return lines
     return []
 
 
@@ -3095,7 +3128,7 @@ def _article_preferred_readability_page_count(
     english_pixel_pages = max(1, math.ceil(english_pixels / english_capacity))
     english_word_pages = max(
         1,
-        math.ceil(len(words) / ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS),
+        math.ceil(len(words) / ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS),
     )
 
     chinese_pages = 1
@@ -3105,8 +3138,17 @@ def _article_preferred_readability_page_count(
         chinese_capacity = max(1, 2 * acx(ARTICLE_SUBTITLE_ZH_WIDTH))
         chinese_pages = max(1, math.ceil(chinese_pixels / chinese_capacity))
 
+    measured_load_pages = max(
+        english_pixel_pages,
+        english_word_pages,
+        chinese_pages,
+    )
     duration_pages = 1
-    if cue_duration_ms is not None and cue_duration_ms > 0:
+    if (
+        measured_load_pages > 1
+        and cue_duration_ms is not None
+        and cue_duration_ms > 0
+    ):
         duration_pages = max(
             1,
             math.ceil(cue_duration_ms / ARTICLE_PAGE_COMFORTABLE_MAX_DURATION_MS),
@@ -3114,9 +3156,7 @@ def _article_preferred_readability_page_count(
     return min(
         ARTICLE_VISUAL_PAGE_MAX_PAGES,
         max(
-            english_pixel_pages,
-            english_word_pages,
-            chinese_pages,
+            measured_load_pages,
             duration_pages,
         ),
     )
@@ -3197,6 +3237,7 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         and issue_codes
         and issue_codes
         <= {
+            "clause_complement_entrance_split",
             "clause_introducer_split",
             "coordinated_constituent_split",
             "object_content_clause_split",
@@ -3222,6 +3263,7 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         and atomic
         and atomic
         <= {
+            "embedded_wh_clause_split",
             "relative_clause_subject_verb_split",
             "subject_finite_verb_split",
             "subject_predicate_split",
@@ -3414,7 +3456,12 @@ def _article_forced_continuation_decision(
         }
     )
     if likely_infinitive_start:
-        reviewable.add("protected_syntax_cut")
+        reviewable.update(
+            {
+                "high_confidence_modifier_head_split",
+                "protected_syntax_cut",
+            }
+        )
     complete_phrase = _caption_phrase_start_is_complete(words, split)
     complete_continuation = _caption_complete_continuation_clause(words[split:])
     if (
@@ -3453,6 +3500,9 @@ def _article_forced_continuation_decision(
             ),
             "forced_display_continuation": True,
             "forced_subject_predicate": forced_subject_predicate,
+            "forced_complete_to_phrase": bool(
+                likely_infinitive_start and not forced_subject_predicate
+            ),
         }
     return decision
 
@@ -3600,7 +3650,16 @@ def _article_page_boundary_risk(decision: Mapping, cost: int | float) -> int:
             risk = max(risk, 6)
     if float(cost) >= DISPLAY_PAGE_HIGH_RISK_COST:
         risk = max(risk, 1)
-    if decision.get("forced_display_continuation"):
+    if (
+        decision.get("forced_complete_to_phrase")
+        and not issue_codes
+        & {"short_verb_complement_split", "verb_complement_split"}
+    ):
+        # A complete ``to ...`` phrase is still reviewable, but it is a
+        # substantially safer page restart only when the left page has not
+        # stranded the governing verb from that complement.
+        risk = min(risk, 2)
+    elif decision.get("forced_display_continuation"):
         risk = max(risk, 4)
     if decision.get("forced_subject_predicate"):
         risk = max(risk, 5)
@@ -3909,7 +3968,8 @@ def _partition_article_english_pages(
     allow_review_boundary: bool = False,
     span_layout: Callable[[int, int, int, bool], Sequence[str]] | None = None,
     span_balance: Callable[[int, int, int, int], float] | None = None,
-) -> list[tuple[int, int]] | None:
+    max_candidates: int = 1,
+) -> list[tuple[int, int]] | list[list[tuple[int, int]]] | None:
     """Find fixed-font page spans without creating a hard phrase split."""
     def span_is_readable(
         start: int,
@@ -3948,6 +4008,10 @@ def _partition_article_english_pages(
                 )
                 or bool(boundary_decision.get("forced_display_continuation"))
                 or bool(
+                    boundary_decision.get("classification") == "allow"
+                    and boundary_decision.get("complete_page_clause_start")
+                )
+                or bool(
                     allow_review_boundary
                     and boundary_decision.get("classification") == "review"
                 )
@@ -3985,15 +4049,13 @@ def _partition_article_english_pages(
             and lines
         )
 
-    return plan_word_page_spans(
-        len(words),
-        page_count,
-        cue_start=float(cue.start),
-        cue_end=float(cue.end),
-        word_timing=word_timing,
-        min_page_duration=ARTICLE_PAGE_MIN_DURATION_MS / 1000.0,
-        span_is_readable=span_is_readable,
-        break_score=lambda end, target: _article_page_break_rank(
+    planner_kwargs = {
+        "cue_start": float(cue.start),
+        "cue_end": float(cue.end),
+        "word_timing": word_timing,
+        "min_page_duration": ARTICLE_PAGE_MIN_DURATION_MS / 1000.0,
+        "span_is_readable": span_is_readable,
+        "break_score": lambda end, target: _article_page_break_rank(
             cue,
             words,
             end,
@@ -4002,7 +4064,7 @@ def _partition_article_english_pages(
             allow_forced_continuation=allow_forced_continuation,
             allow_review_boundary=allow_review_boundary,
         ),
-        span_score=(
+        "span_score": (
             (lambda start, end: span_balance(
                 start,
                 end,
@@ -4022,7 +4084,19 @@ def _partition_article_english_pages(
                 )
             )
         ),
-        diagnostics=diagnostics,
+        "diagnostics": diagnostics,
+    }
+    if int(max_candidates or 1) > 1:
+        return plan_word_page_span_frontier(
+            len(words),
+            page_count,
+            **planner_kwargs,
+            max_candidates=max_candidates,
+        )
+    return plan_word_page_spans(
+        len(words),
+        page_count,
+        **planner_kwargs,
     )
 
 
@@ -4121,6 +4195,17 @@ def _article_planning_final_page_layout(
         if lines:
             return int(font_size), list(lines)
     return None
+
+
+def _article_candidate_fallback_tier(
+    candidate: Mapping[str, object],
+) -> int:
+    """Order page candidates as strict, explicit review, then forced."""
+    if candidate.get("review_boundary_candidate"):
+        return 1
+    if candidate.get("forced_continuation"):
+        return 2
+    return 0
 
 
 def _finalize_article_same_screen_layout(
@@ -4409,123 +4494,137 @@ def _build_article_english_page_plan(
     )
     if not base_static_lines and len(words) > ARTICLE_VISUAL_PAGE_PREFERRED_WORDS:
         base_preferred_page_count = max(2, base_preferred_page_count)
+    base_duration_ms = max(
+        0,
+        round((float(cue.end) - float(cue.start)) * 1000),
+    )
+    enumerate_high_pressure_alternatives = bool(
+        not base_static_lines
+        or len(words) > ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
+        or base_duration_ms > ARTICLE_PAGE_COMFORTABLE_MAX_DURATION_MS
+    )
 
-    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
-        max_page_count = min(ARTICLE_VISUAL_PAGE_MAX_PAGES, len(words))
-        for page_count in range(1, max_page_count + 1):
-            attempt_diagnostics: set[str] = set()
-            spans = _partition_article_english_pages(
-                draw,
+    def candidate_from_spans(
+        spans: list[tuple[int, int]],
+        page_count: int,
+        forced_continuation: bool,
+        review_boundary_candidate: bool = False,
+    ) -> tuple[dict | None, str]:
+        if (
+            page_count == 1
+            and str(cue.zh or "").strip()
+            and not _article_fixed_chinese_lines(draw, str(cue.zh))
+        ):
+            return None, "chinese_does_not_fit_fixed_font"
+        # Candidate scoring must use the exact typography that the frozen
+        # blueprint will publish. Planning feasibility was already checked by
+        # ``_partition_article_english_pages``; using the later reflow result
+        # here prevents a nominal 56/52px candidate from becoming 50px only
+        # after whole-episode selection.
+        page_layouts = [
+            _article_final_page_layout(draw, cue, words, start, end)
+            for start, end in spans
+        ]
+        if any(layout is None for layout in page_layouts):
+            return None, "english_does_not_fit_fixed_font"
+        page_font_sizes = [int(layout[0]) for layout in page_layouts if layout]
+        english_layouts = [list(layout[1]) for layout in page_layouts if layout]
+        selected_parent_font = min(page_font_sizes)
+        boundaries, timing_reason = _schedule_article_page_boundaries(cue, spans)
+        if boundaries is None:
+            return None, timing_reason
+        boundary_decisions = [
+            (
+                _article_forced_continuation_decision(cue, words, start)
+                if forced_continuation
+                else _article_display_boundary_decision(cue, start)
+            )
+            for start, _ in spans[1:]
+        ]
+        boundary_costs = [
+            _article_page_break_score(
                 cue,
                 words,
-                page_count,
+                start,
+                len(words) / page_count,
                 cue.word_timing,
-                font_size,
-                diagnostics=attempt_diagnostics,
-                span_layout=span_layout,
-                span_balance=span_balance,
+                allow_forced_continuation=forced_continuation,
+                allow_review_boundary=review_boundary_candidate,
             )
-            forced_continuation = False
-            if spans is None and page_count > 1:
-                spans = _partition_article_english_pages(
-                    draw,
-                    cue,
-                    words,
-                    page_count,
-                    cue.word_timing,
-                    font_size,
-                    diagnostics=attempt_diagnostics,
-                    allow_forced_continuation=True,
-                    span_layout=span_layout,
-                    span_balance=span_balance,
-                )
-                forced_continuation = spans is not None
-            if spans is None:
-                failure_reasons.update(
-                    attempt_diagnostics or {"no_complete_legal_page_partition"}
-                )
-                continue
-            if (
-                page_count == 1
-                and str(cue.zh or "").strip()
-                and not _article_fixed_chinese_lines(draw, str(cue.zh))
-            ):
-                failure_reasons.add("chinese_does_not_fit_fixed_font")
-                continue
-            page_layouts = [
-                _article_planning_final_page_layout(draw, cue, words, start, end)
-                for start, end in spans
+            for start, _ in spans[1:]
+        ]
+        if any(cost is None for cost in boundary_costs):
+            return None, "hard_page_boundary"
+        boundary_risks = [
+            _article_page_boundary_risk(decision, int(cost or 0))
+            for decision, cost in zip(boundary_decisions, boundary_costs)
+        ]
+        review_count = sum(
+            decision.get("classification") == "review"
+            for decision in boundary_decisions
+        )
+        high_risk_count = sum(risk > 0 for risk in boundary_risks)
+        medium_risk_count = sum(
+            decision.get("classification") == "review"
+            and decision.get("confidence") == "medium"
+            for decision in boundary_decisions
+        )
+        low_risk_count = sum(
+            decision.get("classification") == "review"
+            and decision.get("confidence") == "low"
+            for decision in boundary_decisions
+        )
+        supported_restart_count = sum(
+            decision.get("classification") == "review"
+            and decision.get("strong_pause_evidence")
+            for decision in boundary_decisions
+        )
+        tight_complete_phrase_count = sum(
+            bool(decision.get("tight_complete_phrase_start"))
+            for decision in boundary_decisions
+        )
+        risk_score = sum(boundary_risks)
+        soft_word_overflow = sum(
+            max(0, end - start - ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS)
+            for start, end in spans
+        )
+        page_balance_cost = sum(
+            _article_page_span_balance_cost(
+                draw,
+                words,
+                start,
+                end,
+                cue.word_timing,
+                page_font_sizes[index],
+                page_count,
+            )
+            for index, (start, end) in enumerate(spans)
+        )
+        pages = []
+        line_balance_ratios = []
+        line_balance_cost = 0.0
+        for index, (start, end) in enumerate(spans):
+            layout_lines = english_layouts[index]
+            layout_font_size = page_font_sizes[index]
+            layout_font = article_en_font(layout_font_size, 600)
+            measured_line_widths = [
+                text_w(draw, line, layout_font) for line in layout_lines
             ]
-            if any(layout is None for layout in page_layouts):
-                failure_reasons.add("english_does_not_fit_fixed_font")
-                continue
-            page_font_sizes = [int(layout[0]) for layout in page_layouts if layout]
-            english_layouts = [list(layout[1]) for layout in page_layouts if layout]
-            selected_parent_font = min(page_font_sizes)
-            boundaries, timing_reason = _schedule_article_page_boundaries(cue, spans)
-            if boundaries is None:
-                failure_reasons.add(timing_reason)
-                continue
-            boundary_decisions = [
-                (
-                    _article_forced_continuation_decision(cue, words, start)
-                    if forced_continuation
-                    else _article_display_boundary_decision(cue, start)
+            max_line_width = max(measured_line_widths, default=0)
+            line_balance_ratio = 1.0
+            if len(measured_line_widths) == 2 and max_line_width:
+                line_balance_ratio = min(measured_line_widths) / max_line_width
+                imbalance = max(
+                    0.0,
+                    ARTICLE_PAGE_TWO_LINE_BALANCE_FREE_RATIO - line_balance_ratio,
                 )
-                for start, _ in spans[1:]
-            ]
-            boundary_costs = [
-                _article_page_break_score(
-                    cue,
-                    words,
-                    start,
-                    len(words) / page_count,
-                    cue.word_timing,
-                    allow_forced_continuation=forced_continuation,
+                line_balance_cost += (
+                    imbalance
+                    * imbalance
+                    * ARTICLE_PAGE_TWO_LINE_BALANCE_PENALTY
                 )
-                for start, _ in spans[1:]
-            ]
-            if any(cost is None for cost in boundary_costs):
-                failure_reasons.add("hard_page_boundary")
-                continue
-            boundary_risks = [
-                _article_page_boundary_risk(decision, int(cost or 0))
-                for decision, cost in zip(boundary_decisions, boundary_costs)
-            ]
-            review_count = sum(
-                decision.get("classification") == "review"
-                for decision in boundary_decisions
-            )
-            high_risk_count = sum(risk > 0 for risk in boundary_risks)
-            medium_risk_count = sum(
-                decision.get("classification") == "review"
-                and decision.get("confidence") == "medium"
-                for decision in boundary_decisions
-            )
-            low_risk_count = sum(
-                decision.get("classification") == "review"
-                and decision.get("confidence") == "low"
-                for decision in boundary_decisions
-            )
-            supported_restart_count = sum(
-                decision.get("classification") == "review"
-                and decision.get("strong_pause_evidence")
-                for decision in boundary_decisions
-            )
-            tight_complete_phrase_count = sum(
-                bool(decision.get("tight_complete_phrase_start"))
-                for decision in boundary_decisions
-            )
-            risk_score = sum(boundary_risks)
-            soft_word_overflow = sum(
-                max(0, end - start - ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS)
-                for start, end in spans
-            )
-            page_balance_cost = sum(
-                span_balance(start, end, font_size, page_count)
-                for start, end in spans
-            )
-            pages = [
+            line_balance_ratios.append(round(line_balance_ratio, 6))
+            pages.append(
                 {
                     "index": index,
                     "display_page_id": (
@@ -4551,8 +4650,10 @@ def _build_article_english_page_plan(
                     ),
                     "start": boundaries[index],
                     "end": boundaries[index + 1],
-                    "en_lines": english_layouts[index],
-                    "english_font_size": page_font_sizes[index],
+                    "en_lines": layout_lines,
+                    "english_font_size": layout_font_size,
+                    "rendered_line_width": max_line_width,
+                    "line_balance_ratio": round(line_balance_ratio, 6),
                     "boundary_before": (
                         boundary_decisions[index - 1]
                         if index > 0
@@ -4564,203 +4665,357 @@ def _build_article_english_page_plan(
                     ),
                     "en_width": _article_english_layout_width(
                         draw,
-                        english_layouts[index],
-                        page_font_sizes[index],
+                        layout_lines,
+                        layout_font_size,
                     ),
                     "line_wrap_review": bool(
                         _has_discouraged_caption_break(
                             " ".join(words[start:end]),
-                            english_layouts[index],
+                            layout_lines,
                             boundary_penalty=lambda split, base=start: (
                                 _article_line_boundary_penalty(cue, base + split)
                             ),
                         )
                     ),
                 }
-                for index, (start, end) in enumerate(spans)
-            ]
-            warnings = []
-            last_word = (
-                re.sub(r"[^A-Za-z']", "", words[-1]).lower()
-                if words
-                else ""
             )
-            static_dangling_tail = bool(
-                page_count == 1
-                and last_word in LINE_BREAK_AVOID_AFTER_WORDS
-                and not _caption_has_terminal_completion(words)
+        warnings = []
+        last_word = (
+            re.sub(r"[^A-Za-z']", "", words[-1]).lower() if words else ""
+        )
+        static_dangling_tail = bool(
+            page_count == 1
+            and last_word in LINE_BREAK_AVOID_AFTER_WORDS
+            and not _caption_has_terminal_completion(words)
+        )
+        if (
+            (page_count < base_preferred_page_count or static_dangling_tail)
+            and not (
+                page_count == 1 and _caption_has_terminal_completion(words)
             )
-            if (
-                (
-                    page_count < base_preferred_page_count
-                    or static_dangling_tail
-                )
-                and not (
-                    page_count == 1
-                    and _caption_has_terminal_completion(words)
-                )
-            ):
-                warnings.append(
-                    {
-                        "reason": "preferred_readability_page_unscheduled",
-                        "requested_page_count": max(
-                            base_preferred_page_count,
-                            2 if static_dangling_tail else 1,
-                        ),
-                    }
-                )
-            if review_count:
-                warnings.append(
-                    {
-                        "reason": "review_boundary_fallback",
-                        "boundary_count": review_count,
-                        "high_risk_count": high_risk_count,
-                        "risk_score": risk_score,
-                    }
-                )
-            if forced_continuation:
-                warnings.append(
-                    {
-                        "reason": "forced_complete_continuation_page_split",
-                        "boundary_count": sum(
-                            bool(decision.get("forced_display_continuation"))
-                            for decision in boundary_decisions
-                        ),
-                        "requires_review": True,
-                    }
-                )
-            if soft_word_overflow:
-                warnings.append(
-                    {
-                        "reason": "visual_word_budget_exceeded",
-                        "soft_limit": ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS,
-                        "overflow_words": soft_word_overflow,
-                    }
-                )
-            if selected_parent_font < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE:
-                warnings.append(
-                    {
-                        "reason": "emergency_font_fallback",
-                        "normal_minimum": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
-                        "selected": selected_parent_font,
-                        "requires_review": True,
-                    }
-                )
-            page_word_counts = [end - start for start, end in spans]
-            if (
-                len(page_word_counts) > 1
-                and max(page_word_counts) / max(min(page_word_counts), 1) >= 1.8
-            ):
-                warnings.append(
-                    {
-                        "reason": "display_page_load_imbalance",
-                        "page_word_counts": page_word_counts,
-                        "balance_cost": round(page_balance_cost),
-                    }
-                )
-            plan = {
-                "status": "ok",
-                "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
-                "font_size": {
-                    "english": selected_parent_font,
-                    "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
-                },
-                "font_fallback": (
-                    {
-                        "used": True,
-                        "from": ARTICLE_SUBTITLE_EN_FONT_SIZE,
-                        "to": selected_parent_font,
-                        "reason": (
-                            "no_safe_normal_font_layout"
-                            if selected_parent_font < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
-                            else "no_safe_higher_font_layout"
-                        ),
-                    }
-                    if selected_parent_font != ARTICLE_SUBTITLE_EN_FONT_SIZE
-                    else {"used": False}
-                ),
-                "pages": pages,
-                "readability_warnings": warnings,
-            }
-            font_reduction = ARTICLE_SUBTITLE_EN_FONT_SIZE - selected_parent_font
-            quality_cost = (
-                sum(int(cost or 0) for cost in boundary_costs)
-                + page_balance_cost
-                + soft_word_overflow * 300
-                + font_reduction * DISPLAY_PAGE_FONT_STEP_PENALTY
-                + abs(page_count - base_preferred_page_count)
-                * DISPLAY_PAGE_COUNT_DEVIATION_PENALTY
-                + max(0, page_count - 1) * DISPLAY_PAGE_TRANSITION_PENALTY
-            )
-            candidates.append(
+        ):
+            warnings.append(
                 {
-                    "plan": plan,
-                    "page_count": page_count,
-                    "font_reduction": font_reduction,
-                    "forced_continuation": forced_continuation,
-                    "risk_score": risk_score,
-                    "high_risk_count": high_risk_count,
-                    "medium_risk_count": medium_risk_count,
-                    "low_risk_count": low_risk_count,
-                    "supported_restart_count": supported_restart_count,
-                    "severe_risk_count": sum(
-                        risk >= 3 for risk in boundary_risks
-                    ),
-                    "tight_complete_phrase_count": tight_complete_phrase_count,
-                    "review_count": review_count,
-                    "quality_cost": round(quality_cost),
-                    "page_pressures": tuple(
-                        _article_display_page_pressure(page) for page in pages
+                    "reason": "preferred_readability_page_unscheduled",
+                    "requested_page_count": max(
+                        base_preferred_page_count,
+                        2 if static_dangling_tail else 1,
                     ),
                 }
             )
+        if review_count:
+            warnings.append(
+                {
+                    "reason": "review_boundary_fallback",
+                    "boundary_count": review_count,
+                    "high_risk_count": high_risk_count,
+                    "risk_score": risk_score,
+                }
+            )
+        if forced_continuation:
+            warnings.append(
+                {
+                    "reason": "forced_complete_continuation_page_split",
+                    "boundary_count": sum(
+                        bool(decision.get("forced_display_continuation"))
+                        for decision in boundary_decisions
+                    ),
+                    "requires_review": True,
+                }
+            )
+        if soft_word_overflow:
+            warnings.append(
+                {
+                    "reason": "visual_word_budget_exceeded",
+                    "soft_limit": ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS,
+                    "overflow_words": soft_word_overflow,
+                }
+            )
+        if selected_parent_font < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE:
+            warnings.append(
+                {
+                    "reason": "emergency_font_fallback",
+                    "normal_minimum": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
+                    "selected": selected_parent_font,
+                    "requires_review": True,
+                }
+            )
+        page_word_counts = [end - start for start, end in spans]
+        if (
+            len(page_word_counts) > 1
+            and max(page_word_counts) / max(min(page_word_counts), 1) >= 1.8
+        ):
+            warnings.append(
+                {
+                    "reason": "display_page_load_imbalance",
+                    "page_word_counts": page_word_counts,
+                    "balance_cost": round(page_balance_cost),
+                }
+            )
+        plan = {
+            "status": "ok",
+            "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
+            "font_size": {
+                "english": selected_parent_font,
+                "chinese": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+            },
+            "font_fallback": (
+                {
+                    "used": True,
+                    "from": ARTICLE_SUBTITLE_EN_FONT_SIZE,
+                    "to": selected_parent_font,
+                    "reason": (
+                        "no_safe_normal_font_layout"
+                        if selected_parent_font < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
+                        else "no_safe_higher_font_layout"
+                    ),
+                }
+                if selected_parent_font != ARTICLE_SUBTITLE_EN_FONT_SIZE
+                else {"used": False}
+            ),
+            "pages": pages,
+            "readability_warnings": warnings,
+        }
+        font_reduction = ARTICLE_SUBTITLE_EN_FONT_SIZE - selected_parent_font
+        quality_cost = (
+            sum(int(cost or 0) for cost in boundary_costs)
+            + page_balance_cost
+            + line_balance_cost
+            + soft_word_overflow * 300
+            + font_reduction * DISPLAY_PAGE_FONT_STEP_PENALTY
+            + (
+                ARTICLE_PAGE_50PX_LAST_RESORT_PENALTY
+                if selected_parent_font == ARTICLE_SUBTITLE_EN_MIN_SIZE
+                else 0
+            )
+            + abs(page_count - base_preferred_page_count)
+            * DISPLAY_PAGE_COUNT_DEVIATION_PENALTY
+            + max(0, page_count - 1) * DISPLAY_PAGE_TRANSITION_PENALTY
+        )
+        return (
+            {
+                "plan": plan,
+                "page_count": page_count,
+                "font_reduction": font_reduction,
+                "forced_continuation": forced_continuation,
+                "review_boundary_candidate": review_boundary_candidate,
+                "risk_score": risk_score,
+                "high_risk_count": high_risk_count,
+                "medium_risk_count": medium_risk_count,
+                "low_risk_count": low_risk_count,
+                "supported_restart_count": supported_restart_count,
+                "severe_risk_count": sum(
+                    risk >= 3 for risk in boundary_risks
+                ),
+                "tight_complete_phrase_count": tight_complete_phrase_count,
+                "review_count": review_count,
+                "incomplete_review_count": sum(
+                    decision.get("classification") == "review"
+                    and not _article_secondary_review_boundary_is_complete(page)
+                    for decision, page in zip(boundary_decisions, pages[1:])
+                ),
+                "quality_cost": round(quality_cost),
+                "page_pressures": tuple(
+                    _article_display_page_pressure(page) for page in pages
+                ),
+                "line_balance_ratios": tuple(line_balance_ratios),
+            },
+            "",
+        )
+
+    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        max_page_count = min(ARTICLE_VISUAL_PAGE_MAX_PAGES, len(words))
+        for page_count in range(1, max_page_count + 1):
+            attempt_diagnostics: set[str] = set()
+            strict_partitions = _partition_article_english_pages(
+                draw,
+                cue,
+                words,
+                page_count,
+                cue.word_timing,
+                font_size,
+                diagnostics=attempt_diagnostics,
+                span_layout=span_layout,
+                span_balance=span_balance,
+                max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
+            )
+            partition_modes = []
+            if strict_partitions:
+                partition_modes.append((strict_partitions, False, False))
+            if page_count > 1 and (
+                not strict_partitions or enumerate_high_pressure_alternatives
+            ):
+                forced_partitions = _partition_article_english_pages(
+                    draw,
+                    cue,
+                    words,
+                    page_count,
+                    cue.word_timing,
+                    font_size,
+                    diagnostics=attempt_diagnostics,
+                    allow_forced_continuation=True,
+                    span_layout=span_layout,
+                    span_balance=span_balance,
+                    max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
+                )
+                if forced_partitions:
+                    partition_modes.append((forced_partitions, True, False))
+                review_partitions = _partition_article_english_pages(
+                    draw,
+                    cue,
+                    words,
+                    page_count,
+                    cue.word_timing,
+                    font_size,
+                    diagnostics=attempt_diagnostics,
+                    allow_review_boundary=True,
+                    span_layout=span_layout,
+                    span_balance=span_balance,
+                    max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
+                )
+                if review_partitions:
+                    partition_modes.append((review_partitions, False, True))
+            if not partition_modes:
+                failure_reasons.update(
+                    attempt_diagnostics or {"no_complete_legal_page_partition"}
+                )
+                continue
+            for partitions, forced_continuation, review_boundary_candidate in (
+                partition_modes
+            ):
+                for spans in partitions:
+                    candidate, failure_reason = candidate_from_spans(
+                        spans,
+                        page_count,
+                        forced_continuation,
+                        review_boundary_candidate,
+                    )
+                    if candidate is None:
+                        failure_reasons.add(failure_reason)
+                        continue
+                    candidates.append(candidate)
+
     if candidates:
-        normal_font_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate["plan"]["font_size"]["english"]
-            >= ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
-        ]
-        if normal_font_candidates:
-            candidates = normal_font_candidates
+        deduplicated: dict[tuple, dict] = {}
+        for candidate in candidates:
+            pages = candidate.get("plan", {}).get("pages") or []
+            signature = tuple(
+                (
+                    int(page.get("word_start") or 0),
+                    int(page.get("word_end") or 0),
+                    int(page.get("english_font_size") or 0),
+                    tuple(page.get("en_lines") or []),
+                )
+                for page in pages
+            )
+            existing = deduplicated.get(signature)
+            rank = (
+                _article_candidate_fallback_tier(candidate),
+                int(candidate.get("severe_risk_count") or 0),
+                int(candidate.get("high_risk_count") or 0),
+                int(candidate.get("medium_risk_count") or 0),
+                float(candidate.get("quality_cost") or 0.0),
+            )
+            if existing is None:
+                deduplicated[signature] = candidate
+                continue
+            existing_rank = (
+                _article_candidate_fallback_tier(existing),
+                int(existing.get("severe_risk_count") or 0),
+                int(existing.get("high_risk_count") or 0),
+                int(existing.get("medium_risk_count") or 0),
+                float(existing.get("quality_cost") or 0.0),
+            )
+            if rank < existing_rank:
+                deduplicated[signature] = candidate
+        bounded_candidates = []
+        candidate_groups = sorted(
+            {
+                (
+                    int(candidate.get("page_count") or 0),
+                    _article_candidate_fallback_tier(candidate),
+                )
+                for candidate in deduplicated.values()
+            }
+        )
+        for page_count, fallback_tier in candidate_groups:
+            same_count = [
+                candidate
+                for candidate in deduplicated.values()
+                if int(candidate.get("page_count") or 0) == page_count
+                and _article_candidate_fallback_tier(candidate) == fallback_tier
+            ]
+            same_count.sort(
+                key=lambda candidate: (
+                    _article_candidate_fallback_tier(candidate),
+                    int(candidate.get("severe_risk_count") or 0),
+                    int(candidate.get("high_risk_count") or 0),
+                    int(candidate.get("medium_risk_count") or 0),
+                    float(candidate.get("quality_cost") or 0.0),
+                    tuple(
+                        int(page.get("word_end") or 0)
+                        for page in candidate.get("plan", {}).get("pages") or []
+                    ),
+                )
+            )
+            bounded_candidates.extend(
+                same_count[:ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT]
+            )
+        candidates = bounded_candidates
+    if candidates:
         # Page count is a reading-load decision. Break rewards and penalties
         # are deliberately absent here; they select a boundary only after the
         # number of pages is fixed.
         strict_candidates = [
             candidate
             for candidate in candidates
-            if not candidate["forced_continuation"]
+            if _article_candidate_fallback_tier(candidate) == 0
         ]
+        candidate_mode = (
+            "strict"
+            if strict_candidates
+            else (
+                "review_boundary"
+                if any(
+                    candidate.get("review_boundary_candidate")
+                    for candidate in candidates
+                )
+                else "forced_continuation"
+            )
+        )
         selection_pool = strict_candidates or candidates
         secondary_review_candidates = _article_high_pressure_review_candidates(
-            selection_pool,
+            candidates,
             total_word_count=len(words),
         )
         if secondary_review_candidates:
             selection_pool = secondary_review_candidates
-        if _return_candidates:
-            if not secondary_review_candidates:
-                safe_preferred_font_candidates = [
-                    candidate
-                    for candidate in selection_pool
-                    if candidate["plan"]["font_size"]["english"]
-                    == ARTICLE_SUBTITLE_EN_FONT_SIZE
-                    and not candidate["forced_continuation"]
-                    and not candidate["severe_risk_count"]
-                    and not candidate["medium_risk_count"]
-                ]
-                if safe_preferred_font_candidates:
-                    selection_pool = safe_preferred_font_candidates
+
+        def selected_page_count_for(
+            candidate_pool: Sequence[Mapping[str, object]],
+        ) -> tuple[dict[int, list[Mapping[str, object]]], int]:
             by_page_count = {
                 page_count: [
                     candidate
-                    for candidate in selection_pool
-                    if candidate["page_count"] == page_count
+                    for candidate in candidate_pool
+                    if int(candidate.get("page_count") or 0) == page_count
                 ]
                 for page_count in sorted(
-                    {candidate["page_count"] for candidate in selection_pool}
+                    {
+                        int(candidate.get("page_count") or 0)
+                        for candidate in candidate_pool
+                    }
                 )
             }
+            available_page_counts = sorted(by_page_count)
+            selected_page_count = min(
+                available_page_counts,
+                key=lambda page_count: (
+                    abs(page_count - base_preferred_page_count),
+                    page_count < base_preferred_page_count,
+                    page_count,
+                ),
+            )
             preferred_candidates = by_page_count.get(
                 base_preferred_page_count,
                 [],
@@ -4768,7 +5023,7 @@ def _build_article_english_page_plan(
             static_candidates = by_page_count.get(1, [])
             best_static_font_reduction = min(
                 (
-                    candidate["font_reduction"]
+                    int(candidate.get("font_reduction") or 0)
                     for candidate in static_candidates
                 ),
                 default=None,
@@ -4776,9 +5031,37 @@ def _build_article_english_page_plan(
             preferred_is_low_confidence_or_supported_only = bool(
                 preferred_candidates
                 and all(
-                    candidate["review_count"]
-                    == candidate["low_risk_count"]
-                    + candidate["supported_restart_count"]
+                    int(candidate.get("review_count") or 0)
+                    == int(candidate.get("low_risk_count") or 0)
+                    + int(candidate.get("supported_restart_count") or 0)
+                    for candidate in preferred_candidates
+                )
+            )
+            preferred_requires_structural_fallback = bool(
+                preferred_candidates
+                and all(
+                    any(
+                        (
+                            len(str(page.get("en") or "").split())
+                            < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+                            and (
+                                _article_candidate_fallback_tier(candidate) > 0
+                                or int(candidate.get("review_count") or 0) > 0
+                            )
+                        )
+                        or bool(
+                            _article_nonoverridable_atomic_page_boundary_issues(
+                                page.get("boundary_before") or {}
+                            )
+                        )
+                        for page in candidate.get("plan", {}).get("pages") or []
+                    )
+                    or (
+                        int(candidate.get("incomplete_review_count") or 0) > 0
+                        and best_static_font_reduction is not None
+                        and best_static_font_reduction
+                        <= ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT
+                    )
                     for candidate in preferred_candidates
                 )
             )
@@ -4787,82 +5070,52 @@ def _build_article_english_page_plan(
                 and base_preferred_page_count > 1
                 and preferred_candidates
                 and static_candidates
-                and all(
-                    candidate["severe_risk_count"]
-                    or candidate["tight_complete_phrase_count"]
-                    for candidate in preferred_candidates
-                )
                 and (
-                    not preferred_is_low_confidence_or_supported_only
-                    or best_static_font_reduction
-                    <= ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT
+                    preferred_requires_structural_fallback
+                    or all(
+                        int(candidate.get("severe_risk_count") or 0)
+                        or int(candidate.get("tight_complete_phrase_count") or 0)
+                        for candidate in preferred_candidates
+                    )
+                    and (
+                        not preferred_is_low_confidence_or_supported_only
+                        or best_static_font_reduction
+                        <= ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT
+                    )
                 )
             ):
-                selection_pool = static_candidates
+                # Avoid structurally uncertain page turns. A low-confidence
+                # turn may still beat the deepest 50px fallback, but not the
+                # normal 54/52px fallback range.
+                selected_page_count = 1
+            return by_page_count, selected_page_count
+
+        if _return_candidates:
+            if not secondary_review_candidates:
+                safe_preferred_font_candidates = [
+                    candidate
+                    for candidate in selection_pool
+                    if candidate["plan"]["font_size"]["english"]
+                    == ARTICLE_SUBTITLE_EN_FONT_SIZE
+                    and _article_candidate_fallback_tier(candidate) == 0
+                    and not candidate["severe_risk_count"]
+                    and not candidate["medium_risk_count"]
+                ]
+                if safe_preferred_font_candidates:
+                    selection_pool = safe_preferred_font_candidates
+            by_page_count, selected_page_count = selected_page_count_for(
+                selection_pool
+            )
+            selection_pool = list(by_page_count[selected_page_count])
             return {
                 "status": "candidate_bundle",
                 "candidates": selection_pool,
                 "preferred_page_count": base_preferred_page_count,
-                "candidate_mode": (
-                    "strict" if strict_candidates else "forced_continuation"
-                ),
+                "candidate_mode": candidate_mode,
             }
-        by_page_count = {
-            page_count: [
-                candidate
-                for candidate in selection_pool
-                if candidate["page_count"] == page_count
-            ]
-            for page_count in sorted(
-                {candidate["page_count"] for candidate in selection_pool}
-            )
-        }
-        available_page_counts = sorted(by_page_count)
-        selected_page_count = min(
-            available_page_counts,
-            key=lambda page_count: (
-                abs(page_count - base_preferred_page_count),
-                page_count < base_preferred_page_count,
-                page_count,
-            ),
+        by_page_count, selected_page_count = selected_page_count_for(
+            selection_pool
         )
-        preferred_candidates = by_page_count.get(base_preferred_page_count, [])
-        best_static_font_reduction = min(
-            (
-                candidate["font_reduction"]
-                for candidate in by_page_count.get(1, [])
-            ),
-            default=None,
-        )
-        preferred_is_low_confidence_or_supported_only = bool(
-            preferred_candidates
-            and all(
-                candidate["review_count"]
-                == candidate["low_risk_count"]
-                + candidate["supported_restart_count"]
-                for candidate in preferred_candidates
-            )
-        )
-        if (
-            not secondary_review_candidates
-            and base_preferred_page_count > 1
-            and preferred_candidates
-            and 1 in by_page_count
-            and all(
-                candidate["severe_risk_count"]
-                or candidate["tight_complete_phrase_count"]
-                for candidate in preferred_candidates
-            )
-            and (
-                not preferred_is_low_confidence_or_supported_only
-                or best_static_font_reduction
-                <= ARTICLE_PAGE_LOW_CONFIDENCE_FONT_REDUCTION_LIMIT
-            )
-        ):
-            # Avoid structurally uncertain page turns. A low-confidence turn
-            # may still beat the deepest 50px fallback, but not the normal
-            # 54/52px fallback range; medium/high risk never wins on font size.
-            selected_page_count = 1
 
         selected = min(
             by_page_count[selected_page_count],
@@ -4879,7 +5132,7 @@ def _build_article_english_page_plan(
             "preferred": base_preferred_page_count,
             "selected": selected_page_count,
             "candidate_mode": (
-                "strict" if strict_candidates else "forced_continuation"
+                candidate_mode
             ),
             "basis": "pixel_word_chinese_duration_load",
         }
@@ -4922,8 +5175,10 @@ def _article_display_page_pressure(page: Mapping[str, object]) -> float:
         0.001,
     )
     word_load = word_count / max(ARTICLE_VISUAL_PAGE_PREFERRED_WORDS, 1)
-    width_load = float(page.get("en_width") or 0.0) / max(
-        float(acx(ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH)),
+    width_load = float(
+        page.get("rendered_line_width") or page.get("en_width") or 0.0
+    ) / max(
+        float(acx(ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH)),
         1.0,
     )
     spoken_load = (word_count / duration) / 3.2
@@ -4935,32 +5190,105 @@ def _article_high_pressure_review_candidates(
     *,
     total_word_count: int,
 ) -> list[dict]:
-    """Promote only complete, readable review cuts over a dense static page."""
-    static_candidates = [
+    """Promote only complete 56px expansions over the least-page baseline."""
+    available_page_counts = [
+        int(candidate.get("page_count") or 0)
+        for candidate in candidates
+        if int(candidate.get("page_count") or 0) > 0
+    ]
+    if not available_page_counts:
+        return []
+    baseline_page_count = min(available_page_counts)
+    baseline_candidates = [
         candidate
         for candidate in candidates
-        if int(candidate.get("page_count") or 0) == 1
+        if int(candidate.get("page_count") or 0) == baseline_page_count
     ]
-    if not static_candidates:
+    if not baseline_candidates:
         return []
-    static_is_high_pressure = any(
-        total_word_count > ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS
-        or int(candidate.get("plan", {}).get("font_size", {}).get("english") or 0)
-        <= 52
-        for candidate in static_candidates
+    baseline_is_high_pressure = any(
+        any(
+            len(str(page.get("en") or "").split())
+            > ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
+            or int(
+                page.get("english_font_size")
+                or candidate.get("plan", {}).get("font_size", {}).get(
+                    "english"
+                )
+                or 0
+            )
+            < ARTICLE_SUBTITLE_EN_FONT_SIZE
+            or (
+                float(page.get("end") or 0.0)
+                - float(page.get("start") or 0.0)
+            )
+            * 1000
+            > ARTICLE_PAGE_COMFORTABLE_MAX_DURATION_MS
+            for page in candidate.get("plan", {}).get("pages") or []
+        )
+        for candidate in baseline_candidates
     )
-    if not static_is_high_pressure:
+    if not baseline_is_high_pressure:
         return []
+
+    baseline_font_floor = max(
+        (
+            min(
+                (
+                    int(
+                        page.get("english_font_size")
+                        or candidate.get("plan", {}).get("font_size", {}).get(
+                            "english"
+                        )
+                        or 0
+                    )
+                    for page in candidate.get("plan", {}).get("pages") or []
+                ),
+                default=0,
+            )
+            for candidate in baseline_candidates
+        ),
+        default=0,
+    )
+    baseline_uses_three_lines = any(
+        any(
+            len(list(page.get("en_lines") or [])) > 2
+            for page in candidate.get("plan", {}).get("pages") or []
+        )
+        for candidate in baseline_candidates
+    )
 
     promoted: list[dict] = []
     for candidate in candidates:
         plan = candidate.get("plan") or {}
         pages = list(plan.get("pages") or [])
+        candidate_font_floor = min(
+            (
+                int(
+                    page.get("english_font_size")
+                    or plan.get("font_size", {}).get("english")
+                    or 0
+                )
+                for page in pages
+            ),
+            default=0,
+        )
+        restores_preferred_font = bool(
+            candidate_font_floor == ARTICLE_SUBTITLE_EN_FONT_SIZE
+            and (
+                baseline_font_floor < ARTICLE_SUBTITLE_EN_FONT_SIZE
+                or total_word_count > ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
+            )
+        )
+        removes_three_line_fallback = bool(
+            baseline_uses_three_lines
+            and pages
+            and all(len(list(page.get("en_lines") or [])) <= 2 for page in pages)
+            and candidate_font_floor >= baseline_font_floor
+        )
         if (
-            int(candidate.get("page_count") or 0) <= 1
-            or int(plan.get("font_size", {}).get("english") or 0)
-            != ARTICLE_SUBTITLE_EN_FONT_SIZE
-            or candidate.get("forced_continuation")
+            int(candidate.get("page_count") or 0) <= baseline_page_count
+            or not (restores_preferred_font or removes_three_line_fallback)
             or int(candidate.get("severe_risk_count") or 0)
             or not pages
         ):
@@ -4975,6 +5303,14 @@ def _article_high_pressure_review_candidates(
             * 1000
             < ARTICLE_PAGE_MIN_DURATION_MS
             for page in pages
+        ):
+            continue
+        if (
+            not baseline_uses_three_lines
+            and any(
+                _article_secondary_boundary_needs_three_line_escape(page)
+                for page in pages[1:]
+            )
         ):
             continue
         if not all(
@@ -4996,37 +5332,113 @@ def _article_high_pressure_review_candidates(
         promoted_candidate["plan"] = promoted_plan
         promoted_candidate["secondary_review_promoted"] = True
         promoted.append(promoted_candidate)
-    return promoted
+    preferred_font_promoted = [
+        candidate
+        for candidate in promoted
+        if int(
+            candidate.get("plan", {}).get("font_size", {}).get("english") or 0
+        )
+        == ARTICLE_SUBTITLE_EN_FONT_SIZE
+    ]
+    return preferred_font_promoted or promoted
+
+
+def _article_nonoverridable_atomic_page_boundary_issues(
+    decision: Mapping[str, object],
+) -> set[str]:
+    """Return lexical issues that acoustic restart evidence cannot relax."""
+    issue_codes = {
+        str(issue or "") for issue in decision.get("issue_codes") or []
+    }
+    atomic_issues = issue_codes & ARTICLE_PAGE_ATOMIC_BOUNDARY_ISSUES
+    if (
+        decision.get("balanced_predicate_restart")
+        and int(decision.get("pause_ms") or 0)
+        >= ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS
+    ):
+        atomic_issues -= {
+            "subject_predicate_split",
+            "subject_finite_verb_split",
+        }
+    return atomic_issues
 
 
 def _article_secondary_review_boundary_is_complete(
     right_page: Mapping[str, object],
 ) -> bool:
     decision = right_page.get("boundary_before") or {}
-    if str(decision.get("classification") or "") == "reject":
+    classification = str(decision.get("classification") or "")
+    if classification == "reject":
+        return False
+    if _article_nonoverridable_atomic_page_boundary_issues(decision):
         return False
     issue_codes = {
         str(issue or "") for issue in decision.get("issue_codes") or []
     }
-    if issue_codes & {
-        "modifier_head_split",
-        "modifier_noun_head_split",
-        "post_noun_participial_modifier_split",
-        "subject_predicate_split",
-        "subject_finite_verb_split",
-        "verb_object_split",
-        "to_infinitive_split",
-    }:
-        return False
     words = str(right_page.get("en") or "").split()
     if not words:
         return False
     first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
+    complete_from_gerund = _article_complete_from_gerund_restart(right_page)
+    if issue_codes & {
+        "clause_introducer_split",
+        "object_attached_modifier_split",
+        "post_noun_participial_modifier_split",
+        "verb_preposition_complement_split",
+    } and not complete_from_gerund:
+        return False
+    # Strictly allowed boundaries have already passed the page-level syntax
+    # contract.  Only review boundaries need additional restart evidence.
+    if classification == "allow":
+        return True
     return bool(
         decision.get("strong_pause_evidence")
         and int(decision.get("pause_ms") or 0)
         >= ARTICLE_PAGE_SECONDARY_REVIEW_STRONG_PAUSE_MS
         or decision.get("complete_page_clause_start")
+        or decision.get("tight_complete_phrase_start")
+        or first_word in {"that", "who", "which"}
+    )
+
+
+def _article_complete_from_gerund_restart(
+    right_page: Mapping[str, object],
+) -> bool:
+    decision = right_page.get("boundary_before") or {}
+    words = str(right_page.get("en") or "").split()
+    if len(words) < 2:
+        return False
+    first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
+    second_word = re.sub(r"[^A-Za-z]+", "", words[1]).casefold()
+    return bool(
+        decision.get("tight_complete_phrase_start")
+        and first_word == "from"
+        and second_word.endswith("ing")
+    )
+
+
+def _article_secondary_boundary_needs_three_line_escape(
+    right_page: Mapping[str, object],
+) -> bool:
+    """Keep unsupported tight phrase restarts as a three-line last resort."""
+    decision = right_page.get("boundary_before") or {}
+    if (
+        str(decision.get("classification") or "") == "allow"
+        or not decision.get("tight_complete_phrase_start")
+        or _article_complete_from_gerund_restart(right_page)
+    ):
+        return False
+    words = str(right_page.get("en") or "").split()
+    if not words:
+        return True
+    first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
+    return not bool(
+        decision.get("complete_page_clause_start")
+        or (
+            decision.get("strong_pause_evidence")
+            and int(decision.get("pause_ms") or 0)
+            >= ARTICLE_PAGE_SECONDARY_REVIEW_STRONG_PAUSE_MS
+        )
         or first_word in {"that", "who", "which"}
     )
 
@@ -5036,14 +5448,104 @@ def _article_dense_page_pair_cost(left: float, right: float) -> float:
     return shared_overload * shared_overload * 6_000
 
 
+def _article_candidate_page_signature(
+    candidate: Mapping[str, object],
+    page_index: int,
+) -> tuple[float, int, int]:
+    """Return renderer-only pressure, font, and line count for one page."""
+    plan = candidate.get("plan") or {}
+    pages = list(plan.get("pages") or [])
+    if not pages or not -len(pages) <= page_index < len(pages):
+        return 0.0, 0, 0
+    normalized_index = page_index % len(pages)
+    page = pages[normalized_index]
+    pressures = tuple(float(value) for value in candidate.get("page_pressures") or ())
+    pressure = (
+        pressures[normalized_index]
+        if normalized_index < len(pressures)
+        else _article_display_page_pressure(page)
+    )
+    font_size = int(
+        page.get("english_font_size")
+        or plan.get("font_size", {}).get("english")
+        or 0
+    )
+    lines = [
+        str(line).strip()
+        for line in (
+            page.get("en_lines")
+            or page.get("english_lines")
+            or []
+        )
+        if str(line).strip()
+    ]
+    return pressure, font_size, len(lines)
+
+
+def _article_visual_page_transition_cost(
+    left_candidate: Mapping[str, object],
+    left_page_index: int,
+    right_candidate: Mapping[str, object],
+    right_page_index: int,
+    *,
+    include_typography: bool = True,
+) -> float:
+    """Downrank abrupt layout changes only after both pages are already valid."""
+    left_pressure, left_font, left_lines = _article_candidate_page_signature(
+        left_candidate,
+        left_page_index,
+    )
+    right_pressure, right_font, right_lines = _article_candidate_page_signature(
+        right_candidate,
+        right_page_index,
+    )
+    pressure_delta = max(
+        0.0,
+        abs(left_pressure - right_pressure)
+        - ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA,
+    )
+    cost = _article_dense_page_pair_cost(left_pressure, right_pressure)
+    cost += (
+        pressure_delta
+        * pressure_delta
+        * ARTICLE_PAGE_PRESSURE_TRANSITION_PENALTY
+    )
+    if include_typography and left_font and right_font:
+        cost += (
+            abs(left_font - right_font)
+            * ARTICLE_PAGE_FONT_TRANSITION_PENALTY
+        )
+    if include_typography and left_lines and right_lines:
+        cost += (
+            abs(left_lines - right_lines)
+            * ARTICLE_PAGE_LINE_COUNT_TRANSITION_PENALTY
+        )
+    return cost
+
+
 def _article_candidate_sequence_cost(candidate: Mapping[str, object]) -> float:
     pressures = tuple(float(value) for value in candidate.get("page_pressures") or ())
     overload_cost = sum(max(0.0, value - 1.0) ** 2 * 3_000 for value in pressures)
-    consecutive_cost = sum(
-        _article_dense_page_pair_cost(left, right)
-        for left, right in zip(pressures, pressures[1:])
+    incomplete_review_cost = (
+        int(candidate.get("incomplete_review_count") or 0)
+        * ARTICLE_PAGE_INCOMPLETE_REVIEW_PENALTY
     )
-    return float(candidate.get("quality_cost") or 0.0) + overload_cost + consecutive_cost
+    internal_transition_cost = sum(
+        _article_visual_page_transition_cost(
+            candidate,
+            index,
+            candidate,
+            index + 1,
+            include_typography=False,
+        )
+        for index in range(max(0, len(pressures) - 1))
+    )
+    return (
+        float(candidate.get("quality_cost") or 0.0)
+        + overload_cost
+        + incomplete_review_cost
+        + internal_transition_cost
+    )
 
 
 def _select_article_page_plan_sequence(
@@ -5059,12 +5561,15 @@ def _select_article_page_plan_sequence(
     if not groups or any(not group for group in groups):
         return []
 
-    states: list[tuple[tuple[int, int, float], list[Mapping[str, object]]]] = []
+    states: list[
+        tuple[tuple[int, int, int, float], list[Mapping[str, object]]]
+    ] = []
     for candidate in groups[0]:
         states.append(
             (
                 (
                     int(bool(candidate.get("forced_continuation"))),
+                    int(bool(candidate.get("review_boundary_candidate"))),
                     int(candidate.get("severe_risk_count") or 0),
                     _article_candidate_sequence_cost(candidate),
                 ),
@@ -5077,6 +5582,7 @@ def _select_article_page_plan_sequence(
         for candidate in group:
             local_rank = (
                 int(bool(candidate.get("forced_continuation"))),
+                int(bool(candidate.get("review_boundary_candidate"))),
                 int(candidate.get("severe_risk_count") or 0),
                 _article_candidate_sequence_cost(candidate),
             )
@@ -5091,14 +5597,17 @@ def _select_article_page_plan_sequence(
                 )
                 transition_cost = 0.0
                 if previous_pressures and current_pressures:
-                    transition_cost = _article_dense_page_pair_cost(
-                        previous_pressures[-1],
-                        current_pressures[0],
+                    transition_cost = _article_visual_page_transition_cost(
+                        previous,
+                        -1,
+                        candidate,
+                        0,
                     )
                 rank = (
                     previous_rank[0] + local_rank[0],
                     previous_rank[1] + local_rank[1],
-                    previous_rank[2] + local_rank[2] + transition_cost,
+                    previous_rank[2] + local_rank[2],
+                    previous_rank[3] + local_rank[3] + transition_cost,
                 )
                 proposed = (rank, [*previous_path, candidate])
                 if best is None or proposed[0] < best[0]:
@@ -5204,6 +5713,7 @@ def article_display_page_layout_profile() -> dict:
         "english_normal_min_size": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
         "english_min_size": ARTICLE_SUBTITLE_EN_MIN_SIZE,
         "chinese_font_size": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        "english_preferred_line_width": ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH,
         "english_comfortable_width": ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
         "english_width": ARTICLE_SUBTITLE_EN_WIDTH,
         "english_wide_safe_width": ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,

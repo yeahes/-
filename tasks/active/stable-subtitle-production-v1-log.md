@@ -1,5 +1,71 @@
 # Progress Log
 
+## 2026-08-16 Concise Chinese And 48px Article Typography
+
+- Fresh production A/B compared oil v6 run
+  `20260816T195901.871590-95b43f33` with v5 run
+  `20260816T180732.415118-413818b4`. Both retained the same 140 frozen parent
+  IDs, English, and word spans. Parent Chinese fell 2674 -> 2380 CJK
+  characters, actual-page Chinese 2687 -> 2440, pages above 28 characters
+  7 -> 2, and longest page 39 -> 30. Page translation passed in both runs.
+- Residual quality defects now concentrate in page-level re-expansion or fact
+  duplication and a few overcompressed parent translations. Further global
+  compression is not justified; the next root owner is page projection and
+  semantic QA.
+- Upgraded the Pro complete-translation owner from v5 to v6 after the first
+  production comparison showed only about 4.6% whole-episode Chinese
+  reduction. Each semantic group now carries fixed subtitle IDs, exact
+  English, word-ledger display durations, advisory per-ID character budgets,
+  and the summed group budget. The prompt treats an existing Chinese
+  translation only as terminology/fact reference and gives general idiomatic
+  compression patterns instead of sample-specific substitutions.
+- The budget remains a soft writing target. Facts, names, numbers, negation,
+  causality, modality, reactions, hedges, and stance cannot be removed to meet
+  it. No second LLM request, local character deletion, English change, ID
+  change, timing change, or page-authority change was introduced. The v6 cache
+  task intentionally prevents reuse of v5 translations generated without the
+  duration contract.
+- Audited the first three minutes of the reference video
+  `我们正进入一个普遍“性压抑”的时代。.mp4`. Its compact Chinese comes mainly
+  from idiomatic clause rewriting and removing empty spoken scaffolding, not
+  character truncation or a smaller font.
+- Updated the Pro complete-translation owner to v5. The prompt now asks for
+  one-glance documentary Chinese while explicitly protecting facts, entities,
+  numbers, negation, modality, reactions, hedges, and speaker stance. Existing
+  fixed-ID allocation and page projection contracts remain unchanged.
+- Raised article-template Chinese from 46px to 48px and bumped the display
+  planner to v22. The two-line and safe-width limits remain fixed.
+- Read-only replay of the latest 140-parent oil run kept every frozen parent
+  field and produced 157 pages. Only `S0134` changed from one 50px three-line
+  page to two pages (50px/56px); total three-line pages fell from three to two.
+- Focused prompt, renderer, page-mapping, and full article-readability tests
+  pass. The complete `runtime\python.exe scripts\run_regression.py` command
+  also exits zero.
+
+## 2026-08-16 Oil English Dependency Boundary Repair
+
+- Reproduced eight hard parent-caption boundaries from the frozen
+  `石油市场，现在中国说了算？` word ledger, including `April 30 th |
+  intraday high`, `oil supply | is suddenly trapped`, `window | the strait
+  was shut`, `how long | they can withstand`, and `acting | as if`.
+- Added parser-backed pre-ID guards for the shared dependency classes rather
+  than matching episode text. The pre-ID repair owner now tries another legal
+  timestamp cut first and may keep one complete structural-overflow parent only
+  when the same final contract proves that no normal-limit temporal cut exists.
+- Kept the renderer's exception narrower: only a complete, timed clause restart
+  can remain REVIEW-eligible; lexical atoms still cannot be relaxed. Added a
+  rendered-result regression that rejects `the strait was shut.` as an
+  isolated display page.
+- Frozen replay preserved all 1,537 ordered words and their complete coverage,
+  reduced parent cues from 147 to 140, and reduced hard English boundaries from
+  eight to zero. The long conditional is repartitioned as 17+8 words instead
+  of being retained as one 25-word parent.
+- Focused stable-caption and article-readability suites pass. The complete
+  `runtime\python.exe scripts\run_regression.py` command exits zero. Replay
+  evidence is
+  `E:\VideoCaptioner-e2e-runs\oil-market-english-boundary-fix-20260816\frozen-mainline-report.json`;
+  production outputs were not changed.
+
 ## 2026-08-12 Authoritative Parent-Chinese Replay Gate
 
 - Added and tested the fixed-ID authoritative Chinese record contract. New
@@ -2358,6 +2424,21 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
 - No production output was modified and no ASR, LLM, translation, synthesis,
   paid request, or network-dependent operation ran.
 
+## 2026-08-15 Final Parent Chinese State Ownership Fix
+
+- Traced the oil sample's `display_page_translation_invalid` failure to two
+  diverging in-memory projections of the same fixed-ID parent Chinese. Final
+  punctuation alignment changed `ASRDataSeg.translated_text`, while
+  `_last_subtitle_items` still held the pre-alignment values.
+- Added `_sync_fixed_id_parent_chinese_state()` after final display coverage,
+  punctuation handling, and optional Chinese compression. It validates count,
+  ordered IDs, English, and word spans before updating only `translated`.
+- Kept the downstream `fixed-ID parent Chinese drifted` check unchanged and
+  added coverage proving a later real Chinese mutation still fails closed.
+- Focused tests, both owning full test scripts, and the complete 26-stage
+  regression pass. The failed 147-cue oil checkpoint replayed read-only with
+  three pre-sync differences and zero post-sync differences.
+
 ## 2026-08-15 Translation Role And Display Projection Hardening
 
 - Complete semantic-group translation remains a Pro-owned request. Ordinary
@@ -2381,3 +2462,84 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
   26-stage regression completes successfully. Read-only loading of the 147-cue
   oil and 213-cue Mixue packages changed no file size, mtime, or SHA-256 and
   made no ASR, LLM, synthesis, network, or paid request.
+
+## 2026-08-15 Renderer Page Visual Stability v20
+
+- Compared the existing renderer plan with the Netflix English timed-text
+  guide and TED subtitling tips. Both support two ordinary lines, linguistic
+  unit preservation, balanced line length, and controlled reading load; neither
+  publishes an adjacent-page density-delta threshold.
+- Added renderer-only sequence scoring for adjacent pressure, font, and line
+  count while preserving the existing candidate set, frozen IDs, English,
+  word ledger, and timing. Pressure continuity is subordinate to consecutive
+  overload, and typography continuity is a weak cross-parent tie-breaker only.
+- Added `incomplete_review_count` to sequence cost with an explicit review
+  penalty. A complete coordinated restart such as `investment, | and it
+  works...` remains eligible, while a modifier/predicate break such as
+  `officially | overtook...` cannot win from visual continuity alone.
+- Extended secondary safe-page review to 54px static pages. Replacement pages
+  still require 56px, six words, 900ms, and a complete supported boundary.
+  Ordinary 56px two-line pages do not enter this escalation solely for above-
+  average density.
+- Bumped the page planner to `article-fixed-font-pages-v20`; page projection
+  caches must be regenerated while ASR and translation caches remain reusable.
+- Focused readability contracts pass. Read-only old/new replay changed one
+  plan in the 147-parent oil package and one in the 211-parent Mixue package;
+  both changes merged unnecessary short-tail pages into 56px two-line pages.
+  English coverage, ID order, word ranges, and timing remained exact, and no
+  production output or paid request was made. Existing v19 manual-final
+  packages reopened with 147/211 cues, 168/256 saved pages, and unchanged
+  recursive size, mtime, and SHA-256 snapshots. The complete 26-stage
+  regression exits zero.
+
+## 2026-08-16 Reference-Style Display Planning v21
+
+- Replaced the single-best span state with a bounded page-span frontier and
+  retained candidates separately by page count and safety tier. Production
+  scoring uses the same final font and line wrap stored in frozen render plans.
+- Page count is a local measured-load decision; whole-episode continuity only
+  selects boundaries within that count. High-pressure cues enumerate reviewed
+  and forced alternatives even when an earlier strict partition exists.
+- Added complete high-pressure upgrades for all-56px partitions, complete
+  two-line replacements for 50px three-line fallbacks, controlled `to ...` and
+  `from + gerund` restarts, and explicit rejection of attached modifiers and
+  incomplete clause-introducer transitions.
+- Mixue read-only replay: 245 pages, 20.0 pages/minute for the first three
+  minutes, zero three-line pages, four 50px pages, two-line balance median
+  0.796, adjacent word-delta P90 7, and zero frozen-field drift.
+- Oil read-only replay: 165 pages, 19.0 pages/minute for the first three
+  minutes, three-line pages 4 to 2, 50px pages 7 to 5, two-line balance median
+  0.775 to 0.808, adjacent word-delta P90 10 to 8, and zero frozen-field drift.
+  Remaining three-line cues have no safe timed page boundary. No source or
+  production artifact, ASR, translation, synthesis, network, or paid request
+  was used.
+
+## 2026-08-16 v21 Final Replay Correction
+
+- Replayed the same two frozen manual-final packages after the three root-layer
+  fixes. Frozen parent IDs, English, word ranges, and cue start/end times had
+  zero drift.
+- Current v21 output is 238 Mixue pages (56 in the first three minutes,
+  18.667/minute) and 163 oil pages (54 in the first three minutes, 18.0/minute).
+  Mixue has 0 three-line and 5 50px pages; oil has 2 three-line and 6 50px
+  pages. Two-line balance medians are 0.806 and 0.803; adjacent word-delta P90
+  is 9 for both.
+- The page-rate decrease from the earlier replay is intentional and bounded:
+  three cues were no longer split solely because their cue duration exceeded
+  the comfortable maximum, and incomplete 5-word/attached-modifier review
+  partitions remain rejected. This favors readable complete pages over a
+  frequency target and does not modify frozen cue timing.
+- Replay was read-only and offline. No production artifact, ASR, LLM,
+  translation, synthesis, network, or paid request was used.
+
+## 2026-08-16 Display-Page Chinese Stale-State Correction
+
+- Root cause: the manual editor compared concatenated page-local Chinese with
+  the parent cue. Valid page translation may reorder wording across pages, so
+  this incorrectly marked 29 translated pages as stale and yellow.
+- New-schema artifacts now use their explicit `source_parent_chinese` binding
+  for parent drift detection. Legacy artifacts keep the aggregate fallback.
+- The fresh oil run reopens as 163 display pages with zero missing Chinese and
+  zero stale-Chinese rows; four English-boundary review rows remain unchanged.
+- Manual editor tests and the complete regression command pass. The replay was
+  read-only and did not modify production output.

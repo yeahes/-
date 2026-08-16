@@ -5700,6 +5700,7 @@ class ManualFinalSubtitleSession:
 
         translated_pages: Dict[str, Dict[str, Any]] = {}
         translated_parent_chinese: Dict[str, str] = {}
+        source_parent_chinese_by_parent: Dict[str, str] = {}
         for parent in artifact.get("parents") or []:
             if not isinstance(parent, Mapping):
                 continue
@@ -5707,6 +5708,9 @@ class ManualFinalSubtitleSession:
             aggregate_chinese = str(parent.get("aggregate_chinese") or "")
             if parent_id and aggregate_chinese:
                 translated_parent_chinese[parent_id] = aggregate_chinese
+            source_parent_chinese = str(parent.get("source_parent_chinese") or "")
+            if parent_id and source_parent_chinese:
+                source_parent_chinese_by_parent[parent_id] = source_parent_chinese
             for page in parent.get("pages") or []:
                 if not isinstance(page, Mapping):
                     continue
@@ -5806,6 +5810,10 @@ class ManualFinalSubtitleSession:
                         if page_id.startswith(parent_page_prefix)
                     },
                     "translated_parent_chinese": translated_parent_chinese.get(
+                        parent_id,
+                        "",
+                    ),
+                    "source_parent_chinese": source_parent_chinese_by_parent.get(
                         parent_id,
                         "",
                     ),
@@ -5925,13 +5933,26 @@ class ManualFinalSubtitleSession:
                 and all(value.strip() for value in source_page_chinese)
                 else ""
             )
-            planned_chinese = re.sub(
-                r"\s+",
+            source_parent_chinese = source_parent_chinese_by_parent.get(
+                subtitle_id,
                 "",
-                page_aggregate_chinese
-                or translated_parent_chinese.get(subtitle_id, "")
-                or str(plan.get("chinese") or ""),
             )
+            if source_parent_chinese:
+                # New page artifacts bind their projection to the parent
+                # translation that produced it. Page-local Chinese may be
+                # re-ordered for visual reading and must not be compared
+                # directly with the parent text.
+                planned_chinese = re.sub(r"\s+", "", source_parent_chinese)
+            else:
+                # Legacy artifacts have no source-parent binding. Preserve
+                # the old reconstruction check for backward compatibility.
+                planned_chinese = re.sub(
+                    r"\s+",
+                    "",
+                    page_aggregate_chinese
+                    or translated_parent_chinese.get(subtitle_id, "")
+                    or str(plan.get("chinese") or ""),
+                )
             parent_translation_stale = bool(
                 planned_chinese and current_chinese != planned_chinese
             )
@@ -6119,10 +6140,15 @@ class ManualFinalSubtitleSession:
                         "translation_issue_codes": translation_issue_codes,
                     }
                 )
+            parent_translation_is_current = bool(
+                source_parent_chinese
+                and re.sub(r"\s+", "", source_parent_chinese) == current_chinese
+            )
             if pages and (
                 manual_page_override
                 or allow_incomplete_page_chinese
                 or any(page["chinese_stale_draft"] for page in pages)
+                or parent_translation_is_current
                 or re.sub(r"\s+", "", "".join(page["chinese"] for page in pages))
                 == current_chinese
             ):

@@ -103,7 +103,7 @@ SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
 SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v4"
-SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v4"
+SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v6"
 SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION = "semantic-full-translation-context-v1"
 SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION = "semantic-full-translation-source-echo-v1"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION = "semantic-full-translation-style-retry-v1"
@@ -122,7 +122,7 @@ LEGACY_FULL_TRANSLATION_CACHE_ALLOCATION_CONTRACTS = (
         "fixed_id_allocation_algorithm_version": "fixed-id-allocation-v4",
     },
 )
-SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v4"
+SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v6"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK = (
     "screen_subtitle_semantic_full_translation_style_retry_v1"
 )
@@ -288,19 +288,61 @@ context for resolving pronouns, discourse stance, and terminology. Translate
 only the top-level target group identified by `id`; never return context groups
 or copy their translations into the target.
 
+Some payload entries also include `subtitle_parts` and a `translation_budget`.
+The budget is the sum of the fixed subtitle durations for that sense group.
+`target_zh_chars` is a soft reading target and `absolute_max_zh_chars` is a
+strong warning threshold, both counted as Chinese characters rather than
+punctuation. Use them to write a compact one-glance translation, but do not
+delete a fact merely to hit a number. If the complete meaning cannot fit,
+preserve the meaning and modestly exceed the soft target; the later fixed-ID
+allocation stage owns per-page distribution.
+
+The top-level `current_translation`, when present, is terminology and fact
+reference only. Do not inherit its sentence shape, repetition, or length.
+Write a fresh compact translation from `full_english`, using the reference only
+to avoid losing an established name, number, or domain term.
+
 Rules:
 - Translate the complete meaning, not the English word order.
 - Use polished magazine/documentary/finance explainer narration.
+- Write for a one-glance video subtitle, not for a transcript or written essay.
 - First identify the Chinese main subject, predicate, object, and logical relation; then write Chinese in that order.
 - Rebuild English post-modifiers, relative clauses, and delayed predicates into normal Chinese assertions.
 - A sentence led by a reporting verb such as "发现、表明、显示、指出" must complete what was found or shown. Do not leave a chained noun phrase in place of the main assertion.
+- Remove meaning-free conversational scaffolding when idiomatic Chinese can
+  express the same message directly. Compress phrases such as "what we are
+  talking about is", "the thing is", "it is kind of like", and repeated
+  subject pronouns into a shorter Chinese assertion when their discourse
+  meaning is already preserved.
+- Prefer the shortest natural Chinese expression that still carries the same
+  proposition. For example, "The main takeaway is that X" can become
+  "关键是X"; "I mean, the simplest way to X is Y" can become
+  "要X，最简单的办法是Y"; and "during the exact window when X" can become
+  "X期间". These are style patterns, not text substitutions: retain any
+  qualification, contrast, uncertainty, or emphasis that changes the meaning.
+- Remove redundant written shells such as "这是因为", "我们可以看到的是",
+  or "在这种情况下" when they add no relation or stance. Keep a connector
+  when it expresses a real cause, contrast, condition, conclusion, or spoken
+  reaction. A standalone "Yes", "No", "Right", or "Exactly" is a real
+  response beat and must not be silently erased.
+- Prefer a compact Chinese verb or clause over a literal English-shaped noun
+  phrase. Omit an explicit subject only when the surrounding context makes it
+  unambiguous, and do not repeat information already established by an
+  adjacent context group.
+- Do not remove a reaction, hedge, or stance when it is independently spoken
+  meaning. Concision may remove verbal padding, never facts or speaker intent.
 - Keep facts, numbers, names, negation, contrast, conditions, modality, and speaker stance.
 - Avoid stiff translationese and overly literal English sentence shape.
 - Default to Chinese commas, full stops, colons, semicolons, or parentheses to organize a sentence.
 - Do not use em dashes for ordinary explanations, examples, appositives, causes, or results.
 - Use an em dash only for a clear spoken interruption, abrupt turn, or emphasis that cannot read naturally another way.
 - Never leave an em dash at the beginning or end of a translation.
-- Do not compress aggressively in this stage.
+- Be concise without turning the translation into a summary. When accuracy
+  and brevity conflict, preserve the complete meaning.
+- Treat the soft reading target as a writing constraint before punctuation
+  polishing: remove repetition and English-shaped scaffolding first, then
+  choose a compact native Chinese verb or clause. Never solve length by
+  dropping names, numbers, negation, modality, causal links, or speaker stance.
 - Do not split into subtitle lines in this stage.
 
 Return pure JSON only:
@@ -904,6 +946,64 @@ class ScreenSubtitleEditor:
             previous_snapshot_items=self._boundary_snapshot_items,
         )
 
+    def _sync_fixed_id_parent_chinese_state(
+        self,
+        final_segments: Sequence[ASRDataSeg],
+    ) -> None:
+        """Publish final Chinese post-processing back to the fixed-ID items.
+
+        Final punctuation alignment and optional Chinese compression operate on
+        ``ASRDataSeg`` objects.  Stable artifacts and page projection also keep
+        the pre-existing ``ScreenSubtitleItem`` objects, so both projections
+        must agree before artifacts are written.  Structural fields are frozen
+        and are validated before any item is mutated.
+        """
+        subtitle_items = list(getattr(self, "_last_subtitle_items", []) or [])
+        if not subtitle_items:
+            return
+        segments = list(final_segments or [])
+        if len(subtitle_items) != len(segments):
+            raise RuntimeError(
+                "fixed_id_parent_chinese_sync_invalid: subtitle count drifted"
+            )
+
+        item_ids: List[str] = []
+        segment_ids: List[str] = []
+        for item, segment in zip(subtitle_items, segments):
+            item_id = str(item.subtitle_id or "")
+            segment_id = str(getattr(segment, "subtitle_id", "") or "")
+            item_ids.append(item_id)
+            segment_ids.append(segment_id)
+            if not item_id or not segment_id or item_id != segment_id:
+                raise RuntimeError(
+                    "fixed_id_parent_chinese_sync_invalid: subtitle ID drifted"
+                )
+            if str(item.original or "") != str(segment.text or ""):
+                raise RuntimeError(
+                    "fixed_id_parent_chinese_sync_invalid: English text drifted"
+                )
+            if (
+                item.word_start != getattr(segment, "word_start", None)
+                or item.word_end != getattr(segment, "word_end", None)
+            ):
+                raise RuntimeError(
+                    "fixed_id_parent_chinese_sync_invalid: word span drifted"
+                )
+
+        if len(set(item_ids)) != len(item_ids) or len(set(segment_ids)) != len(
+            segment_ids
+        ):
+            raise RuntimeError(
+                "fixed_id_parent_chinese_sync_invalid: duplicate subtitle ID"
+            )
+        if item_ids != segment_ids:
+            raise RuntimeError(
+                "fixed_id_parent_chinese_sync_invalid: subtitle order drifted"
+            )
+
+        for item, segment in zip(subtitle_items, segments):
+            item.translated = str(segment.translated_text or "")
+
     def repair_after_final_time_alignment(
         self,
         asr_data: ASRData,
@@ -942,6 +1042,7 @@ class ScreenSubtitleEditor:
                 semantic_groups=getattr(self, "_last_semantic_groups", []) or None,
                 subtitle_items=getattr(self, "_last_subtitle_items", []) or None,
             )
+        self._sync_fixed_id_parent_chinese_state(segments)
         asr_data.segments = list(segments)
         self.refresh_final_cue_timeline_artifact(asr_data.segments)
         if source_segments:
@@ -5112,6 +5213,7 @@ class ScreenSubtitleEditor:
             if (
                 self._word_count(item.original) > self.max_english_words
                 and not allows_structural_overflow
+                and not self._is_allowed_pre_id_item_structural_overflow(item)
             ):
                 reasons.append("max_english_words_exceeded")
 
@@ -5166,19 +5268,57 @@ class ScreenSubtitleEditor:
             anchors.add(pair)
         return anchors
 
+    def _is_allowed_pre_id_item_structural_overflow(
+        self,
+        item: ScreenSubtitleItem,
+    ) -> bool:
+        if (
+            item.subtitle_id
+            or item.word_start is None
+            or item.word_end is None
+        ):
+            return False
+        text = self._normalize_text(item.original)
+        word_count = self._word_count(text)
+        if word_count <= self.max_english_words:
+            return False
+        segment = ASRDataSeg(text, 0, 0, "")
+        segment.word_start = item.word_start
+        segment.word_end = item.word_end
+        return self._is_allowed_structural_english_overflow(
+            segment,
+            text,
+            word_count,
+            self.max_english_words,
+        )
+
+    @staticmethod
+    def _pre_id_structural_dependency_issues() -> set[str]:
+        return {
+            "clause_complement_entrance_split",
+            "comparative_clause_split",
+            "date_nominal_continuation_split",
+            "dependency_phrase_entrance_split",
+            "embedded_wh_clause_split",
+            "object_control_complement_split",
+            "predicative_clause_complement_split",
+            "short_verb_object_split",
+            "subject_finite_verb_split",
+            "zero_relative_clause_split",
+        }
+
     def _is_allowed_pre_id_structural_overflow_merge(
         self,
         old_items: Sequence[ScreenSubtitleItem],
         new_items: Sequence[ScreenSubtitleItem],
         fragment_issues: Sequence[str],
     ) -> bool:
-        """Allow one complete 17-19 word cue only while removing a hard fragment.
+        """Allow one unsplittable complete cue while removing a hard dependency.
 
-        This is deliberately narrower than the final validation warning: it is
-        only available to the direct two-cue fragment merge path before IDs
-        exist.  The shared structural-overflow check proves that no legal
-        normal-limit split exists, so the exception cannot grant a visual or
-        general repartitioning path permission to create an overlong cue.
+        Fragment-only repair remains capped at 19 words. A parser-confirmed
+        dependency may exceed that cap only when the shared final overflow
+        contract proves there is no legal normal-limit temporal cut; renderer
+        pagination then owns the visual projection.
         """
         high_confidence_fragment_issues = {
             "weak_subject_fragment",
@@ -5191,10 +5331,15 @@ class ScreenSubtitleEditor:
             "trailing_possessive_fragment",
             "trailing_quantifier_fragment",
         }
+        issues = set(fragment_issues or ())
+        has_fragment_issue = bool(issues.intersection(high_confidence_fragment_issues))
+        has_dependency_issue = bool(
+            issues.intersection(self._pre_id_structural_dependency_issues())
+        )
         if (
             len(old_items) != 2
             or len(new_items) != 1
-            or not set(fragment_issues or ()).intersection(high_confidence_fragment_issues)
+            or not (has_fragment_issue or has_dependency_issue)
         ):
             return False
         merged = new_items[0]
@@ -5206,7 +5351,9 @@ class ScreenSubtitleEditor:
             return False
         text = self._normalize_text(merged.original)
         word_count = self._word_count(text)
-        if word_count <= self.max_english_words or word_count > self.max_english_words + 3:
+        if word_count <= self.max_english_words:
+            return False
+        if not has_dependency_issue and word_count > self.max_english_words + 3:
             return False
         segment = ASRDataSeg(text, 0, 0, "")
         segment.word_start = merged.word_start
@@ -5309,11 +5456,25 @@ class ScreenSubtitleEditor:
             return []
         candidate_issues = list(evaluation.get("hard_issues") or [])
         candidate_issues.extend(evaluation.get("hard_fragment_issues") or [])
-        if not any(issue in weak_codes for issue in candidate_issues):
+        if not (
+            any(issue in weak_codes for issue in candidate_issues)
+            or set(candidate_issues).intersection(
+                self._pre_id_structural_dependency_issues()
+            )
+        ):
             return []
         merged = self._merge_subtitle_items(items[0], items[1])
+        merged_word_count = self._word_count(merged.original)
         if (
-            self._word_count(merged.original) > self.max_english_words
+            merged_word_count > self.max_english_words + 3
+            and set(candidate_issues).intersection(
+                self._pre_id_structural_dependency_issues()
+            )
+            and self._repartition_pre_id_window(items)[0]
+        ):
+            return []
+        if (
+            merged_word_count > self.max_english_words
             and not self._is_allowed_pre_id_structural_overflow_merge(
                 items,
                 [merged],
@@ -5457,7 +5618,11 @@ class ScreenSubtitleEditor:
                 or continuation_display_issues
             ):
                 continue
-            if any(count > self.max_english_words for count in word_counts):
+            if any(
+                count > self.max_english_words
+                and not self._is_allowed_pre_id_item_structural_overflow(item)
+                for item, count in zip(candidate_items, word_counts)
+            ):
                 continue
             if any(self._internal_sentence_transition_word_index(item) is not None for item in candidate_items):
                 continue
@@ -7862,18 +8027,23 @@ class ScreenSubtitleEditor:
                 if right - left <= 3:
                     self._protect_internal_boundaries(range(left, right + 1), protected)
             self._protect_short_verb_complement_boundaries(doc, doc_to_word)
+            self._protect_object_control_complement_boundaries(doc, doc_to_word)
             self._protect_short_dative_object_chains(doc, doc_to_word)
             self._protect_verb_particle_boundaries(doc, doc_to_word)
             self._protect_short_gerundial_modifier_boundaries(doc, doc_to_word)
             self._protect_clause_introducer_boundaries(doc, doc_to_word)
+            self._protect_clause_complement_entrances(doc, doc_to_word)
             self._protect_preposition_object_boundaries(doc, doc_to_word)
             self._protect_verb_preposition_complement_boundaries(doc, doc_to_word)
             self._protect_verb_adverb_preposition_boundaries(doc, doc_to_word)
             self._protect_verb_numeric_result_boundaries(doc, doc_to_word)
             self._protect_numeric_range_boundaries(doc, doc_to_word)
+            self._protect_date_nominal_continuation_boundaries(doc, doc_to_word)
             self._protect_subject_verb_boundaries(doc, doc_to_word)
             self._protect_fronted_wh_clause_boundaries(doc, doc_to_word)
+            self._protect_embedded_wh_clause_boundaries(doc, doc_to_word)
             self._protect_comparative_measure_boundaries(doc, doc_to_word)
+            self._protect_comparative_clause_boundaries(doc, doc_to_word)
             self._protect_coordinated_subject_boundaries(doc, doc_to_word)
             self._protect_compact_coordination_boundaries(doc, doc_to_word)
             self._protect_object_content_clause_boundaries(doc, doc_to_word)
@@ -8011,7 +8181,15 @@ class ScreenSubtitleEditor:
             head = token.head
             if head.i not in doc_to_word or token.i not in doc_to_word:
                 continue
-            if getattr(head, "pos_", "") not in {"VERB", "AUX"}:
+            head_is_predicate = getattr(head, "pos_", "") in {"VERB", "AUX"}
+            if not head_is_predicate:
+                head_is_predicate = bool(
+                    getattr(head, "dep_", "") == "conj"
+                    and getattr(getattr(head, "head", None), "pos_", "")
+                    in {"VERB", "AUX"}
+                    and token.head == head
+                )
+            if not head_is_predicate:
                 continue
             head_index = doc_to_word[head.i]
             subtree_indices = sorted(
@@ -8023,6 +8201,14 @@ class ScreenSubtitleEditor:
                 continue
             complement_start = min(subtree_indices)
             if complement_start <= head_index:
+                continue
+            if any(
+                re.search(
+                    r"[,;:.!?]\s*$",
+                    str(self._active_word_entries[index].get("surface") or ""),
+                )
+                for index in range(head_index, complement_start)
+            ):
                 continue
             between_indices = range(head_index + 1, complement_start)
             # Allow only a phrasal-verb particle between a verb and its direct
@@ -8039,6 +8225,52 @@ class ScreenSubtitleEditor:
             protected_indices = list(range(head_index, complement_start + 1))
             self._record_syntax_hard_issue_for_indices(protected_indices, issue)
             self._record_syntax_hard_issue_for_indices(protected_indices, "short_verb_complement_split")
+
+    def _protect_object_control_complement_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep ``verb + object + to-clause`` control predicates together."""
+        for complement in doc:
+            if (
+                getattr(complement, "dep_", "") != "xcomp"
+                or complement.i not in doc_to_word
+                or getattr(complement.head, "pos_", "") not in {"VERB", "AUX"}
+            ):
+                continue
+            governing = complement.head
+            object_children = [
+                child
+                for child in governing.children
+                if getattr(child, "dep_", "") in {"obj", "dobj", "iobj"}
+            ]
+            object_indices = sorted(
+                doc_to_word[token.i]
+                for child in object_children
+                for token in child.subtree
+                if token.i in doc_to_word
+            )
+            complement_indices = sorted(
+                doc_to_word[token.i]
+                for token in complement.subtree
+                if token.i in doc_to_word
+            )
+            if not object_indices or not complement_indices:
+                continue
+            object_end = max(object_indices)
+            complement_start = min(complement_indices)
+            if complement_start != object_end + 1:
+                continue
+            if self._is_unambiguous_sentence_terminal(
+                str(self._active_word_entries[object_end].get("surface") or ""),
+                str(self._active_word_entries[complement_start].get("surface") or ""),
+            ):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [object_end, complement_start],
+                "object_control_complement_split",
+            )
 
     def _protect_short_dative_object_chains(self, doc, doc_to_word: Dict[int, int]) -> None:
         """Keep a compact verb-dative-object start together.
@@ -8242,6 +8474,65 @@ class ScreenSubtitleEditor:
                 [token_index, token_index + 1],
                 "clause_introducer_split",
             )
+
+    def _protect_clause_complement_entrances(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep a predicate attached to its immediately following clause."""
+        for clause in doc:
+            if getattr(clause, "dep_", "") not in {"advcl", "ccomp", "xcomp"}:
+                continue
+            head = clause.head
+            if head.i not in doc_to_word:
+                continue
+            markers = sorted(
+                (
+                    token
+                    for token in clause.children
+                    if getattr(token, "dep_", "") == "mark"
+                    and token.i in doc_to_word
+                ),
+                key=lambda token: doc_to_word[token.i],
+            )
+            if not markers:
+                continue
+            head_index = doc_to_word[head.i]
+            marker_indices = [doc_to_word[token.i] for token in markers]
+            marker_start = min(marker_indices)
+            if marker_start == head_index + 1 and getattr(head, "pos_", "") in {
+                "ADJ",
+                "AUX",
+                "VERB",
+            }:
+                left_surface = str(
+                    self._active_word_entries[head_index].get("surface") or ""
+                )
+                right_surface = str(
+                    self._active_word_entries[marker_start].get("surface") or ""
+                )
+                if not self._is_unambiguous_sentence_terminal(
+                    left_surface,
+                    right_surface,
+                ):
+                    issue = (
+                        "predicative_clause_complement_split"
+                        if getattr(head, "pos_", "") == "ADJ"
+                        else "clause_complement_entrance_split"
+                    )
+                    self._record_syntax_hard_issue_for_indices(
+                        [head_index, marker_start],
+                        issue,
+                    )
+            for left_marker, right_marker in zip(markers, markers[1:]):
+                left_index = doc_to_word[left_marker.i]
+                right_index = doc_to_word[right_marker.i]
+                if right_index == left_index + 1:
+                    self._record_syntax_hard_issue_for_indices(
+                        [left_index, right_index],
+                        "compound_clause_marker_split",
+                    )
 
     def _protect_preposition_object_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
         """Protect a parser-confirmed preposition from its local complement.
@@ -8525,12 +8816,71 @@ class ScreenSubtitleEditor:
                 "numeric_range_split",
             )
 
+    def _protect_date_nominal_continuation_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep a written date attached to its following nominal description."""
+        months = {
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+        }
+        tokens_by_word: Dict[int, List] = {}
+        for token in doc:
+            if token.i in doc_to_word:
+                tokens_by_word.setdefault(doc_to_word[token.i], []).append(token)
+
+        for suffix in doc:
+            if (
+                suffix.i not in doc_to_word
+                or self._clean_boundary_token(getattr(suffix, "text", ""))
+                not in {"st", "nd", "rd", "th"}
+            ):
+                continue
+            suffix_index = doc_to_word[suffix.i]
+            if suffix_index <= 0 or suffix_index + 2 >= len(self._active_word_entries):
+                continue
+            previous = self._clean_boundary_token(
+                self._active_word_entries[suffix_index - 1].get("token") or ""
+            )
+            if not self._token_is_digits_like(previous):
+                continue
+            prior_tokens = {
+                self._clean_boundary_token(
+                    self._active_word_entries[index].get("token") or ""
+                )
+                for index in range(max(0, suffix_index - 3), suffix_index)
+            }
+            if not prior_tokens.intersection(months):
+                continue
+            following = [
+                token
+                for word_index in (suffix_index + 1, suffix_index + 2)
+                for token in tokens_by_word.get(word_index, [])
+                if getattr(token, "pos_", "") != "PUNCT"
+            ]
+            if len(following) < 2 or any(
+                getattr(token, "pos_", "") not in {"ADJ", "ADV", "NOUN", "PROPN"}
+                for token in following[:2]
+            ):
+                continue
+            if self._is_unambiguous_sentence_terminal(
+                str(self._active_word_entries[suffix_index].get("surface") or ""),
+                str(self._active_word_entries[suffix_index + 1].get("surface") or ""),
+            ):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(suffix_index, suffix_index + 3),
+                "date_nominal_continuation_split",
+            )
+
     def _protect_subject_verb_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
         for token in doc:
             if token.dep_ not in {"nsubj", "nsubjpass", "csubj", "csubjpass", "expl"}:
                 continue
             head = token.head
-            if head.i not in doc_to_word or token.i not in doc_to_word:
+            if head.i not in doc_to_word:
                 continue
             if getattr(head, "pos_", "") not in {"VERB", "AUX"}:
                 continue
@@ -8598,6 +8948,54 @@ class ScreenSubtitleEditor:
                 "fronted_wh_clause_split",
             )
 
+    def _protect_embedded_wh_clause_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep an embedded WH phrase with the subject and predicate it scopes."""
+        for predicate in doc:
+            if (
+                getattr(predicate, "dep_", "") not in {"ccomp", "xcomp"}
+                or predicate.i not in doc_to_word
+                or getattr(predicate.head, "pos_", "") not in {"VERB", "AUX"}
+            ):
+                continue
+            predicate_index = doc_to_word[predicate.i]
+            wh_indices = sorted(
+                doc_to_word[token.i]
+                for token in predicate.subtree
+                if token.i in doc_to_word
+                and getattr(token, "tag_", "") in {"WDT", "WP", "WP$", "WRB"}
+                and doc_to_word[token.i] < predicate_index
+            )
+            subject_indices = sorted(
+                doc_to_word[token.i]
+                for token in predicate.subtree
+                if token.i in doc_to_word
+                and getattr(token, "dep_", "")
+                in {"nsubj", "nsubjpass", "csubj", "csubjpass", "expl"}
+                and doc_to_word[token.i] < predicate_index
+            )
+            if not wh_indices or not subject_indices:
+                continue
+            wh_start = min(wh_indices)
+            subject_start = min(subject_indices)
+            if wh_start >= subject_start:
+                continue
+            if any(
+                self._is_unambiguous_sentence_terminal(
+                    str(self._active_word_entries[index].get("surface") or ""),
+                    str(self._active_word_entries[index + 1].get("surface") or ""),
+                )
+                for index in range(wh_start, predicate_index)
+            ):
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                range(wh_start, predicate_index + 1),
+                "embedded_wh_clause_split",
+            )
+
     def _protect_comparative_measure_boundaries(
         self,
         doc,
@@ -8658,6 +9056,45 @@ class ScreenSubtitleEditor:
             self._record_syntax_hard_issue_for_indices(
                 range(measure_end, complement_index + 1),
                 "comparative_measure_phrase_split",
+            )
+
+    def _protect_comparative_clause_boundaries(
+        self,
+        doc,
+        doc_to_word: Dict[int, int],
+    ) -> None:
+        """Keep a delayed ``than`` complement with its comparison scope."""
+        comparative_tokens = {"better", "less", "more", "rather", "worse"}
+        mapped_tokens = [token for token in doc if token.i in doc_to_word]
+        for token in mapped_tokens:
+            if self._clean_boundary_token(getattr(token, "text", "")) != "than":
+                continue
+            right = doc_to_word[token.i]
+            if right <= 0:
+                continue
+            left = right - 1
+            if self._is_unambiguous_sentence_terminal(
+                str(self._active_word_entries[left].get("surface") or ""),
+                str(self._active_word_entries[right].get("surface") or ""),
+            ):
+                continue
+            has_comparison_scope = any(
+                right - 10 <= doc_to_word[candidate.i] < right
+                and self._clean_boundary_token(getattr(candidate, "text", ""))
+                in comparative_tokens
+                for candidate in mapped_tokens
+            )
+            if not has_comparison_scope:
+                continue
+            complement_indices = sorted(
+                doc_to_word[candidate.i]
+                for candidate in token.subtree
+                if candidate.i in doc_to_word
+            )
+            complement_end = max(complement_indices, default=right)
+            self._record_syntax_hard_issue_for_indices(
+                range(left, complement_end + 1),
+                "comparative_clause_split",
             )
 
     def _protect_coordinated_subject_boundaries(self, doc, doc_to_word: Dict[int, int]) -> None:
@@ -8849,15 +9286,23 @@ class ScreenSubtitleEditor:
             }
             if not any(token.i in head_subtree_indices for token in anchor_tokens):
                 continue
-            first_clause_tokens = [
+            clause_subjects = [
                 token
                 for token in predicate.subtree
-                if token.i in doc_to_word and doc_to_word[token.i] == clause_start
+                if token.i in doc_to_word
+                and getattr(token, "dep_", "")
+                in {"nsubj", "nsubjpass", "csubj", "csubjpass", "expl"}
             ]
-            if not any(
-                getattr(token, "dep_", "") in {"nsubj", "nsubjpass", "expl"}
-                for token in first_clause_tokens
-            ):
+            subject_starts = [
+                min(
+                    doc_to_word[item.i]
+                    for item in subject.subtree
+                    if item.i in doc_to_word
+                )
+                for subject in clause_subjects
+                if any(item.i in doc_to_word for item in subject.subtree)
+            ]
+            if clause_start not in subject_starts:
                 continue
             first_clause_word = self._clean_boundary_token(
                 self._active_word_entries[clause_start].get("token") or ""
@@ -9047,7 +9492,7 @@ class ScreenSubtitleEditor:
             # A nominal complement entrance such as ``the secret to how``.
             if (
                 dep == "prep"
-                and pos == "ADP"
+                and pos in {"ADP", "VERB"}
                 and head_word == left
                 and getattr(head, "pos_", "") in {"NOUN", "PROPN", "PRON", "ADJ"}
                 and has_local_complement(token)
@@ -9055,7 +9500,7 @@ class ScreenSubtitleEditor:
                 protected = True
             elif (
                 dep == "prep"
-                and pos == "ADP"
+                and pos in {"ADP", "VERB"}
                 and head_word == left
                 and getattr(head, "pos_", "") in {"NOUN", "PROPN", "PRON", "ADJ"}
             ):
@@ -15249,7 +15694,7 @@ class ScreenSubtitleEditor:
         payload: Sequence[Dict],
         cache_task: str,
     ) -> List[str]:
-        """Return verified pre-v5 cache keys for whole-group translations only."""
+        """Return verified legacy role-coupled cache keys for whole-group translations."""
         if not str(cache_task or "").startswith("screen_subtitle_semantic_full_translation"):
             return []
         contract = dict(getattr(self, "_chinese_cache_contract", {}) or {})
@@ -16217,6 +16662,23 @@ class ScreenSubtitleEditor:
     ) -> Dict:
         """Build one target translation entry with bounded read-only neighbors."""
         group = groups[index]
+        subtitle_parts: List[Dict[str, Any]] = []
+        for offset, item in enumerate(group.get("items") or [], 1):
+            timing = self._item_word_timing(item)
+            duration_ms = max(0, timing[1] - timing[0]) if timing else None
+            part: Dict[str, Any] = {
+                "subtitle_id": self._item_subtitle_id(
+                    item,
+                    int(group.get("start_index") or 0) + offset,
+                ),
+                "english": item.original,
+                "duration_ms": duration_ms,
+                "max_zh_chars": self.max_cjk_chars,
+            }
+            if duration_ms is not None:
+                part.update(self._chinese_display_budget(duration_ms))
+            subtitle_parts.append(part)
+
         entry = {
             "id": int(group["id"]),
             "full_english": " ".join(
@@ -16225,6 +16687,7 @@ class ScreenSubtitleEditor:
             "current_translation": self._merge_group_translation(
                 group.get("items", [])
             ),
+            "subtitle_parts": subtitle_parts,
             "translation_context_version": SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION,
             "source_echo_required": True,
             "source_echo_version": SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION,
@@ -16243,6 +16706,21 @@ class ScreenSubtitleEditor:
                 ),
             },
         }
+        if subtitle_parts and all(
+            part.get("target_zh_chars") is not None
+            and part.get("absolute_max_zh_chars") is not None
+            for part in subtitle_parts
+        ):
+            entry["translation_budget"] = {
+                "budget_basis": "sum_of_fixed_subtitle_display_durations",
+                "target_zh_chars": sum(
+                    int(part["target_zh_chars"]) for part in subtitle_parts
+                ),
+                "absolute_max_zh_chars": sum(
+                    int(part["absolute_max_zh_chars"])
+                    for part in subtitle_parts
+                ),
+            }
         return entry
 
     def _semantic_full_translation_neighbor_entries(

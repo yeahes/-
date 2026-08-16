@@ -96,6 +96,14 @@ Output:
 Rules:
 
 - Full group translation comes first.
+- Full translation v6 writes compact one-glance documentary Chinese at the
+  semantic owner. Its request includes fixed subtitle IDs, exact English,
+  word-ledger display durations, advisory per-ID budgets, and their summed
+  semantic-group budget. It may remove meaning-free conversational or written
+  scaffolding and redundant explicit subjects, but it must preserve facts,
+  entities, numbers, negation, causal/contrast relations, modality, reactions,
+  hedges, and speaker stance. The target budget is soft; this is concise
+  translation, not summarization or character truncation.
 - Allocation maps the full Chinese meaning back to fixed global subtitle IDs.
 - Under the DeepSeek role policy, complete semantic-group translation uses the
   configured full-translation model (normally Pro). Ordinary fixed-ID
@@ -497,22 +505,30 @@ Rule:
   1498px safe-width profile, with at most two English and two Chinese lines.
   Chinese load and a 16-word target are soft page-count signals. Measured
   English pixels, Chinese pixels, word load, and cue duration choose candidate
-  page counts before any break reward is considered. A bounded whole-episode
-  dynamic program then compares the feasible 56/54/52/50px cue-local plans and
-  adds a penalty for adjacent dense pages. Within each candidate, allowed,
-  low-, medium-, and high-risk transitions are graded before measured balance
-  and visual cost.
+  page counts before any break reward is considered. A bounded cue-local
+  frontier retains several distinct partitions for each page count and
+  strict/review/forced fallback tier. The whole-episode dynamic program may
+  penalize adjacent dense pages, but it compares boundaries only within the
+  locally selected page count. Within each candidate, allowed, low-, medium-,
+  and high-risk transitions are graded before final-font line balance and
+  visual cost.
   A complete sentence that fits a static two-line layout may remain one page
-  when every requested page turn is only reviewable.
-  A static page over 16 words or requiring 52/50px receives a bounded secondary
-  review. It may be replaced by a 56px reviewed partition only when every page
-  has at least six words and 900ms, and each boundary is supported by a
-  complete clause restart or at least 500ms of verified pause. Incomplete
-  lexical dependencies remain ineligible regardless of density.
-  Strict candidates are exhausted first. Only an otherwise unrenderable cue may
-  use a complete continuation phrase or clause as a high-risk reviewed page
-  transition; atomic lexical splits remain forbidden and the editor retains the
-  review evidence.
+  when every requested page turn is only reviewable or the only extra signal is
+  duration. Duration may request high-pressure alternatives, but it cannot by
+  itself force a readable 56px two-line cue to paginate.
+  A high-pressure static or multipage baseline (over 14 words on a page,
+  longer than 5.2 seconds, or below 56px) receives a bounded secondary review.
+  A complete all-56px partition takes precedence over smaller-font options. If
+  no all-56px plan exists, a complete partition may still replace a 50px
+  three-line fallback when it does not reduce the font floor and every page is
+  at most two lines. Every promoted page keeps at least six words and 900ms.
+  Complete `to ...` and `from + gerund` restarts are reviewed fallbacks;
+  incomplete lexical, noun-attached, clause-introducer, and modifier boundaries
+  remain ineligible regardless of density.
+  Strict candidates retain priority, but high-pressure cues also enumerate
+  bounded reviewed and forced alternatives so an early strict partition cannot
+  hide a complete, materially more readable plan. Atomic lexical splits remain
+  forbidden and the editor retains review evidence.
   The selected fallback is recorded in the page artifact. Timed transitions
   switch only at ledger word gaps and require at least 900ms per page.
   A balanced subject/predicate restart with at least four words on each side,
@@ -538,10 +554,20 @@ Rule:
   line break, never to reproduce the same break at a smaller size. This pass
   has no write authority over page count, word ownership, ID, English, Chinese,
   or timing.
-  The page contract version is `article-fixed-font-pages-v19`, so page-layout
+  Article-template Chinese uses a fixed 48px font, at most two lines, and the
+  existing 1455-design-pixel safe width.
+  The page contract version is `article-fixed-font-pages-v22`, so page-layout
   and page-translation caches from earlier planner versions cannot be reused;
   unchanged ASR, full-translation, and fixed-ID allocation caches remain
   independently reusable under their own fingerprints.
+  Whole-episode selection adds a renderer-only continuity preference across
+  already legal candidates: adjacent pressure changes are penalized after a
+  free band, while font and line-count changes are weaker tie-breakers. The
+  selector first minimizes forced and severe boundaries and charges an explicit
+  incomplete-review penalty, so visual continuity alone cannot create a less
+  complete English page edge. A
+  54px static page may request the existing complete 56px secondary partition;
+  an ordinary 56px two-line page is not split solely for density continuity.
 - Interrupted-run resume records the article-ASR-correction policy version.
   A policy change recomputes only `asr_corrected.json`; the verified article
   context and raw transcription remain independently reusable.

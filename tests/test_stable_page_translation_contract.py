@@ -9,7 +9,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
-from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor
+from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
 from app.core.subtitle_processor.authoritative_parent_chinese import (
     AuthoritativeParentChineseError,
     bind_display_page_parent_records,
@@ -98,7 +98,7 @@ def _contract(case):
         layout_profile={
             "template": "article",
             "english_font_size": 58,
-            "chinese_font_size": 46,
+            "chinese_font_size": 48,
         },
     )
 
@@ -1607,7 +1607,7 @@ def test_renderer_uses_valid_page_mapping_without_proportional_fallback():
         assert plan["status"] == "ok"
         assert plan["font_size"] == {
             "english": int(frozen_plan["english_font_size"]),
-            "chinese": 46,
+            "chinese": 48,
         }
         assert [page["display_page_id"] for page in plan["pages"]] == [
             page["display_page_id"] for page in frozen_plan["pages"]
@@ -1712,7 +1712,24 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
     editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
     editor._active_source_segments_by_id = {}
     editor._last_semantic_groups = []
-    editor._last_subtitle_items = []
+    editor._last_subtitle_items = [
+        ScreenSubtitleItem(
+            source_ids=[1],
+            original=paginated.text,
+            translated=paginated.translated_text,
+            word_start=paginated.word_start,
+            word_end=paginated.word_end,
+            subtitle_id=paginated.subtitle_id,
+        ),
+        ScreenSubtitleItem(
+            source_ids=[2],
+            original=single_page.text,
+            translated=single_page.translated_text,
+            word_start=single_page.word_start,
+            word_end=single_page.word_end,
+            subtitle_id=single_page.subtitle_id,
+        ),
+    ]
     editor._display_page_translation_artifact = {}
     editor._display_page_translation_path = ""
     editor._display_page_external_request_count = 0
@@ -1797,6 +1814,14 @@ def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
         record.get("scope") == "display_page"
         for record in post_page_audits[-1]["records"]
     )
+
+    editor._last_subtitle_items[0].translated = "被篡改的父字幕中文。"
+    try:
+        editor.apply_display_page_translations_after_final_timing(asr_data)
+    except RuntimeError as exc:
+        assert "fixed-ID parent Chinese drifted" in str(exc)
+    else:
+        raise AssertionError("real parent-Chinese drift must remain render-blocking")
 
 
 def test_flash_page_fragment_retries_only_parent_and_pro_residual_stays_review():

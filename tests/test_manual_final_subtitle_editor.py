@@ -2048,7 +2048,29 @@ def test_manual_save_publishes_one_parent_chinese_record_across_artifacts():
         assert reloaded.cues[0]["translated_subtitle"] == record["chinese"]
 
 
-def test_page_chinese_aggregate_detects_stale_pages_even_when_parent_copy_is_current():
+def test_page_chinese_source_parent_copy_allows_page_local_reordering():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        artifact_path = session.artifact_dir / "display-page-translations.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["parents"][0]["source_parent_chinese"] = "中文一"
+        artifact["parents"][0]["aggregate_chinese"] = "旧分页中文"
+        artifact["parents"][0]["pages"][0]["zh"] = "旧"
+        artifact["parents"][0]["pages"][1]["zh"] = "分页"
+        _write_json(artifact_path, artifact)
+
+        rows = session.to_model_data()
+
+        assert [rows["1"]["translated_subtitle"], rows["2"]["translated_subtitle"]] == [
+            "旧",
+            "分页",
+        ]
+        assert rows["1"]["display_page_chinese_stale"] is False
+        assert rows["2"]["display_page_chinese_stale"] is False
+
+
+def test_legacy_page_chinese_aggregate_detects_stale_pages_without_source_parent_copy():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
         _write_display_page_preview_artifact(session)
@@ -2061,10 +2083,21 @@ def test_page_chinese_aggregate_detects_stale_pages_even_when_parent_copy_is_cur
 
         rows = session.to_model_data()
 
-        assert [rows["1"]["translated_subtitle"], rows["2"]["translated_subtitle"]] == [
-            "旧",
-            "分页",
-        ]
+        assert rows["1"]["display_page_chinese_stale"] is True
+        assert rows["2"]["display_page_chinese_stale"] is True
+
+
+def test_page_chinese_source_parent_copy_detects_true_parent_drift():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        artifact_path = session.artifact_dir / "display-page-translations.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["parents"][0]["source_parent_chinese"] = "旧版父字幕"
+        _write_json(artifact_path, artifact)
+
+        rows = session.to_model_data()
+
         assert rows["1"]["display_page_chinese_stale"] is True
         assert rows["2"]["display_page_chinese_stale"] is True
 
@@ -5158,7 +5191,9 @@ if __name__ == "__main__":
     test_model_data_uses_validated_parent_chinese_instead_of_stale_render_plan()
     test_legacy_parent_and_translations_conflict_fails_closed()
     test_manual_save_publishes_one_parent_chinese_record_across_artifacts()
-    test_page_chinese_aggregate_detects_stale_pages_even_when_parent_copy_is_current()
+    test_page_chinese_source_parent_copy_allows_page_local_reordering()
+    test_legacy_page_chinese_aggregate_detects_stale_pages_without_source_parent_copy()
+    test_page_chinese_source_parent_copy_detects_true_parent_drift()
     test_stale_single_page_uses_current_parent_chinese_without_confirmation()
     test_stale_page_chinese_remains_visible_but_cannot_publish_until_confirmed()
     test_reallocated_stale_page_chinese_can_become_authoritative()

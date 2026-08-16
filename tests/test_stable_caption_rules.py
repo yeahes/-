@@ -293,6 +293,100 @@ def test_final_time_alignment_runs_chinese_speed_repair_without_touching_english
     assert repaired.segments[0].translated_text == "它来自一个平时拼写很差的人"
 
 
+def test_fixed_id_parent_chinese_sync_updates_only_the_chinese_projection():
+    editor = _editor()
+    editor._last_subtitle_items = [
+        ScreenSubtitleItem(
+            source_ids=[1],
+            original="This is still the same English cue",
+            translated="这仍是同一条中文字幕，",
+            word_start=3,
+            word_end=9,
+            subtitle_id="S0001",
+        )
+    ]
+    segment = ASRDataSeg(
+        "This is still the same English cue",
+        1000,
+        2600,
+        "这仍是同一条中文字幕",
+    )
+    segment.subtitle_id = "S0001"
+    segment.word_start = 3
+    segment.word_end = 9
+
+    editor._sync_fixed_id_parent_chinese_state([segment])
+
+    item = editor._last_subtitle_items[0]
+    assert item.translated == segment.translated_text
+    assert item.original == "This is still the same English cue"
+    assert (item.word_start, item.word_end, item.subtitle_id) == (3, 9, "S0001")
+
+
+def test_fixed_id_parent_chinese_sync_rejects_structural_drift_before_writing():
+    editor = _editor()
+    editor._last_subtitle_items = [
+        ScreenSubtitleItem(
+            source_ids=[1],
+            original="Frozen English cue.",
+            translated="同步前中文。",
+            word_start=0,
+            word_end=2,
+            subtitle_id="S0001",
+        )
+    ]
+    segment = ASRDataSeg("Changed English cue.", 0, 1000, "同步后中文。")
+    segment.subtitle_id = "S0001"
+    segment.word_start = 0
+    segment.word_end = 2
+
+    try:
+        editor._sync_fixed_id_parent_chinese_state([segment])
+    except RuntimeError as exc:
+        assert "fixed_id_parent_chinese_sync_invalid" in str(exc)
+    else:
+        raise AssertionError("English drift must not be hidden by Chinese state sync")
+
+    assert editor._last_subtitle_items[0].translated == "同步前中文。"
+
+
+def test_final_time_alignment_publishes_punctuation_repair_to_fixed_id_items():
+    editor = _editor()
+    segment = ASRDataSeg(
+        "This parent remains open",
+        1000,
+        2500,
+        "这条父字幕仍未结束，",
+    )
+    segment.subtitle_id = "S0001"
+    segment.word_start = 0
+    segment.word_end = 3
+    editor._last_subtitle_items = [
+        ScreenSubtitleItem(
+            source_ids=[1],
+            original=segment.text,
+            translated=segment.translated_text,
+            word_start=segment.word_start,
+            word_end=segment.word_end,
+            subtitle_id=segment.subtitle_id,
+        )
+    ]
+    editor._active_source_segments_by_id = {}
+    editor._reconcile_final_display_coverage = lambda segments, source: list(segments)
+    editor.refresh_final_cue_timeline_artifact = lambda segments: None
+    editor._write_coverage_report = lambda *args, **kwargs: None
+    editor._write_stable_pipeline_artifacts = lambda **kwargs: None
+
+    repaired = editor.repair_after_final_time_alignment(
+        ASRData([segment]),
+        preserve_aligned_timing=True,
+        allow_chinese_compression=False,
+    )
+
+    assert repaired.segments[0].translated_text == "这条父字幕仍未结束"
+    assert editor._last_subtitle_items[0].translated == "这条父字幕仍未结束"
+
+
 def test_blocked_checkpoint_timeline_skips_chinese_compression_api_work():
     editor = _editor()
     asr_data = ASRData([ASRDataSeg("Precisely.", 1000, 1120, "正是如此。")])
@@ -545,7 +639,7 @@ def test_semantic_cache_identity_uses_only_the_request_owner_model():
     editor._assign_global_subtitle_ids(_id_items(2))
     prompt = "role-scoped cache"
     payload = [{"id": 1, "full_english": "English 1. English 2."}]
-    full_task = "screen_subtitle_semantic_full_translation_v4"
+    full_task = "screen_subtitle_semantic_full_translation_v6"
     allocation_task = "screen_subtitle_semantic_translation_allocation_v3"
 
     full_key = editor._semantic_chinese_cache_key(prompt, payload, full_task)
@@ -798,7 +892,7 @@ def test_semantic_full_translation_cache_survives_allocation_algorithm_change():
     editor._assign_global_subtitle_ids(_id_items(2))
     prompt = "semantic full translation"
     payload = [{"id": 1, "full_english": "English 1. English 2."}]
-    full_task = "screen_subtitle_semantic_full_translation_v4"
+    full_task = "screen_subtitle_semantic_full_translation_v6"
     allocation_task = "screen_subtitle_semantic_translation_allocation_v3"
 
     full_key_before = editor._semantic_chinese_cache_key(prompt, payload, full_task)
@@ -810,12 +904,12 @@ def test_semantic_full_translation_cache_survives_allocation_algorithm_change():
     assert editor._semantic_chinese_cache_key(prompt, payload, allocation_task) != allocation_key_before
 
 
-def test_semantic_full_translation_reads_verified_pre_v5_cache_once():
+def test_semantic_full_translation_reads_verified_legacy_role_cache_once():
     editor = _id_editor()
     editor._assign_global_subtitle_ids(_id_items(2))
     prompt = "semantic full translation"
     payload = [{"id": 1, "full_english": "English 1. English 2."}]
-    cache_task = "screen_subtitle_semantic_full_translation_v4"
+    cache_task = "screen_subtitle_semantic_full_translation_v6"
     current_key = editor._semantic_chinese_cache_key(prompt, payload, cache_task)
     legacy_keys = editor._legacy_semantic_full_translation_cache_keys(
         prompt,
@@ -2970,6 +3064,165 @@ def test_parser_blocks_misattached_zero_relative_clause_boundary():
 
     assert "zero_relative_clause_split" in evaluation["hard_issues"]
     assert not evaluation["legal"]
+
+
+def test_parser_blocks_cross_cue_dependency_units_from_oil_run():
+    cases = [
+        (
+            "Brent crude is sitting about 40 below its April 30 th intraday high of 126 a barrel.",
+            "th",
+            "intraday",
+            "date_nominal_continuation_split",
+        ),
+        (
+            "And surprisingly, Iran has found itself with far less leverage over Donald Trump than anyone anticipated heading into this.",
+            "Trump",
+            "than",
+            "comparative_clause_split",
+        ),
+        (
+            "Because when you hear that one-fifth of the world's oil supply is suddenly trapped behind a blockade, your immediate expectation is just total panic, right?",
+            "supply",
+            "is",
+            "subject_finite_verb_split",
+        ),
+        (
+            "Usually, China imports crude, refines it, and exports a lot of finished diesel and gasoline for profit.",
+            "exports",
+            "a",
+            "short_verb_object_split",
+        ),
+        (
+            "They basically commanded heavy industry to dial back consumption during the exact window the strait was shut.",
+            "window",
+            "the",
+            "zero_relative_clause_split",
+        ),
+        (
+            "It makes it impossible for America and others to know how long they can withstand sanctions or war.",
+            "long",
+            "they",
+            "embedded_wh_clause_split",
+        ),
+        (
+            "But the relief of a 2026 superglut masks a much more dangerous long-term reality regarding global supply and demand, doesn't it?",
+            "reality",
+            "regarding",
+            "dependency_phrase_entrance_split",
+        ),
+        (
+            "why are so many other nations still acting as if the current oil dependent system will last forever?",
+            "acting",
+            "as",
+            "clause_complement_entrance_split",
+        ),
+    ]
+
+    for text, left_surface, right_surface, expected_issue in cases:
+        words = text.split()
+        editor = _marker_editor(words, max_words=16)
+        editor._prepare_syntax_cut_hints()
+        left = next(
+            index
+            for index, (current, following) in enumerate(zip(words, words[1:]))
+            if current == left_surface and following == right_surface
+        )
+
+        evaluation = editor._evaluate_stable_cut_boundary(left, left + 1)
+
+        assert expected_issue in evaluation["hard_issues"], text
+        assert not evaluation["legal"], text
+
+
+def test_cross_cue_dependency_guards_keep_independent_boundaries_legal():
+    cases = [
+        ("If prices rise, how should consumers respond?", "rise,", "how"),
+        ("For my entire life, we were taught to expect scarcity.", "life,", "we"),
+        ("If China checks out entirely, the rest of the market adapts.", "entirely,", "the"),
+        ("Supply tightened, but demand remained strong.", "tightened,", "but"),
+        ("They met on April 30 th. Intraday trading resumed later.", "th.", "Intraday"),
+        ("The plan was impossible. For America, that changed everything.", "impossible.", "For"),
+    ]
+
+    for text, left_surface, right_surface in cases:
+        words = text.split()
+        editor = _marker_editor(words, max_words=16)
+        editor._prepare_syntax_cut_hints()
+        left = next(
+            index
+            for index, (current, following) in enumerate(zip(words, words[1:]))
+            if current == left_surface and following == right_surface
+        )
+
+        evaluation = editor._evaluate_stable_cut_boundary(left, left + 1)
+
+        assert evaluation["legal"], (text, evaluation)
+
+
+def test_final_pre_id_repairs_oil_dependency_boundaries_without_word_loss():
+    cases = [
+        (
+            "Brent crude is sitting about 40 below its April 30 th intraday high of 126 a barrel.",
+            "th",
+            [17],
+        ),
+        (
+            "And surprisingly, Iran has found itself with far less leverage over Donald Trump than anyone anticipated heading into this.",
+            "Trump",
+            [19],
+        ),
+        (
+            "Because when you hear that one-fifth of the world's oil supply is suddenly trapped behind a blockade, your immediate expectation is just total panic, right?",
+            "supply",
+            [17, 8],
+        ),
+        (
+            "Usually, China imports crude, refines it, and exports a lot of finished diesel and gasoline for profit.",
+            "exports",
+            [17],
+        ),
+        (
+            "They basically commanded heavy industry to dial back consumption during the exact window the strait was shut.",
+            "window",
+            [17],
+        ),
+        (
+            "It makes it impossible for America and others to know how long they can withstand sanctions or war.",
+            "long",
+            [18],
+        ),
+        (
+            "But the relief of a 2026 superglut masks a much more dangerous long-term reality regarding global supply and demand, doesn't it?",
+            "reality",
+            [21],
+        ),
+        (
+            "why are so many other nations still acting as if the current oil dependent system will last forever?",
+            "acting",
+            [18],
+        ),
+    ]
+
+    for text, left_surface, expected_counts in cases:
+        words = text.split()
+        editor = _marker_editor(words, max_words=16)
+        editor._prepare_syntax_cut_hints()
+        cut = words.index(left_surface)
+        items = [
+            _word_item(editor, 0, cut, 1),
+            _word_item(editor, cut + 1, len(words) - 1, 2),
+        ]
+        original_tokens = editor._items_word_tokens(items)
+
+        repaired = editor._validate_and_repair_final_pre_id_boundaries(items)
+
+        assert [editor._word_count(item.original) for item in repaired] == expected_counts, text
+        assert editor._items_word_tokens(repaired) == original_tokens, text
+        assert all(not item.subtitle_id for item in repaired), text
+        assert all(
+            editor._evaluate_item_pair_for_final_boundary(left, right)["legal"]
+            for left, right in zip(repaired, repaired[1:])
+        ), text
 
 
 def test_parser_blocks_clausal_subject_from_its_finite_predicate():
@@ -5269,7 +5522,7 @@ def test_article_page_timeline_uses_fixed_fonts_and_word_boundaries():
     cue.article_page_plan = plan
 
     assert plan["status"] == "ok"
-    assert plan["font_size"] == {"english": 56, "chinese": 46}
+    assert plan["font_size"] == {"english": 56, "chinese": 48}
     assert " ".join(page["en"] for page in plan["pages"]) == english
     assert "".join(page["zh"] for page in plan["pages"]) == chinese
     assert all(
@@ -5367,30 +5620,15 @@ def test_article_renderer_never_accepts_a_forbidden_line_break_in_a_long_cue():
         "所以，他们确实是出于纯粹的生存需求，不得不发明全新的办法来解决同一个数学问题。",
         "male",
     )
+    cue.subtitle_id = "S0156"
     cue.word_timing = _article_word_timing(cue)
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
-    english_plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
-    assert english_plan["status"] == "ok"
-    page_word_counts = [
-        int(page["word_end"]) - int(page["word_start"]) + 1
-        for page in english_plan["pages"]
-    ]
-    chinese_pages = podcast_learning_video._strict_split_chinese_visual_pages(
-        cue.zh,
-        len(english_plan["pages"]),
-        page_word_counts,
-        strict=True,
-    )
-    assert chinese_pages is not None
-    _attach_explicit_article_page_translations(cue, chinese_pages)
-
-    plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
-
-    assert plan["status"] == "ok"
-    assert "".join(page["zh"] for page in plan["pages"]) == cue.zh
-    for page in plan["pages"]:
+    blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+    english_plan = blueprint["render_plans"][0]
+    assert " ".join(page["english"] for page in english_plan["pages"]) == english
+    for page in english_plan["pages"]:
         assert not podcast_learning_video._has_discouraged_caption_break(
-            page["en"], page["en_lines"]
+            page["english"], page["english_lines"]
         )
 
 
@@ -5713,7 +5951,10 @@ def test_article_renderer_uses_pixel_width_for_43_character_chinese_cue():
         podcast_learning_video.text_w(
             draw,
             line,
-            podcast_learning_video.article_cjk_font(46, 700),
+            podcast_learning_video.article_cjk_font(
+                podcast_learning_video.ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+                700,
+            ),
         )
         <= podcast_learning_video.acx(podcast_learning_video.ARTICLE_SUBTITLE_ZH_WIDTH)
         for line in lines
@@ -7761,9 +8002,9 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
         full_translations = editor._translate_semantic_group_full_translations(groups)
 
     assert calls == [
-        ("screen_subtitle_semantic_full_translation_v4", [1, 2]),
-        ("screen_subtitle_semantic_full_translation_v4", [3]),
-        ("screen_subtitle_semantic_full_translation_v4_retry", [2]),
+        ("screen_subtitle_semantic_full_translation_v6", [1, 2]),
+        ("screen_subtitle_semantic_full_translation_v6", [3]),
+        ("screen_subtitle_semantic_full_translation_v6_retry", [2]),
     ]
     assert full_translations == {1: "full-1", 2: "full-2", 3: "full-3"}
     assert editor._translation_structure_errors == []
@@ -7842,11 +8083,80 @@ def test_full_translation_payload_adds_bounded_read_only_neighbor_context():
     assert "id" not in context_entry
 
 
+def test_full_translation_payload_includes_fixed_id_soft_reading_budgets():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(
+        [
+            ScreenSubtitleItem(
+                source_ids=[1],
+                original="The main takeaway is clear.",
+                translated="",
+                word_start=0,
+                word_end=2,
+            ),
+            ScreenSubtitleItem(
+                source_ids=[2],
+                original="The system can respond faster.",
+                translated="",
+                word_start=3,
+                word_end=5,
+            ),
+        ]
+    )
+    editor._active_word_entries = [
+        {"start_time": 0, "end_time": 300},
+        {"start_time": 350, "end_time": 800},
+        {"start_time": 850, "end_time": 1500},
+        {"start_time": 1600, "end_time": 2100},
+        {"start_time": 2150, "end_time": 2800},
+        {"start_time": 2850, "end_time": 3600},
+    ]
+    groups = [_id_group(1, 0, items)]
+
+    payload = editor._semantic_full_translation_payload_entry(groups, 0)
+
+    assert payload["subtitle_parts"] == [
+        {
+            "subtitle_id": "S0001",
+            "english": "The main takeaway is clear.",
+            "duration_ms": 1500,
+            "max_zh_chars": 18,
+            "target_zh_chars": 12,
+            "absolute_max_zh_chars": 18,
+        },
+        {
+            "subtitle_id": "S0002",
+            "english": "The system can respond faster.",
+            "duration_ms": 2000,
+            "max_zh_chars": 18,
+            "target_zh_chars": 16,
+            "absolute_max_zh_chars": 18,
+        },
+    ]
+    assert payload["translation_budget"] == {
+        "budget_basis": "sum_of_fixed_subtitle_display_durations",
+        "target_zh_chars": 28,
+        "absolute_max_zh_chars": 36,
+    }
+
+
 def test_full_translation_prompt_restrains_ordinary_chinese_em_dashes():
-    from app.core.subtitle_processor.screen_editor import SEMANTIC_FULL_TRANSLATION_PROMPT
+    from app.core.subtitle_processor.screen_editor import (
+        SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
+        SEMANTIC_FULL_TRANSLATION_PROMPT,
+        SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION,
+    )
 
     assert "Do not use em dashes for ordinary explanations" in SEMANTIC_FULL_TRANSLATION_PROMPT
     assert "Never leave an em dash at the beginning or end" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "one-glance video subtitle" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "Remove meaning-free conversational scaffolding" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "Do not remove a reaction, hedge, or stance" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "translation_budget" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "soft reading target" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "The main takeaway is that X" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION == "semantic-full-translation-v6"
+    assert SEMANTIC_FULL_TRANSLATION_CACHE_TASK == "screen_subtitle_semantic_full_translation_v6"
 
 
 def test_full_translation_em_dash_style_detector_ignores_lexical_hyphen():
@@ -7866,7 +8176,7 @@ def test_full_translation_style_retry_only_retries_flagged_group_and_accepts_imp
 
     def request(prompt, payload, cache_task, **kwargs):
         calls.append((cache_task, [entry["id"] for entry in payload]))
-        if cache_task == "screen_subtitle_semantic_full_translation_v4":
+        if cache_task == "screen_subtitle_semantic_full_translation_v6":
             return {
                 "groups": [
                     {
@@ -7897,7 +8207,7 @@ def test_full_translation_style_retry_only_retries_flagged_group_and_accepts_imp
         full_translations = editor._translate_semantic_group_full_translations(groups)
 
     assert calls == [
-        ("screen_subtitle_semantic_full_translation_v4", [1, 2]),
+        ("screen_subtitle_semantic_full_translation_v6", [1, 2]),
         ("screen_subtitle_semantic_full_translation_style_retry_v1", [2]),
     ]
     assert full_translations == {1: "这是一句普通陈述。", 2: "这项研究得出了明确结论。"}
@@ -12374,13 +12684,16 @@ if __name__ == "__main__":
     test_formal_boundary_audit_projects_display_pages_and_unresolved_pre_id_evidence()
     test_stable_chinese_cache_rejects_stale_frozen_boundary_context()
     test_semantic_full_translation_cache_survives_allocation_algorithm_change()
-    test_semantic_full_translation_reads_verified_pre_v5_cache_once()
+    test_semantic_full_translation_reads_verified_legacy_role_cache_once()
     test_semantic_cache_identity_uses_only_the_request_owner_model()
     test_invalid_full_translation_cache_is_replaced_only_by_valid_response()
     test_invalid_allocation_cache_is_replaced_only_after_id_validation()
     test_final_time_alignment_reapplies_display_padding_to_loaded_short_subtitle()
     test_final_time_alignment_shifts_next_when_loaded_short_has_no_gap()
     test_final_time_alignment_runs_chinese_speed_repair_without_touching_english()
+    test_fixed_id_parent_chinese_sync_updates_only_the_chinese_projection()
+    test_fixed_id_parent_chinese_sync_rejects_structural_drift_before_writing()
+    test_final_time_alignment_publishes_punctuation_repair_to_fixed_id_items()
     test_screen_editor_uses_16_word_stable_hard_floor()
     test_screen_editor_routes_full_translation_and_allocation_models_by_role()
     test_screen_manifest_records_translation_model_roles_and_retry_owners()
@@ -12487,6 +12800,9 @@ if __name__ == "__main__":
     test_parser_blocks_object_content_clause_boundary()
     test_parser_blocks_object_attached_modifier_boundary()
     test_parser_blocks_misattached_zero_relative_clause_boundary()
+    test_parser_blocks_cross_cue_dependency_units_from_oil_run()
+    test_cross_cue_dependency_guards_keep_independent_boundaries_legal()
+    test_final_pre_id_repairs_oil_dependency_boundaries_without_word_loss()
     test_parser_blocks_clausal_subject_from_its_finite_predicate()
     test_parser_blocks_short_dative_object_start_boundary()
     test_parser_blocks_numeric_range_boundaries()
@@ -12664,6 +12980,7 @@ if __name__ == "__main__":
     test_missing_full_translation_does_not_discard_prior_fixed_id_allocation()
     test_full_translation_number_error_is_not_misclassified_as_allocation_error()
     test_full_translation_requests_are_chunked_and_retry_missing_groups()
+    test_full_translation_payload_includes_fixed_id_soft_reading_budgets()
     test_full_translation_prompt_restrains_ordinary_chinese_em_dashes()
     test_full_translation_em_dash_style_detector_ignores_lexical_hyphen()
     test_full_translation_style_retry_only_retries_flagged_group_and_accepts_improvement()

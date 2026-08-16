@@ -16,7 +16,11 @@ from app.core.subtitle_processor.stable_display_page_contract import (
     display_page_id,
     validate_page_translation_response,
 )
-from app.core.subtitle_processor.stable_display_planner import plan_word_page_spans
+from app.core.subtitle_processor.stable_display_planner import (
+    plan_word_page_span_frontier,
+    plan_word_page_spans,
+    spans_cover_words,
+)
 from app.core.utils import podcast_learning_video
 
 
@@ -451,6 +455,27 @@ def test_subject_predicate_boundary_is_not_used_for_efficiency_gap_page_change()
     assert " ".join(page["en"] for page in pages) == text
 
 
+def test_zero_relative_tail_does_not_become_an_isolated_display_page():
+    text = (
+        "They basically commanded heavy industry to dial back consumption "
+        "during the exact window the strait was shut."
+    )
+    words = text.split()
+    _, cue = _syntax_backed_cue(text, "S0059")
+
+    plan = _plan(cue)
+    page_starts = _page_starts(plan)
+    tail_start = next(
+        index
+        for index, (left, right) in enumerate(zip(words, words[1:]), 1)
+        if left == "window" and right == "the"
+    )
+
+    assert tail_start not in page_starts
+    assert all(page["en"] != "the strait was shut." for page in plan["pages"])
+    assert " ".join(page["en"] for page in plan["pages"]) == text
+
+
 def test_wh_clause_boundary_is_not_used_for_chinese_businesses_page_change():
     text = (
         "The research shows that Chinese businesses, collectively, spend less than "
@@ -543,7 +568,7 @@ def test_page_translation_contract_rejects_a_chinese_token_split_across_pages():
                 ],
             }
         ],
-        layout_profile={"template": "article", "english_font_size": 56, "chinese_font_size": 46},
+        layout_profile={"template": "article", "english_font_size": 56, "chinese_font_size": 48},
     )
 
     result = validate_page_translation_response(
@@ -580,6 +605,7 @@ def test_frozen_page_artifact_records_font_size_and_line_width_for_each_page():
 
     plan = contract["render_plans"][0]
     assert contract["layout_profile"]["english_font_size"] == 56
+    assert contract["layout_profile"]["chinese_font_size"] == 48
     assert contract["layout_profile"]["english_font_fallback_sizes"] == [56, 54, 52, 50]
     assert contract["layout_profile"]["english_emergency_fallback_sizes"] == []
     assert contract["layout_profile"]["english_normal_min_size"] == 50
@@ -589,6 +615,21 @@ def test_frozen_page_artifact_records_font_size_and_line_width_for_each_page():
         page["english_font_size"] for page in plan["pages"]
     )
     assert all(page["english_width"] > 0 for page in plan["pages"])
+
+
+def test_article_chinese_font_keeps_sixteen_characters_inside_safe_width():
+    draw = ImageDraw.Draw(Image.new("RGB", (1600, 900)))
+    font = podcast_learning_video.article_cjk_font(
+        podcast_learning_video.ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        700,
+    )
+    sample = "这是一条十六个汉字的中文显示字幕"
+
+    assert len(sample) == 16
+    assert podcast_learning_video.ARTICLE_SUBTITLE_ZH_FONT_SIZE == 48
+    assert podcast_learning_video.text_w(draw, sample, font) <= (
+        podcast_learning_video.acx(podcast_learning_video.ARTICLE_SUBTITLE_ZH_WIDTH)
+    )
 
 
 def test_page_span_score_prefers_balanced_legal_boundary_when_risk_is_equal():
@@ -606,6 +647,150 @@ def test_page_span_score_prefers_balanced_legal_boundary_when_risk_is_equal():
     )
 
     assert spans == [(0, 12), (12, 24)]
+
+
+def test_page_span_frontier_retains_distinct_safe_visual_partitions():
+    readable = {
+        (0, 4),
+        (4, 10),
+        (0, 5),
+        (5, 10),
+        (0, 6),
+        (6, 10),
+    }
+
+    frontier = plan_word_page_span_frontier(
+        10,
+        2,
+        cue_start=0.0,
+        cue_end=8.0,
+        span_is_readable=lambda start, end, _first, _paginated: (start, end)
+        in readable,
+        break_score=lambda end, _target: 0.0 if end in {4, 5, 6} else None,
+        span_score=lambda start, end: abs((end - start) - 5),
+        max_candidates=3,
+    )
+
+    assert frontier == [
+        [(0, 5), (5, 10)],
+        [(0, 4), (4, 10)],
+        [(0, 6), (6, 10)],
+    ]
+    assert all(
+        spans_cover_words(spans, 10)
+        for spans in frontier
+    )
+
+
+def test_reference_style_wrap_prefers_balanced_two_lines_before_wide_single_line():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    text = "People today prefer simple local choices."
+
+    lines = podcast_learning_video._article_fixed_english_lines(draw, text)
+    font = podcast_learning_video.article_en_font(56, 600)
+    widths = [podcast_learning_video.text_w(draw, line, font) for line in lines]
+
+    assert len(lines) == 2
+    assert " ".join(lines) == text
+    assert min(widths) / max(widths) >= 0.80
+    assert not podcast_learning_video._has_discouraged_caption_break(text, lines)
+
+
+def test_production_candidate_bundle_keeps_a_bounded_visual_frontier():
+    text = (
+        "Customers save money every day, stores grow quickly across China, "
+        "workers gain valuable experience, and communities receive reliable "
+        "services nationwide."
+    )
+    words = text.split()
+    cue = _cue(
+        text,
+        "S9303",
+        display_boundary_evidence={
+            str(index): {
+                "hard_issues": [],
+                "soft_issues": [],
+                "pause_ms": 600,
+            }
+            for index in range(1, len(words))
+        },
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    bundle = podcast_learning_video._build_article_english_page_plan(
+        cue,
+        draw,
+        _return_candidates=True,
+    )
+    two_page_candidates = [
+        candidate
+        for candidate in bundle["candidates"]
+        if candidate["page_count"] == 2
+    ]
+    boundaries = {
+        tuple(page["word_end"] for page in candidate["plan"]["pages"])
+        for candidate in two_page_candidates
+    }
+
+    assert 1 < len(two_page_candidates) <= 4
+    assert len(boundaries) == len(two_page_candidates)
+    assert {
+        candidate["page_count"] for candidate in bundle["candidates"]
+    } == {bundle["preferred_page_count"]}
+    assert all(
+        " ".join(page["en"] for page in candidate["plan"]["pages"])
+        == text
+        for candidate in two_page_candidates
+    )
+
+
+def test_production_candidates_score_the_same_font_used_by_final_reflow():
+    text = (
+        "itself are now being actively weaponized against these returning "
+        "students."
+    )
+    cue = _cue(
+        text,
+        "S9304",
+        display_boundary_evidence={
+            str(split): {
+                "hard_issues": (
+                    [] if split in {1, 2, 3} else ["modifier_head_split"]
+                ),
+                "soft_issues": [],
+                "pause_ms": 0,
+            }
+            for split in range(1, len(text.split()))
+        },
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    bundle = podcast_learning_video._build_article_english_page_plan(
+        cue,
+        draw,
+        _return_candidates=True,
+    )
+
+    assert bundle["status"] == "candidate_bundle"
+    assert bundle["candidates"]
+    for candidate in bundle["candidates"]:
+        finalized = podcast_learning_video._finalize_article_same_screen_layout(
+            cue,
+            draw,
+            candidate["plan"],
+        )
+        assert [
+            page["english_font_size"]
+            for page in candidate["plan"]["pages"]
+        ] == [
+            page["english_font_size"]
+            for page in finalized["pages"]
+        ]
+        assert [
+            page["en_lines"] for page in candidate["plan"]["pages"]
+        ] == [
+            page["en_lines"] for page in finalized["pages"]
+        ]
 
 
 def test_medium_review_boundary_can_beat_static_font_reduction_on_quality():
@@ -1231,6 +1416,647 @@ def test_sequence_selection_relaxes_consecutive_dense_pages():
     assert selected == [relaxed_split, following_dense]
 
 
+def test_sequence_selection_avoids_an_abrupt_adjacent_pressure_jump():
+    preceding = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "a comfortable preceding page",
+                    "english_font_size": 56,
+                    "en_lines": ["a comfortable", "preceding page"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 0,
+        "page_pressures": (0.72,),
+    }
+    abrupt_dense = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "a suddenly dense but otherwise legal page",
+                    "english_font_size": 56,
+                    "en_lines": ["a suddenly dense", "but otherwise legal page"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 100,
+        "page_pressures": (1.28,),
+    }
+    visually_steady = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "the same legal content at a steadier density",
+                    "english_font_size": 56,
+                    "en_lines": ["the same legal content", "at a steadier density"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 500,
+        "page_pressures": (0.84,),
+    }
+
+    selected = podcast_learning_video._select_article_page_plan_sequence(
+        [[preceding], [abrupt_dense, visually_steady]]
+    )
+
+    assert selected == [preceding, visually_steady]
+
+
+def test_sequence_selection_prefers_stable_56px_when_risk_is_equal():
+    preceding = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "a regular two line page",
+                    "english_font_size": 56,
+                    "en_lines": ["a regular", "two line page"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 0,
+        "page_pressures": (0.90,),
+    }
+    smaller_font = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "an equally safe candidate",
+                    "english_font_size": 54,
+                    "en_lines": ["an equally", "safe candidate"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 100,
+        "page_pressures": (0.90,),
+    }
+    stable_font = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "an equally safe candidate",
+                    "english_font_size": 56,
+                    "en_lines": ["an equally", "safe candidate"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 160,
+        "page_pressures": (0.90,),
+    }
+
+    selected = podcast_learning_video._select_article_page_plan_sequence(
+        [[preceding], [smaller_font, stable_font]]
+    )
+
+    assert selected == [preceding, stable_font]
+
+
+def test_sequence_stability_cannot_create_a_short_lead_in_before_a_50px_tail():
+    preceding = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "a normal preceding page",
+                    "english_font_size": 56,
+                    "en_lines": ["a normal", "preceding page"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 0,
+        "page_pressures": (0.80,),
+    }
+    compact_fallback = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "one compact fallback page keeps its complete phrase together",
+                    "english_font_size": 50,
+                    "en_lines": ["one compact fallback", "page keeps its complete", "phrase together"],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 4_500,
+        "page_pressures": (1.333333,),
+    }
+    artificial_lead_in = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "one short lead in",
+                    "english_font_size": 56,
+                    "en_lines": ["one short lead in"],
+                },
+                {
+                    "en": "the remaining dense phrase still needs the fallback",
+                    "english_font_size": 50,
+                    "en_lines": [
+                        "the remaining dense",
+                        "phrase still needs",
+                        "the fallback",
+                    ],
+                },
+            ]
+        },
+        "page_count": 2,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "quality_cost": 5_614,
+        "page_pressures": (1.1956, 1.0),
+    }
+    following = {
+        **preceding,
+        "plan": {
+            "pages": [
+                {
+                    "en": "a normal following page",
+                    "english_font_size": 56,
+                    "en_lines": ["a normal", "following page"],
+                }
+            ]
+        },
+    }
+
+    selected = podcast_learning_video._select_article_page_plan_sequence(
+        [[preceding], [compact_fallback, artificial_lead_in], [following]]
+    )
+
+    assert selected == [preceding, compact_fallback, following]
+
+
+def test_sequence_downranks_an_incomplete_review_cut_before_visual_stability():
+    risk_free = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "a denser but semantically safe page",
+                    "english_font_size": 50,
+                    "en_lines": [
+                        "a denser but",
+                        "semantically safe",
+                        "page",
+                    ],
+                }
+            ]
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "high_risk_count": 0,
+        "medium_risk_count": 0,
+        "low_risk_count": 0,
+        "incomplete_review_count": 0,
+        "quality_cost": 600,
+        "page_pressures": (1.25,),
+    }
+    visually_smooth_review_cut = {
+        "plan": {
+            "pages": [
+                {
+                    "en": "a smooth first page",
+                    "english_font_size": 56,
+                    "en_lines": ["a smooth first page"],
+                },
+                {
+                    "en": "with a review-only boundary",
+                    "english_font_size": 56,
+                    "en_lines": ["with a review-only boundary"],
+                },
+            ]
+        },
+        "page_count": 2,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "high_risk_count": 0,
+        "medium_risk_count": 1,
+        "low_risk_count": 0,
+        "incomplete_review_count": 1,
+        "quality_cost": 0,
+        "page_pressures": (0.75, 0.78),
+    }
+
+    selected = podcast_learning_video._select_article_page_plan_sequence(
+        [[risk_free, visually_smooth_review_cut]]
+    )
+
+    assert selected == [risk_free]
+
+
+def test_54px_static_page_promotes_only_a_complete_56px_partition():
+    static = {
+        "plan": {
+            "font_size": {"english": 54},
+            "pages": [
+                {
+                    "en": "one two three four five six seven eight nine ten eleven twelve",
+                    "start": 0.0,
+                    "end": 4.0,
+                }
+            ],
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "page_pressures": (1.02,),
+    }
+    complete_partition = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one two three four five six",
+                    "start": 0.0,
+                    "end": 2.0,
+                },
+                {
+                    "en": "seven eight nine ten eleven twelve",
+                    "start": 2.0,
+                    "end": 4.0,
+                    "boundary_before": {
+                        "classification": "review",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+            ],
+        },
+        "page_count": 2,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+        "page_pressures": (0.68, 0.70),
+    }
+
+    promoted = podcast_learning_video._article_high_pressure_review_candidates(
+        [static, complete_partition],
+        total_word_count=12,
+    )
+
+    assert [candidate["page_count"] for candidate in promoted] == [2]
+
+
+def test_duration_alone_does_not_paginate_a_readable_static_cue():
+    text = (
+        "they feed that curated, highly structured data to a new, smaller "
+        "model, the student."
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    page_count = podcast_learning_video._article_preferred_readability_page_count(
+        draw,
+        text.split(),
+        "他们把经精选、高度结构化的数据喂给更小的新模型，即学生",
+        cue_duration_ms=6_324,
+    )
+
+    assert page_count == 1
+
+
+def test_duration_alone_does_not_promote_an_equally_sized_partition():
+    static = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one readable static page stays at the preferred font",
+                    "english_font_size": 56,
+                    "en_lines": [
+                        "one readable static page",
+                        "stays at the preferred font",
+                    ],
+                    "start": 0.0,
+                    "end": 6.0,
+                }
+            ],
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+    equally_sized_partition = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one readable static page",
+                    "english_font_size": 56,
+                    "en_lines": ["one readable static page"],
+                    "start": 0.0,
+                    "end": 3.0,
+                },
+                {
+                    "en": "stays at the preferred font",
+                    "english_font_size": 56,
+                    "en_lines": ["stays at the preferred font"],
+                    "start": 3.0,
+                    "end": 6.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                    },
+                },
+            ],
+        },
+        "page_count": 2,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+
+    promoted = podcast_learning_video._article_high_pressure_review_candidates(
+        [static, equally_sized_partition],
+        total_word_count=9,
+    )
+
+    assert promoted == []
+
+
+def test_complete_review_partition_remains_visible_after_strict_static_candidate():
+    static = {
+        "plan": {
+            "font_size": {"english": 50},
+            "pages": [
+                {
+                    "en": "one two three four five six seven eight nine ten eleven twelve",
+                    "start": 0.0,
+                    "end": 4.0,
+                }
+            ],
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+    reviewed_partition = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one two three four five six",
+                    "start": 0.0,
+                    "end": 2.0,
+                },
+                {
+                    "en": "seven eight nine ten eleven twelve",
+                    "start": 2.0,
+                    "end": 4.0,
+                    "boundary_before": {
+                        "classification": "review",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+            ],
+        },
+        "page_count": 2,
+        "forced_continuation": True,
+        "severe_risk_count": 0,
+    }
+
+    promoted = podcast_learning_video._article_high_pressure_review_candidates(
+        [static, reviewed_partition],
+        total_word_count=12,
+    )
+
+    assert [candidate["page_count"] for candidate in promoted] == [2]
+    assert promoted[0]["secondary_review_promoted"] is True
+
+
+def test_multipage_50px_baseline_promotes_complete_56px_expansion():
+    dense_baseline = {
+        "plan": {
+            "font_size": {"english": 50},
+            "pages": [
+                {
+                    "en": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen",
+                    "english_font_size": 50,
+                    "start": 0.0,
+                    "end": 4.0,
+                },
+                {
+                    "en": "sixteen seventeen eighteen nineteen twenty twenty-one",
+                    "english_font_size": 56,
+                    "start": 4.0,
+                    "end": 6.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+            ],
+        },
+        "page_count": 2,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+    complete_expansion = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one two three four five six seven",
+                    "english_font_size": 56,
+                    "start": 0.0,
+                    "end": 2.0,
+                },
+                {
+                    "en": "eight nine ten eleven twelve thirteen fourteen",
+                    "english_font_size": 56,
+                    "start": 2.0,
+                    "end": 4.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+                {
+                    "en": "fifteen sixteen seventeen eighteen nineteen twenty twenty-one",
+                    "english_font_size": 56,
+                    "start": 4.0,
+                    "end": 6.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+            ],
+        },
+        "page_count": 3,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+
+    promoted = podcast_learning_video._article_high_pressure_review_candidates(
+        [dense_baseline, complete_expansion],
+        total_word_count=21,
+    )
+
+    assert [candidate["page_count"] for candidate in promoted] == [3]
+
+
+def test_balanced_56px_multipage_baseline_is_not_over_paginated():
+    baseline = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one two three four five six seven eight nine",
+                    "english_font_size": 56,
+                    "start": 0.0,
+                    "end": 3.0,
+                },
+                {
+                    "en": "ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen",
+                    "english_font_size": 56,
+                    "start": 3.0,
+                    "end": 6.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+            ],
+        },
+        "page_count": 2,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+    extra_page = {
+        **baseline,
+        "page_count": 3,
+        "plan": {
+            **baseline["plan"],
+            "pages": [
+                {
+                    "en": "one two three four five six",
+                    "english_font_size": 56,
+                    "start": 0.0,
+                    "end": 2.0,
+                },
+                {
+                    "en": "seven eight nine ten eleven twelve",
+                    "english_font_size": 56,
+                    "start": 2.0,
+                    "end": 4.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+                {
+                    "en": "thirteen fourteen fifteen sixteen seventeen eighteen",
+                    "english_font_size": 56,
+                    "start": 4.0,
+                    "end": 6.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+            ],
+        },
+    }
+
+    promoted = podcast_learning_video._article_high_pressure_review_candidates(
+        [baseline, extra_page],
+        total_word_count=18,
+    )
+
+    assert promoted == []
+
+
+def test_long_56px_static_page_promotes_only_a_complete_readable_partition():
+    static = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen",
+                    "start": 0.0,
+                    "end": 6.0,
+                }
+            ],
+        },
+        "page_count": 1,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+    complete_partition = {
+        "plan": {
+            "font_size": {"english": 56},
+            "pages": [
+                {
+                    "en": "one two three four five six seven",
+                    "start": 0.0,
+                    "end": 3.0,
+                },
+                {
+                    "en": "eight nine ten eleven twelve thirteen fourteen fifteen",
+                    "start": 3.0,
+                    "end": 6.0,
+                    "boundary_before": {
+                        "classification": "allow",
+                        "issue_codes": [],
+                        "complete_page_clause_start": True,
+                    },
+                },
+            ],
+        },
+        "page_count": 2,
+        "forced_continuation": False,
+        "severe_risk_count": 0,
+    }
+
+    promoted = podcast_learning_video._article_high_pressure_review_candidates(
+        [static, complete_partition],
+        total_word_count=15,
+    )
+
+    assert promoted == [
+        {
+            **complete_partition,
+            "plan": {
+                **complete_partition["plan"],
+                "readability_warnings": [
+                    {
+                        "reason": "high_pressure_secondary_page_review",
+                        "review_required": True,
+                    }
+                ],
+            },
+            "secondary_review_promoted": True,
+        }
+    ]
+
+
 def test_blueprint_keeps_56px_when_a_safe_page_plan_exists():
     text = (
         "Like Moonshot AI, the startup in Beijing, they launched their K 3 "
@@ -1361,6 +2187,128 @@ def test_high_pressure_secondary_review_rejects_incomplete_phrase_boundaries():
         )["render_plans"][0]
 
         assert [page["english"] for page in plan["pages"]] == [text]
+
+
+def test_secondary_page_promotion_distinguishes_safe_and_attached_boundaries():
+    assert podcast_learning_video._article_secondary_review_boundary_is_complete(
+        {
+            "en": "you can pour whatever you want into it",
+            "boundary_before": {
+                "classification": "allow",
+                "issue_codes": [],
+            },
+        }
+    )
+    assert not podcast_learning_video._article_secondary_review_boundary_is_complete(
+        {
+            "en": "for Chinese nationals studying in critical fields",
+            "boundary_before": {
+                "classification": "review",
+                "issue_codes": [
+                    "dependency_phrase_entrance_split",
+                    "object_attached_modifier_split",
+                ],
+                "tight_complete_phrase_start": True,
+            },
+        }
+    )
+    assert podcast_learning_video._article_secondary_review_boundary_is_complete(
+        {
+            "en": "from paying any royalties for the first three years",
+            "boundary_before": {
+                "classification": "review",
+                "issue_codes": [
+                    "dependency_phrase_entrance_split",
+                    "object_attached_modifier_split",
+                ],
+                "tight_complete_phrase_start": True,
+            },
+        }
+    )
+
+
+def test_complete_from_gerund_page_beats_single_50px_fallback():
+    text = (
+        "the parent company completely exempts franchisees from paying any "
+        "royalties for the first three years of operation."
+    )
+    _, cue = _syntax_backed_cue(
+        text,
+        "S9519",
+        word_timing=_word_timing_with_gaps(text),
+    )
+
+    plan = podcast_learning_video.build_article_display_page_blueprint(
+        [cue]
+    )["render_plans"][0]
+
+    assert [page["english"] for page in plan["pages"]] == [
+        "the parent company completely exempts franchisees",
+        "from paying any royalties for the first three years of operation.",
+    ]
+    assert all(page["english_font_size"] == 56 for page in plan["pages"])
+
+
+def test_nested_continuation_clause_starts_after_punctuation_not_introducer():
+    text = (
+        "We need to pause and establish exactly what Mixue Bingcheng is, "
+        "because if you aren't familiar with the Asian food and beverage "
+        "market, the scale of this company is going to sound totally "
+        "fabricated."
+    )
+    _, cue = _syntax_backed_cue(
+        text,
+        "S9520",
+        word_timing=_word_timing_with_gaps(text, {10: 160, 22: 521}),
+    )
+
+    plan = podcast_learning_video.build_article_display_page_blueprint(
+        [cue]
+    )["render_plans"][0]
+
+    assert [page["english"] for page in plan["pages"]] == [
+        "We need to pause and establish exactly what Mixue Bingcheng is,",
+        "because if you aren't familiar with the Asian food and beverage market,",
+        "the scale of this company is going to sound totally fabricated.",
+    ]
+    assert all(page["english_font_size"] == 56 for page in plan["pages"])
+
+
+def test_three_line_fallback_promotes_complete_two_page_alternative():
+    cases = (
+        (
+            "S9521",
+            (
+                "Last year, Mixue Bingcheng officially overtook McDonald's "
+                "to become the world's largest fast-food operator by number "
+                "of locations."
+            ),
+            "to become the world's largest fast-food operator by number of locations.",
+        ),
+        (
+            "S9522",
+            (
+                "You're getting plugged directly into the most aggressive "
+                "expansion engine in the modern food and beverage industry."
+            ),
+            "in the modern food and beverage industry.",
+        ),
+    )
+
+    for subtitle_id, text, expected_second_page in cases:
+        _, cue = _syntax_backed_cue(
+            text,
+            subtitle_id,
+            word_timing=_word_timing_with_gaps(text),
+        )
+
+        plan = podcast_learning_video.build_article_display_page_blueprint(
+            [cue]
+        )["render_plans"][0]
+
+        assert len(plan["pages"]) == 2
+        assert plan["pages"][1]["english"] == expected_second_page
+        assert all(len(page["english_lines"]) <= 2 for page in plan["pages"])
 
 
 def test_line_wrap_downranks_page_syntax_without_blocking_same_screen_lines():
@@ -2163,6 +3111,7 @@ def test_forced_verb_complement_split_ranks_below_subject_predicate_fallback():
         "classification": "review",
         "confidence": "high",
         "forced_display_continuation": True,
+        "forced_complete_to_phrase": True,
         "issue_codes": ["verb_complement_split", "short_verb_complement_split"],
     }
     subject_predicate = {
@@ -2186,11 +3135,16 @@ if __name__ == "__main__":
     test_display_planning_does_not_mutate_frozen_cue_identity_text_or_timing()
     test_visual_planning_reuses_the_complete_frozen_page_projection()
     test_subject_predicate_boundary_is_not_used_for_efficiency_gap_page_change()
+    test_zero_relative_tail_does_not_become_an_isolated_display_page()
     test_wh_clause_boundary_is_not_used_for_chinese_businesses_page_change()
     test_infinitive_phrase_remains_single_page_when_two_lines_fit_at_allowed_font()
     test_page_translation_contract_rejects_a_chinese_token_split_across_pages()
     test_frozen_page_artifact_records_font_size_and_line_width_for_each_page()
     test_page_span_score_prefers_balanced_legal_boundary_when_risk_is_equal()
+    test_page_span_frontier_retains_distinct_safe_visual_partitions()
+    test_reference_style_wrap_prefers_balanced_two_lines_before_wide_single_line()
+    test_production_candidate_bundle_keeps_a_bounded_visual_frontier()
+    test_production_candidates_score_the_same_font_used_by_final_reflow()
     test_medium_review_boundary_can_beat_static_font_reduction_on_quality()
     test_article_english_font_profile_has_a_strict_50px_floor()
     test_font_floor_regression_cues_render_at_50px_without_emergency_warnings()
@@ -2201,10 +3155,25 @@ if __name__ == "__main__":
     test_spaced_thousands_group_is_atomic_at_line_wrap()
     test_amount_frequency_phrase_stays_on_the_same_display_page()
     test_sequence_selection_relaxes_consecutive_dense_pages()
+    test_sequence_selection_avoids_an_abrupt_adjacent_pressure_jump()
+    test_sequence_selection_prefers_stable_56px_when_risk_is_equal()
+    test_sequence_stability_cannot_create_a_short_lead_in_before_a_50px_tail()
+    test_sequence_downranks_an_incomplete_review_cut_before_visual_stability()
+    test_54px_static_page_promotes_only_a_complete_56px_partition()
+    test_duration_alone_does_not_paginate_a_readable_static_cue()
+    test_duration_alone_does_not_promote_an_equally_sized_partition()
+    test_complete_review_partition_remains_visible_after_strict_static_candidate()
+    test_multipage_50px_baseline_promotes_complete_56px_expansion()
+    test_balanced_56px_multipage_baseline_is_not_over_paginated()
+    test_long_56px_static_page_promotes_only_a_complete_readable_partition()
     test_blueprint_keeps_56px_when_a_safe_page_plan_exists()
     test_automatic_multipage_plan_assigns_font_from_each_final_page()
     test_high_pressure_single_pages_promote_only_complete_review_partitions()
     test_high_pressure_secondary_review_rejects_incomplete_phrase_boundaries()
+    test_secondary_page_promotion_distinguishes_safe_and_attached_boundaries()
+    test_complete_from_gerund_page_beats_single_50px_fallback()
+    test_nested_continuation_clause_starts_after_punctuation_not_introducer()
+    test_three_line_fallback_promotes_complete_two_page_alternative()
     test_line_wrap_downranks_page_syntax_without_blocking_same_screen_lines()
     test_same_screen_subject_predicate_wrap_keeps_preferred_font()
     test_same_screen_line_wrap_keeps_atomic_language_units_hard()
