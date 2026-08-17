@@ -1,39 +1,37 @@
 # Project State
 Status: complete
-Last verified: 2026-08-17 20:30:42 Asia/Shanghai
+Last verified: 2026-08-17 23:31:32 Asia/Shanghai
 Branch: main
-Verified HEAD: 55974cc99542d36559ad2f063247f1997cf1497d
-Working tree: modified; pre-existing work plus current manual-editor changes
+Verified HEAD: 9e1d0b32f4ccf8039176818b3e87c76f8aed2aa5
+Working tree: clean except untracked local audit output under `output/`
 
 ## Current Goal
-Verify multiword English correction, combined mute-plus-tail deletion, and read-only English copy end to end.
+Improve long-caption automatic pagination without changing frozen subtitle authority.
 
 ## Confirmed Facts
-- Contiguous raw word IDs can map to one display surface without changing raw IDs or word times.
-- Display overrides survive separate one-word edits, parent merge, save/reload, undo, and redo.
-- A tail cut cannot split a display override; complete retained/removed spans stay atomic.
-- Media derivation schema v2 supports ordered mute intervals plus an optional suffix cut from original media.
-- Selected English rows copy in display order through `Ctrl+C` or `复制英文` without session mutation.
-- Focused suites and the complete unified regression pass.
+- The v25 planner keeps the existing whole-episode sequence pass, then promotes only an already validated cross-page-count candidate that objectively dominates its baseline.
+- Promoted pages retain fixed English, IDs, ledger ownership, word times, parent timing, parent Chinese, and synthesis authority.
+- The oil replay changes only S0059 (9+8), S0081 (8+8), and S0135 (10+4 to one 14-word page).
+- Pages over 14 words fall 21 to 19; pages below 56px fall 16 to 14; three-line pages stay at 3.
 
 ## Approved Decisions
-- Preserve fixed subtitle IDs, raw word ledger, word times, cue timing, and automatic pagination policy.
-- Treat multiword correction as presentation-only many-to-one projection, not free English rewriting.
-- Always derive edited audio once from the hash-bound original media.
+- Keep automatic promotion conservative; unresolved long captions remain manual-review work.
+- Rebuild only v24 page-layout/page-Chinese cache identity; preserve unrelated ASR and translation caches.
 
 ## Relevant Paths
-- `app/core/subtitle_processor/manual_final_subtitle_editor.py`
-- `app/view/subtitle_interface.py`
-- `tests/test_manual_final_subtitle_editor.py`
+- `app/core/utils/podcast_learning_video.py`
+- `app/core/subtitle_processor/stable_display_page_contract.py`
+- `tests/test_article_display_readability_contract.py`
+- `output/article-page-shadow-20260817/oil-market-v25-production-audit.json`
 
 ## Last Verification
-- `runtime\python.exe scripts\run_regression.py` and `git diff --check` exit zero.
+- Article readability, stable page-Chinese, and complete `scripts/run_regression.py` suites passed; `git diff --check` passed.
 
 ## Next Action
-Restart the GUI and smoke-test copy, multiword correction, and mute-plus-tail deletion on a duplicate package.
+Restart the GUI and run one new audio through the normal workflow to validate v25 on unseen material.
 
 ## Do Not Regress
-- Do not mutate original media, frozen IDs, raw word times, or automatic English segmentation.
+- Do not mutate fixed English, subtitle IDs, word ledger/times, cue timing, parent Chinese, or manifest-owned synthesis input.
 
 ## Unknowns
-- Fresh mouse-driven GUI smoke remains pending after automated verification.
+- Blind-sample behavior on a fresh unseen audio has not yet been measured.
