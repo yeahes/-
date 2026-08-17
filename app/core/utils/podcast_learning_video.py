@@ -320,6 +320,9 @@ ARTICLE_PAGE_PHRASE_START_WORDS = frozenset(
         "to", "under", "until", "with", "without",
     }
 )
+ARTICLE_PAGE_OPTIONAL_TEMPORAL_ADJUNCT_START_WORDS = frozenset(
+    {"after", "before", "during"}
+)
 ARTICLE_PAGE_CONTINUATION_START_WORDS = frozenset(
     (LINE_BREAK_AVOID_BEFORE_WORDS - ARTICLE_PAGE_PHRASE_START_WORDS)
     | {"and", "but", "nor", "or", "so", "yet"}
@@ -2299,23 +2302,7 @@ def _looks_like_numeric_phrase_boundary(words: list[str], split: int) -> bool:
 
     previous = normalized(split - 1)
     following = normalized(split)
-    nearby_left = [normalized(index) for index in range(max(0, split - 5), split)]
-    has_nearby_quantity = any(
-        is_numeric_value(token) or token in ENGLISH_NUMERIC_MAGNITUDE_WORDS
-        for token in nearby_left
-    )
-    if (
-        has_nearby_quantity
-        and following in ENGLISH_RATE_DETERMINERS
-        and split + 1 < len(words)
-        and normalized(split + 1) in ENGLISH_RATE_PERIOD_WORDS
-    ):
-        return True
-    if (
-        has_nearby_quantity
-        and previous in ENGLISH_RATE_DETERMINERS
-        and following in ENGLISH_RATE_PERIOD_WORDS
-    ):
+    if _looks_like_numeric_rate_boundary(words, split):
         return True
     if is_numeric_value(previous) and is_numeric_value(following):
         return True
@@ -2344,6 +2331,39 @@ def _looks_like_numeric_phrase_boundary(words: list[str], split: int) -> bool:
     ):
         return True
     return False
+
+
+def _looks_like_numeric_rate_boundary(words: list[str], split: int) -> bool:
+    """Keep an evidenced amount together with ``a/per + period``."""
+    if split <= 0 or split >= len(words):
+        return False
+
+    def normalized(index: int) -> str:
+        return re.sub(r"[^A-Za-z0-9'.]", "", words[index]).lower()
+
+    def is_quantity(token: str) -> bool:
+        return bool(
+            re.fullmatch(r"\d+(?:[.,]\d+)?", token)
+            or token in ENGLISH_NUMERIC_MAGNITUDE_WORDS
+        )
+
+    previous = normalized(split - 1)
+    following = normalized(split)
+    nearby_left = [normalized(index) for index in range(max(0, split - 5), split)]
+    has_nearby_quantity = any(is_quantity(token) for token in nearby_left)
+    return bool(
+        (
+            has_nearby_quantity
+            and following in ENGLISH_RATE_DETERMINERS
+            and split + 1 < len(words)
+            and normalized(split + 1) in ENGLISH_RATE_PERIOD_WORDS
+        )
+        or (
+            has_nearby_quantity
+            and previous in ENGLISH_RATE_DETERMINERS
+            and following in ENGLISH_RATE_PERIOD_WORDS
+        )
+    )
 
 
 def _caption_line_break_penalty(words: list[str], split: int) -> int:
@@ -5418,6 +5438,11 @@ def _build_article_english_page_plan(
             )
         )
         selection_pool = strict_candidates or eligible_candidates
+        # Diagnostic callers may compare production selection with the wider
+        # bounded frontier.  These candidates have already passed word-cover,
+        # timing, layout, and minimum raw-hard-risk filtering; exposing them
+        # does not grant them production authority.
+        shadow_candidates = list(eligible_candidates)
         secondary_review_candidates = _article_high_pressure_review_candidates(
             eligible_candidates,
             total_word_count=len(words),
@@ -5544,6 +5569,7 @@ def _build_article_english_page_plan(
             return {
                 "status": "candidate_bundle",
                 "candidates": selection_pool,
+                "shadow_candidates": shadow_candidates,
                 "preferred_page_count": base_preferred_page_count,
                 "candidate_mode": candidate_mode,
             }
@@ -5562,13 +5588,22 @@ def _build_article_english_page_plan(
                 candidate["quality_cost"],
             ),
         )
+        selected = _select_article_dominant_readability_candidate(
+            cue,
+            selected,
+            shadow_candidates,
+        )
         selected["plan"]["page_count_decision"] = {
             "preferred": base_preferred_page_count,
-            "selected": selected_page_count,
+            "selected": int(selected.get("page_count") or selected_page_count),
             "candidate_mode": (
                 candidate_mode
             ),
-            "basis": "pixel_word_chinese_duration_load",
+            "basis": (
+                "dominant_cross_page_count_candidate"
+                if selected.get("dominant_readability_promoted")
+                else "pixel_word_chinese_duration_load"
+            ),
         }
         return _finalize_article_same_screen_layout(
             cue,
@@ -5982,6 +6017,265 @@ def _article_candidate_sequence_cost(candidate: Mapping[str, object]) -> float:
     )
 
 
+def _article_candidate_readability_metrics(
+    candidate: Mapping[str, object],
+) -> dict[str, float | int]:
+    """Summarize objective display load for cross-page-count comparison."""
+    pages = list((candidate.get("plan") or {}).get("pages") or [])
+    word_counts = [len(str(page.get("en") or "").split()) for page in pages]
+    font_sizes = [
+        int(
+            page.get("english_font_size")
+            or candidate.get("plan", {}).get("font_size", {}).get("english")
+            or 0
+        )
+        for page in pages
+    ]
+    pressures = [_article_display_page_pressure(page) for page in pages]
+    return {
+        "page_count": len(pages),
+        "min_font": min(font_sizes, default=0),
+        "max_words": max(word_counts, default=0),
+        "min_words": min(word_counts, default=0),
+        "max_pressure": max(pressures, default=0.0),
+        "low_font_pages": sum(
+            font_size < ARTICLE_SUBTITLE_EN_FONT_SIZE
+            for font_size in font_sizes
+        ),
+        "over_16_pages": sum(
+            word_count > ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS
+            for word_count in word_counts
+        ),
+        "three_line_pages": sum(
+            len(list(page.get("en_lines") or [])) > 2 for page in pages
+        ),
+        "risk_score": int(candidate.get("risk_score") or 0),
+        "review_count": int(candidate.get("review_count") or 0),
+        "incomplete_review_count": int(
+            candidate.get("incomplete_review_count") or 0
+        ),
+        "severe_risk_count": int(candidate.get("severe_risk_count") or 0),
+        "relaxed_raw_hard_count": int(
+            candidate.get("relaxed_raw_hard_count") or 0
+        ),
+    }
+
+
+def _article_added_reviews_are_complete_phrases(
+    cue: Cue,
+    baseline: Mapping[str, object],
+    candidate: Mapping[str, object],
+) -> bool:
+    """Allow one new review edge only for a complete visible phrase."""
+    baseline_metrics = _article_candidate_readability_metrics(baseline)
+    candidate_metrics = _article_candidate_readability_metrics(candidate)
+    baseline_reviews = int(baseline_metrics["review_count"])
+    candidate_reviews = int(candidate_metrics["review_count"])
+    if candidate_reviews > baseline_reviews + 1:
+        return False
+    words = _article_boundary_words(cue)
+    reviewable_phrase_issues = {
+        "dependency_phrase_entrance_split",
+        "object_attached_modifier_split",
+        "unsupported_tight_page_transition",
+    }
+    for page in list((candidate.get("plan") or {}).get("pages") or [])[1:]:
+        decision = page.get("boundary_before") or {}
+        if str(decision.get("classification") or "") != "review":
+            continue
+        if decision.get("relaxed_raw_hard"):
+            return False
+        issue_codes = {
+            str(value) for value in decision.get("issue_codes") or []
+        }
+        split = int(page.get("word_start") or 0)
+        first_word = (
+            re.sub(r"[^A-Za-z']", "", words[split]).casefold()
+            if 0 <= split < len(words)
+            else ""
+        )
+        attached_modifier_is_optional_temporal_adjunct = bool(
+            "object_attached_modifier_split" in issue_codes
+            and first_word in ARTICLE_PAGE_OPTIONAL_TEMPORAL_ADJUNCT_START_WORDS
+        )
+        if (
+            "object_attached_modifier_split" in issue_codes
+            and not attached_modifier_is_optional_temporal_adjunct
+        ):
+            return False
+        if (
+            not issue_codes
+            or not issue_codes <= reviewable_phrase_issues
+            or not _article_page_can_start_with_complete_phrase(words, split)
+        ):
+            return False
+    return True
+
+
+def _article_mark_dominant_readability_candidate(
+    candidate: Mapping[str, object],
+    reason: str,
+) -> dict:
+    promoted = dict(candidate)
+    plan = dict(promoted.get("plan") or {})
+    plan["readability_selection"] = {
+        "basis": "dominant_cross_page_count_candidate",
+        "reason": reason,
+    }
+    promoted["plan"] = plan
+    promoted["dominant_readability_promoted"] = reason
+    return promoted
+
+
+def _select_article_dominant_readability_candidate(
+    cue: Cue,
+    baseline: Mapping[str, object],
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    """Promote only a cross-page-count candidate with a non-compensating win.
+
+    Stable English and timing have already been frozen.  This selector may
+    only choose another validated renderer projection: it cannot create a new
+    boundary, relax an atomic issue, or change any word ownership.
+    """
+    baseline_metrics = _article_candidate_readability_metrics(baseline)
+    words = _article_boundary_words(cue)
+    eligible: list[tuple[str, Mapping[str, object], dict[str, float | int]]] = []
+    for candidate in candidates:
+        metrics = _article_candidate_readability_metrics(candidate)
+        pages = list((candidate.get("plan") or {}).get("pages") or [])
+        if (
+            int(metrics["severe_risk_count"])
+            or int(metrics["relaxed_raw_hard_count"])
+            or int(metrics["three_line_pages"])
+            > int(baseline_metrics["three_line_pages"])
+            or int(metrics["min_words"])
+            < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+            or not _article_added_reviews_are_complete_phrases(
+                cue,
+                baseline,
+                candidate,
+            )
+            or any(
+                str(
+                    (page.get("boundary_before") or {}).get("classification")
+                    or ""
+                )
+                == "reject"
+                or bool(
+                    _article_nonoverridable_atomic_page_boundary_issues(
+                        page.get("boundary_before") or {}
+                    )
+                )
+                or _looks_like_numeric_rate_boundary(
+                    words,
+                    int(page.get("word_start") or 0),
+                )
+                for page in pages[1:]
+            )
+        ):
+            continue
+        page_delta = int(metrics["page_count"]) - int(
+            baseline_metrics["page_count"]
+        )
+        risk_not_worse = int(metrics["risk_score"]) <= int(
+            baseline_metrics["risk_score"]
+        )
+        if page_delta < 0:
+            if (
+                risk_not_worse
+                and int(metrics["min_font"]) >= ARTICLE_SUBTITLE_EN_FONT_SIZE
+                and int(metrics["max_words"])
+                <= ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
+                and float(metrics["max_pressure"])
+                <= float(baseline_metrics["max_pressure"])
+                + ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA
+            ):
+                eligible.append(("fewer_comfortable_pages", candidate, metrics))
+            continue
+        if page_delta > 0:
+            baseline_needs_relief = bool(
+                int(baseline_metrics["low_font_pages"])
+                or int(baseline_metrics["over_16_pages"])
+                or int(baseline_metrics["three_line_pages"])
+            )
+            if (
+                baseline_needs_relief
+                and int(metrics["min_font"]) >= ARTICLE_SUBTITLE_EN_FONT_SIZE
+                and int(metrics["max_words"])
+                <= ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
+                and int(metrics["min_words"])
+                >= ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+                and float(metrics["max_pressure"])
+                < float(baseline_metrics["max_pressure"])
+            ):
+                eligible.append(("objective_pressure_relief", candidate, metrics))
+            continue
+        dominates = bool(
+            risk_not_worse
+            and int(metrics["incomplete_review_count"])
+            <= int(baseline_metrics["incomplete_review_count"])
+            and int(metrics["low_font_pages"])
+            <= int(baseline_metrics["low_font_pages"])
+            and int(metrics["over_16_pages"])
+            <= int(baseline_metrics["over_16_pages"])
+            and int(metrics["max_words"]) <= int(baseline_metrics["max_words"])
+            and float(metrics["max_pressure"])
+            <= float(baseline_metrics["max_pressure"])
+            and (
+                int(metrics["low_font_pages"])
+                < int(baseline_metrics["low_font_pages"])
+                or int(metrics["over_16_pages"])
+                < int(baseline_metrics["over_16_pages"])
+                or int(metrics["max_words"]) < int(baseline_metrics["max_words"])
+                or float(metrics["max_pressure"])
+                < float(baseline_metrics["max_pressure"])
+            )
+        )
+        if dominates:
+            eligible.append(("same_page_count_dominance", candidate, metrics))
+
+    fewer_pages = [item for item in eligible if item[0] == "fewer_comfortable_pages"]
+    if fewer_pages:
+        reason, selected, _ = min(
+            fewer_pages,
+            key=lambda item: (
+                int(item[2]["page_count"]),
+                float(item[2]["max_pressure"]),
+                float(item[1].get("quality_cost") or 0.0),
+            ),
+        )
+        return _article_mark_dominant_readability_candidate(selected, reason)
+    pressure_relief = [item for item in eligible if item[0] == "objective_pressure_relief"]
+    if pressure_relief:
+        reason, selected, _ = min(
+            pressure_relief,
+            key=lambda item: (
+                int(item[2]["low_font_pages"]),
+                int(item[2]["over_16_pages"]),
+                float(item[2]["max_pressure"]),
+                int(item[2]["risk_score"]),
+                int(item[2]["page_count"]),
+            ),
+        )
+        return _article_mark_dominant_readability_candidate(selected, reason)
+    same_page_count = [
+        item for item in eligible if item[0] == "same_page_count_dominance"
+    ]
+    if same_page_count:
+        reason, selected, _ = min(
+            same_page_count,
+            key=lambda item: (
+                int(item[2]["low_font_pages"]),
+                int(item[2]["over_16_pages"]),
+                float(item[2]["max_pressure"]),
+                int(item[2]["risk_score"]),
+            ),
+        )
+        return _article_mark_dominant_readability_candidate(selected, reason)
+    return baseline
+
+
 def _select_article_page_plan_sequence(
     candidate_groups: Sequence[Sequence[Mapping[str, object]]],
 ) -> list[Mapping[str, object]]:
@@ -6064,9 +6358,13 @@ def _finalize_article_sequence_candidate(
         "selected": int(candidate.get("page_count") or 1),
         "candidate_mode": str(bundle.get("candidate_mode") or "strict"),
         "basis": (
-            "high_pressure_secondary_review"
-            if candidate.get("secondary_review_promoted")
-            else "semantic_pixel_duration_sequence_pressure"
+            "dominant_cross_page_count_candidate"
+            if candidate.get("dominant_readability_promoted")
+            else (
+                "high_pressure_secondary_review"
+                if candidate.get("secondary_review_promoted")
+                else "semantic_pixel_duration_sequence_pressure"
+            )
         ),
     }
     return plan
@@ -6181,6 +6479,14 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
         raise RenderStructuralOverflowError(
             [{"cue_index": "all", "reason": "display_page_sequence_unavailable"}]
         )
+    selected_candidates = [
+        _select_article_dominant_readability_candidate(
+            cue,
+            selected,
+            bundle.get("shadow_candidates") or (),
+        )
+        for cue, bundle, selected in zip(cues, bundles, selected_candidates)
+    ]
 
     parents: list[dict] = []
     render_plans: list[dict] = []

@@ -78,6 +78,14 @@
   after strict planning fails. This ordering applies only inside one frozen
   cue and cannot change English text, subtitle IDs, word ownership, parent
   Chinese, or cue timing.
+- After whole-episode sequence selection, one bounded cross-page-count pass may
+  replace the baseline only with a strictly dominant validated projection. A
+  promoted split must keep every page at 56px, at least six words, and at least
+  900ms; lower maximum pressure; and add no severe, relaxed-atomic,
+  numeric-rate, or incomplete attached boundary. A promoted merge must remain
+  a comfortable 56px page. The decision and reason are recorded in the page
+  artifact. This pass chooses among already enumerated word-ledger candidates
+  and cannot create a new cut or mutate the frozen cue.
 - A multipage cue uses deterministic display-page IDs below the frozen parent
   subtitle ID. Chinese page meaning must be assigned to those IDs explicitly;
   proportional character slicing is forbidden.

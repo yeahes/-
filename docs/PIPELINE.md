@@ -528,9 +528,13 @@ Rule:
   English pixels, Chinese pixels, word load, and cue duration choose candidate
   page counts before any break reward is considered. A bounded cue-local
   frontier retains several distinct partitions for each page count and
-  strict/review/forced fallback tier. The whole-episode dynamic program may
-  penalize adjacent dense pages, but it compares boundaries only within the
-  locally selected page count. Within each candidate, allowed, low-, medium-,
+  strict/review/forced fallback tier. The whole-episode dynamic program first
+  selects within the locally preferred page count and may penalize adjacent
+  dense pages. A final bounded dominance pass may then choose another page
+  count only when it objectively improves the selected baseline: every page
+  keeps at least six words and 900ms, reaches 56px, lowers measured pressure or
+  removes a short tail, and introduces no severe, atomic, numeric-rate, or
+  incomplete attached boundary. Within each candidate, allowed, low-, medium-,
   and high-risk transitions are graded before final-font line balance and
   visual cost.
   A complete sentence that fits a static two-line layout may remain one page
@@ -580,7 +584,7 @@ Rule:
   or timing.
   Article-template Chinese uses a fixed 48px font, at most two lines, and the
   existing 1455-design-pixel safe width.
-  The page contract version is `article-fixed-font-pages-v24`, so page-layout
+  The page contract version is `article-fixed-font-pages-v25`, so page-layout
   and page-translation caches from earlier planner versions cannot be reused;
   unchanged ASR, full-translation, and fixed-ID allocation caches remain
   independently reusable under their own fingerprints.

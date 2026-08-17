@@ -518,6 +518,104 @@ def test_zero_relative_tail_does_not_become_an_isolated_display_page():
     assert " ".join(page["en"] for page in plan["pages"]) == text
 
 
+def test_dominant_readability_selection_relieves_low_font_with_complete_phrases():
+    cases = (
+        {
+            "subtitle_id": "S0059",
+            "text": (
+                "They basically commanded heavy industry to dial back consumption "
+                "during the exact window the strait was shut."
+            ),
+            "chinese": "他们基本上下令重工业在海峡关闭期间减少消耗。",
+            "word_ids": range(626, 643),
+            "starts": (
+                219847, 220007, 220487, 220967, 221307, 222068, 222388,
+                222688, 222909, 223809, 224109, 224289, 224750, 225130,
+                225250, 225510, 225650,
+            ),
+            "ends": (
+                219967, 220447, 220867, 221227, 221748, 222168, 222648,
+                222869, 223449, 224049, 224209, 224670, 225070, 225230,
+                225470, 225610, 225871,
+            ),
+            "expected_pages": (
+                "They basically commanded heavy industry to dial back consumption",
+                "during the exact window the strait was shut.",
+            ),
+        },
+        {
+            "subtitle_id": "S0081",
+            "text": (
+                "I read it extracted up to 5.7 trillion from the global economy "
+                "between 1970 and 2014."
+            ),
+            "chinese": "我读到1970至2014年，它从全球经济抽走最多5.7万亿美元。",
+            "word_ids": range(873, 889),
+            "starts": (
+                303302, 303422, 303603, 303743, 304203, 304283, 304463,
+                305364, 306404, 306524, 306625, 307025, 307485, 308206,
+                308626, 308746,
+            ),
+            "ends": (
+                303362, 303562, 303663, 304163, 304263, 304383, 304983,
+                306344, 306504, 306605, 306985, 307425, 308166, 308586,
+                308706, 309526,
+            ),
+            "expected_pages": (
+                "I read it extracted up to 5.7 trillion",
+                "from the global economy between 1970 and 2014.",
+            ),
+        },
+    )
+    for case in cases:
+        timing = _production_word_timing(
+            case["text"].split(),
+            case["word_ids"],
+            case["starts"],
+            case["ends"],
+        )
+        _, cue = _syntax_backed_cue(
+            case["text"],
+            case["subtitle_id"],
+            word_timing=timing,
+        )
+        cue.zh = case["chinese"]
+
+        plan = _plan(cue)
+
+        assert tuple(page["en"] for page in plan["pages"]) == case["expected_pages"]
+        assert all(page["english_font_size"] == 56 for page in plan["pages"])
+        assert all(page["end"] - page["start"] >= 0.9 for page in plan["pages"])
+        assert all(len(page["en"].split()) >= 6 for page in plan["pages"])
+
+
+def test_dominant_readability_selection_merges_a_comfortable_short_tail():
+    text = (
+        "Time that must be used to aggressively diversify supply sources and "
+        "reduce overall consumption."
+    )
+    timing = _production_word_timing(
+        text.split(),
+        range(1436, 1450),
+        (
+            492769, 493190, 493330, 493530, 493730, 493890, 494050,
+            494731, 495331, 495711, 496632, 496732, 497192, 497533,
+        ),
+        (
+            493150, 493290, 493470, 493630, 493850, 493990, 494671,
+            495291, 495671, 496052, 496692, 497092, 497513, 498033,
+        ),
+    )
+    _, cue = _syntax_backed_cue(text, "S0135", word_timing=timing)
+    cue.zh = "这段时间必须用来积极推进供应来源多元化，并降低整体消费。"
+
+    plan = _plan(cue)
+
+    assert [page["en"] for page in plan["pages"]] == [text]
+    assert plan["pages"][0]["english_font_size"] == 56
+    assert len(plan["pages"][0]["en_lines"]) <= 2
+
+
 def test_wh_clause_boundary_is_not_used_for_chinese_businesses_page_change():
     text = (
         "The research shows that Chinese businesses, collectively, spend less than "
@@ -968,6 +1066,72 @@ def test_production_candidate_bundle_keeps_a_bounded_visual_frontier():
         " ".join(page["en"] for page in candidate["plan"]["pages"])
         == text
         for candidate in two_page_candidates
+    )
+
+
+def test_shadow_candidate_frontier_exposes_alternatives_without_changing_production():
+    text = (
+        "Customers save money every day, stores grow quickly across China, "
+        "workers gain valuable experience, and communities receive reliable "
+        "services nationwide."
+    )
+    words = text.split()
+    cue = _cue(
+        text,
+        "S9305",
+        display_boundary_evidence={
+            str(index): {
+                "hard_issues": [],
+                "soft_issues": [],
+                "pause_ms": 600,
+            }
+            for index in range(1, len(words))
+        },
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    production_plan = podcast_learning_video._build_article_english_page_plan(
+        cue,
+        draw,
+    )
+    bundle = podcast_learning_video._build_article_english_page_plan(
+        cue,
+        draw,
+        _return_candidates=True,
+    )
+
+    assert bundle["status"] == "candidate_bundle"
+    assert bundle["shadow_candidates"]
+    assert {
+        candidate["page_count"] for candidate in bundle["candidates"]
+    } == {bundle["preferred_page_count"]}
+    assert {
+        candidate["page_count"] for candidate in bundle["shadow_candidates"]
+    } >= {
+        candidate["page_count"] for candidate in bundle["candidates"]
+    }
+    selected = min(
+        bundle["candidates"],
+        key=lambda candidate: (
+            candidate["risk_score"],
+            candidate["high_risk_count"],
+            candidate["medium_risk_count"],
+            candidate["low_risk_count"],
+            candidate["font_reduction"],
+            candidate["quality_cost"],
+        ),
+    )
+    assert [
+        (page["word_start"], page["word_end"], page["start"], page["end"])
+        for page in selected["plan"]["pages"]
+    ] == [
+        (page["word_start"], page["word_end"], page["start"], page["end"])
+        for page in production_plan["pages"]
+    ]
+    assert all(
+        " ".join(page["en"] for page in candidate["plan"]["pages"])
+        == text
+        for candidate in bundle["shadow_candidates"]
     )
 
 
@@ -3449,6 +3613,8 @@ if __name__ == "__main__":
     test_visual_planning_reuses_the_complete_frozen_page_projection()
     test_subject_predicate_boundary_is_not_used_for_efficiency_gap_page_change()
     test_zero_relative_tail_does_not_become_an_isolated_display_page()
+    test_dominant_readability_selection_relieves_low_font_with_complete_phrases()
+    test_dominant_readability_selection_merges_a_comfortable_short_tail()
     test_wh_clause_boundary_is_not_used_for_chinese_businesses_page_change()
     test_infinitive_phrase_remains_single_page_when_two_lines_fit_at_allowed_font()
     test_page_translation_contract_rejects_a_chinese_token_split_across_pages()
@@ -3463,6 +3629,7 @@ if __name__ == "__main__":
     test_manual_page_proposal_requires_explicit_hard_boundary_override()
     test_automatic_page_limit_stays_four_while_manual_can_request_six()
     test_production_candidate_bundle_keeps_a_bounded_visual_frontier()
+    test_shadow_candidate_frontier_exposes_alternatives_without_changing_production()
     test_production_candidates_score_the_same_font_used_by_final_reflow()
     test_medium_review_boundary_can_beat_static_font_reduction_on_quality()
     test_relaxed_raw_hard_boundary_cannot_beat_strict_static_layout()

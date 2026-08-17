@@ -199,6 +199,16 @@ model reset; full reset remains reserved for imports and view-mode switches.
 Read-only replay on two real packages preserved unrelated parents across edit,
 split, undo, and redo. The final complete regression passed in 346.3 seconds.
 
+2026-08-17 automatic-planner increment: the production planner now exposes a
+bounded cross-page-count shadow frontier and applies a conservative dominance
+selector only after the existing whole-episode sequence pass. It may promote
+an already valid 56px partition or merge a short tail, but it cannot invent a
+cut, relax an atomic/numeric-rate boundary, accept an incomplete attached
+phrase, or change frozen IDs, English, word ownership, timing, or parent
+Chinese. The 140-cue oil replay changed three parents, reduced over-14-word and
+low-font pages without adding three-line pages, and passed the focused page,
+page-Chinese, and complete regression suites.
+
 ### 5. Optional AI boundary fallback
 
 - Offer only when deterministic candidates remain high risk.

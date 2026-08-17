@@ -2,6 +2,29 @@
 
 Last updated: 2026-08-17
 
+## 2026-08-17 Conservative Cross-Page-Count Readability Selection
+
+- The article planner now retains a bounded read-only candidate frontier across
+  page counts. Normal whole-episode sequence selection still runs first; a final
+  selector promotes only an already validated candidate that objectively
+  dominates the selected baseline.
+- Promotion cannot create cuts or change fixed English, subtitle IDs, the word
+  ledger, word times, parent cue timing, parent Chinese, or synthesis authority.
+  Every promoted page keeps at least six words and 900ms, reaches 56px, and adds
+  no severe, relaxed-atomic, numeric-rate, or incomplete attached boundary.
+- The page contract is `article-fixed-font-pages-v25`. Old page-layout and page
+  Chinese caches are rebuilt; ASR, full-translation, and fixed-ID allocation
+  retain their independent cache identities.
+- Read-only replay of the 140-cue `石油市场，现在中国说了算？` artifact changed
+  only `S0059` (17 words to 9+8 at 56px), `S0081` (16 words to 8+8 at
+  56px), and `S0135` (10+4 pages to one 14-word 56px page). Total pages changed
+  156 to 157; pages over 14 words fell 21 to 19, pages over 16 words fell 9 to
+  8, pages below 56px fell 16 to 14, and three-line pages stayed at 3.
+- The article readability contract, stable page-Chinese contract, and complete
+  regression command pass. The reproducible audit is
+  `output/article-page-shadow-20260817/oil-market-v25-production-audit.json`
+  and remains an untracked local artifact.
+
 ## 2026-08-17 Balanced Same-Screen Wrap And Manual Split Fallback
 
 - Article-template same-screen English wrapping now compares every legal width
