@@ -58,6 +58,7 @@ def test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only():
                             {
                                 "subtitle_ids": ["S0004", "S0005"],
                                 "mapping_valid": True,
+                                "confidence": "high",
                                 "confidence_score": 0.9,
                                 "reason": "semantic_loss",
                                 "rule_codes": ["semantic_loss"],
@@ -216,9 +217,24 @@ def test_review_marks_ignore_noisy_audits_and_keep_verified_id_markers_only():
         assert "S0002" not in marks
         assert "S0006" not in marks
         assert "S0099" not in marks
-        assert "S0009" not in marks
-        assert "S0005" not in marks
-        assert "S0008" not in marks
+        assert (
+            "REVIEW",
+            "chinese_allocation",
+            "chinese",
+            "high_confidence_chinese_semantic_issue",
+        ) in _marks_for(marks, "S0009")
+        assert (
+            "REVIEW",
+            "chinese_allocation",
+            "chinese",
+            "high_confidence_chinese_semantic_issue",
+        ) in _marks_for(marks, "S0005")
+        assert (
+            "REVIEW",
+            "chinese_allocation",
+            "chinese",
+            "allocation_unresolved",
+        ) in _marks_for(marks, "S0008")
 
 
 def test_semantic_review_queue_is_loaded_as_id_bound_read_only_marks():

@@ -308,16 +308,32 @@ Rule:
   SRT, word ledger, final cue timeline, page translations, edit history, and a
   SHA-256-bound `stable-final-manifest.json`. It never overwrites the original
   stable package.
-- A manual English correction may replace the display surface of exactly one
-  frozen word ID while preserving that ID, its order, its time range, and the
-  cue/page word spans. The editor rejects multi-ID free rewriting and marks the
-  corresponding Chinese for confirmation. The parent/actual-page context menu
-  exposes an explicit `修正当前英文（保持时间轴）` dialog so this operation does
-  not depend on the table delegate's unreliable inline double-click editor.
+- A manual English correction may replace the surface of one frozen word ID,
+  or map one continuous range of two or more frozen word IDs to one
+  presentation-only surface. The raw ledger text, word IDs, order, word times,
+  cue/page spans, and subtitle IDs remain unchanged. A many-to-one override
+  cannot cross a cue or page boundary and that override remains bound through
+  later merge, boundary, tail-trim, save/reload, undo, and redo operations.
+  Arbitrary multi-ID free rewriting remains rejected and affected Chinese is
+  marked for confirmation. The parent/actual-page context menu exposes an
+  explicit `修正当前英文（保持时间轴）` dialog so this operation does not depend
+  on the table delegate's unreliable inline double-click editor.
+- Selected visible English rows can be copied through `Ctrl+C` or the
+  `复制英文` context-menu action. Copying is read-only: it does not write the
+  table model, session, edit history, page state, or timeline.
 - A parent cue may be marked `display_suppressed`. Its visible SRT and page
   plan entries are omitted, but its fixed subtitle ID, word range, word times,
   and final-timeline record remain authoritative. This operation never trims
   or rewrites source media.
+- A separate parent-level operation may set both `display_suppressed` and
+  `media_muted`. Saving uses one schema-v2 media derivation whose optional
+  mute intervals run before its optional suffix-only `atrim`, followed by
+  `asetpts`. It always derives once from the hash-bound original media, never
+  from an older derivative. The decision binds the original-media SHA-256,
+  cue IDs and times, current word-ledger hash, optional cut, decision hash,
+  and derived-media SHA-256. Subtitle IDs and retained word/cue times do not
+  shift. Page-only mute remains unsupported; legacy one-operation packages
+  remain readable and are upgraded on the next save.
 - Manual-final imports have explicit checkpoint semantics. Importing
   `*-人工终稿字幕.srt` continues the latest hash-bound manual package. Importing
   `*-原文在上双语字幕.srt` starts again from the immutable stable parent
@@ -479,6 +495,11 @@ Rule:
 - A manifest carrying `tail_trim` owns its SHA-256-bound derived audio even when
   the caller still holds the original media path. The first tail-trim release is
   accepted only by the static podcast-template path; other renderers fail closed.
+- A manifest carrying `media_mute` likewise owns its SHA-256-bound derived
+  audio. `VideoSynthesisThread` always resolves manifest inputs before rendering,
+  so a stale original-media path cannot bypass interval mute. Missing, tampered,
+  or decision-mismatched media fails before rendering; the first release is
+  accepted only by the static podcast-template path.
 - A saved manual package that is blocked only by
   `render_structural_overflow`, `manual_page_translation_required`, or
   `manual_page_translation_invalid` may be opened through the explicit
@@ -546,20 +567,30 @@ Rule:
   manual page splitting, frozen-artifact validation, editor preview, and final
   rendering consume the same per-page font value.
   After those page spans, IDs, Chinese assignments, and page times are frozen,
-  a renderer-only pass compares the same page at 56/54/52/50px and selects its
-  same-screen one- or two-line English layout. It may treat broad clause and
-  subject/predicate evidence as a soft line-break score because both lines stay
-  visible, while lexical atoms remain hard. The previously selected layout is
-  retained as a baseline: reducing the font is legal only for a strictly better
-  line break, never to reproduce the same break at a smaller size. This pass
+  a renderer-only pass compares every legal width profile for the same page at
+  56/54/52/50px and selects its same-screen one- or two-line English layout.
+  Pixel-width balance is scored after lexical and frozen syntax protection, so
+  punctuation cannot win merely by leaving an extreme short line. A warning
+  that only means `unsupported_tight_page_transition` is ignored here because
+  both lines remain visible simultaneously; the real page planner still keeps
+  that timing risk. Lexical atoms remain hard. The previously selected layout
+  is retained as a baseline: reducing the font is legal only for a strictly
+  better layout, never to reproduce the same break at a smaller size. This pass
   has no write authority over page count, word ownership, ID, English, Chinese,
   or timing.
   Article-template Chinese uses a fixed 48px font, at most two lines, and the
   existing 1455-design-pixel safe width.
-  The page contract version is `article-fixed-font-pages-v22`, so page-layout
+  The page contract version is `article-fixed-font-pages-v24`, so page-layout
   and page-translation caches from earlier planner versions cannot be reused;
   unchanged ASR, full-translation, and fixed-ID allocation caches remain
   independently reusable under their own fingerprints.
+  Raw hard/atomic syntax evidence remains attached when an acoustic or
+  continuation fallback makes a boundary reviewable. Candidates without such
+  relaxed atomic evidence are selected first; a verified complete continuation
+  can re-enter only to replace an emergency three-line layout.
+  Page Chinese uses `fixed-parent-page-allocation-v6`. Its aggregate projection
+  is checked against the authoritative parent Chinese for repeated meaning and
+  significant expansion before the existing parent-local retry is accepted.
   Whole-episode selection adds a renderer-only continuity preference across
   already legal candidates: adjacent pressure changes are penalized after a
   free band, while font and line-count changes are weaker tie-breakers. The

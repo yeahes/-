@@ -10,6 +10,7 @@ import json
 import logging
 from pathlib import Path
 from threading import Lock, Thread
+from typing import Any, Mapping
 
 from openai import OpenAI
 from PyQt5.QtCore import (
@@ -22,7 +23,7 @@ from PyQt5.QtCore import (
     QAbstractTableModel,
     pyqtSignal,
 )
-from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent
+from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeySequence
 from PyQt5.QtWidgets import (
     QAbstractItemDelegate,
     QAbstractItemView,
@@ -36,6 +37,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QListWidget,
     QListWidgetItem,
+    QShortcut,
     QVBoxLayout,
     QWidget,
 )
@@ -99,7 +101,10 @@ from app.core.entities import (
 from app.core.task_factory import TaskFactory
 from app.core.output_paths import containing_media_result_dir, media_result_dir
 from app.core.utils.json_repair import loads as repair_json_loads
-from app.core.utils.podcast_learning_video import current_llm_config
+from app.core.utils.podcast_learning_video import (
+    ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES,
+    current_llm_config,
+)
 from app.core.utils.get_subtitle_style import get_subtitle_style
 from app.thread.subtitle_thread import SubtitleThread
 from app.thread.video_synthesis_thread import (
@@ -267,10 +272,16 @@ class SubtitleTableModel(QAbstractTableModel):
 
         marks = self._marks_for_segment(segment)
         if role == Qt.BackgroundRole:
+            if segment.get("media_muted"):
+                return QColor(126, 58, 58, 88)
             if segment.get("display_suppressed"):
                 return QColor(112, 112, 112, 72)
             return self._review_background(marks, col)
         if role == Qt.ToolTipRole:
+            if segment.get("media_muted"):
+                return self.tr(
+                    "该条字幕已隐藏；保存人工终稿后，对应音频区间也会静音。"
+                )
             if segment.get("display_suppressed"):
                 return self.tr("该条只隐藏字幕显示；原音频、词 ID 和时间轴仍保留。")
             review_tooltip = self._review_tooltip(marks, col)
@@ -1011,6 +1022,8 @@ class SubtitleInterface(QWidget):
         self.subtitle_table.setBorderVisible(True)
         self.subtitle_table.setBorderRadius(8)
         self.subtitle_table.setWordWrap(True)
+        self.subtitle_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.subtitle_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.model.modelReset.connect(self._apply_subtitle_table_column_layout)
         self._apply_subtitle_table_column_layout()
 
@@ -1033,6 +1046,12 @@ class SubtitleInterface(QWidget):
         self.subtitle_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.subtitle_table.customContextMenuRequested.connect(self.show_context_menu)
         self.subtitle_table.viewport().installEventFilter(self)
+        self.copy_english_shortcut = QShortcut(
+            QKeySequence.Copy,
+            self.subtitle_table,
+        )
+        self.copy_english_shortcut.setContext(Qt.WidgetShortcut)
+        self.copy_english_shortcut.activated.connect(self.copy_selected_english)
 
         self.review_color_legend = CaptionLabel(
             self.tr(
@@ -1207,7 +1226,7 @@ class SubtitleInterface(QWidget):
 
     def _manual_boundary_context(self, selected_row: int | None) -> dict | None:
         session = self.manual_final_session
-        if session is None or len(session.cues) < 2 or self.model.rowCount() < 2:
+        if session is None or self.model.rowCount() < 2:
             return None
         if selected_row is None:
             current = self.subtitle_table.currentIndex()
@@ -1217,9 +1236,14 @@ class SubtitleInterface(QWidget):
                 else self._manual_boundary_table_left_row
             )
         selected_row = int(selected_row)
-        if selected_row < 0 or selected_row + 1 >= self.model.rowCount():
+        if selected_row < 0 or selected_row >= self.model.rowCount():
             return None
-        left_row = selected_row
+        left_row = SubtitleInterface._manual_boundary_left_index(
+            self.model.rowCount(),
+            selected_row,
+        )
+        if left_row is None:
+            return None
         left = dict(self.model._data.get(str(left_row + 1)) or {})
         right = dict(self.model._data.get(str(left_row + 2)) or {})
         if not left or not right:
@@ -2994,7 +3018,8 @@ class SubtitleInterface(QWidget):
             set_manual_mode(True)
         self.subtitle_table.setToolTip(
             self.tr(
-                "双击英文可修正一个冻结词的词面；词 ID 和时间不变。"
+                "英文词面可修正单词，或把连续多个误识别词合并为一个词；"
+                "词 ID 和时间不变。"
                 "选中字幕后仍可使用英文单元格内的按钮调整相邻边界。"
             )
         )
@@ -3925,6 +3950,14 @@ class SubtitleInterface(QWidget):
         selected_data = [
             self.model._data.get(str(row + 1)) or {} for row in rows
         ]
+        copy_english_action = Action(FIF.COPY, self.tr("复制英文"))
+        copy_handler = getattr(self, "copy_selected_english", None)
+        if callable(copy_handler):
+            copy_english_action.triggered.connect(copy_handler)
+        menu.addAction(copy_english_action)
+        add_separator = getattr(menu, "addSeparator", None)
+        if callable(add_separator):
+            add_separator()
         page_rows = any(
             (self.model._data.get(str(row + 1)) or {}).get("display_page_view")
             for row in rows
@@ -3933,7 +3966,30 @@ class SubtitleInterface(QWidget):
             merge_action = Action(FIF.LINK, self.tr("合并相邻字幕"))
             menu.addAction(merge_action)
             merge_action.setShortcut("Ctrl+M")
-            merge_action.triggered.connect(lambda: self.merge_selected_rows(rows))
+            if self.manual_final_session:
+                stable_parent_ids = tuple(
+                    str(row.get("manual_cue_id") or "")
+                    for row in selected_data
+                )
+                merge_action.triggered.connect(
+                    lambda _checked=False, ids=stable_parent_ids: (
+                        self._queue_manual_structure_action(
+                            self._merge_manual_rows_by_stable_ids,
+                            ids,
+                            False,
+                        )
+                    )
+                )
+            else:
+                stable_rows = tuple(rows)
+                merge_action.triggered.connect(
+                    lambda _checked=False, selected=stable_rows: (
+                        self._queue_manual_structure_action(
+                            self.merge_selected_rows,
+                            list(selected),
+                        )
+                    )
+                )
         elif (
             len(rows) == 2
             and rows_are_contiguous
@@ -3950,7 +4006,18 @@ class SubtitleInterface(QWidget):
             merge_action = Action(FIF.LINK, self.tr(label))
             menu.addAction(merge_action)
             merge_action.setShortcut("Ctrl+M")
-            merge_action.triggered.connect(lambda: self.merge_selected_rows(rows))
+            stable_page_ids = tuple(
+                str(row.get("display_page_id") or "") for row in selected_data
+            )
+            merge_action.triggered.connect(
+                lambda _checked=False, ids=stable_page_ids: (
+                    self._queue_manual_structure_action(
+                        self._merge_manual_rows_by_stable_ids,
+                        ids,
+                        True,
+                    )
+                )
+            )
 
         if self.manual_final_session and len(rows) == 1:
             selected_row = rows[0]
@@ -3977,7 +4044,10 @@ class SubtitleInterface(QWidget):
                     merge_page_action.triggered.connect(
                         lambda _checked=False, pid=str(
                             selected.get("display_page_id") or ""
-                        ): self._merge_display_page_with_next(pid)
+                        ): self._queue_manual_structure_action(
+                            self._merge_display_page_with_next,
+                            pid,
+                        )
                     )
                     menu.addAction(merge_page_action)
                 current_parent_page_count = sum(
@@ -3989,7 +4059,8 @@ class SubtitleInterface(QWidget):
                 )
                 current_parent_page_count = max(current_parent_page_count, 1)
                 if (
-                    current_parent_page_count < 4
+                    current_parent_page_count
+                    < ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES
                     and int(selected.get("word_end", -1))
                     > int(selected.get("word_start", -1))
                 ):
@@ -4000,13 +4071,16 @@ class SubtitleInterface(QWidget):
                     split_current_page_action.triggered.connect(
                         lambda _checked=False, pid=str(
                             selected.get("display_page_id") or ""
-                        ): self._split_display_page(pid)
+                        ): self._queue_manual_structure_action(
+                            self._split_display_page,
+                            pid,
+                        )
                     )
                     menu.addAction(split_current_page_action)
                 focus_word_id = int(selected.get("word_start"))
                 for target_parent_page_count in range(
                     current_parent_page_count + 1,
-                    5,
+                    ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES + 1,
                 ):
                     split_action = Action(
                         FIF.EDIT,
@@ -4019,7 +4093,8 @@ class SubtitleInterface(QWidget):
                         pid=parent_id,
                         count=target_parent_page_count,
                         focus=focus_word_id: (
-                            self._split_parent_into_display_pages(
+                            self._queue_manual_structure_action(
+                                self._split_parent_into_display_pages,
                                 pid,
                                 count,
                                 focus_word_id=focus,
@@ -4107,20 +4182,36 @@ class SubtitleInterface(QWidget):
                 )
                 menu.addAction(edit_english_action)
                 suppressed = bool(selected.get("display_suppressed"))
-                suppress_action = Action(
-                    FIF.VIEW if suppressed else FIF.DELETE,
+                media_muted = bool(selected.get("media_muted"))
+                if not media_muted:
+                    suppress_action = Action(
+                        FIF.VIEW if suppressed else FIF.DELETE,
+                        self.tr(
+                            "恢复显示这条字幕"
+                            if suppressed
+                            else "隐藏这条字幕（保留音频）"
+                        ),
+                    )
+                    suppress_action.triggered.connect(
+                        lambda _checked=False, pid=parent_id, hide=not suppressed: (
+                            self._set_manual_cue_display_suppressed(pid, hide)
+                        )
+                    )
+                    menu.addAction(suppress_action)
+                mute_action = Action(
+                    FIF.VOLUME,
                     self.tr(
-                        "恢复显示这条字幕"
-                        if suppressed
-                        else "隐藏这条字幕（保留音频）"
+                        "恢复字幕和声音"
+                        if media_muted
+                        else "隐藏整条字幕并静音这段"
                     ),
                 )
-                suppress_action.triggered.connect(
-                    lambda _checked=False, pid=parent_id, hide=not suppressed: (
-                        self._set_manual_cue_display_suppressed(pid, hide)
+                mute_action.triggered.connect(
+                    lambda _checked=False, pid=parent_id, enabled=not media_muted: (
+                        self._set_manual_cue_hidden_and_media_muted(pid, enabled)
                     )
                 )
-                menu.addAction(suppress_action)
+                menu.addAction(mute_action)
             selected_page_id = str(selected.get("display_page_id") or "")
             tail_target_available = bool(
                 selected_page_id or not selected.get("display_page_view")
@@ -4155,6 +4246,83 @@ class SubtitleInterface(QWidget):
 
         # 显示菜单
         menu.exec(self.subtitle_table.viewport().mapToGlobal(pos))
+
+    def _selected_english_text(self) -> str:
+        rows = sorted(
+            {index.row() for index in self.subtitle_table.selectedIndexes()}
+        )
+        english_rows = []
+        for row in rows:
+            value = str(
+                (self.model._data.get(str(row + 1)) or {}).get(
+                    "original_subtitle"
+                )
+                or ""
+            ).strip()
+            if value:
+                english_rows.append(value)
+        return "\n".join(english_rows)
+
+    def copy_selected_english(self) -> str:
+        """Copy visible English rows without entering the edit pipeline."""
+        text = self._selected_english_text()
+        if text:
+            QApplication.clipboard().setText(text)
+        return text
+
+    @staticmethod
+    def _queue_manual_structure_action(callback, *args, **kwargs) -> None:
+        """Run model-resetting actions after the native menu loop exits."""
+        QTimer.singleShot(0, lambda: callback(*args, **kwargs))
+
+    def _merge_manual_rows_by_stable_ids(
+        self,
+        stable_ids: tuple[str, ...],
+        page_mode: bool,
+    ) -> None:
+        """Resolve queued merge targets after the context menu has closed."""
+        normalized_ids = tuple(str(value or "").strip() for value in stable_ids)
+        if (
+            not normalized_ids
+            or any(not value for value in normalized_ids)
+            or len(set(normalized_ids)) != len(normalized_ids)
+        ):
+            InfoBar.warning(
+                self.tr("无法合并"),
+                self.tr("字幕视图已经变化，请重新选择要合并的相邻字幕。"),
+                duration=4000,
+                parent=self,
+            )
+            return
+        key = "display_page_id" if page_mode else "manual_cue_id"
+        current_rows = list(self.model._data.values())
+        resolved_rows: list[int] = []
+        for stable_id in normalized_ids:
+            matches = [
+                index
+                for index, row in enumerate(current_rows)
+                if str(row.get(key) or "") == str(stable_id or "")
+            ]
+            if len(matches) != 1:
+                InfoBar.warning(
+                    self.tr("无法合并"),
+                    self.tr("字幕视图已经变化，请重新选择要合并的相邻字幕。"),
+                    duration=4000,
+                    parent=self,
+                )
+                return
+            resolved_rows.append(matches[0])
+        if resolved_rows != list(
+            range(resolved_rows[0], resolved_rows[-1] + 1)
+        ):
+            InfoBar.warning(
+                self.tr("无法合并"),
+                self.tr("字幕视图已经变化，请重新选择要合并的相邻字幕。"),
+                duration=4000,
+                parent=self,
+            )
+            return
+        self.merge_selected_rows(resolved_rows)
 
     def _style_manual_review_dialog(
         self,
@@ -4258,7 +4426,7 @@ class SubtitleInterface(QWidget):
             workspace = self.manual_final_session.build_display_page_candidate_workspace(
                 parent_id,
                 min_page_count=2,
-                max_page_count=4,
+                max_page_count=ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES,
             )
         except ManualFinalSubtitleEditError as exc:
             InfoBar.warning(
@@ -5033,15 +5201,21 @@ class SubtitleInterface(QWidget):
         if replacement == str(selected.get("original_subtitle") or ""):
             return False
 
-        rows = copy.deepcopy(self.model._data)
-        rows[key]["original_subtitle"] = replacement
-        if selected.get("display_page_view"):
-            changed = self.manual_final_session.apply_display_page_model_data(
-                rows,
-                allow_incomplete_chinese=True,
-            )
-        else:
-            changed = self.manual_final_session.apply_parent_model_data(rows)
+        changed = SubtitleInterface._apply_manual_multiword_surface_replacement(
+            self,
+            selected,
+            replacement,
+        )
+        if not changed:
+            rows = copy.deepcopy(self.model._data)
+            rows[key]["original_subtitle"] = replacement
+            if selected.get("display_page_view"):
+                changed = self.manual_final_session.apply_display_page_model_data(
+                    rows,
+                    allow_incomplete_chinese=True,
+                )
+            else:
+                changed = self.manual_final_session.apply_parent_model_data(rows)
         if not changed:
             return False
 
@@ -5062,6 +5236,63 @@ class SubtitleInterface(QWidget):
             self.tr(f"{page_id or parent_id} 英文已修正；词 ID 和时间轴未改变")
         )
         return True
+
+    def _apply_manual_multiword_surface_replacement(
+        self,
+        selected: Mapping[str, Any],
+        replacement_text: str,
+    ) -> bool:
+        """Route one contiguous many-to-one correction to the span contract."""
+        source_tokens = str(selected.get("original_subtitle") or "").split()
+        replacement_tokens = str(replacement_text or "").split()
+        if source_tokens == replacement_tokens:
+            return False
+
+        prefix = 0
+        while (
+            prefix < len(source_tokens)
+            and prefix < len(replacement_tokens)
+            and source_tokens[prefix] == replacement_tokens[prefix]
+        ):
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < len(source_tokens) - prefix
+            and suffix < len(replacement_tokens) - prefix
+            and source_tokens[-1 - suffix] == replacement_tokens[-1 - suffix]
+        ):
+            suffix += 1
+
+        source_end = len(source_tokens) - suffix
+        replacement_end = len(replacement_tokens) - suffix
+        source_changed = source_tokens[prefix:source_end]
+        replacement_changed = replacement_tokens[prefix:replacement_end]
+        if len(source_changed) < 2 or len(replacement_changed) != 1:
+            return False
+
+        row_start = int(selected.get("word_start", -1))
+        row_end = int(selected.get("word_end", -1))
+        if row_start < 0 or row_end < row_start:
+            return False
+        display_spans = self.manual_final_session._display_word_spans(
+            row_start,
+            row_end,
+        )
+        if (
+            len(display_spans) != len(source_tokens)
+            or [str(item.get("surface") or "") for item in display_spans]
+            != source_tokens
+        ):
+            return False
+
+        first_span = display_spans[prefix]
+        last_span = display_spans[source_end - 1]
+        return self.manual_final_session.replace_english_surface_span(
+            parent_subtitle_id=str(selected.get("manual_cue_id") or ""),
+            word_start=int(first_span["word_start"]),
+            word_end=int(last_span["word_end"]),
+            replacement_text=replacement_changed[0],
+        )
 
     def _show_manual_english_edit_dialog(self, row: int) -> None:
         selected = self.model._data.get(str(int(row) + 1)) or {}
@@ -5126,6 +5357,45 @@ class SubtitleInterface(QWidget):
         except ManualFinalSubtitleEditError as exc:
             InfoBar.warning(
                 self.tr("无法修改字幕显示状态"),
+                str(exc),
+                duration=5000,
+                parent=self,
+            )
+
+    def _set_manual_cue_hidden_and_media_muted(
+        self,
+        parent_subtitle_id: str,
+        enabled: bool,
+    ) -> None:
+        if not self.manual_final_session:
+            return
+        try:
+            self._sync_manual_final_text_edits(
+                allow_incomplete_page_chinese=True
+            )
+            result = self.manual_final_session.set_cue_hidden_and_media_muted(
+                parent_subtitle_id,
+                enabled,
+            )
+            if not result.get("changed"):
+                return
+            self._invalidate_manual_review_marks_for_parent_ids(
+                [parent_subtitle_id]
+            )
+            self._manual_page_view = True
+            self._manual_parent_boundaries_dirty = False
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self._apply_manual_final_session()
+            self.status_label.setText(
+                self.tr(
+                    f"{parent_subtitle_id} 已隐藏；保存终稿后对应音频区间会静音"
+                    if enabled
+                    else f"{parent_subtitle_id} 已恢复字幕和声音"
+                )
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法修改字幕和声音状态"),
                 str(exc),
                 duration=5000,
                 parent=self,
@@ -5267,7 +5537,30 @@ class SubtitleInterface(QWidget):
                 parent=self,
             )
 
-    def _split_display_page(self, display_page_id: str) -> None:
+    def _confirm_high_risk_manual_page_split(
+        self,
+        target_id: str,
+        page_count: int,
+    ) -> bool:
+        dialog = MessageBox(
+            self.tr("没有安全切点，仍要人工分屏？"),
+            self.tr(
+                f"{target_id} 找不到同时满足语法、停顿和时长要求的自动方案。"
+                f"确认后程序会按词时间和页面负担先分为 {page_count} 屏，"
+                "并把切点标为待复核；英文原文、父字幕 ID、词时间和音频不会改变。"
+            ),
+            self,
+        )
+        dialog.yesButton.setText(self.tr("仍然分屏"))
+        dialog.cancelButton.setText(self.tr("取消"))
+        return bool(dialog.exec())
+
+    def _split_display_page(
+        self,
+        display_page_id: str,
+        *,
+        allow_high_risk: bool = False,
+    ) -> None:
         if not self.manual_final_session:
             return
         page_id = str(display_page_id or "").strip()
@@ -5275,7 +5568,13 @@ class SubtitleInterface(QWidget):
             return
         try:
             self._sync_manual_final_text_edits()
-            result = self.manual_final_session.split_display_page(page_id)
+            split_kwargs = (
+                {"allow_high_risk": True} if allow_high_risk else {}
+            )
+            result = self.manual_final_session.split_display_page(
+                page_id,
+                **split_kwargs,
+            )
             parent_id = str(result["parent_subtitle_id"])
             cue = next(
                 (
@@ -5314,13 +5613,36 @@ class SubtitleInterface(QWidget):
                     f"{result['page_count']} 屏"
                 )
             )
-            InfoBar.success(
-                self.tr("当前屏已拆分"),
-                self.tr("其他屏的英文范围、中文和时间轴均未改变。"),
-                duration=4000,
-                parent=self,
-            )
+            if result.get("high_risk_override"):
+                InfoBar.warning(
+                    self.tr("已按人工兜底分屏"),
+                    self.tr(
+                        "切点存在语法或显示时长风险，已标为待复核；"
+                        "请调整边界并填写逐页中文。"
+                    ),
+                    duration=6000,
+                    parent=self,
+                )
+            else:
+                InfoBar.success(
+                    self.tr("当前屏已拆分"),
+                    self.tr("其他屏的英文范围、中文和时间轴均未改变。"),
+                    duration=4000,
+                    parent=self,
+                )
         except ManualFinalSubtitleEditError as exc:
+            if (
+                not allow_high_risk
+                and exc.code
+                == "manual_high_risk_page_split_confirmation_required"
+                and self._confirm_high_risk_manual_page_split(page_id, 2)
+            ):
+                self._queue_manual_structure_action(
+                    self._split_display_page,
+                    page_id,
+                    allow_high_risk=True,
+                )
+                return
             InfoBar.warning(
                 self.tr("无法只拆当前屏"),
                 str(exc),
@@ -5334,6 +5656,7 @@ class SubtitleInterface(QWidget):
         page_count: int,
         *,
         focus_word_id: int | None = None,
+        allow_high_risk: bool = False,
     ) -> None:
         if not self.manual_final_session:
             return
@@ -5342,7 +5665,7 @@ class SubtitleInterface(QWidget):
         if not any(
             str(cue.get("cue_id") or "") == parent_id
             for cue in self.manual_final_session.cues
-        ) or requested not in {2, 3, 4}:
+        ) or requested not in range(2, ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES + 1):
             InfoBar.warning(
                 self.tr("无法拆分实际分页"),
                 self.tr("所选父字幕或页数已经失效，请重新选择。"),
@@ -5379,9 +5702,13 @@ class SubtitleInterface(QWidget):
             return
         try:
             self._sync_manual_final_text_edits()
+            split_kwargs = (
+                {"allow_high_risk": True} if allow_high_risk else {}
+            )
             result = self.manual_final_session.split_parent_into_display_pages(
                 parent_id,
                 requested,
+                **split_kwargs,
             )
             if result.get("changed") is False:
                 self.status_label.setText(
@@ -5433,15 +5760,43 @@ class SubtitleInterface(QWidget):
                     "请逐屏填写中文后保存人工终稿"
                 )
             )
-            InfoBar.success(
-                self.tr("实际分页已重建"),
-                self.tr(
-                    "英文切点已按停顿和意群规划；新页面中文留空，必须人工确认。"
-                ),
-                duration=5000,
-                parent=self,
-            )
+            if result.get("high_risk_override"):
+                InfoBar.warning(
+                    self.tr("已按人工兜底分屏"),
+                    self.tr(
+                        "没有安全自动切点，程序已先按词时间和页面负担分屏；"
+                        "请调整边界并填写逐页中文。"
+                    ),
+                    duration=6000,
+                    parent=self,
+                )
+            else:
+                InfoBar.success(
+                    self.tr("实际分页已重建"),
+                    self.tr(
+                        "英文切点已按停顿和意群规划；新页面中文留空，必须人工确认。"
+                    ),
+                    duration=5000,
+                    parent=self,
+                )
         except ManualFinalSubtitleEditError as exc:
+            if (
+                not allow_high_risk
+                and exc.code
+                == "manual_high_risk_page_split_confirmation_required"
+                and self._confirm_high_risk_manual_page_split(
+                    parent_id,
+                    requested,
+                )
+            ):
+                self._queue_manual_structure_action(
+                    self._split_parent_into_display_pages,
+                    parent_id,
+                    requested,
+                    focus_word_id=focus_word_id,
+                    allow_high_risk=True,
+                )
+                return
             InfoBar.warning(
                 self.tr("无法拆分实际分页"),
                 str(exc),
@@ -5456,6 +5811,8 @@ class SubtitleInterface(QWidget):
         if session.source_media_path is not None and session.source_media_path.is_file():
             return session.source_media_path
         inferred_media = session._tail_trim_source_media_path()
+        if inferred_media is None:
+            inferred_media = session._media_mute_source_media_path()
         if inferred_media is not None and inferred_media.is_file():
             session.source_media_path = inferred_media.resolve()
             return session.source_media_path
@@ -5560,9 +5917,23 @@ class SubtitleInterface(QWidget):
                 f"{len(preview['removed_subtitle_ids'])} 条字幕。\n"
             )
         )
+        retained_muted_count = sum(
+            bool(cue.get("media_muted"))
+            for cue in self.manual_final_session.cues
+            if int(cue.get("end_time") or 0) <= int(preview["cut_ms"])
+        )
+        mute_note = (
+            self.tr(
+                f"已保留的 {retained_muted_count} 条静音区间会继续静音；"
+                "切点后的静音区间将随尾部内容一并删除。\n"
+            )
+            if retained_muted_count
+            else ""
+        )
         dialog = MessageBox(
             self.tr("从当前字幕删除到结尾？"),
             partial_page_text
+            + mute_note
             + self.tr(
                 f"音频将在 {cut_time.toString('hh:mm:ss.zzz')} 生成派生裁剪副本；"
                 "原始音频不会被修改。"

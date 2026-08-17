@@ -5,7 +5,10 @@ from pathlib import Path
 
 from app.core.article_context import (
     ARTICLE_ANALYSIS_META_KEY,
+    ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
     apply_article_asr_corrections,
+    article_analysis_cache_key,
+    article_analysis_prompt_hash,
     article_text_hash,
     build_translation_context_prompt,
 )
@@ -28,6 +31,17 @@ from app.core.subtitle_processor.stable_artifacts import (
     find_stable_manifest_for_artifact,
     stable_artifact_dir,
 )
+
+
+def _article_analysis_meta(article_text: str) -> dict:
+    prompt_hash = article_analysis_prompt_hash()
+    return {
+        "article_text_hash": article_text_hash(article_text),
+        "prompt_hash": prompt_hash,
+        "analysis_prompt_hash": prompt_hash,
+        "analysis_prompt_policy_version": ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+        "analysis_cache_key": article_analysis_cache_key(article_text),
+    }
 from app.thread.subtitle_thread import SubtitleThread
 
 
@@ -190,7 +204,7 @@ class TaskContextContractTests(unittest.TestCase):
     def test_transcribe_task_owns_source_audio_and_article_state(self):
         context = {
             "summary": "Current article",
-            ARTICLE_ANALYSIS_META_KEY: {"prompt_hash": article_text_hash("Article")},
+            ARTICLE_ANALYSIS_META_KEY: _article_analysis_meta("Article"),
         }
 
         task = TaskFactory.create_transcribe_task(
@@ -213,9 +227,7 @@ class TaskContextContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             context = {
                 "summary": "Analysis for A",
-                ARTICLE_ANALYSIS_META_KEY: {
-                    "prompt_hash": article_text_hash("Article A")
-                },
+                ARTICLE_ANALYSIS_META_KEY: _article_analysis_meta("Article A"),
             }
             thread = SubtitleThread.__new__(SubtitleThread)
             thread.task = SubtitleTask(
@@ -236,9 +248,7 @@ class TaskContextContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             context = {
                 "summary": "Analysis for A",
-                ARTICLE_ANALYSIS_META_KEY: {
-                    "prompt_hash": article_text_hash("Article A")
-                },
+                ARTICLE_ANALYSIS_META_KEY: _article_analysis_meta("Article A"),
             }
             thread = SubtitleThread.__new__(SubtitleThread)
             thread.task = SubtitleTask(
@@ -279,8 +289,8 @@ class TaskContextContractTests(unittest.TestCase):
                     }
                 ],
                 ARTICLE_ANALYSIS_META_KEY: {
+                    **_article_analysis_meta(article),
                     "cache_used": True,
-                    "prompt_hash": article_text_hash(article),
                 },
             }
             thread = SubtitleThread.__new__(SubtitleThread)

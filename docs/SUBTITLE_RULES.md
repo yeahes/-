@@ -191,9 +191,10 @@ Manual editor operations:
 - A selected middle row exposes both its upper and lower boundary. Choosing a
   direction resets the movable count to one word, and changing the count updates
   the highlighted source words before confirmation.
-- Changing one parent's display-page count may create two, three, or four pages
-  only through the shared syntax/timing planner. It must preserve the parent
-  subtitle ID, English, word span, parent timing, and complete word coverage.
+- Automatic planning remains capped at four pages. An explicit manual action
+  may create two through six pages through the shared syntax/timing planner.
+  It must preserve the parent subtitle ID, English, word span, parent timing,
+  and complete word coverage.
 - After that initial safe partition, an explicit manual boundary move may accept
   a grammar-risk boundary or a page below the normal 900ms policy floor. The
   frozen plan records `manual_override`, the original issue codes, and a REVIEW
@@ -201,6 +202,24 @@ Manual editor operations:
 - Empty pages, lost/duplicated/reordered words, missing IDs, a boundary outside
   the parent, no legal shared word-time boundary, or fixed-font layout overflow
   remain non-overridable structural errors.
+- `display_suppressed` hides a complete parent cue while preserving its audio,
+  fixed ID, word coverage, and final timeline. `media_muted` is a separate
+  explicit operation and implies `display_suppressed`; restoring visible text
+  alone while its audio remains muted is invalid.
+- Parent-level media mute and suffix-only tail deletion share one schema-v2
+  derivation contract. Save applies ordered fixed-cue mute intervals and an
+  optional final cut to the hash-bound original media in one FFmpeg pass. It
+  must never derive again from an older muted or trimmed file. Retained word
+  IDs, word times, cue IDs, cue order, and cue envelopes do not shift.
+  Page-only mute remains unsupported.
+- Manual English correction may replace one raw word surface or collapse one
+  continuous raw-word range to one presentation-only surface. The raw word
+  ledger, IDs, order, and timing remain authoritative. Display spans may not
+  cross cue or page boundaries and may not be split by a later boundary move
+  or tail cut; complete retained or removed spans remain atomic through
+  merge, save/reload, undo, and redo.
+- Copying one or more selected English rows is read-only and must not enter the
+  manual edit, pagination, history, or timing paths.
 - A new or moved manual display page has no authoritative Chinese allocation.
   Empty page Chinese is an allowed editor intermediate state so the user can keep
   adjusting boundaries. `manual_page_translation_required` still blocks save as
@@ -229,9 +248,14 @@ Manual editor operations:
   reloads successfully.
 - `Split into N pages` first uses the strict automatic partition. If that has no
   result, an explicit manual request may choose the lowest-risk REVIEW boundary
-  as an editable proposal. This does not relax automatic planning: HARD
-  boundaries, non-contiguous ownership, fixed-font overflow, and pages below
-  the 900ms floor remain rejected. The proposed pages still require explicit
+  as an editable proposal. If neither strict nor REVIEW planning can satisfy the
+  requested page count, the editor must ask for a second explicit confirmation.
+  Only after that confirmation may it create a high-risk editable proposal from
+  timed-word boundaries, ranked by page pixel load, duration balance, pause, and
+  syntax evidence. The original HARD classification remains recorded as REVIEW
+  evidence; automatic planning is not relaxed. Non-contiguous ownership,
+  missing word-time boundaries, lost/duplicated/reordered words, and fixed-font
+  overflow remain non-overridable. Every proposed page still requires explicit
   page-Chinese review before publication.
 - Tail deletion is suffix-only and must retain at least the first parent cue.
   The cut lies between retained and removed word envelopes. Retained fixed IDs,

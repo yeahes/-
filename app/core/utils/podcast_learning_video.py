@@ -196,6 +196,14 @@ ARTICLE_PAGE_INCOMPLETE_REVIEW_PENALTY = 800
 ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT = 4
 ARTICLE_PAGE_TWO_LINE_BALANCE_FREE_RATIO = 0.82
 ARTICLE_PAGE_TWO_LINE_BALANCE_PENALTY = 4_000
+# Same-screen line wrapping may choose a wider profile than page planning, but
+# it must not leave an extreme orphan line merely because a punctuation cut was
+# encountered first.  This threshold is deliberately conservative: ordinary
+# two-line pages remain at 56px, while a severe imbalance may use one complete
+# line at a lower allowed size when that is the only cleaner layout.
+ARTICLE_SAME_SCREEN_SEVERE_IMBALANCE_RATIO = 0.48
+ARTICLE_SAME_SCREEN_BALANCE_FREE_RATIO = 0.72
+ARTICLE_SAME_SCREEN_BALANCE_PENALTY = 30_000
 ARTICLE_PAGE_50PX_LAST_RESORT_PENALTY = 1_200
 ARTICLE_PAGE_ATOMIC_BOUNDARY_ISSUES = frozenset(
     {
@@ -220,6 +228,9 @@ ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS = 14
 ARTICLE_VISUAL_PAGE_PREFERRED_WORDS = 12
 ARTICLE_VISUAL_PAGE_MIN_WORDS = 4
 ARTICLE_VISUAL_PAGE_MAX_PAGES = 4
+# Automatic planning stays conservative. An explicit editor action may use
+# more pages because the user reviews every new boundary and translation.
+ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES = 6
 ARTICLE_STATIC_TWO_WORD_LINE_MAX_WORDS = ARTICLE_VISUAL_PAGE_MIN_WORDS * 2
 ARTICLE_AVOID_LINE_START_WORDS = frozenset(
     {"away", "back", "down", "in", "off", "on", "out", "over", "up"}
@@ -479,11 +490,123 @@ class Cue:
     article_page_plan: dict | None = None
     display_page_translations: dict[str, str] | None = None
     display_boundary_evidence: dict[str, dict] | None = None
+    # Optional presentation projection.  Each item maps one visible surface
+    # back to an inclusive range in ``word_timing``.
+    display_word_spans: tuple[dict, ...] = ()
+
+
+def _article_timing_word_end(item: Mapping[str, object]) -> int:
+    return int(item.get("word_end", item.get("word_id", -1)))
+
+
+def _project_article_display_word_timing(
+    raw_timing: Sequence[Mapping[str, object]],
+    display_spans: Sequence[Mapping[str, object]],
+) -> tuple[dict, ...]:
+    """Project immutable raw words into atomic display spans."""
+    timing = [dict(item) for item in raw_timing if isinstance(item, Mapping)]
+    spans = [dict(item) for item in display_spans if isinstance(item, Mapping)]
+    if not timing or not spans:
+        return ()
+    try:
+        by_id = {int(item["word_id"]): item for item in timing}
+        expected_start = int(timing[0]["word_id"])
+        projected: list[dict] = []
+        for span in spans:
+            start = int(span["word_start"])
+            end = int(span["word_end"])
+            surface = re.sub(
+                r"\s+",
+                " ",
+                str(span.get("surface") or ""),
+            ).strip()
+            if (
+                start != expected_start
+                or end < start
+                or not surface
+                or any(word_id not in by_id for word_id in range(start, end + 1))
+            ):
+                return ()
+            projected.append(
+                {
+                    "word_id": start,
+                    "word_end": end,
+                    "surface": surface,
+                    "start": float(by_id[start]["start"]),
+                    "end": float(by_id[end]["end"]),
+                }
+            )
+            expected_start = end + 1
+        if expected_start != int(timing[-1]["word_id"]) + 1:
+            return ()
+    except (KeyError, TypeError, ValueError):
+        return ()
+    return tuple(projected)
+
+
+def _article_local_spans_for_global_ranges(
+    timing: Sequence[Mapping[str, object]],
+    ranges: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]] | None:
+    """Map raw ledger ranges to display-token indexes without splitting a span."""
+    records = [dict(item) for item in timing if isinstance(item, Mapping)]
+    try:
+        by_start = {int(item["word_id"]): index for index, item in enumerate(records)}
+        by_end = {
+            _article_timing_word_end(item): index
+            for index, item in enumerate(records)
+        }
+        local_spans: list[tuple[int, int]] = []
+        for global_start, global_end in ranges:
+            local_start = by_start[int(global_start)]
+            local_end_index = by_end[int(global_end)]
+            if local_end_index < local_start:
+                return None
+            previous_end = int(global_start) - 1
+            for item in records[local_start : local_end_index + 1]:
+                item_start = int(item["word_id"])
+                item_end = _article_timing_word_end(item)
+                if item_start != previous_end + 1 or item_end < item_start:
+                    return None
+                previous_end = item_end
+            if previous_end != int(global_end):
+                return None
+            local_spans.append((local_start, local_end_index + 1))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return local_spans
 
 
 def _article_boundary_words(cue: Cue) -> list[str]:
-    """Return one display surface per authoritative timed word record."""
+    """Return validated presentation surfaces without losing word provenance."""
     timing = list(cue.word_timing or ())
+    spans = list(cue.display_word_spans or ())
+    if timing and spans and len(timing) == len(spans):
+        surfaces: list[str] = []
+        expected_start = int(timing[0].get("word_id", -1))
+        for item, span in zip(timing, spans):
+            if not isinstance(item, Mapping) or not isinstance(span, Mapping):
+                return str(cue.en or "").split()
+            try:
+                start, end = int(span["word_start"]), int(span["word_end"])
+            except (KeyError, TypeError, ValueError):
+                return str(cue.en or "").split()
+            surface = re.sub(r"\s+", " ", str(span.get("surface") or "")).strip()
+            if (
+                not surface
+                or start != expected_start
+                or end < start
+                or int(item.get("word_id", -1)) != start
+                or _article_timing_word_end(item) != end
+            ):
+                return str(cue.en or "").split()
+            surfaces.append(surface)
+            expected_start = end + 1
+        if (
+            expected_start == _article_timing_word_end(timing[-1]) + 1
+            and " ".join(surfaces) == " ".join(str(cue.en or "").split())
+        ):
+            return surfaces
     if timing:
         surfaces = [
             re.sub(r"\s+", " ", str(item.get("surface") or "")).strip()
@@ -735,6 +858,7 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         cue.article_page_plan = None
         cue.display_page_translations = None
         cue.display_boundary_evidence = None
+        cue.display_word_spans = ()
 
     manifest_path = find_stable_manifest_for_artifact(subtitle_path)
     if manifest_path is None:
@@ -787,6 +911,7 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         if expected_ledger_sha256 and file_sha256(ledger_path) != expected_ledger_sha256:
             return False
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        raw_surface_overrides = list(ledger.get("english_surface_overrides") or [])
         boundary_evidence: Mapping[str, object] | None = None
         boundary_path_value = str(
             manifest.get("display_boundary_evidence_path") or ""
@@ -826,7 +951,27 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
     ]
     if len(visible_records) != len(cues) or not words:
         return False
-    attached: list[tuple[Cue, str, tuple[dict, ...], dict[str, dict] | None]] = []
+    overrides_by_start: dict[int, dict] = {}
+    previous_override_end = -1
+    for raw_override in raw_surface_overrides:
+        if not isinstance(raw_override, Mapping):
+            return False
+        try:
+            start, end = int(raw_override["word_start"]), int(raw_override["word_end"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        expected = [str(value) for value in raw_override.get("expected_surfaces") or []]
+        surface = re.sub(r"\s+", " ", str(raw_override.get("display_surface") or "")).strip()
+        if (
+            start <= previous_override_end or end <= start or start < 0 or end >= len(words)
+            or len(expected) != end - start + 1 or not surface
+            or expected != [str(words[word_id].get("surface") or "") for word_id in range(start, end + 1)]
+        ):
+            return False
+        overrides_by_start[start] = dict(raw_override)
+        previous_override_end = end
+
+    attached: list[tuple[Cue, str, tuple[dict, ...], tuple[dict, ...], dict[str, dict] | None]] = []
     seen_subtitle_ids: set[str] = set()
     previous_word_end = -1
     visible_cue_index = 0
@@ -874,33 +1019,37 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
                 )
             except (KeyError, TypeError, ValueError):
                 return False
+        display_spans: list[dict] = []
+        cursor = word_start
+        while cursor <= word_end:
+            override = overrides_by_start.get(cursor)
+            if override is not None:
+                override_end = int(override["word_end"])
+                if override_end > word_end or str(override.get("parent_subtitle_id") or "") != subtitle_id:
+                    return False
+                display_spans.append({"word_start": cursor, "word_end": override_end, "surface": str(override["display_surface"])})
+                cursor = override_end + 1
+            else:
+                display_spans.append({"word_start": cursor, "word_end": cursor, "surface": str(words[cursor].get("surface") or "")})
+                cursor += 1
         displayed_text = (
             str(record.get("original") or "")
             if cue is None
             else cue.en
         )
-        displayed_tokens = [
-            token.casefold()
-            for token in re.findall(
-                r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*",
-                displayed_text,
-            )
-        ]
-        ledger_tokens = [
-            token.casefold()
-            for word in timed_words
-            for token in re.findall(
-                r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*",
-                str(word["surface"]),
-            )
-        ]
-        if not displayed_tokens or displayed_tokens != ledger_tokens:
+        if " ".join(str(displayed_text or "").split()) != " ".join(span["surface"] for span in display_spans):
             return False
         if (
             not timed_words
             or float(timed_words[0]["start"]) < record_start - 0.005
             or float(timed_words[-1]["end"]) > record_end + 0.005
         ):
+            return False
+        projected_timing = _project_article_display_word_timing(
+            timed_words,
+            display_spans,
+        )
+        if not projected_timing:
             return False
         cue_boundary_evidence: dict[str, dict] | None = None
         if boundary_evidence is not None:
@@ -914,16 +1063,23 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         previous_word_end = word_end
         if cue is not None:
             attached.append(
-                (cue, subtitle_id, tuple(timed_words), cue_boundary_evidence)
+                (
+                    cue,
+                    subtitle_id,
+                    projected_timing,
+                    tuple(display_spans),
+                    cue_boundary_evidence,
+                )
             )
             visible_cue_index += 1
 
     if previous_word_end != len(words) - 1 or visible_cue_index != len(cues):
         return False
 
-    for cue, subtitle_id, timed_words, cue_boundary_evidence in attached:
+    for cue, subtitle_id, timed_words, display_spans, cue_boundary_evidence in attached:
         cue.subtitle_id = subtitle_id
         cue.word_timing = timed_words
+        cue.display_word_spans = display_spans
         cue.display_boundary_evidence = cue_boundary_evidence
     return True
 
@@ -2229,7 +2385,13 @@ def _caption_line_break_penalty(words: list[str], split: int) -> int:
 
 def _article_intrinsic_line_break_penalty(words: list[str], split: int) -> int:
     """Keep lexical morphology hard when no frozen syntax evidence exists."""
-    return _caption_line_break_penalty(words, split)
+    penalty = _caption_line_break_penalty(words, split)
+    if 0 < split < len(words) and "-" in words[split - 1]:
+        # Both renderer lines remain visible, and the break is outside the
+        # complete whitespace token. Keep the generic wrapper unchanged while
+        # removing only its article-template false positive.
+        penalty -= CAPTION_HARD_BREAK_PENALTY * 2
+    return penalty
 
 
 def _article_same_screen_intrinsic_line_break_penalty(
@@ -2262,6 +2424,47 @@ def _article_same_screen_intrinsic_line_break_penalty(
             + ARTICLE_LINE_SOFT_MODIFIER_PENALTY
         )
     return penalty
+
+
+def _article_same_screen_line_balance_penalty(
+    first_width: int,
+    second_width: int,
+) -> int:
+    """Penalize visibly uneven lines without overriding lexical hard stops."""
+    widest = max(int(first_width), int(second_width), 1)
+    ratio = min(int(first_width), int(second_width)) / widest
+    deficit = max(0.0, ARTICLE_SAME_SCREEN_BALANCE_FREE_RATIO - ratio)
+    penalty = int(round(deficit * deficit * ARTICLE_SAME_SCREEN_BALANCE_PENALTY))
+    # A slight bottom-heavy preference matches established timed-text layout
+    # guidance while leaving genuinely balanced candidates effectively tied.
+    if first_width > second_width:
+        penalty += int(round((first_width - second_width) * 0.12))
+    return penalty
+
+
+def _article_line_balance_ratio(
+    draw: ImageDraw.ImageDraw,
+    lines: Sequence[str],
+    font_size: int,
+) -> float:
+    if len(lines) != 2:
+        return 1.0
+    font = article_en_font(int(font_size), 600)
+    widths = [text_w(draw, str(line), font) for line in lines]
+    widest = max(widths, default=0)
+    return min(widths) / widest if widest else 1.0
+
+
+def _article_layout_has_severe_imbalance(
+    draw: ImageDraw.ImageDraw,
+    lines: Sequence[str],
+    font_size: int,
+) -> bool:
+    return (
+        len(lines) == 2
+        and _article_line_balance_ratio(draw, lines, font_size)
+        < ARTICLE_SAME_SCREEN_SEVERE_IMBALANCE_RATIO
+    )
 
 
 def _caption_boundary_has_stranded_dependency(words: list[str], split: int) -> bool:
@@ -2359,6 +2562,7 @@ def wrap_en(
     minimum_line_words: int = 3,
     boundary_penalty: Callable[[int], int] | None = None,
     intrinsic_penalty: Callable[[list[str], int], int] | None = None,
+    line_balance_penalty: Callable[[int, int], int] | None = None,
 ) -> list[str]:
     """Choose a balanced two-line fit while retaining basic phrase units."""
     words = text.split()
@@ -2377,6 +2581,8 @@ def wrap_en(
             score = abs(aw - bw) + score_break(words, split)
             if boundary_penalty is not None:
                 score += int(boundary_penalty(split))
+            if line_balance_penalty is not None:
+                score += int(line_balance_penalty(aw, bw))
             if score < best_score:
                 best = [a, b]
                 best_score = score
@@ -2428,6 +2634,7 @@ def wrap_en_preserving_highlight(
     minimum_line_words: int = 3,
     boundary_penalty: Callable[[int], int] | None = None,
     intrinsic_penalty: Callable[[list[str], int], int] | None = None,
+    line_balance_penalty: Callable[[int, int], int] | None = None,
 ) -> list[str]:
     """Avoid splitting the active vocabulary expression when a two-line fit permits it."""
     lines = wrap_en(
@@ -2438,6 +2645,7 @@ def wrap_en_preserving_highlight(
         minimum_line_words=minimum_line_words,
         boundary_penalty=boundary_penalty,
         intrinsic_penalty=intrinsic_penalty,
+        line_balance_penalty=line_balance_penalty,
     )
     if not key or len(lines) != 2 or any(key.lower() in line.lower() for line in lines):
         return lines
@@ -2479,6 +2687,8 @@ def wrap_en_preserving_highlight(
         break_penalty = score_break(words, split)
         if boundary_penalty is not None:
             break_penalty += int(boundary_penalty(split))
+        if line_balance_penalty is not None:
+            break_penalty += int(line_balance_penalty(before_width, after_width))
         if break_penalty >= CAPTION_HARD_BREAK_PENALTY:
             continue
         score = (
@@ -3042,6 +3252,7 @@ def _article_fixed_english_lines(
     )
     for max_lines in max_line_candidates:
         for minimum_line_words in minimum_word_candidates:
+            candidates: list[tuple[tuple[int, int, int], list[str]]] = []
             for width in width_profiles:
                 max_width = acx(width)
                 lines = wrap_en_preserving_highlight(
@@ -3053,6 +3264,7 @@ def _article_fixed_english_lines(
                     minimum_line_words=minimum_line_words,
                     boundary_penalty=boundary_penalty,
                     intrinsic_penalty=score_intrinsic,
+                    line_balance_penalty=_article_same_screen_line_balance_penalty,
                 )
                 if (
                     not lines
@@ -3076,11 +3288,47 @@ def _article_fixed_english_lines(
                     )
                 ):
                     continue
+                line_count = len(lines)
+                if line_count == 1:
+                    layout_tier = 1
+                    layout_score = text_w(draw, lines[0], fnt)
+                elif line_count == 2:
+                    ratio = _article_line_balance_ratio(draw, lines, font_size)
+                    layout_tier = (
+                        2
+                        if ratio < ARTICLE_SAME_SCREEN_SEVERE_IMBALANCE_RATIO
+                        else 0
+                    )
+                    split = len(lines[0].split())
+                    words = text.split()
+                    layout_score = abs(
+                        text_w(draw, lines[0], fnt)
+                        - text_w(draw, lines[1], fnt)
+                    )
+                    if score_intrinsic is not None:
+                        layout_score += int(score_intrinsic(words, split))
+                    if boundary_penalty is not None:
+                        layout_score += int(boundary_penalty(split))
+                    layout_score += int(
+                        _article_same_screen_line_balance_penalty(
+                            text_w(draw, lines[0], fnt),
+                            text_w(draw, lines[1], fnt),
+                        )
+                    )
+                else:
+                    layout_tier = 3
+                    layout_score = sum(
+                        text_w(draw, line, fnt) for line in lines
+                    )
+                candidates.append(
+                    ((layout_tier, layout_score, width), list(lines))
+                )
+            if candidates:
                 # Two-word lines and a third 50px line are last-resort
                 # fallbacks. Every two-line width is exhausted before the
                 # three-line pass. The existing 50px emergency syntax review
                 # remains unchanged and is still audited downstream.
-                return lines
+                return min(candidates, key=lambda item: item[0])[1]
     return []
 
 
@@ -3298,9 +3546,11 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
     if complete_wh_clause_start:
         classification = "review"
         confidence = "medium"
+        relaxation_reason = "complete_wh_clause_start"
     elif strong_pause_reviews_clause_boundary:
         classification = "review"
         confidence = "high"
+        relaxation_reason = "strong_pause_clause_restart"
     elif (
         complete_clause_restart
         or coordinated_phrase_restart
@@ -3308,15 +3558,25 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
     ):
         classification = "review"
         confidence = "medium"
+        relaxation_reason = (
+            "balanced_predicate_restart"
+            if balanced_predicate_restart
+            else "complete_clause_restart"
+        )
     elif atomic:
         classification = "hard"
         confidence = "high"
+        relaxation_reason = ""
     elif hard_issues or soft_issues:
         classification = "review"
         confidence = "medium"
+        relaxation_reason = (
+            "reviewable_hard_issue" if hard_issues else "soft_issue"
+        )
     else:
         classification = "allow"
         confidence = "low"
+        relaxation_reason = ""
     complete_phrase_start = _article_page_can_start_with_complete_phrase(
         words,
         split,
@@ -3351,6 +3611,15 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
     return {
         "classification": classification,
         "issue_codes": sorted(issue_codes),
+        "raw_hard_issue_codes": sorted(hard_issues),
+        "raw_atomic_issue_codes": sorted(atomic),
+        "relaxed_raw_hard": bool(
+            classification == "review"
+            and atomic
+            and not complete_wh_clause_start
+            and not punctuation_boundary
+        ),
+        "relaxation_reason": relaxation_reason,
         "confidence": confidence,
         "pause_ms": pause_ms,
         "boundary_score": item.get("boundary_score"),
@@ -3371,6 +3640,11 @@ def _article_line_boundary_penalty(cue: Cue, split: int) -> int:
     """Project frozen syntax evidence onto a renderer-only line break."""
     decision = _article_display_boundary_decision(cue, split)
     issue_codes = set(decision.get("issue_codes") or [])
+    if issue_codes == {"unsupported_tight_page_transition"}:
+        # A tight pause matters when the text disappears and the next display
+        # page replaces it. Both renderer lines remain visible at once, so a
+        # page-turn-only timing warning must not distort the line wrap.
+        return 0
     if issue_codes & ARTICLE_LINE_ATOMIC_BOUNDARY_ISSUES:
         return CAPTION_HARD_BREAK_PENALTY
     if decision.get("classification") == "hard":
@@ -3488,6 +3762,14 @@ def _article_forced_continuation_decision(
             **decision,
             "classification": "review",
             "confidence": "high",
+            "relaxed_raw_hard": bool(
+                decision.get("raw_atomic_issue_codes")
+            ),
+            "relaxation_reason": (
+                "forced_subject_predicate"
+                if forced_subject_predicate
+                else "forced_complete_continuation"
+            ),
             "issue_codes": sorted(
                 issue_codes
                 | {
@@ -3617,6 +3899,45 @@ def _article_page_break_rank(
         return None
     risk = _article_page_boundary_risk(decision, cost)
     return risk, float(cost)
+
+
+def _article_manual_override_break_rank(
+    cue: Cue,
+    words: list[str],
+    split: int,
+    target_words: float,
+    word_timing: tuple[dict, ...],
+) -> tuple[int, float]:
+    """Rank every timed-word boundary for an explicit human override."""
+    regular = _article_page_break_rank(
+        cue,
+        words,
+        split,
+        target_words,
+        word_timing,
+        allow_review_boundary=True,
+    )
+    if regular is not None:
+        return regular
+
+    decision = _article_display_boundary_decision(cue, split)
+    score = abs(split - target_words) * 240
+    score += max(0, _article_visual_break_penalty(words, split))
+    if len(word_timing) == len(words):
+        pause_ms = max(
+            0,
+            round(
+                (
+                    word_timing[split]["start"]
+                    - word_timing[split - 1]["end"]
+                )
+                * 1000
+            ),
+        )
+        score -= min(pause_ms, ARTICLE_PAGE_PAUSE_PREFERENCE_MS) * 4
+    issue_codes = set(decision.get("issue_codes") or [])
+    atomic_count = len(issue_codes & ARTICLE_PAGE_ATOMIC_BOUNDARY_ISSUES)
+    return 7 + min(atomic_count, 2), float(score)
 
 
 def _article_page_boundary_risk(decision: Mapping, cost: int | float) -> int:
@@ -3966,6 +4287,7 @@ def _partition_article_english_pages(
     *,
     allow_forced_continuation: bool = False,
     allow_review_boundary: bool = False,
+    allow_manual_override: bool = False,
     span_layout: Callable[[int, int, int, bool], Sequence[str]] | None = None,
     span_balance: Callable[[int, int, int, int], float] | None = None,
     max_candidates: int = 1,
@@ -4036,6 +4358,8 @@ def _partition_article_english_pages(
                 ),
             )
         )
+        if allow_manual_override:
+            return bool(page_words and lines)
         return bool(
             _article_page_span_is_readable(
                 page_words,
@@ -4053,16 +4377,30 @@ def _partition_article_english_pages(
         "cue_start": float(cue.start),
         "cue_end": float(cue.end),
         "word_timing": word_timing,
-        "min_page_duration": ARTICLE_PAGE_MIN_DURATION_MS / 1000.0,
+        "min_page_duration": (
+            0.0
+            if allow_manual_override
+            else ARTICLE_PAGE_MIN_DURATION_MS / 1000.0
+        ),
         "span_is_readable": span_is_readable,
-        "break_score": lambda end, target: _article_page_break_rank(
-            cue,
-            words,
-            end,
-            target,
-            word_timing,
-            allow_forced_continuation=allow_forced_continuation,
-            allow_review_boundary=allow_review_boundary,
+        "break_score": lambda end, target: (
+            _article_manual_override_break_rank(
+                cue,
+                words,
+                end,
+                target,
+                word_timing,
+            )
+            if allow_manual_override
+            else _article_page_break_rank(
+                cue,
+                words,
+                end,
+                target,
+                word_timing,
+                allow_forced_continuation=allow_forced_continuation,
+                allow_review_boundary=allow_review_boundary,
+            )
         ),
         "span_score": (
             (lambda start, end: span_balance(
@@ -4151,8 +4489,9 @@ def _article_final_page_layout(
 ) -> tuple[int, list[str]] | None:
     """Keep the preferred font whenever the page fits within two lines."""
     text = " ".join(words[start:end])
-    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
-        lines = _article_fixed_english_lines(
+    return _article_choose_page_layout_by_font(
+        draw,
+        lambda font_size: _article_fixed_english_lines(
             draw,
             text,
             font_size=font_size,
@@ -4168,10 +4507,8 @@ def _article_final_page_layout(
                     base + split,
                 )
             ),
-        )
-        if lines:
-            return int(font_size), list(lines)
-    return None
+        ),
+    )
 
 
 def _article_planning_final_page_layout(
@@ -4183,18 +4520,43 @@ def _article_planning_final_page_layout(
 ) -> tuple[int, list[str]] | None:
     """Use the v18 feasibility contract while selecting page boundaries."""
     text = " ".join(words[start:end])
-    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
-        lines = _article_fixed_english_lines(
+    return _article_choose_page_layout_by_font(
+        draw,
+        lambda font_size: _article_fixed_english_lines(
             draw,
             text,
             font_size=font_size,
             boundary_penalty=lambda split, base=start: (
                 _article_page_planning_line_boundary_penalty(cue, base + split)
             ),
-        )
-        if lines:
-            return int(font_size), list(lines)
-    return None
+        ),
+    )
+
+
+def _article_choose_page_layout_by_font(
+    draw: ImageDraw.ImageDraw,
+    layout_for_font: Callable[[int], list[str]],
+) -> tuple[int, list[str]] | None:
+    """Keep 56px unless it is severely imbalanced and a smaller size is one line."""
+    first: tuple[int, list[str]] | None = None
+    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        lines = layout_for_font(int(font_size))
+        if not lines:
+            continue
+        candidate = (int(font_size), list(lines))
+        if first is None:
+            first = candidate
+            if font_size != ARTICLE_SUBTITLE_EN_FONT_SIZE:
+                return first
+            if not _article_layout_has_severe_imbalance(draw, lines, font_size):
+                return first
+            # A severe 56px two-line imbalance is allowed to seek a complete
+            # one-line layout at the next permitted size. A merely moderate
+            # imbalance keeps the larger, more legible font.
+            continue
+        if first[0] == ARTICLE_SUBTITLE_EN_FONT_SIZE and len(lines) == 1:
+            return candidate
+    return first
 
 
 def _article_candidate_fallback_tier(
@@ -4318,7 +4680,7 @@ def reflow_article_frozen_page_plan_same_screen(
     raw_pages = list(frozen_plan.get("pages") or [])
     try:
         first_word_id = int(timing[0]["word_id"])
-        last_word_id = int(timing[-1]["word_id"])
+        last_word_id = _article_timing_word_end(timing[-1])
         plan_word_start = int(frozen_plan["word_start"])
         plan_word_end = int(frozen_plan["word_end"])
     except (IndexError, KeyError, TypeError, ValueError) as exc:
@@ -4352,8 +4714,21 @@ def reflow_article_frozen_page_plan_same_screen(
             raise RenderStructuralOverflowError(
                 [{"cue_index": cue.index, "reason": "frozen_page_reflow_invalid"}]
             ) from exc
-        local_start = global_start - first_word_id
-        local_end = global_end - first_word_id
+        local_spans = _article_local_spans_for_global_ranges(
+            timing,
+            [(global_start, global_end)],
+        )
+        if local_spans is None:
+            raise RenderStructuralOverflowError(
+                [
+                    {
+                        "cue_index": cue.index,
+                        "reason": "frozen_page_reflow_splits_display_span",
+                    }
+                ]
+            )
+        local_start, local_end_exclusive = local_spans[0]
+        local_end = local_end_exclusive - 1
         page_english = " ".join(words[local_start : local_end + 1])
         if (
             global_start != expected_start
@@ -4421,6 +4796,7 @@ def _build_article_english_page_plan(
     draw: ImageDraw.ImageDraw,
     *,
     _return_candidates: bool = False,
+    max_page_count: int = ARTICLE_VISUAL_PAGE_MAX_PAGES,
 ) -> dict:
     """Freeze the English word pages before any Chinese page text is selected."""
     words = _article_boundary_words(cue)
@@ -4579,6 +4955,10 @@ def _build_article_english_page_plan(
             and decision.get("strong_pause_evidence")
             for decision in boundary_decisions
         )
+        relaxed_raw_hard_count = sum(
+            bool(decision.get("relaxed_raw_hard"))
+            for decision in boundary_decisions
+        )
         tight_complete_phrase_count = sum(
             bool(decision.get("tight_complete_phrase_start"))
             for decision in boundary_decisions
@@ -4643,7 +5023,7 @@ def _build_article_english_page_plan(
                         else None
                     ),
                     "global_word_end": (
-                        int(cue.word_timing[end - 1].get("word_id"))
+                        _article_timing_word_end(cue.word_timing[end - 1])
                         if len(cue.word_timing) == len(words)
                         and cue.word_timing[end - 1].get("word_id") is not None
                         else None
@@ -4804,6 +5184,7 @@ def _build_article_english_page_plan(
                 "medium_risk_count": medium_risk_count,
                 "low_risk_count": low_risk_count,
                 "supported_restart_count": supported_restart_count,
+                "relaxed_raw_hard_count": relaxed_raw_hard_count,
                 "severe_risk_count": sum(
                     risk >= 3 for risk in boundary_risks
                 ),
@@ -4824,8 +5205,8 @@ def _build_article_english_page_plan(
         )
 
     for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
-        max_page_count = min(ARTICLE_VISUAL_PAGE_MAX_PAGES, len(words))
-        for page_count in range(1, max_page_count + 1):
+        bounded_max_page_count = min(max(1, int(max_page_count)), len(words))
+        for page_count in range(1, bounded_max_page_count + 1):
             attempt_diagnostics: set[str] = set()
             strict_partitions = _partition_article_english_pages(
                 draw,
@@ -4910,6 +5291,7 @@ def _build_article_english_page_plan(
             )
             existing = deduplicated.get(signature)
             rank = (
+                int(candidate.get("relaxed_raw_hard_count") or 0),
                 _article_candidate_fallback_tier(candidate),
                 int(candidate.get("severe_risk_count") or 0),
                 int(candidate.get("high_risk_count") or 0),
@@ -4920,6 +5302,7 @@ def _build_article_english_page_plan(
                 deduplicated[signature] = candidate
                 continue
             existing_rank = (
+                int(existing.get("relaxed_raw_hard_count") or 0),
                 _article_candidate_fallback_tier(existing),
                 int(existing.get("severe_risk_count") or 0),
                 int(existing.get("high_risk_count") or 0),
@@ -4947,6 +5330,7 @@ def _build_article_english_page_plan(
             ]
             same_count.sort(
                 key=lambda candidate: (
+                    int(candidate.get("relaxed_raw_hard_count") or 0),
                     _article_candidate_fallback_tier(candidate),
                     int(candidate.get("severe_risk_count") or 0),
                     int(candidate.get("high_risk_count") or 0),
@@ -4963,29 +5347,79 @@ def _build_article_english_page_plan(
             )
         candidates = bounded_candidates
     if candidates:
+        minimum_relaxed_raw_hard_count = min(
+            int(candidate.get("relaxed_raw_hard_count") or 0)
+            for candidate in candidates
+        )
+        eligible_candidates = [
+            candidate
+            for candidate in candidates
+            if int(candidate.get("relaxed_raw_hard_count") or 0)
+            == minimum_relaxed_raw_hard_count
+        ]
+        safe_baseline_page_count = min(
+            (
+                int(candidate.get("page_count") or 0)
+                for candidate in eligible_candidates
+                if int(candidate.get("page_count") or 0) > 0
+            ),
+            default=0,
+        )
+        safe_baseline_candidates = [
+            candidate
+            for candidate in eligible_candidates
+            if int(candidate.get("page_count") or 0) == safe_baseline_page_count
+        ]
+        safe_plan_requires_three_lines = bool(
+            minimum_relaxed_raw_hard_count == 0
+            and safe_baseline_candidates
+            and all(
+                any(
+                    len(list(page.get("en_lines") or [])) > 2
+                    for page in candidate.get("plan", {}).get("pages") or []
+                )
+                for candidate in safe_baseline_candidates
+            )
+        )
+        if safe_plan_requires_three_lines:
+            # A verified complete continuation may replace the emergency
+            # three-line layout, but it cannot compete with any safe one- or
+            # two-line plan. Ordinary pause-relaxed hard boundaries stay out.
+            eligible_candidates.extend(
+                candidate
+                for candidate in candidates
+                if int(candidate.get("relaxed_raw_hard_count") or 0) > 0
+                and bool(candidate.get("forced_continuation"))
+                and all(
+                    len(list(page.get("en_lines") or [])) <= 2
+                    for page in candidate.get("plan", {}).get("pages") or []
+                )
+            )
         # Page count is a reading-load decision. Break rewards and penalties
         # are deliberately absent here; they select a boundary only after the
         # number of pages is fixed.
         strict_candidates = [
             candidate
-            for candidate in candidates
+            for candidate in eligible_candidates
             if _article_candidate_fallback_tier(candidate) == 0
         ]
         candidate_mode = (
-            "strict"
+            "relaxed_raw_hard"
+            if minimum_relaxed_raw_hard_count
+            else "strict"
             if strict_candidates
             else (
                 "review_boundary"
                 if any(
                     candidate.get("review_boundary_candidate")
-                    for candidate in candidates
+                    for candidate in eligible_candidates
                 )
                 else "forced_continuation"
             )
         )
-        selection_pool = strict_candidates or candidates
+        selection_pool = strict_candidates or eligible_candidates
         secondary_review_candidates = _article_high_pressure_review_candidates(
-            candidates,
+            eligible_candidates,
             total_word_count=len(words),
         )
         if secondary_review_candidates:
@@ -5820,15 +6254,28 @@ def build_article_display_page_candidate_workspace(
     cue: Cue,
     *,
     min_page_count: int = 2,
-    max_page_count: int = 4,
+    max_page_count: int = ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES,
 ) -> dict:
     """Return bounded read-only page candidates for editor inspection.
 
     The production blueprint remains the only writer of ``article_page_plan``.
     This helper creates no IDs, translations, timing overrides, or file output.
     """
+    lower = max(2, int(min_page_count or 2))
+    upper = min(
+        ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES,
+        max(
+            lower,
+            int(max_page_count or ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES),
+        ),
+    )
     draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
-    bundle = _build_article_english_page_plan(cue, draw, _return_candidates=True)
+    bundle = _build_article_english_page_plan(
+        cue,
+        draw,
+        _return_candidates=True,
+        max_page_count=upper,
+    )
     if bundle.get("status") != "candidate_bundle":
         return {
             "status": "unavailable",
@@ -5837,8 +6284,6 @@ def build_article_display_page_candidate_workspace(
             "errors": list(bundle.get("errors") or []),
             "candidates": [],
         }
-    lower = max(2, int(min_page_count or 2))
-    upper = min(ARTICLE_VISUAL_PAGE_MAX_PAGES, max(lower, int(max_page_count or 4)))
     selected = [
         candidate
         for candidate in bundle.get("candidates") or []
@@ -5866,6 +6311,7 @@ def propose_article_manual_page_word_ranges(
     page_count: int,
     *,
     allow_review_boundary: bool = False,
+    allow_hard_boundary: bool = False,
 ) -> list[tuple[int, int]]:
     """Plan an explicit page count with the normal syntax/timing scorer."""
     requested = int(page_count)
@@ -5873,7 +6319,7 @@ def propose_article_manual_page_word_ranges(
     timing = list(cue.word_timing or ())
     if (
         requested < 2
-        or requested > ARTICLE_VISUAL_PAGE_MAX_PAGES
+        or requested > ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES
         or requested > len(words)
         or len(words) != len(timing)
     ):
@@ -5910,7 +6356,10 @@ def propose_article_manual_page_word_ranges(
                 attempted_reasons.add(schedule_error)
                 continue
             return [
-                (first_word_id + start, first_word_id + end - 1)
+                (
+                    int(timing[start]["word_id"]),
+                    _article_timing_word_end(timing[end - 1]),
+                )
                 for start, end in spans
             ]
 
@@ -5935,7 +6384,42 @@ def propose_article_manual_page_word_ranges(
                 attempted_reasons.add(schedule_error)
                 continue
             return [
-                (first_word_id + start, first_word_id + end - 1)
+                (
+                    int(timing[start]["word_id"]),
+                    _article_timing_word_end(timing[end - 1]),
+                )
+                for start, end in spans
+            ]
+
+    if allow_hard_boundary:
+        for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+            diagnostics: set[str] = set()
+            spans = _partition_article_english_pages(
+                draw,
+                cue,
+                words,
+                requested,
+                cue.word_timing,
+                font_size,
+                diagnostics=diagnostics,
+                allow_manual_override=True,
+            )
+            attempted_reasons.update(diagnostics)
+            if spans is None:
+                continue
+            schedule, schedule_error = _schedule_article_page_boundaries(
+                cue,
+                spans,
+                minimum_page_duration_ms=0,
+            )
+            if schedule is None:
+                attempted_reasons.add(schedule_error)
+                continue
+            return [
+                (
+                    int(timing[start]["word_id"]),
+                    _article_timing_word_end(timing[end - 1]),
+                )
                 for start, end in spans
             ]
 
@@ -5987,7 +6471,7 @@ def rebuild_article_frozen_page_plan_from_word_ranges(
 
     try:
         first_word_id = int(timing[0]["word_id"])
-        last_word_id = int(timing[-1]["word_id"])
+        last_word_id = _article_timing_word_end(timing[-1])
         ranges = [(int(start), int(end)) for start, end in page_word_ranges]
     except (KeyError, TypeError, ValueError) as exc:
         raise RenderStructuralOverflowError(
@@ -6006,10 +6490,16 @@ def rebuild_article_frozen_page_plan_from_word_ranges(
             [{"cue_index": cue.index, "reason": "manual_page_boundary_not_contiguous"}]
         )
 
-    local_spans = [
-        (start - first_word_id, end - first_word_id + 1)
-        for start, end in ranges
-    ]
+    local_spans = _article_local_spans_for_global_ranges(timing, ranges)
+    if local_spans is None:
+        raise RenderStructuralOverflowError(
+            [
+                {
+                    "cue_index": cue.index,
+                    "reason": "manual_page_boundary_splits_display_span",
+                }
+            ]
+        )
     schedule, schedule_error = _schedule_article_page_boundaries(
         cue,
         local_spans,
@@ -6037,7 +6527,7 @@ def rebuild_article_frozen_page_plan_from_word_ranges(
                     {
                         "cue_index": cue.index,
                         "reason": "manual_page_boundary_is_hard",
-                        "word_start": first_word_id + local_start,
+                        "word_start": int(timing[local_start]["word_id"]),
                         "issue_codes": list(decision.get("issue_codes") or []),
                     }
                 ]
@@ -6102,19 +6592,24 @@ def rebuild_article_frozen_page_plan_from_word_ranges(
     frozen_pages = []
     for page_index, (
         (global_start, global_end),
+        (local_start, local_end),
         raw_page,
         lines,
         page_font_size,
     ) in enumerate(
-        zip(ranges, page_templates, selected_lines, selected_page_fonts)
+        zip(
+            ranges,
+            local_spans,
+            page_templates,
+            selected_lines,
+            selected_page_fonts,
+        )
     ):
         page_id = str(raw_page.get("display_page_id") or "")
         if page_id != display_page_id(str(cue.subtitle_id or ""), page_index + 1):
             raise RenderStructuralOverflowError(
                 [{"cue_index": cue.index, "reason": "manual_page_id_mismatch"}]
             )
-        local_start = global_start - first_word_id
-        local_end = global_end - first_word_id + 1
         frozen_pages.append(
             {
                 "display_page_id": page_id,
@@ -6180,7 +6675,7 @@ def _article_plan_from_frozen_artifact(
         return None
     try:
         first_word_id = int(timing[0]["word_id"])
-        last_word_id = int(timing[-1]["word_id"])
+        last_word_id = _article_timing_word_end(timing[-1])
         font_size = int(frozen["english_font_size"])
         frozen_word_start = int(frozen["word_start"])
         frozen_word_end = int(frozen["word_end"])
@@ -6223,8 +6718,14 @@ def _article_plan_from_frozen_artifact(
             english_width = int(raw_page["english_width"])
         except (KeyError, TypeError, ValueError):
             return None
-        local_start = global_start - first_word_id
-        local_end = global_end - first_word_id
+        local_spans = _article_local_spans_for_global_ranges(
+            timing,
+            [(global_start, global_end)],
+        )
+        if local_spans is None:
+            return None
+        local_start, local_end_exclusive = local_spans[0]
+        local_end = local_end_exclusive - 1
         if (
             global_start != expected_global_start
             or local_start < 0
@@ -6579,7 +7080,9 @@ def build_article_manual_draft_page_plan(
                             "word_start": start,
                             "word_end": end - 1,
                             "global_word_start": int(cue.word_timing[start]["word_id"]),
-                            "global_word_end": int(cue.word_timing[end - 1]["word_id"]),
+                            "global_word_end": _article_timing_word_end(
+                                cue.word_timing[end - 1]
+                            ),
                             "start": timed_boundaries[index],
                             "end": timed_boundaries[index + 1],
                             "en_lines": list(lines),
@@ -6959,6 +7462,19 @@ def fit_article_zh_font(
 ) -> ImageFont.FreeTypeFont:
     """Article subtitle typography is fixed; page planning owns overflow."""
     return article_cjk_font(ARTICLE_SUBTITLE_ZH_FONT_SIZE, 700)
+
+
+def article_subtitle_origins(en_count: int, zh_count: int) -> tuple[int, int]:
+    """Return stable design-space origins for the rendered subtitle block."""
+    if en_count == 1 and zh_count <= 1:
+        return 604, 766
+    if en_count == 2 and zh_count <= 1:
+        return 570, 772
+    if en_count == 1 and zh_count == 2:
+        return 586, 736
+    if en_count == 3:
+        return (552, 774) if zh_count <= 1 else (552, 746)
+    return 560, 736
 
 
 def wrap_article_en_subtitle(
@@ -8046,16 +8562,7 @@ def draw_article_frame(
         zh_gap = 58
         en_count = max(1, len(en_lines))
         zh_count = max(0, len(zh_lines))
-        if en_count == 1 and zh_count <= 1:
-            en_y, zh_y = 604, 766
-        elif en_count == 2 and zh_count <= 1:
-            en_y, zh_y = 570, 772
-        elif en_count == 1 and zh_count == 2:
-            en_y, zh_y = 586, 736
-        elif en_count == 3:
-            en_y, zh_y = 552, 746
-        else:
-            en_y, zh_y = 560, 736
+        en_y, zh_y = article_subtitle_origins(en_count, zh_count)
         for idx, line in enumerate(en_lines):
             fill = with_alpha((42, 63, 93, 255), subtitle_alpha)
             if highlight_ranges[idx]:

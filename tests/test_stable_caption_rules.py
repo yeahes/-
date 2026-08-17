@@ -1841,6 +1841,31 @@ def test_chinese_semantic_audit_ignores_normal_short_responses():
         assert not issues
 
 
+def test_allocation_validator_retries_multi_signal_chinese_boundary_issue():
+    editor = _editor()
+    entry = {
+        "id": 31,
+        "full_english": "The risk appears if markets continue rising.",
+        "full_translation": "如果市场继续上涨，风险就会出现。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0201", "english": "The risk appears if"},
+            {"subtitle_id": "S0202", "english": "markets continue rising."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0201": "风险在于如果",
+            "S0202": "市场继续上涨，就会出现。",
+        },
+    )
+
+    assert validation["valid"] is False
+    assert "modifier_head_split" in validation["issue_codes"]
+    assert "punctuation_discontinuity" in validation["issue_codes"]
+
+
 def test_semantic_audit_context_requires_id_signature_and_expected_ids():
     editor = _editor()
     context = _semantic_context(24, ["S0101", "S0102"], "Meta, the American tech giant.", "甲")
@@ -7901,7 +7926,26 @@ def test_single_cue_authoritative_translation_ending_in_de_is_not_an_allocation_
     assert not editor._last_allocation_unresolved
 
 
-def test_invalid_single_cue_group_does_not_discard_other_fixed_id_allocations():
+def test_just_because_non_entailment_translation_is_not_semantic_loss():
+    editor = _id_editor()
+    english = (
+        "Just because human microbiomes differ significantly from person to person "
+        "does not mean an era of personalized microbiome medicine has actually arrived."
+    )
+    chinese = "人类微生物组个体差异大，不等于个性化微生物医学时代已到来。"
+
+    findings = editor._chinese_group_quality_findings(
+        english,
+        chinese,
+        [chinese],
+        full_translation=chinese,
+        mapping_valid=True,
+    )
+
+    assert "semantic_loss" not in {finding["code"] for finding in findings}
+
+
+def test_invalid_single_cue_quality_preserves_authoritative_translation_for_review():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
     groups = [_id_group(1, 0, [items[0]]), _id_group(2, 1, [items[1]])]
@@ -7920,8 +7964,14 @@ def test_invalid_single_cue_group_does_not_discard_other_fixed_id_allocations():
             {1: "无效完整翻译", 2: "保留第二组翻译。"},
         )
 
-    assert allocated == {2: {"S0002": "保留第二组翻译。"}}
+    assert allocated == {
+        1: {"S0001": "无效完整翻译"},
+        2: {"S0002": "保留第二组翻译。"},
+    }
     assert editor._last_allocation_unresolved[0]["semantic_group_id"] == "G0001"
+    assert editor._last_allocation_unresolved[0]["allocation"] == {
+        "S0001": "无效完整翻译"
+    }
 
 
 def test_missing_full_translation_does_not_discard_prior_fixed_id_allocation():
@@ -12730,6 +12780,7 @@ if __name__ == "__main__":
     test_chinese_semantic_group_audit_warns_on_lost_core_action()
     test_chinese_semantic_audit_skips_semantic_loss_when_mapping_invalid()
     test_chinese_semantic_audit_ignores_normal_short_responses()
+    test_allocation_validator_retries_multi_signal_chinese_boundary_issue()
     test_semantic_audit_context_requires_id_signature_and_expected_ids()
     test_semantic_audit_mapping_does_not_shift_when_audit_groups_exceed_generation_count()
     test_semantic_audit_mapping_does_not_shift_when_audit_groups_drop_generation_count()
@@ -12976,7 +13027,8 @@ if __name__ == "__main__":
     test_allocation_final_artifact_keeps_unresolved_group_fixed_id_mapping()
     test_single_cue_group_uses_authoritative_full_translation_without_allocation_request()
     test_single_cue_authoritative_translation_ending_in_de_is_not_an_allocation_fragment()
-    test_invalid_single_cue_group_does_not_discard_other_fixed_id_allocations()
+    test_just_because_non_entailment_translation_is_not_semantic_loss()
+    test_invalid_single_cue_quality_preserves_authoritative_translation_for_review()
     test_missing_full_translation_does_not_discard_prior_fixed_id_allocation()
     test_full_translation_number_error_is_not_misclassified_as_allocation_error()
     test_full_translation_requests_are_chunked_and_retry_missing_groups()

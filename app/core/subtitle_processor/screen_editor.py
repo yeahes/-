@@ -405,7 +405,7 @@ DISPLAY_PAGE_TRANSLATION_PROMPT = """
 You are assigning a display-only Simplified Chinese projection to fixed visual
 pages below one frozen parent subtitle ID.
 
-Version: display-page-translation-v4
+Version: display-page-translation-v5
 
 The English page IDs, English text, order, word ownership, and timing are
 immutable. Re-express the supplied full_translation as one concise Chinese
@@ -431,6 +431,9 @@ Rules:
   wording without dropping any fact-bearing meaning when a page is short.
 - Keep the concatenated Chinese concise and semantically equivalent to
   full_translation. Do not add explanations or commentary.
+- The concatenated page text is only a projection of full_translation. Do not
+  restate the same fact on adjacent pages, add a new lead-in, or expand one
+  source statement into a longer explanation.
 
 Return pure JSON only:
 {"pages":[{"display_page_id":"S0001.P01","source_english":"exact English copied from this page","zh":"第一页中文"}]}
@@ -1261,11 +1264,25 @@ class ScreenSubtitleEditor:
                     contract, response, require_source_echo=True
                 )
                 quality_errors = self._display_page_translation_quality_errors(contract, artifact)
+                initial_artifact = dict(artifact)
+                initial_blocking_errors = [
+                    *list(artifact.get("errors") or []),
+                    *quality_errors,
+                ]
+                initial_reviews = [
+                    dict(review)
+                    for review in getattr(
+                        self,
+                        "_display_page_translation_reviews",
+                        [],
+                    )
+                ]
+                retry_triggers = list(initial_blocking_errors)
                 if (
                     self._display_page_translation_model_name()
                     != self._full_translation_model_name()
                 ):
-                    quality_errors.extend(
+                    retry_triggers.extend(
                         {
                             "code": "display_page_naturalness_review",
                             "parent_subtitle_id": str(
@@ -1273,14 +1290,15 @@ class ScreenSubtitleEditor:
                             ),
                             "issue_codes": list(review.get("issue_codes") or []),
                         }
-                        for review in self._display_page_translation_reviews
+                        for review in getattr(
+                            self,
+                            "_display_page_translation_reviews",
+                            [],
+                        )
                         if str(review.get("parent_subtitle_id") or "")
                     )
-                if artifact.get("status") != "PASS" or quality_errors:
-                    initial_errors = [
-                        *list(artifact.get("errors") or []),
-                        *quality_errors,
-                    ]
+                if artifact.get("status") != "PASS" or retry_triggers:
+                    initial_errors = list(retry_triggers)
                     # A missing/duplicate/unknown page is a contract-wide
                     # cardinality failure.  A scoped retry cannot reconstruct
                     # the accepted pages because the validator intentionally
@@ -1309,24 +1327,40 @@ class ScreenSubtitleEditor:
                             str(parent.get("parent_subtitle_id") or "")
                             for parent in retry_contract.get("parents") or []
                         ]
-                        artifact = {
-                            **dict(artifact),
-                            "status": "ERROR",
-                            "contract_hash": contract.get("contract_hash"),
-                            "render_plans": [
-                                dict(plan)
-                                for plan in contract.get("render_plans") or []
-                            ],
-                            "errors": [
-                                *initial_errors,
-                                {
-                                    "code": "display_page_translation_retry_failed",
-                                    "message": str(retry_exc),
-                                    "parent_subtitle_ids": retry_parent_ids,
-                                },
-                            ],
+                        retry_failure = {
+                            "code": "display_page_translation_retry_failed",
+                            "message": str(retry_exc),
+                            "parent_subtitle_ids": retry_parent_ids,
                         }
-                        quality_errors = []
+                        if (
+                            initial_artifact.get("status") == "PASS"
+                            and not initial_blocking_errors
+                        ):
+                            # This retry was an optional fluency improvement.
+                            # A request failure cannot invalidate the complete
+                            # initial page projection that triggered only
+                            # REVIEW evidence.
+                            artifact = {
+                                **initial_artifact,
+                                "retry_attempt_errors": [retry_failure],
+                            }
+                            self._display_page_translation_reviews = initial_reviews
+                            quality_errors = []
+                        else:
+                            artifact = {
+                                **dict(artifact),
+                                "status": "ERROR",
+                                "contract_hash": contract.get("contract_hash"),
+                                "render_plans": [
+                                    dict(plan)
+                                    for plan in contract.get("render_plans") or []
+                                ],
+                                "errors": [
+                                    *initial_errors,
+                                    retry_failure,
+                                ],
+                            }
+                            quality_errors = []
                     else:
                         if (
                             retry_artifact.get("status") == "PASS"
@@ -1340,6 +1374,26 @@ class ScreenSubtitleEditor:
                             quality_errors = self._display_page_translation_quality_errors(
                                 contract, artifact
                             )
+                        elif (
+                            initial_artifact.get("status") == "PASS"
+                            and not initial_blocking_errors
+                        ):
+                            # The Pro call is a candidate improvement, not a
+                            # second authority.  If it adds semantic, identity,
+                            # token-boundary, or speed errors, retain the
+                            # complete Flash projection and its explicit review
+                            # state instead of converting the whole episode to
+                            # a 96% render blocker.
+                            retry_attempt_errors = [
+                                *list(retry_artifact.get("errors") or []),
+                                *retry_quality_errors,
+                            ]
+                            artifact = {
+                                **initial_artifact,
+                                "retry_attempt_errors": retry_attempt_errors,
+                            }
+                            self._display_page_translation_reviews = initial_reviews
+                            quality_errors = []
                         else:
                             retry_parent_ids = [
                                 str(parent.get("parent_subtitle_id") or "")
@@ -1812,10 +1866,23 @@ class ScreenSubtitleEditor:
             validation = self._validate_group_chinese_allocation(entry, allocation)
             if not validation.get("valid"):
                 issue_codes = list(validation.get("issue_codes") or [])
+                # A display page is allowed to be a readable continuation of
+                # its frozen parent.  These codes describe local fluency or
+                # punctuation at that page edge; after the Pro retry they are
+                # editor REVIEW evidence.  Meaning loss, duplication, missing
+                # IDs/text, anchor drift, and reading overflow remain blockers.
+                review_only_codes = {
+                    "unnatural_chinese_fragment",
+                    "missing_predicate",
+                    "dangling_preposition",
+                    "modifier_head_split",
+                    "punctuation_discontinuity",
+                    "english_word_order",
+                }
                 blocking_codes = [
                     code
                     for code in issue_codes
-                    if code != "unnatural_chinese_fragment"
+                    if code not in review_only_codes
                 ]
                 record = {
                     "parent_subtitle_id": parent_id,
@@ -12484,7 +12551,13 @@ class ScreenSubtitleEditor:
             )
         if mapping_valid and not single_complete_cue:
             bad_fragments = [
-                index + 1 for index, part in enumerate(parts) if self._is_bad_chinese_fragment(part)
+                index + 1
+                for index, part in enumerate(parts)
+                if self._is_bad_allocation_chinese_fragment(
+                    part,
+                    index,
+                    len(parts),
+                )
             ]
             if bad_fragments:
                 findings.append(
@@ -14609,7 +14682,16 @@ class ScreenSubtitleEditor:
         return False
 
     @staticmethod
-    def _is_incomplete_chinese_group(text: str) -> bool:
+    def _is_terminal_shi_de_predicate(text: str) -> bool:
+        return bool(
+            re.search(
+                r"(?:不是|并非|是)[^，。！？；：]{0,20}(?:写|做|创|制|编|说|叫|算|为|用|称|给|由|被|有|在|来自|属于)[^，。！？；：]{0,12}的$",
+                str(text or ""),
+            )
+        )
+
+    @classmethod
+    def _is_incomplete_chinese_group(cls, text: str) -> bool:
         compact = re.sub(r"\s+", "", text or "")
         has_terminal_punctuation = bool(re.search(r"[。！？；：]$", compact))
         normalized = re.sub(r"[，。！？；：、,.!?;:]+$", "", compact)
@@ -14638,6 +14720,8 @@ class ScreenSubtitleEditor:
             return False
         if normalized.endswith("\u4f60\u61c2\u7684"):
             return False
+        if has_terminal_punctuation and cls._is_terminal_shi_de_predicate(normalized):
+            return False
         dangling_endings = (
             "\u65f6",  # 时
             "\u4e4b\u540e",  # 之后
@@ -14661,8 +14745,8 @@ class ScreenSubtitleEditor:
         )
         return not has_action
 
-    @staticmethod
-    def _is_bad_chinese_fragment(text: str) -> bool:
+    @classmethod
+    def _is_bad_chinese_fragment(cls, text: str) -> bool:
         normalized = re.sub(r"\s+", "", text or "")
         normalized = re.sub(r"[，。！？；：、,.!?;:]+$", "", normalized)
         if normalized in {
@@ -14680,6 +14764,8 @@ class ScreenSubtitleEditor:
         # Sentence-final 是的/对的/好的 are complete response forms; their final
         # 的 must not be treated as a dangling modifier by the group audit.
         if normalized.endswith(("\u662f\u7684", "\u5bf9\u7684", "\u597d\u7684", "\u6ca1\u9519", "\u5f53\u7136")):
+            return False
+        if cls._is_terminal_shi_de_predicate(normalized):
             return False
         if normalized.startswith("\u5982\u679c") and re.search(r"[\u5c31\u4f1a\u8981\u80fd\u53ef\u5fc5\u987b]", normalized):
             return False
@@ -14726,6 +14812,20 @@ class ScreenSubtitleEditor:
         full_zh = re.sub(r"\s+", "", full_translation or "")
         full_en = (full_english or "").lower()
 
+        just_because_non_entailment = bool(
+            re.search(
+                r"\bjust\s+because\b.*\b(?:does|do|did)(?:\s+not|n't)\s+mean\b",
+                full_en,
+            )
+        )
+        chinese_non_entailment = bool(
+            re.search(
+                r"(?:不等于|不意味着|不代表|并不(?:等于|意味着|代表|说明)|"
+                r"不能(?:说明|证明|推出)|未必(?:意味着|代表))",
+                merged,
+            )
+        )
+
         # Chinese negation can be written as “并非”; account for it before
         # treating an otherwise complete allocation as a semantic-loss risk.
         semantic_markers = [
@@ -14737,6 +14837,12 @@ class ScreenSubtitleEditor:
             ("but", ("\u4f46", "\u4e0d\u8fc7", "\u800c")),
         ]
         for english_marker, zh_options in semantic_markers:
+            if (
+                english_marker == "because"
+                and just_because_non_entailment
+                and chinese_non_entailment
+            ):
+                continue
             if english_marker in full_en and not any(option in merged for option in zh_options):
                 return True
 
@@ -17176,6 +17282,7 @@ class ScreenSubtitleEditor:
             # result, so do not spend a second LLM request paraphrasing it.
             subtitle_id = str(subtitle_parts[0]["subtitle_id"])
             direct_allocation = {subtitle_id: full_translation}
+            direct_allocations[int(group["id"])] = direct_allocation
             validation = self._validate_group_chinese_allocation(entry, direct_allocation)
             self._last_allocation_validation.append(validation)
             if not validation["valid"]:
@@ -17185,12 +17292,10 @@ class ScreenSubtitleEditor:
                     validation,
                     "authoritative_single_cue_allocation_invalid",
                 )
-                # This group has no allocation boundary, but its failure must
-                # never discard already valid fixed-ID allocations from other
-                # groups. Final ID validation owns the render block for this
-                # one unresolved cue.
+                # Quality evidence cannot erase the non-empty authoritative
+                # translation. Preserve it for review, matching the multi-cue
+                # retry failure contract.
                 continue
-            direct_allocations[int(group["id"])] = direct_allocation
             self._last_allocation_final.append(
                 {
                     "semantic_group_id": f"G{int(group['id']):04d}",
@@ -18202,6 +18307,29 @@ class ScreenSubtitleEditor:
             issue_codes.append("cross_subtitle_predicate_break")
             issues.extend(predicate_breaks)
 
+        semantic_findings = self._chinese_group_quality_findings(
+            str(entry.get("full_english") or ""),
+            merged,
+            ordered_texts,
+            full_translation=full_translation,
+            mapping_valid=bool(
+                full_translation
+                and set(allocation or {}) == set(expected_ids)
+                and all(ordered_texts)
+            ),
+        )
+        if self._is_high_confidence_chinese_group_issue(semantic_findings):
+            for finding in semantic_findings:
+                code = str(finding.get("code") or "")
+                if code:
+                    issue_codes.append(code)
+                issues.append(
+                    {
+                        **dict(finding),
+                        "reason": "high_confidence_chinese_group_quality_issue",
+                    }
+                )
+
         issue_codes = list(dict.fromkeys(issue_codes))
         blocking_issue_codes = [
             code for code in issue_codes if code != "full_translation_quality_issue"
@@ -18541,10 +18669,7 @@ class ScreenSubtitleEditor:
         # final grammar is not itself a dangling modifier or connective.
         if terminal_punctuation and (
             not normalized.endswith(terminal_dangling_endings)
-            or re.search(
-                r"(?:不是|并非|是)[^，。！？；：]{0,20}(?:写|做|创|制|编|说|叫|算|为|用|称|给|由|被|有|在|来自|属于)[^，。！？；：]{0,12}的$",
-                normalized,
-            )
+            or self._is_terminal_shi_de_predicate(normalized)
         ):
             return False
         if total <= 1:

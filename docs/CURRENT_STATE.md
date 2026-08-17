@@ -1,6 +1,109 @@
 # Current State
 
-Last updated: 2026-08-16
+Last updated: 2026-08-17
+
+## 2026-08-17 Balanced Same-Screen Wrap And Manual Split Fallback
+
+- Article-template same-screen English wrapping now compares every legal width
+  profile instead of accepting the first fit. It scores measured pixel balance,
+  keeps lexical atoms hard, and ignores only the page-turn-specific
+  `unsupported_tight_page_transition` warning because both lines remain visible.
+- The article display planner is `article-fixed-font-pages-v24`; older page
+  layout/projection caches are rebuilt while ASR, full-translation, and fixed-ID
+  caches retain their independent fingerprints.
+- Automatic page planning remains conservative. When strict and REVIEW
+  partitions cannot satisfy a requested manual page count, the editor offers a
+  Chinese confirmation dialog. Confirming creates a timed-word, pixel-load and
+  duration-balanced high-risk proposal, preserves the original HARD evidence,
+  and requires the user to adjust boundaries and confirm page Chinese.
+- The override cannot change the parent ID, English, word ledger, word times,
+  cue envelope, or audio. It cannot permit missing timing, non-contiguous word
+  ownership, lost/duplicated/reordered words, or fixed-font overflow.
+- Read-only oil replay kept 163 pages and two three-line pages while reducing
+  two-line balance ratios below 0.60 from 23 to 18 and ratios below 0.45 from
+  eight to two. The complete regression command passes.
+
+## 2026-08-17 Display-Page Chinese Candidate Fallback Recovery
+
+- The fresh `肠道菌群，能人为操控吗？` run later reached 96% and failed in
+  display-page Chinese assignment. Its ASR, 217 frozen subtitle IDs, English,
+  word ledger, final timing, and 33 paginated parent contracts were complete.
+- The stricter page audit correctly detected repetition and significant
+  expansion, but the retry control flow treated Pro as a second authority.
+  The initial Flash projection was complete with zero hard errors and six
+  local-fluency REVIEW findings; Pro made several parents worse, and the old
+  flow incorrectly converted that optional improvement failure into an
+  episode-wide render blocker.
+- Local page-edge fluency evidence (`unnatural_chinese_fragment`, missing local
+  predicate, dangling preposition/modifier, punctuation discontinuity, or
+  English-shaped page order) is now REVIEW evidence after retry. It does not
+  hide missing Chinese, page-ID/cardinality errors, semantic loss, repetition,
+  significant expansion, entity/number/negation/relation drift, illegal Chinese
+  token cuts, or hard page reading-speed overflow; those remain blockers.
+- When a complete initial projection has only REVIEW evidence, Pro is an
+  optional candidate. If the request fails or the candidate introduces hard
+  errors, the system preserves the usable Flash pages and records the rejected
+  attempt in `retry_attempt_errors`. An initially incomplete or semantically
+  invalid projection still fails closed.
+- Read-only replay of the failed package passes all 33 paginated parents with
+  zero hard errors and six retained REVIEW findings. Focused tests, the full
+  page-translation contract suite, `runtime\python.exe scripts\run_regression.py`,
+  and `git diff --check` pass. No English, ID, word-time, page-geometry, font,
+  rendering, or production artifact was changed by this repair.
+
+## 2026-08-17 Single-Cue Chinese Quality-Gate Recovery
+
+- A fresh `肠道菌群，能人为操控吗？` run reached 84% and failed while
+  building `authoritative-parent-chinese.json`. The page planner and page-level
+  Chinese gates had not run. Cached response replay traced the empty parent to
+  `G0163 / S0194`.
+- The semantic detector treated every English `because` as requiring a literal
+  Chinese causal marker. It therefore misclassified the natural construction
+  `Just because ... does not mean ... -> ...不等于...` as `semantic_loss`.
+  The detector now recognizes negative-entailment Chinese for that general
+  English construction without weakening ordinary causal checks.
+- A non-empty authoritative translation for a one-cue semantic group can no
+  longer be erased by a heuristic quality finding. The translation remains
+  ID-bound and the unresolved quality evidence is retained for editor review,
+  matching the existing multi-cue retry-failure contract. Missing upstream
+  translations still fail the fixed-ID structural gate.
+- Read-only replay of the saved model caches covered 180 semantic groups and
+  all 217 fixed subtitle IDs: no empty multi-cue allocation and no invalid
+  direct group remained. The stable-caption suite and complete
+  `runtime\python.exe scripts\run_regression.py` command pass.
+
+## 2026-08-16 Page Quality And Analysis-Cache Audit Repair
+
+- Page-level Chinese projection now validates the concatenated rendered text
+  against its authoritative fixed-ID parent Chinese. Exact fact repetition and
+  significant expansion with novel Chinese content fail the page contract and
+  enter the existing parent-local retry path; normal reordering and small
+  connective changes remain legal. The allocation contract is
+  `fixed-parent-page-allocation-v6` and the request prompt is
+  `display-page-translation-v5`, so older accepted page responses are not
+  silently reused.
+- The article display planner is `article-fixed-font-pages-v23`. Boundary
+  evidence retains its raw hard and atomic syntax codes after an acoustic or
+  continuation relaxation. A plan without a relaxed atomic boundary wins over
+  a pause-relaxed hard split. The existing verified complete-continuation
+  fallback may still replace an emergency three-line page, but it cannot
+  compete with a safe one- or two-line plan.
+- High-confidence Chinese semantic-group findings now feed the existing
+  parent/group-local Pro retry before publication. If they remain unresolved,
+  the editor trusts the producer's high-confidence classification and marks
+  every affected fixed subtitle ID instead of applying a second threshold or
+  marking only the first ID.
+- Article-analysis cache identity now includes the source article, schema,
+  prompt contents, and an explicit prompt-policy version. GUI-provided context,
+  resume artifacts, and stable-run fingerprints use the same identity, so a
+  prompt improvement cannot reuse an older proper-noun or terminology analysis.
+- Read-only replay of the saved 140-parent oil package produced 156 pages with
+  zero selected relaxed-atomic boundaries. The new Chinese projection gate
+  identified the known expansion in `S0117` and `S0136`; the inspected
+  manifest, SRT, and page artifact hashes were unchanged.
+- Focused suites and the complete
+  `runtime\python.exe scripts\run_regression.py` command exit zero. No model
+  request, production subtitle write, or synthesis run was performed.
 
 ## 2026-08-16 Concise Chinese Translation And 48px Article Subtitle
 
@@ -3119,3 +3222,48 @@ Result:
   `git diff --check`, and the complete 26-stage regression pass. The unified
   run took 352.6 seconds. No ASR, LLM, translation, synthesis, paid request, or
   production artifact write was performed.
+
+## 2026-08-17 Manual Final Boundary, Page, ASR, And Media-Mute Hardening
+
+- The last visible row now resolves to its upper fixed or display-page boundary;
+  a single parent with multiple pages can also adjust its internal boundary.
+- Context-menu split, repage, and merge mutations are queued out of the native
+  menu callback and capture stable parent/page IDs instead of `QModelIndex` or
+  stale row numbers, removing the known model-reset re-entry path behind the
+  Windows last-row split crash.
+- Automatic pagination remains capped at four pages. Explicit manual actions may
+  create up to six pages, and the on-demand manual candidate workspace can
+  inspect two-to-six-page alternatives. Both preserve fixed English, IDs, word
+  coverage, timing, and the existing validation contract.
+- Article ASR correction policy v5 can collapse an article-evidenced two-token
+  work title only when phonetic and local article context both agree. The real
+  `new lie -> Niulai` spans correct before IDs freeze; high-signal `Yulai`
+  remains review-only instead of being silently rewritten.
+- The editor now offers `隐藏整条字幕并静音这段`. Saving creates a SHA-256-bound,
+  duration-preserving derived AAC with the exact parent cue intervals muted.
+  It preserves the original media, subtitle/word timeline, and video duration,
+  supports whole-document undo/redo, is mutually exclusive with tail trim, and
+  is resolved again inside `VideoSynthesisThread` before rendering.
+- Focused ASR, editor, publication/UI, synthesis-safety, real FFmpeg mute, and
+  manual candidate tests pass. The final complete regression command and
+  `git diff --check` both exit zero.
+
+## 2026-08-17 Multiword Surface, Combined Media Derivation, And English Copy
+
+- The manual editor now owns a presentation-only `english_surface_overrides`
+  projection. A continuous raw-word span such as `New Ally` can display as
+  `Niulai` without changing the raw ledger, word IDs, word times, subtitle IDs,
+  or cue/page ownership. Ordinary one-word edits, parent merges, boundary
+  moves, tail deletion, save/reload, undo, and redo rebuild through the same
+  display projection instead of silently restoring raw surfaces.
+- Tail deletion rejects a cut inside a display override, preserves a complete
+  retained override, and removes a complete suffix override. Old mute-only
+  packages recover their hash-bound original media before a later tail cut.
+- Schema-v2 media derivation permits ordered mute intervals plus an optional
+  suffix cut in one FFmpeg filter chain. The original media remains the only
+  derivation source; synthesis resolves the manifest-owned derivative.
+- The subtitle table supports ordered multi-row English copy through `Ctrl+C`
+  and `复制英文`. Copying does not mutate the table, edit session, history,
+  page contract, or timeline.
+- Focused manual-editor, publication/UI, synthesis-safety, page-translation,
+  and display-readability contracts pass before the final unified regression.

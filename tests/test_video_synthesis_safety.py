@@ -20,6 +20,7 @@ from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleSession,
 )
 from app.core.subtitle_processor.stable_artifacts import file_sha256
+from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
 from app.core.task_factory import TaskFactory
 from app.core.utils import podcast_learning_video, video_utils
 from app.thread.batch_process_thread import BatchProcessThread, BatchTask
@@ -214,6 +215,7 @@ def _synthesis_package(
     root: Path,
     *,
     with_tail_trim: bool,
+    with_media_mute: bool = False,
 ) -> tuple[Path, Path]:
     root.mkdir(parents=True)
     subtitle = root / "final.srt"
@@ -237,6 +239,26 @@ def _synthesis_package(
         selected_media.write_bytes(b"trimmed source audio")
         manifest["source_media_path"] = str(selected_media)
         manifest["tail_trim"] = {
+            "derived_media_path": str(selected_media),
+            "derived_media_sha256": file_sha256(selected_media),
+        }
+    if with_media_mute:
+        assert not with_tail_trim
+        selected_media = root / "source-muted.m4a"
+        selected_media.write_bytes(b"muted source audio")
+        manifest["source_media_path"] = str(selected_media)
+        decision = {
+            "schema_version": 1,
+            "source_media_sha256": file_sha256(source_media),
+            "source_word_ledger_hash": "fixture-word-ledger-hash",
+            "intervals": [
+                {"subtitle_id": "S0001", "start_ms": 0, "end_ms": 1000}
+            ],
+        }
+        manifest["media_mute"] = {
+            **decision,
+            "muted_subtitle_ids": ["S0001"],
+            "decision_hash": stable_payload_hash(decision),
             "derived_media_path": str(selected_media),
             "derived_media_sha256": file_sha256(selected_media),
         }
@@ -964,6 +986,9 @@ def test_video_synthesis_thread_forwards_manual_draft_mode_to_safety_layers():
     thread = VideoSynthesisThread(task)
 
     with patch(
+        "app.thread.video_synthesis_thread.resolve_synthesis_package_inputs",
+        return_value=("source.m4a", "stable-final-manifest.json"),
+    ) as package_resolver, patch(
         "app.thread.video_synthesis_thread.ensure_synthesis_subtitle_not_blocked"
     ) as ensure_gate, patch(
         "app.thread.video_synthesis_thread.resolve_podcast_template_subtitle",
@@ -975,6 +1000,11 @@ def test_video_synthesis_thread_forwards_manual_draft_mode_to_safety_layers():
 
     ensure_gate.assert_called_once_with(
         "stable-final-manifest.json",
+        allow_manual_draft=True,
+    )
+    package_resolver.assert_called_once_with(
+        Path("stable-final-manifest.json"),
+        "source.m4a",
         allow_manual_draft=True,
     )
     resolver.assert_called_once_with(
@@ -1111,6 +1141,96 @@ def test_video_synthesis_thread_allows_tail_trim_for_podcast_templates():
             article_renderer.assert_called_once()
 
 
+def test_video_synthesis_thread_resolves_muted_media_before_rendering():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        manifest_path, derived_media = _synthesis_package(
+            root / "muted",
+            with_tail_trim=False,
+            with_media_mute=True,
+        )
+        original_media = root / "original.m4a"
+        original_media.write_bytes(b"stale original audio")
+        task = SynthesisTask(
+            video_path=str(original_media),
+            subtitle_path=str(manifest_path),
+            output_path=str(root / "muted.mp4"),
+            synthesis_config=SynthesisConfig(
+                podcast_learning_template=True,
+                podcast_template_style="文章单词",
+            ),
+        )
+        thread = VideoSynthesisThread(task)
+        errors = []
+        thread.error.connect(errors.append)
+
+        with patch(
+            "app.thread.video_synthesis_thread.resolve_podcast_template_subtitle",
+            return_value="final.srt",
+        ), patch(
+            "app.thread.video_synthesis_thread.render_podcast_learning_video"
+        ) as renderer:
+            thread.run()
+
+        assert errors == []
+        renderer.assert_called_once()
+        assert Path(renderer.call_args.args[0]).resolve() == derived_media.resolve()
+
+
+def test_video_synthesis_thread_direct_srt_cannot_bypass_derived_media():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        for index, (with_tail_trim, with_media_mute) in enumerate(
+            ((True, False), (False, True))
+        ):
+            package_root = root / str(index)
+            _, derived_media = _synthesis_package(
+                package_root,
+                with_tail_trim=with_tail_trim,
+                with_media_mute=with_media_mute,
+            )
+            direct_srt = package_root / "final.srt"
+            stale_media = package_root / "stale-original.m4a"
+            stale_media.write_bytes(b"stale original audio")
+            podcast_task = SynthesisTask(
+                video_path=str(stale_media),
+                subtitle_path=str(direct_srt),
+                output_path=str(root / f"podcast-{index}.mp4"),
+                synthesis_config=SynthesisConfig(
+                    podcast_learning_template=True,
+                    podcast_template_style="文章单词",
+                ),
+            )
+            podcast_thread = VideoSynthesisThread(podcast_task)
+            podcast_errors = []
+            podcast_thread.error.connect(podcast_errors.append)
+            with patch(
+                "app.thread.video_synthesis_thread.resolve_podcast_template_subtitle",
+                return_value=str(direct_srt),
+            ), patch(
+                "app.thread.video_synthesis_thread.render_podcast_learning_video"
+            ) as renderer:
+                podcast_thread.run()
+            assert podcast_errors == []
+            assert Path(renderer.call_args.args[0]).resolve() == derived_media.resolve()
+
+            ordinary_task = SynthesisTask(
+                video_path=str(stale_media),
+                subtitle_path=str(direct_srt),
+                output_path=str(root / f"ordinary-{index}.mp4"),
+                synthesis_config=SynthesisConfig(podcast_learning_template=False),
+            )
+            ordinary_thread = VideoSynthesisThread(ordinary_task)
+            ordinary_errors = []
+            ordinary_thread.error.connect(ordinary_errors.append)
+            with patch(
+                "app.thread.video_synthesis_thread.add_subtitles"
+            ) as ordinary_renderer:
+                ordinary_thread.run()
+            assert ordinary_errors and "静态播客模板" in ordinary_errors[0]
+            ordinary_renderer.assert_not_called()
+
+
 def test_video_synthesis_thread_allows_ordinary_package_without_tail_trim():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -1224,6 +1344,8 @@ if __name__ == "__main__":
     test_video_synthesis_thread_rejects_manual_draft_outside_article_template()
     test_video_synthesis_thread_rejects_tail_trim_outside_podcast_template()
     test_video_synthesis_thread_allows_tail_trim_for_podcast_templates()
+    test_video_synthesis_thread_resolves_muted_media_before_rendering()
+    test_video_synthesis_thread_direct_srt_cannot_bypass_derived_media()
     test_video_synthesis_thread_allows_ordinary_package_without_tail_trim()
     test_batch_cancel_removes_only_target_task_from_queue()
     test_full_process_propagates_source_audio_and_article_state()

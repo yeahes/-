@@ -20,11 +20,13 @@ from app.core.output_paths import (
 )
 from app.core.article_context import (
     ARTICLE_ANALYSIS_META_KEY,
+    ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
     ARTICLE_ASR_CORRECTION_POLICY_VERSION,
     ArticleLLMConfig,
     analyze_article_text,
     apply_article_asr_corrections,
-    article_text_hash,
+    article_analysis_meta_matches,
+    article_analysis_prompt_hash,
     build_article_asr_review_artifact,
     build_article_glossary,
     build_translation_context_prompt,
@@ -145,6 +147,8 @@ class SubtitleThread(QThread):
             ),
             alignment_backend=self._timeline_alignment_backend(),
             custom_prompt_text=self.custom_prompt_text,
+            article_analysis_prompt_policy_version=ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+            article_analysis_prompt_sha256=article_analysis_prompt_hash(),
         )
         prior = store.load() or {}
         self._resume_plan = store.plan_resume(fingerprint)
@@ -276,7 +280,16 @@ class SubtitleThread(QThread):
             return None
         try:
             payload = json.loads((output_dir / "article_context.json").read_text(encoding="utf-8"))
-            return normalize_article_context(payload)
+            context = normalize_article_context(payload)
+            article_text = str(
+                getattr(self.task, "article_reference_text", "") or ""
+            ).strip()
+            if not article_analysis_meta_matches(context, article_text):
+                logger.warning(
+                    "Resume article context uses a stale analysis prompt policy; recomputing"
+                )
+                return None
+            return context
         except Exception as exc:
             logger.warning("Resume article context unavailable; recomputing: %s", exc)
             return None
@@ -673,13 +686,12 @@ class SubtitleThread(QThread):
         context = normalize_article_context(
             getattr(self.task, "article_context_data", None)
         )
-        context_hash = str(
-            (context.get(ARTICLE_ANALYSIS_META_KEY) or {}).get("prompt_hash") or ""
-        )
-        expected_hash = article_text_hash(article_text)
-        if self._has_article_context(context) and context_hash != expected_hash:
+        if self._has_article_context(context) and not article_analysis_meta_matches(
+            context,
+            article_text,
+        ):
             logger.warning(
-                "Discarding stale article context: analysis hash does not match current text"
+                "Discarding stale article context: source or analysis policy does not match"
             )
             context = empty_article_context()
         if not self._has_article_context(context):

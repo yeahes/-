@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ from app.core.output_paths import media_result_dir, media_result_subtitle_dir
 from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleEditError,
     ManualFinalSubtitleSession,
+    _materialize_media_mute_audio,
 )
 from app.core.subtitle_processor import stable_display_page_contract
 from app.core.subtitle_processor.authoritative_parent_chinese import (
@@ -2871,6 +2873,125 @@ def test_manual_english_surface_edit_rejects_changes_across_multiple_word_ids():
             raise AssertionError("multi-word English rewrites must be rejected")
 
 
+def test_manual_english_surface_span_preserves_raw_ledger_and_renderer_provenance():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        before_ledger = copy.deepcopy(session.word_ledger)
+
+        assert session.replace_english_surface_span(
+            parent_subtitle_id="S0002",
+            word_start=9,
+            word_end=10,
+            replacement_text="outof",
+        ) is True
+
+        assert session.cues[1]["original_subtitle"] == "outof date."
+        assert session.word_ledger == before_ledger
+        assert session.english_surface_overrides == [
+            {
+                "word_start": 9,
+                "word_end": 10,
+                "expected_surfaces": ["out", "of"],
+                "display_surface": "outof",
+                "parent_subtitle_id": "S0002",
+            }
+        ]
+        assert session.history[-1]["operation"] == "edit_english_surface_span"
+
+        changed = session.state_fingerprint()
+        assert session.undo() is True
+        assert session.word_ledger == before_ledger
+        assert session.cues[1]["original_subtitle"] == "out of date."
+        assert session.redo() is True
+        assert session.state_fingerprint() == changed
+
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"test-audio-placeholder")
+        paths = session.save_to_source_folder(source_media_path=source_media)
+        manual_srt = Path(paths["subtitle_path"])
+        reloaded = ManualFinalSubtitleSession.load_for_subtitle(
+            manual_srt, work_dir=root / "work"
+        )
+        assert reloaded.english_surface_overrides == session.english_surface_overrides
+        assert reloaded.word_ledger == before_ledger
+
+        rendered_cues = parse_srt(manual_srt)
+        assert attach_article_word_timing(rendered_cues, manual_srt) is True
+        assert rendered_cues[1].en == "outof date."
+        assert [span["surface"] for span in rendered_cues[1].display_word_spans] == [
+            "outof", "date."
+        ]
+        assert [
+            (span["word_start"], span["word_end"])
+            for span in rendered_cues[1].display_word_spans
+        ] == [(9, 10), (11, 11)]
+
+
+def test_manual_english_surface_span_survives_single_word_edit_and_parent_merge():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        assert session.replace_english_surface_span(
+            parent_subtitle_id="S0002",
+            word_start=9,
+            word_end=10,
+            replacement_text="outof",
+        ) is True
+
+        rows = session.to_model_data(prefer_display_pages=False)
+        rows["1"]["original_subtitle"] = (
+            "Right. It means our mental model is just entirely"
+        )
+        assert session.apply_parent_model_data(rows) is True
+        assert session.cues[1]["original_subtitle"] == "outof date."
+
+        before_merge = session.state_fingerprint()
+        session.merge_adjacent(0, 1)
+        assert session.cues[0]["original_subtitle"].endswith("outof date.")
+        assert session.english_surface_overrides[0]["parent_subtitle_id"] == "S0001"
+
+        assert session.undo() is True
+        assert session.state_fingerprint() == before_merge
+        assert session.english_surface_overrides[0]["parent_subtitle_id"] == "S0002"
+
+
+def test_tail_trim_preserves_or_removes_complete_english_surface_spans_atomically():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"audio-placeholder")
+        session.source_media_path = source_media.resolve()
+        assert session.replace_english_surface_span(
+            parent_subtitle_id="S0002",
+            word_start=9,
+            word_end=10,
+            replacement_text="outof",
+        ) is True
+        before = session.state_fingerprint()
+
+        try:
+            session._apply_tail_trim_decision(
+                session._preview_tail_trim_at_word(10)
+            )
+        except ManualFinalSubtitleEditError as exc:
+            assert "人工合并" in str(exc)
+        else:
+            raise AssertionError("tail trim must not split a display surface span")
+        assert session.state_fingerprint() == before
+
+        session._apply_tail_trim_decision(session._preview_tail_trim_at_word(11))
+        assert session.cues[-1]["original_subtitle"] == "outof"
+        assert session.english_surface_overrides[0]["word_end"] == 10
+        assert session.undo() is True
+        assert session.state_fingerprint() == before
+
+        session._apply_tail_trim_decision(session._preview_tail_trim_at_word(9))
+        assert session.english_surface_overrides == []
+        assert session.undo() is True
+        assert session.state_fingerprint() == before
+
+
 def test_actual_page_english_surface_edit_updates_parent_without_moving_page_range():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
@@ -2946,6 +3067,288 @@ def test_suppress_single_cue_hides_srt_but_keeps_full_timeline_and_audio():
         assert reloaded.cues[1]["display_suppressed"] is True
         assert reloaded.set_cue_display_suppressed("S0002", False)["changed"] is True
         assert reloaded.cues[1]["display_suppressed"] is False
+
+
+def test_hide_and_mute_cue_is_parent_scoped_and_can_precede_tail_trim():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"test-audio-placeholder")
+        session.source_media_path = source_media.resolve()
+        before_ledger = copy.deepcopy(session.word_ledger)
+
+        result = session.set_cue_hidden_and_media_muted("S0002", True)
+
+        assert result == {
+            "changed": True,
+            "subtitle_id": "S0002",
+            "hidden_and_muted": True,
+        }
+        assert session.cues[1]["display_suppressed"] is True
+        assert session.cues[1]["media_muted"] is True
+        assert session.word_ledger == before_ledger
+        rows = session.to_model_data(prefer_display_pages=True)
+        muted_row = next(
+            row for row in rows.values() if row.get("manual_cue_id") == "S0002"
+        )
+        assert muted_row["display_suppressed"] is True
+        assert muted_row["media_muted"] is True
+
+        assert session.can_undo_for_parent("S0002") is False
+        try:
+            session.undo_for_parent("S0002")
+        except ManualFinalSubtitleEditError as exc:
+            assert "整体撤销" in str(exc) or "音频" in str(exc)
+        else:
+            raise AssertionError("media mute must use document-scoped undo")
+        assert session.undo() is True
+        assert not session.cues[1].get("display_suppressed")
+        assert not session.cues[1].get("media_muted")
+        assert session.redo() is True
+        assert session.cues[1]["display_suppressed"] is True
+        assert session.cues[1]["media_muted"] is True
+
+        assert session.set_cue_hidden_and_media_muted("S0002", False)[
+            "changed"
+        ] is True
+        assert session.set_cue_hidden_and_media_muted("S0001", True)[
+            "changed"
+        ] is True
+        trim = session.trim_tail_from_cue(1)
+        assert trim["cut_ms"] > 0
+        assert session.cues[0]["media_muted"] is True
+
+
+def test_hide_and_mute_save_round_trip_binds_derived_audio_and_timeline():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"original-audio-placeholder")
+        source_hash = file_sha256(source_media)
+        before_ledger = copy.deepcopy(session.word_ledger)
+        before_times = [
+            (cue["start_time"], cue["end_time"]) for cue in session.cues
+        ]
+        session.source_media_path = source_media.resolve()
+        session.set_cue_hidden_and_media_muted("S0002", True)
+
+        def materialize_fixture_audio(source_path, output_path, intervals):
+            assert source_path.resolve() == source_media.resolve()
+            assert intervals == [
+                {
+                    "subtitle_id": "S0002",
+                    "start_ms": 900,
+                    "end_ms": 1200,
+                }
+            ]
+            shutil.copyfile(source_path, output_path)
+
+        with patch(
+            "app.core.subtitle_processor.manual_final_subtitle_editor."
+            "_materialize_media_mute_audio",
+            side_effect=materialize_fixture_audio,
+        ):
+            paths = session.save_to_source_folder(source_media_path=source_media)
+
+        manifest_path = Path(paths["manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        derived_media = Path(paths["source_media_path"])
+        derivation = manifest["media_derivation"]
+        assert derived_media.is_file()
+        assert derived_media.resolve() != source_media.resolve()
+        assert derivation["mute_intervals"] == [
+            {"subtitle_id": "S0002", "start_ms": 900, "end_ms": 1200}
+        ]
+        assert derivation["source_media_sha256"] == source_hash
+        assert derivation["derived_media_sha256"] == file_sha256(derived_media)
+        assert derivation["decision_hash"]
+        assert not manifest.get("media_mute")
+        assert manifest["manual_final_override"]["media_derivation"] == derivation
+        assert file_sha256(source_media) == source_hash
+        assert session.word_ledger == before_ledger
+        assert [
+            (cue["start_time"], cue["end_time"]) for cue in session.cues
+        ] == before_times
+
+        reloaded = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        assert reloaded.cues[1]["display_suppressed"] is True
+        assert reloaded.cues[1]["media_muted"] is True
+        assert reloaded.media_derivation == derivation
+        resolved_media, resolved_manifest = resolve_synthesis_package_inputs(
+            manifest_path,
+            str(source_media),
+        )
+        assert Path(resolved_media).resolve() == derived_media.resolve()
+        assert Path(resolved_manifest) == manifest_path
+        assert reloaded.set_cue_hidden_and_media_muted("S0002", False)[
+            "changed"
+        ] is True
+        assert reloaded.source_media_path.resolve() == source_media.resolve()
+        assert reloaded.media_derivation == {}
+        assert reloaded.undo() is True
+        assert reloaded.cues[1]["media_muted"] is True
+        assert reloaded.media_derivation == derivation
+        assert reloaded.source_media_path.resolve() == derived_media.resolve()
+        assert reloaded.redo() is True
+        assert not reloaded.cues[1].get("media_muted")
+        assert reloaded.media_derivation == {}
+        assert reloaded.source_media_path.resolve() == source_media.resolve()
+
+        derived_media.write_bytes(b"tampered")
+        try:
+            resolve_synthesis_package_inputs(manifest_path)
+        except RuntimeError as exc:
+            assert "媒体派生" in str(exc) and "哈希" in str(exc)
+        else:
+            raise AssertionError("tampered muted media must be rejected")
+
+
+def test_materialized_media_mute_preserves_duration_and_silences_interval():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_media = root / "source.m4a"
+        derived_media = root / "source-muted.m4a"
+        _run_project_ffmpeg(
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2.000",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-y",
+            str(source_media),
+        )
+        source_hash = file_sha256(source_media)
+
+        _materialize_media_mute_audio(
+            source_media,
+            derived_media,
+            [{"subtitle_id": "S0002", "start_ms": 900, "end_ms": 1200}],
+        )
+
+        assert file_sha256(source_media) == source_hash
+        assert abs(
+            _project_ffmpeg_audio_duration_ms(derived_media)
+            - _project_ffmpeg_audio_duration_ms(source_media)
+        ) <= 120
+        result = subprocess.run(
+            [
+                str(BIN_PATH / "ffmpeg.exe"),
+                "-nostdin",
+                "-hide_banner",
+                "-ss",
+                "0.950",
+                "-t",
+                "0.200",
+                "-i",
+                str(derived_media),
+                "-af",
+                "volumedetect",
+                "-f",
+                "null",
+                "NUL",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                if hasattr(subprocess, "CREATE_NO_WINDOW")
+                else 0
+            ),
+        )
+        assert result.returncode == 0, result.stderr
+        match = re.search(r"max_volume:\s*(-?[0-9.]+)\s*dB", result.stderr)
+        assert match is not None, result.stderr
+        assert float(match.group(1)) <= -60.0
+
+
+def test_tail_trim_keeps_earlier_muted_cue_in_one_v2_derivation():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"original-audio-placeholder")
+        session.source_media_path = source_media.resolve()
+        session.set_cue_hidden_and_media_muted("S0001", True)
+        decision = session._apply_tail_trim_decision(
+            session._preview_tail_trim_at_word(10)
+        )
+        session.cues[1]["translated_subtitle"] = "中"
+        session.cues[1]["chinese_review_required"] = False
+
+        def materialize_fixture_audio(source_path, output_path, **kwargs):
+            assert source_path.resolve() == source_media.resolve()
+            assert kwargs["cut_ms"] == decision["cut_ms"]
+            assert kwargs["mute_intervals"] == [
+                {"subtitle_id": "S0001", "start_ms": 0, "end_ms": 900}
+            ]
+            shutil.copyfile(source_path, output_path)
+
+        with patch(
+            "app.core.subtitle_processor.manual_final_subtitle_editor."
+            "_materialize_media_derivation_audio",
+            side_effect=materialize_fixture_audio,
+        ):
+            paths = session.save_to_source_folder(source_media_path=source_media)
+
+        manifest_path = Path(paths["manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        derivation = manifest["media_derivation"]
+        assert not manifest.get("tail_trim")
+        assert not manifest.get("media_mute")
+        assert derivation["cut_ms"] == decision["cut_ms"]
+        assert derivation["mute_intervals"] == [
+            {"subtitle_id": "S0001", "start_ms": 0, "end_ms": 900}
+        ]
+        assert Path(paths["source_media_path"]).resolve() != source_media.resolve()
+        reloaded = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        assert len(reloaded.cues) == 2
+        assert reloaded.cues[0]["media_muted"] is True
+        assert reloaded.media_derivation == derivation
+
+
+def test_tail_trim_clips_muted_partial_parent_interval():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source_media = Path(temp_dir) / "episode.m4a"
+        source_media.write_bytes(b"audio-placeholder")
+        session, _, _ = _tail_trim_session_fixture(Path(temp_dir), source_media)
+        _write_display_page_preview_artifact(session)
+        decision = session.preview_tail_trim_from_display_page("S0001.P02")
+        session.set_cue_hidden_and_media_muted("S0001", True)
+        session._apply_tail_trim_decision(decision)
+
+        assert decision["partial_parent_trim"] is True
+        assert session._media_mute_intervals() == [
+            {
+                "subtitle_id": "S0001",
+                "start_ms": 0,
+                "end_ms": decision["cut_ms"],
+            }
+        ]
+
+
+def test_tail_trim_source_prefers_legacy_mute_original_over_derived_media():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, _, _ = _session_fixture(root)
+        original_media = root / "original.m4a"
+        derived_media = root / "muted.m4a"
+        original_media.write_bytes(b"original")
+        derived_media.write_bytes(b"derived")
+        session.source_media_path = derived_media.resolve()
+        session.media_mute = {
+            "source_media_path": str(original_media.resolve()),
+            "source_media_sha256": file_sha256(original_media),
+            "derived_media_path": str(derived_media.resolve()),
+            "derived_media_sha256": file_sha256(derived_media),
+        }
+
+        assert session._tail_trim_source_media_path() == original_media.resolve()
 
 
 def test_suppressed_cue_does_not_invalidate_visible_actual_page_edits():
@@ -3752,10 +4155,12 @@ def test_tail_trim_save_materializes_real_audio_and_reuses_exact_decision():
             <= 120
         )
         assert manifest["source_media_path"] == str(derived_media.resolve())
-        assert manifest["tail_trim"]["removed_subtitle_ids"] == ["S0002"]
-        assert manifest["tail_trim"]["derived_media_sha256"] == file_sha256(
+        assert manifest["media_derivation"]["cut_ms"] == decision["cut_ms"]
+        assert manifest["media_derivation"]["mute_intervals"] == []
+        assert manifest["media_derivation"]["derived_media_sha256"] == file_sha256(
             derived_media
         )
+        assert not manifest.get("tail_trim")
         assert manifest["manual_final_override"]["source_media_path"] == str(
             derived_media.resolve()
         )
@@ -3832,7 +4237,7 @@ def test_reloaded_tail_trim_undo_restores_original_media_and_full_package():
             trimmed_manifest_path
         )
         assert reloaded.source_media_path.resolve() == derived_media.resolve()
-        assert reloaded.tail_trim["removed_subtitle_ids"] == ["S0002"]
+        assert reloaded.tail_trim["cut_ms"] == session.tail_trim["cut_ms"]
 
         assert reloaded.undo() is True
 
@@ -4786,6 +5191,74 @@ def test_unconfirmed_manual_split_proposals_can_move_boundary_but_save_stays_blo
         assert blocked["display_page_srt_path"] == ""
 
 
+def test_parent_split_allows_explicit_high_risk_manual_fallback():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        evidence_path = session.artifact_dir / "display-boundary-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        for boundary in evidence["boundaries"].values():
+            boundary["hard_issues"] = ["atomic_of_complement_split"]
+            boundary["soft_issues"] = []
+        _write_json(evidence_path, evidence)
+
+        try:
+            session.split_parent_into_display_pages("S0001", 2)
+        except ManualFinalSubtitleEditError as exc:
+            assert exc.code == "manual_high_risk_page_split_confirmation_required"
+        else:
+            raise AssertionError("a hard split must require explicit human approval")
+
+        before_parent = copy.deepcopy(session.cues[0])
+        result = session.split_parent_into_display_pages(
+            "S0001",
+            2,
+            allow_high_risk=True,
+        )
+        rows = list(session.to_model_data().values())
+
+        assert result["changed"] is True
+        assert result["high_risk_override"] is True
+        assert len(rows) == 2
+        assert session.cues[0]["cue_id"] == before_parent["cue_id"]
+        assert session.cues[0]["word_start"] == before_parent["word_start"]
+        assert session.cues[0]["word_end"] == before_parent["word_end"]
+        assert session.cues[0]["original_subtitle"] == before_parent["original_subtitle"]
+        assert session.display_page_boundary_overrides["S0001"] == [
+            int(rows[1]["word_start"])
+        ]
+
+
+def test_explicit_manual_parent_split_can_reach_six_pages():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        before = copy.deepcopy(session.cues[0])
+        ranges = [(0, 2), (3, 5), (6, 8), (9, 11), (12, 14), (15, 16)]
+
+        result = session.split_parent_into_display_pages(
+            "S0001",
+            6,
+            word_ranges=ranges,
+            allow_high_risk=True,
+        )
+        rows = [
+            row
+            for row in session.display_page_edits
+            if str(row.get("parent_subtitle_id") or "") == "S0001"
+        ]
+
+        assert result["changed"] is True
+        assert result["page_count"] == 6
+        assert [row["display_page_id"] for row in rows] == [
+            f"S0001.P{index:02d}" for index in range(1, 7)
+        ]
+        assert [
+            (int(row["word_start"]), int(row["word_end"])) for row in rows
+        ] == ranges
+        assert session.cues[0]["cue_id"] == before["cue_id"]
+        assert session.cues[0]["word_start"] == before["word_start"]
+        assert session.cues[0]["word_end"] == before["word_end"]
+
+
 def test_manual_page_soft_override_preserves_hard_page_invariants():
     text = "One two three four five six seven eight nine ten"
     timing = tuple(
@@ -5210,8 +5683,17 @@ if __name__ == "__main__":
     test_merge_only_combines_adjacent_continuous_word_ranges()
     test_manual_english_surface_edit_preserves_word_identity_time_and_reload()
     test_manual_english_surface_edit_rejects_changes_across_multiple_word_ids()
+    test_manual_english_surface_span_preserves_raw_ledger_and_renderer_provenance()
+    test_manual_english_surface_span_survives_single_word_edit_and_parent_merge()
+    test_tail_trim_preserves_or_removes_complete_english_surface_spans_atomically()
     test_actual_page_english_surface_edit_updates_parent_without_moving_page_range()
     test_suppress_single_cue_hides_srt_but_keeps_full_timeline_and_audio()
+    test_hide_and_mute_cue_is_parent_scoped_and_can_precede_tail_trim()
+    test_hide_and_mute_save_round_trip_binds_derived_audio_and_timeline()
+    test_materialized_media_mute_preserves_duration_and_silences_interval()
+    test_tail_trim_keeps_earlier_muted_cue_in_one_v2_derivation()
+    test_tail_trim_clips_muted_partial_parent_interval()
+    test_tail_trim_source_prefers_legacy_mute_original_over_derived_media()
     test_suppressed_cue_does_not_invalidate_visible_actual_page_edits()
     test_renderer_attachment_accepts_a_suppressed_middle_timeline_record()
     test_merge_display_page_with_next_keeps_parent_timeline_and_combines_chinese()
@@ -5242,6 +5724,8 @@ if __name__ == "__main__":
     test_saved_reload_can_switch_between_parent_and_actual_page_rows()
     test_manual_save_upgrades_old_page_layout_without_replanning_pages()
     test_unconfirmed_manual_split_proposals_can_move_boundary_but_save_stays_blocked()
+    test_parent_split_allows_explicit_high_risk_manual_fallback()
+    test_explicit_manual_parent_split_can_reach_six_pages()
     test_manual_page_soft_override_preserves_hard_page_invariants()
     test_numeric_phrase_moves_as_one_unit_in_both_directions()
     test_numeric_sentence_end_does_not_absorb_the_next_sentence()

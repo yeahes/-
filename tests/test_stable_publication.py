@@ -6,11 +6,12 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from PyQt5.QtCore import QEvent, QPointF, Qt
+from PyQt5.QtCore import QEvent, QItemSelectionModel, QPointF, Qt
 from PyQt5.QtGui import QColor, QMouseEvent
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractButton,
+    QAbstractItemView,
     QDialog,
     QHeaderView,
     QLabel,
@@ -461,6 +462,57 @@ class StablePublicationTests(unittest.TestCase):
         self.assertTrue(
             stale_model._data["1"]["display_page_chinese_confirmed"]
         )
+
+    def test_subtitle_table_copies_selected_english_without_mutating_rows(self):
+        interface = SubtitleInterface()
+        try:
+            interface.model.update_all(
+                {
+                    "1": {
+                        "start_time": 0,
+                        "end_time": 1000,
+                        "original_subtitle": "First English page.",
+                        "translated_subtitle": "第一页。",
+                    },
+                    "2": {
+                        "start_time": 1000,
+                        "end_time": 2000,
+                        "original_subtitle": "Second English page.",
+                        "translated_subtitle": "第二页。",
+                    },
+                }
+            )
+            before = json.loads(json.dumps(interface.model._data, ensure_ascii=False))
+            selection = interface.subtitle_table.selectionModel()
+            selection.select(
+                interface.model.index(1, 0),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+            selection.select(
+                interface.model.index(0, 0),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+            clipboard = MagicMock()
+
+            with patch.object(QApplication, "clipboard", return_value=clipboard):
+                copied = interface.copy_selected_english()
+
+            self.assertEqual(
+                copied,
+                "First English page.\nSecond English page.",
+            )
+            clipboard.setText.assert_called_once_with(copied)
+            self.assertEqual(interface.model._data, before)
+            self.assertEqual(
+                interface.subtitle_table.selectionBehavior(),
+                QAbstractItemView.SelectRows,
+            )
+            self.assertEqual(
+                interface.subtitle_table.selectionMode(),
+                QAbstractItemView.ExtendedSelection,
+            )
+        finally:
+            interface.close()
 
     def test_review_mark_roles_do_not_invalidate_saved_manual_package(self):
         class Toggle:
@@ -2561,6 +2613,43 @@ class StablePublicationTests(unittest.TestCase):
         self.assertEqual(cross_parent["kind"], "parent")
         self.assertEqual(cross_parent["parent_left_index"], 0)
 
+        last_row = SubtitleInterface._manual_boundary_context(
+            context_interface,
+            2,
+        )
+        self.assertEqual(last_row["left_row"], 1)
+        self.assertEqual(last_row["right_row"], 2)
+
+        single_parent_interface = SimpleNamespace(
+            manual_final_session=SimpleNamespace(cues=[{"cue_id": "S0001"}]),
+            model=SubtitleTableModel(
+                {
+                    "1": {
+                        "display_page_view": True,
+                        "display_page_id": "S0001.P01",
+                        "manual_cue_id": "S0001",
+                        "parent_cue_index": 0,
+                        "word_start": 0,
+                        "word_end": 2,
+                    },
+                    "2": {
+                        "display_page_view": True,
+                        "display_page_id": "S0001.P02",
+                        "manual_cue_id": "S0001",
+                        "parent_cue_index": 0,
+                        "word_start": 3,
+                        "word_end": 5,
+                    },
+                }
+            ),
+        )
+        single_parent_last = SubtitleInterface._manual_boundary_context(
+            single_parent_interface,
+            1,
+        )
+        self.assertEqual(single_parent_last["kind"], "display")
+        self.assertEqual(single_parent_last["left_page_id"], "S0001.P01")
+
         class Toggle:
             def __init__(self):
                 self.enabled = True
@@ -3463,6 +3552,78 @@ class StablePublicationTests(unittest.TestCase):
         self.assertEqual(selected_rows, [0])
         self.assertTrue(interface._manual_page_view)
 
+    def test_parent_split_retries_only_after_high_risk_confirmation(self):
+        split_calls = []
+        warning_messages = []
+
+        class Session:
+            cues = [{"cue_id": "S0001"}]
+
+            @staticmethod
+            def split_parent_into_display_pages(
+                parent_id,
+                page_count,
+                *,
+                allow_high_risk=False,
+            ):
+                split_calls.append((parent_id, page_count, allow_high_risk))
+                if not allow_high_risk:
+                    raise ManualFinalSubtitleEditError(
+                        "没有安全切点",
+                        code=(
+                            "manual_high_risk_page_split_"
+                            "confirmation_required"
+                        ),
+                    )
+                return {
+                    "changed": True,
+                    "page_count": page_count,
+                    "high_risk_override": True,
+                }
+
+        interface = SimpleNamespace(
+            manual_final_session=Session(),
+            _manual_parent_boundaries_dirty=False,
+            _manual_save_in_progress=False,
+            _manual_boundary_edit_active=True,
+            _manual_boundary_move_direction="next",
+            _manual_page_view=False,
+            _sync_manual_final_text_edits=lambda: None,
+            _confirm_high_risk_manual_page_split=lambda _target, _count: True,
+            _queue_manual_structure_action=(
+                lambda callback, *args, **kwargs: callback(*args, **kwargs)
+            ),
+            _invalidate_manual_review_marks_for_parent_ids=lambda _ids: None,
+            _mark_manual_final_dirty=lambda **_kwargs: None,
+            _apply_manual_final_session=lambda: None,
+            _select_manual_boundary_row=lambda _row: None,
+            model=SimpleNamespace(
+                _data={"1": {"manual_cue_id": "S0001"}}
+            ),
+            status_label=SimpleNamespace(setText=lambda _value: None),
+            tr=lambda value: value,
+        )
+        interface._split_parent_into_display_pages = MethodType(
+            SubtitleInterface._split_parent_into_display_pages,
+            interface,
+        )
+
+        with patch("app.view.subtitle_interface.InfoBar.success"), patch(
+            "app.view.subtitle_interface.InfoBar.warning",
+            side_effect=lambda title, content, **_kwargs: warning_messages.append(
+                (str(title), str(content))
+            ),
+        ):
+            interface._split_parent_into_display_pages("S0001", 2)
+
+        self.assertEqual(
+            split_calls,
+            [("S0001", 2, False), ("S0001", 2, True)],
+        )
+        self.assertTrue(
+            any("人工兜底分屏" in title for title, _ in warning_messages)
+        )
+
     def test_parent_row_context_menu_offers_page_count_actions(self):
         class Index:
             @staticmethod
@@ -3568,6 +3729,8 @@ class StablePublicationTests(unittest.TestCase):
         self.assertNotIn("将末尾词移到下一条", action_texts)
         self.assertNotIn("将开头词移到上一条", action_texts)
         self.assertIn("修正当前英文（保持时间轴）", action_texts)
+        self.assertIn("隐藏这条字幕（保留音频）", action_texts)
+        self.assertIn("隐藏整条字幕并静音这段", action_texts)
 
     def test_context_menu_keeps_merge_for_contiguous_parent_rows(self):
         class Index:
@@ -3652,8 +3815,150 @@ class StablePublicationTests(unittest.TestCase):
 
         self.assertEqual(
             [action.text for action in menus[0].actions],
-            ["合并相邻字幕"],
+            ["复制英文", "合并相邻字幕"],
         )
+
+    def test_manual_parent_merge_is_queued_by_stable_ids(self):
+        class Index:
+            def __init__(self, row):
+                self._row = row
+
+            def isValid(self):
+                return True
+
+            def row(self):
+                return self._row
+
+        indexes = [Index(0), Index(1)]
+
+        class Table:
+            @staticmethod
+            def indexAt(_pos):
+                return indexes[0]
+
+            @staticmethod
+            def selectedIndexes():
+                return indexes
+
+            @staticmethod
+            def clearSelection():
+                pass
+
+            @staticmethod
+            def selectRow(_row):
+                pass
+
+            @staticmethod
+            def viewport():
+                return SimpleNamespace(mapToGlobal=lambda pos: pos)
+
+        class Signal:
+            def __init__(self):
+                self.callback = None
+
+            def connect(self, callback):
+                self.callback = callback
+
+        class ActionDouble:
+            def __init__(self, _icon, text):
+                self.text = str(text)
+                self.triggered = Signal()
+
+            def setShortcut(self, _shortcut):
+                pass
+
+        menus = []
+
+        class MenuDouble:
+            def __init__(self, parent=None):
+                self.actions = []
+                menus.append(self)
+
+            def addAction(self, action):
+                self.actions.append(action)
+
+            def exec(self, _pos):
+                pass
+
+        scheduled = []
+        stable_calls = []
+        direct_calls = []
+        interface = SimpleNamespace(
+            subtitle_table=Table(),
+            model=SimpleNamespace(
+                _data={
+                    "1": {
+                        "manual_cue_id": "S0001",
+                        "display_page_view": False,
+                    },
+                    "2": {
+                        "manual_cue_id": "S0002",
+                        "display_page_view": False,
+                    },
+                }
+            ),
+            manual_final_session=SimpleNamespace(cues=[]),
+            tr=lambda value: value,
+            merge_selected_rows=lambda rows: direct_calls.append(rows),
+            _merge_manual_rows_by_stable_ids=(
+                lambda stable_ids, page_mode: stable_calls.append(
+                    (stable_ids, page_mode)
+                )
+            ),
+            _queue_manual_structure_action=(
+                lambda callback, *args, **kwargs: scheduled.append(
+                    lambda: callback(*args, **kwargs)
+                )
+            ),
+        )
+
+        with patch("app.view.subtitle_interface.Action", ActionDouble), patch(
+            "app.view.subtitle_interface.RoundMenu",
+            MenuDouble,
+        ):
+            SubtitleInterface.show_context_menu(interface, object())
+
+        merge_action = next(
+            action
+            for action in menus[0].actions
+            if action.text == "合并相邻字幕"
+        )
+        merge_action.triggered.callback()
+        self.assertEqual(direct_calls, [])
+        self.assertEqual(len(scheduled), 1)
+        scheduled[0]()
+        self.assertEqual(stable_calls, [(('S0001', 'S0002'), False)])
+
+    def test_manual_merge_stable_ids_are_resolved_after_queueing(self):
+        merge_calls = []
+        interface = SimpleNamespace(
+            model=SimpleNamespace(
+                _data={
+                    "1": {
+                        "manual_cue_id": "S0000",
+                        "display_page_view": False,
+                    },
+                    "2": {
+                        "manual_cue_id": "S0001",
+                        "display_page_view": False,
+                    },
+                    "3": {
+                        "manual_cue_id": "S0002",
+                        "display_page_view": False,
+                    },
+                }
+            ),
+            merge_selected_rows=lambda rows: merge_calls.append(rows),
+            tr=lambda value: value,
+        )
+
+        SubtitleInterface._merge_manual_rows_by_stable_ids(
+            interface,
+            ("S0001", "S0002"),
+            False,
+        )
+
+        self.assertEqual(merge_calls, [[1, 2]])
 
     def test_actual_page_context_menu_splits_selected_page_not_existing_parent_count(self):
         class Index:
@@ -3725,6 +4030,7 @@ class StablePublicationTests(unittest.TestCase):
         confirm_calls = []
         boundary_calls = []
         confirm_all_calls = []
+        scheduled = []
         interface = SimpleNamespace(
             subtitle_table=Table(),
             model=SimpleNamespace(
@@ -3760,6 +4066,11 @@ class StablePublicationTests(unittest.TestCase):
             _confirm_current_display_page_chinese=lambda page_id: confirm_calls.append(page_id),
             _confirm_current_display_page_boundary=lambda page_id: boundary_calls.append(page_id),
             _confirm_all_nonblocking_display_page_reviews=lambda: confirm_all_calls.append(True),
+            _queue_manual_structure_action=(
+                lambda callback, *args, **kwargs: scheduled.append(
+                    lambda: callback(*args, **kwargs)
+                )
+            ),
         )
 
         with patch("app.view.subtitle_interface.Action", ActionDouble), patch(
@@ -3771,6 +4082,8 @@ class StablePublicationTests(unittest.TestCase):
         action_texts = [action.text for action in menus[0].actions]
         self.assertIn("整条字幕调整为 3 屏", action_texts)
         self.assertIn("整条字幕调整为 4 屏", action_texts)
+        self.assertIn("整条字幕调整为 5 屏", action_texts)
+        self.assertIn("整条字幕调整为 6 屏", action_texts)
         self.assertIn("仅将当前屏拆为 2 屏", action_texts)
         self.assertIn("与下一屏合并", action_texts)
         self.assertIn("试听从当前页删除的切点", action_texts)
@@ -3783,13 +4096,19 @@ class StablePublicationTests(unittest.TestCase):
         by_text["确认当前中文"].triggered.callback()
         by_text["确认当前分页边界"].triggered.callback()
         by_text["确认全部非阻断提醒"].triggered.callback()
-        self.assertEqual(merge_page_calls, ["S0216.P01"])
+        self.assertEqual(merge_page_calls, [])
         self.assertEqual(confirm_calls, ["S0216.P01"])
         self.assertEqual(boundary_calls, ["S0216.P01"])
         self.assertEqual(confirm_all_calls, [True])
+        scheduled.pop(0)()
+        self.assertEqual(merge_page_calls, ["S0216.P01"])
         by_text["整条字幕调整为 3 屏"].triggered.callback()
-        self.assertEqual(split_calls, [("S0216", 3, 100)])
         by_text["仅将当前屏拆为 2 屏"].triggered.callback()
+        self.assertEqual(split_calls, [])
+        self.assertEqual(split_page_calls, [])
+        while scheduled:
+            scheduled.pop(0)()
+        self.assertEqual(split_calls, [("S0216", 3, 100)])
         self.assertEqual(split_page_calls, ["S0216.P01"])
 
     def test_long_caption_queue_restores_parent_identity_or_nearest_row(self):
@@ -4991,6 +5310,93 @@ class StablePublicationTests(unittest.TestCase):
         self.assertEqual(captured["identity"]["page_id"], "S0028.P02")
         self.assertEqual(captured["selected_row"], 0)
         self.assertIn("词 ID 和时间轴未改变", captured["status"])
+
+    def test_explicit_manual_english_edit_routes_many_words_to_one_surface_span(self):
+        captured = {}
+
+        class Session:
+            @staticmethod
+            def _display_word_spans(start, end):
+                captured["row_range"] = (start, end)
+                return [
+                    {
+                        "word_start": 100 + index,
+                        "word_end": 100 + index,
+                        "surface": surface,
+                    }
+                    for index, surface in enumerate(
+                        ["They", "call", "it", "New", "Ally", "today."]
+                    )
+                ]
+
+            @staticmethod
+            def replace_english_surface_span(**kwargs):
+                captured["span"] = kwargs
+                return True
+
+            @staticmethod
+            def apply_display_page_model_data(*_args, **_kwargs):
+                raise AssertionError("many-to-one edit must use the span contract")
+
+        class Toggle:
+            def setEnabled(self, value):
+                captured["undo_enabled"] = bool(value)
+
+        class Label:
+            def setText(self, value):
+                captured["status"] = str(value)
+
+        model = SubtitleTableModel(
+            {
+                "1": {
+                    "start_time": 1000,
+                    "end_time": 3000,
+                    "original_subtitle": "They call it New Ally today.",
+                    "translated_subtitle": "他们称之为牛来。",
+                    "display_page_view": True,
+                    "display_page_id": "S0007.P01",
+                    "manual_cue_id": "S0007",
+                    "word_start": 100,
+                    "word_end": 105,
+                }
+            }
+        )
+        interface = SimpleNamespace(
+            model=model,
+            manual_final_session=Session(),
+            manual_final_undo_action=Toggle(),
+            status_label=Label(),
+            tr=lambda value: value,
+            _sync_manual_final_text_edits=lambda **kwargs: None,
+            _invalidate_manual_review_marks_for_parent_ids=lambda ids: None,
+            _mark_manual_final_dirty=lambda **kwargs: None,
+            _apply_manual_final_session=lambda: None,
+            _manual_row_for_identity=lambda **kwargs: 0,
+            _select_manual_boundary_row=lambda row: None,
+        )
+        interface._apply_manual_multiword_surface_replacement = MethodType(
+            SubtitleInterface._apply_manual_multiword_surface_replacement,
+            interface,
+        )
+
+        changed = SubtitleInterface._apply_manual_english_replacement(
+            interface,
+            0,
+            "They call it Niulai today.",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(captured["row_range"], (100, 105))
+        self.assertEqual(
+            captured["span"],
+            {
+                "parent_subtitle_id": "S0007",
+                "word_start": 103,
+                "word_end": 104,
+                "replacement_text": "Niulai",
+            },
+        )
+        self.assertTrue(captured["undo_enabled"])
 
     def test_parent_chinese_edit_marks_local_dirty_without_invalidating_pages(self):
         class Toggle:

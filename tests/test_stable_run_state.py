@@ -10,7 +10,14 @@ from app.core.subtitle_processor.stable_run_state import (
     build_stable_run_fingerprint,
     format_stage_progress,
 )
-from app.core.article_context import ARTICLE_ASR_CORRECTION_POLICY_VERSION
+from app.core.article_context import (
+    ARTICLE_ANALYSIS_META_KEY,
+    ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+    ARTICLE_ASR_CORRECTION_POLICY_VERSION,
+    article_analysis_cache_key,
+    article_analysis_prompt_hash,
+    article_text_hash,
+)
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.thread.subtitle_thread import SubtitleThread
 
@@ -50,6 +57,8 @@ def _fingerprint(source: Path, **changes):
         "use_article_translation_terms": True,
         "alignment_backend": "whisperx-time-only",
         "custom_prompt_text": "",
+        "article_analysis_prompt_policy_version": ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+        "article_analysis_prompt_sha256": article_analysis_prompt_hash(),
     }
     values.update(changes)
     return build_stable_run_fingerprint(
@@ -108,6 +117,12 @@ def test_contract_changes_reject_resume_for_article_model_prompt_and_alignment()
 
         changed_prompt = _fingerprint(source, custom_prompt_text="different prompt")
         assert not StableRunStateStore(root).plan_resume(changed_prompt).compatible
+
+        changed_article_policy = _fingerprint(
+            source,
+            article_analysis_prompt_policy_version="article-context-analysis-test-version",
+        )
+        assert not StableRunStateStore(root).plan_resume(changed_article_policy).compatible
 
         class ChangedModelConfig(_Config):
             llm_model = "different-model"
@@ -223,8 +238,20 @@ def test_resume_recomputes_only_stale_article_asr_correction_policy():
 
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
+        article_text = "Reference article."
         (root / "article_context.json").write_text(
-            '{"title":"Reference"}',
+            json.dumps(
+                {
+                    "title": "Reference",
+                    ARTICLE_ANALYSIS_META_KEY: {
+                        "article_text_hash": article_text_hash(article_text),
+                        "prompt_hash": article_analysis_prompt_hash(),
+                        "analysis_prompt_hash": article_analysis_prompt_hash(),
+                        "analysis_prompt_policy_version": ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+                        "analysis_cache_key": article_analysis_cache_key(article_text),
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         corrected = ASRData([ASRDataSeg("Ms Hao", 100, 500)])
@@ -233,6 +260,11 @@ def test_resume_recomputes_only_stale_article_asr_correction_policy():
             encoding="utf-8",
         )
         thread = SubtitleThread.__new__(SubtitleThread)
+        thread.task = type(
+            "Task",
+            (),
+            {"article_reference_text": article_text},
+        )()
         thread._resume_plan = _ResumePlan()
         thread._resume_stage_records = {
             "article_context": {"details": {}},

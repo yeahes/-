@@ -64,6 +64,8 @@ def build_stable_run_fingerprint(
     use_article_translation_terms: bool = False,
     alignment_backend: str = "stable-ts",
     custom_prompt_text: str = "",
+    article_analysis_prompt_policy_version: str = "",
+    article_analysis_prompt_sha256: str = "",
 ) -> Dict[str, Any]:
     """Build the explicit input contract used by the resume planner.
 
@@ -110,6 +112,10 @@ def build_stable_run_fingerprint(
         "input_subtitle_sha256": _file_sha256(source),
         "article_reference_sha256": stable_payload_hash((article_reference_text or "").strip()),
         "article_context_input_sha256": stable_payload_hash(article_payload),
+        "article_analysis_prompt_policy_version": str(
+            article_analysis_prompt_policy_version or ""
+        ),
+        "article_analysis_prompt_sha256": str(article_analysis_prompt_sha256 or ""),
         "use_article_reference_assist": bool(use_article_reference_assist),
         "use_article_translation_terms": bool(use_article_translation_terms),
         "timeline_alignment_backend": str(alignment_backend or "stable-ts").strip().lower(),

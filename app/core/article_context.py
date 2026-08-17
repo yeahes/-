@@ -19,7 +19,8 @@ from app.core.utils.logger import setup_logger
 logger = setup_logger("article_context")
 
 ARTICLE_CONTEXT_SCHEMA_VERSION = 2
-ARTICLE_ASR_CORRECTION_POLICY_VERSION = "article-asr-correction-v4"
+ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION = "article-context-analysis-v2"
+ARTICLE_ASR_CORRECTION_POLICY_VERSION = "article-asr-correction-v5"
 ARTICLE_TRANSLATION_CONTEXT_PROMPT_VERSION = "article-translation-context-v2-hit-only"
 ARTICLE_RAW_RESPONSE_KEY = "_raw_response"
 ARTICLE_ANALYSIS_META_KEY = "_analysis_meta"
@@ -79,6 +80,78 @@ Rules:
 - Do not add facts not supported by the article.
 - Do not output markdown.
 """
+
+
+def article_analysis_prompt_hash(
+    *,
+    prompt: str = ARTICLE_CONTEXT_PROMPT,
+    prompt_policy_version: str = ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+) -> str:
+    payload = {
+        "schema_version": ARTICLE_CONTEXT_SCHEMA_VERSION,
+        "prompt_policy_version": str(prompt_policy_version),
+        "prompt": str(prompt),
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def article_analysis_cache_key(
+    article_text: str,
+    *,
+    prompt: str = ARTICLE_CONTEXT_PROMPT,
+    prompt_policy_version: str = ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+) -> str:
+    payload = {
+        "schema_version": ARTICLE_CONTEXT_SCHEMA_VERSION,
+        "article_text_hash": article_text_hash(article_text),
+        "prompt_policy_version": str(prompt_policy_version),
+        "prompt_hash": article_analysis_prompt_hash(
+            prompt=prompt,
+            prompt_policy_version=prompt_policy_version,
+        ),
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def article_analysis_meta_matches(
+    context: Mapping[str, Any],
+    article_text: str,
+    *,
+    prompt: str = ARTICLE_CONTEXT_PROMPT,
+    prompt_policy_version: str = ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+) -> bool:
+    meta = context.get(ARTICLE_ANALYSIS_META_KEY)
+    if not isinstance(meta, Mapping):
+        return False
+    expected_prompt_hash = article_analysis_prompt_hash(
+        prompt=prompt,
+        prompt_policy_version=prompt_policy_version,
+    )
+    return bool(
+        str(meta.get("article_text_hash") or "") == article_text_hash(article_text)
+        and str(meta.get("analysis_prompt_policy_version") or "")
+        == str(prompt_policy_version)
+        and str(meta.get("analysis_prompt_hash") or meta.get("prompt_hash") or "")
+        == expected_prompt_hash
+        and str(meta.get("analysis_cache_key") or "")
+        == article_analysis_cache_key(
+            article_text,
+            prompt=prompt,
+            prompt_policy_version=prompt_policy_version,
+        )
+    )
 
 
 @dataclass
@@ -168,25 +241,25 @@ def analyze_article_text(
     if not cleaned:
         return empty_article_context()
     cache = cache_manager or CacheManager(str(CACHE_PATH))
-    cache_key = article_text_hash(cleaned)
+    source_hash = article_text_hash(cleaned)
+    prompt_hash = article_analysis_prompt_hash()
+    cache_key = article_analysis_cache_key(cleaned)
     cache_result = cache.get_llm_result(
         cache_key,
         llm_config.model,
         task="article_context_analysis",
         schema_version=ARTICLE_CONTEXT_SCHEMA_VERSION,
+        prompt_policy_version=ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+        prompt_hash=prompt_hash,
     )
     if cache_result:
         cached = normalize_article_context(json.loads(cache_result))
-        meta = dict(cached.get(ARTICLE_ANALYSIS_META_KEY) or {})
-        meta.update(
-            {
-                "model": llm_config.model,
-                "cache_used": True,
-                "prompt_hash": cache_key,
-            }
-        )
-        cached[ARTICLE_ANALYSIS_META_KEY] = meta
-        return cached
+        if article_analysis_meta_matches(cached, cleaned):
+            meta = dict(cached.get(ARTICLE_ANALYSIS_META_KEY) or {})
+            meta.update({"model": llm_config.model, "cache_used": True})
+            cached[ARTICLE_ANALYSIS_META_KEY] = meta
+            return cached
+        logger.warning("Ignoring stale article analysis cache for current prompt policy")
 
     client = OpenAI(base_url=llm_config.base_url, api_key=llm_config.api_key)
     response = client.chat.completions.create(
@@ -204,7 +277,11 @@ def analyze_article_text(
     data[ARTICLE_ANALYSIS_META_KEY] = {
         "model": llm_config.model,
         "cache_used": False,
-        "prompt_hash": cache_key,
+        "article_text_hash": source_hash,
+        "prompt_hash": prompt_hash,
+        "analysis_prompt_hash": prompt_hash,
+        "analysis_prompt_policy_version": ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+        "analysis_cache_key": cache_key,
     }
     cache.set_llm_result(
         cache_key,
@@ -212,6 +289,8 @@ def analyze_article_text(
         llm_config.model,
         task="article_context_analysis",
         schema_version=ARTICLE_CONTEXT_SCHEMA_VERSION,
+        prompt_policy_version=ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+        prompt_hash=prompt_hash,
     )
     return data
 
@@ -269,6 +348,11 @@ def enrich_article_context_with_evidence(context: Dict[str, Any], article_text: 
             enriched = dict(item)
             canonical = str(enriched.get("canonical_name", "") or "")
             canonical_evidence = _find_article_evidence(cleaned, canonical)
+            if canonical_evidence is not None:
+                canonical_evidence["evidence_sentences"] = [
+                    item["evidence_sentence"]
+                    for item in _find_all_article_evidence(cleaned, canonical)
+                ]
             enriched["source_key"] = key
             enriched["canonical_in_article"] = canonical_evidence is not None
             enriched["evidence"] = canonical_evidence or {}
@@ -332,34 +416,56 @@ def build_article_context_audit(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _find_article_evidence(article_text: str, phrase: str) -> Optional[Dict[str, Any]]:
+    evidence = _find_all_article_evidence(article_text, phrase)
+    return evidence[0] if evidence else None
+
+
+def _find_all_article_evidence(
+    article_text: str,
+    phrase: str,
+) -> List[Dict[str, Any]]:
     phrase = str(phrase or "").strip()
     if not article_text or not phrase:
-        return None
+        return []
     article_text = _normalize_article_punctuation(article_text)
     phrase = _normalize_article_punctuation(phrase)
     pattern = re.compile(
         rf"(?<![A-Za-z0-9]){_article_phrase_pattern(phrase)}(?![A-Za-z0-9])",
         re.IGNORECASE,
     )
-    match = pattern.search(article_text)
-    if not match:
-        return None
-    sentence_start = max(article_text.rfind(".", 0, match.start()), article_text.rfind("\n", 0, match.start()))
-    sentence_start = 0 if sentence_start < 0 else sentence_start + 1
-    sentence_end_candidates = [
-        pos for pos in (
-            article_text.find(".", match.end()),
-            article_text.find("\n", match.end()),
+    evidence: List[Dict[str, Any]] = []
+    seen_sentences: set[str] = set()
+    for match in pattern.finditer(article_text):
+        sentence_start = max(
+            article_text.rfind(".", 0, match.start()),
+            article_text.rfind("\n", 0, match.start()),
         )
-        if pos >= 0
-    ]
-    sentence_end = min(sentence_end_candidates) + 1 if sentence_end_candidates else len(article_text)
-    sentence = " ".join(article_text[sentence_start:sentence_end].split())
-    return {
-        "start_char": match.start(),
-        "end_char": match.end(),
-        "evidence_sentence": sentence,
-    }
+        sentence_start = 0 if sentence_start < 0 else sentence_start + 1
+        sentence_end_candidates = [
+            pos
+            for pos in (
+                article_text.find(".", match.end()),
+                article_text.find("\n", match.end()),
+            )
+            if pos >= 0
+        ]
+        sentence_end = (
+            min(sentence_end_candidates) + 1
+            if sentence_end_candidates
+            else len(article_text)
+        )
+        sentence = " ".join(article_text[sentence_start:sentence_end].split())
+        if sentence in seen_sentences:
+            continue
+        seen_sentences.add(sentence)
+        evidence.append(
+            {
+                "start_char": match.start(),
+                "end_char": match.end(),
+                "evidence_sentence": sentence,
+            }
+        )
+    return evidence
 
 
 def _normalize_article_punctuation(text: str) -> str:
@@ -544,10 +650,18 @@ def build_article_asr_review_artifact(
     for item in correction_logs:
         if not isinstance(item, Mapping):
             continue
+        rejection_reason = str(item.get("reason") or "")
+        reviewable_scope_rejection = bool(
+            rejection_reason == "ordinary_text_not_article_proper_noun_scope"
+            and item.get("entity_gate_passed") is True
+        )
         if (
             bool(item.get("applied"))
             or str(item.get("result") or "") != "review_only"
-            or str(item.get("reason") or "") != "below_high_confidence_threshold"
+            or (
+                rejection_reason != "below_high_confidence_threshold"
+                and not reviewable_scope_rejection
+            )
             or item.get("entity_gate_passed") is not True
         ):
             continue
@@ -748,6 +862,20 @@ def _correct_word_timestamp_segments(
                     candidate["matched_conditions"].append(
                         "article_defined_technical_term_context_match"
                     )
+                title_context = _book_title_context_support(
+                    segments,
+                    index,
+                    index + window_size,
+                    candidate,
+                )
+                candidate["book_title_context_match"] = bool(
+                    title_context.get("matched")
+                )
+                candidate["book_title_context_evidence"] = title_context
+                if candidate["book_title_context_match"]:
+                    candidate["matched_conditions"].append(
+                        "article_book_title_context_match"
+                    )
                 candidate["asr_confidence_low"] = None
                 if _is_self_replacement_candidate(candidate):
                     continue
@@ -755,6 +883,7 @@ def _correct_word_timestamp_segments(
                     candidate["final_confidence"] >= review_confidence
                     or _context_supported_person_candidate(candidate)
                     or _context_supported_technical_term_candidate(candidate)
+                    or _context_supported_book_title_candidate(candidate)
                 ):
                     if candidate.get("matched_variant_is_alias"):
                         alias_collision = _find_ambiguous_alias_canonical_collision(candidate, terms)
@@ -1759,6 +1888,125 @@ def _context_supported_technical_term_candidate(candidate: Dict[str, Any]) -> bo
     )
 
 
+def _book_title_context_support(
+    segments: Sequence[ASRDataSeg],
+    start_index: int,
+    end_index: int,
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Match a split ASR title against the title's local article phrasing.
+
+    The title itself is already article-evidenced. This extra check only admits
+    a two-token-to-one-token correction when adjacent words identify the same
+    phrase, which prevents a generic ``new lie`` from becoming a film name.
+    """
+    source = candidate.get("source_glossary") or {}
+    source_key = str(source.get("source_key") or "").casefold()
+    original_tokens = _word_tokens(str(candidate.get("original_text") or ""))
+    canonical_tokens = _word_tokens(str(candidate.get("candidate_text") or ""))
+    if (
+        source_key != "books_and_works"
+        or len(original_tokens) != 2
+        or len(canonical_tokens) != 1
+        or any(
+            _normalize_entity_gate_token(token) in _ENTITY_BLOCKING_FUNCTION_WORDS
+            for token in original_tokens
+        )
+        or float(candidate.get("phonetic_similarity") or 0.0) < 0.86
+        or float(candidate.get("final_confidence") or 0.0) < 0.84
+    ):
+        return {"matched": False, "reason": "not_split_book_title"}
+
+    evidence = source.get("evidence") or {}
+    evidence_sentences = [
+        str(value or "").strip()
+        for value in evidence.get("evidence_sentences") or []
+        if str(value or "").strip()
+    ]
+    if not evidence_sentences and evidence.get("evidence_sentence"):
+        evidence_sentences = [str(evidence["evidence_sentence"])]
+    if not evidence_sentences:
+        return {"matched": False, "reason": "missing_book_title_evidence"}
+
+    local_before = [
+        _normalize_entity_gate_token(str(segment.text or ""))
+        for segment in segments[max(0, start_index - 8) : start_index]
+    ]
+    local_after = [
+        _normalize_entity_gate_token(str(segment.text or ""))
+        for segment in segments[end_index : min(len(segments), end_index + 8)]
+    ]
+    canonical = _normalize_entity_gate_token(canonical_tokens[0])
+    best: Dict[str, Any] = {}
+    for sentence in evidence_sentences:
+        article_tokens = [
+            _normalize_entity_gate_token(token) for token in _word_tokens(sentence)
+        ]
+        for title_index in _token_subsequence_starts(article_tokens, [canonical]):
+            article_before = article_tokens[max(0, title_index - 8) : title_index]
+            article_after = article_tokens[title_index + 1 : title_index + 9]
+            left_match = _suffix_token_match(local_before, article_before)
+            right_match = _prefix_token_match(local_after, article_after)
+            local_terms = set(local_before + local_after)
+            article_terms = set(article_before + article_after)
+            overlap = sorted(
+                token
+                for token in local_terms & article_terms
+                if len(token) >= 5 and token not in _ENTITY_BLOCKING_FUNCTION_WORDS
+            )
+            if max(left_match, right_match) >= 3 or (
+                max(left_match, right_match) >= 2 and overlap
+            ):
+                candidate_result = {
+                    "matched": True,
+                    "reason": "article_book_title_context_overlap",
+                    "left_match": left_match,
+                    "right_match": right_match,
+                    "overlap_terms": overlap,
+                    "evidence_sentence": sentence,
+                }
+                if not best or (
+                    max(left_match, right_match), len(overlap)
+                ) > (
+                    max(best.get("left_match", 0), best.get("right_match", 0)),
+                    len(best.get("overlap_terms") or []),
+                ):
+                    best = candidate_result
+    return best or {
+        "matched": False,
+        "reason": "insufficient_book_title_context_overlap",
+        "overlap_terms": [],
+    }
+
+
+def _context_supported_book_title_candidate(candidate: Dict[str, Any]) -> bool:
+    evidence = candidate.get("book_title_context_evidence") or {}
+    return bool(
+        candidate.get("book_title_context_match")
+        and float(candidate.get("phonetic_similarity") or 0.0) >= 0.86
+        and float(candidate.get("final_confidence") or 0.0) >= 0.84
+        and evidence.get("matched")
+    )
+
+
+def _suffix_token_match(left: Sequence[str], right: Sequence[str]) -> int:
+    count = 0
+    for left_token, right_token in zip(reversed(left), reversed(right)):
+        if left_token != right_token:
+            break
+        count += 1
+    return count
+
+
+def _prefix_token_match(left: Sequence[str], right: Sequence[str]) -> int:
+    count = 0
+    for left_token, right_token in zip(left, right):
+        if left_token != right_token:
+            break
+        count += 1
+    return count
+
+
 def _technical_term_surface_similarity(candidate: Dict[str, Any]) -> float:
     original = " ".join(
         token
@@ -1935,11 +2183,13 @@ def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -
     context_supported_technical_term = _context_supported_technical_term_candidate(
         candidate
     )
+    context_supported_book_title = _context_supported_book_title_candidate(candidate)
     if (
         candidate["final_confidence"] < high_confidence
         and not near_threshold_person_edge
         and not context_supported_person
         and not context_supported_technical_term
+        and not context_supported_book_title
     ):
         return False
     if _article_scope_rejection_reason(candidate):
@@ -1948,6 +2198,7 @@ def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -
         near_threshold_person_edge
         or context_supported_person
         or context_supported_technical_term
+        or context_supported_book_title
     ):
         return True
     return len(candidate.get("matched_conditions") or []) >= 2
@@ -1961,6 +2212,7 @@ def _not_applied_reason(candidate: Dict[str, Any], high_confidence: float) -> st
         and not _near_threshold_person_edge_candidate(candidate, high_confidence)
         and not _context_supported_person_candidate(candidate)
         and not _context_supported_technical_term_candidate(candidate)
+        and not _context_supported_book_title_candidate(candidate)
     ):
         return "below_high_confidence_threshold"
     scope_reason = _article_scope_rejection_reason(candidate)
@@ -2004,6 +2256,7 @@ def _article_scope_rejection_reason(candidate: Dict[str, Any]) -> str:
     if (
         _article_defined_technical_term_candidate(candidate)
         or _context_supported_technical_term_candidate(candidate)
+        or _context_supported_book_title_candidate(candidate)
     ):
         return ""
 

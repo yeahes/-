@@ -315,13 +315,6 @@ def _english_boundary_audit_marks(
 def _high_confidence_chinese_marks(validation: Any) -> List[SubtitleReviewMark]:
     if not isinstance(validation, Mapping):
         return []
-    severe_codes = {
-        "entity_loss",
-        "missing_predicate",
-        "negation_loss",
-        "number_mismatch",
-        "semantic_loss",
-    }
     marks: List[SubtitleReviewMark] = []
     for group in _as_list(validation.get("warnings")):
         if not isinstance(group, Mapping) or group.get("code") != "chinese_semantic_group_warning":
@@ -329,17 +322,12 @@ def _high_confidence_chinese_marks(validation: Any) -> List[SubtitleReviewMark]:
         for entry in _group_entries(group):
             if not bool(entry.get("mapping_valid")):
                 continue
-            try:
-                confidence_score = float(entry.get("confidence_score") or 0.0)
-            except (TypeError, ValueError):
-                confidence_score = 0.0
-            issue_codes = {str(code) for code in _as_list(entry.get("rule_codes"))}
             subtitle_ids = _subtitle_ids(entry)
-            if confidence_score < 0.85 or not issue_codes.intersection(severe_codes) or not subtitle_ids:
+            if str(entry.get("confidence") or "").lower() != "high" or not subtitle_ids:
                 continue
             _append_marks(
                 marks,
-                [subtitle_ids[0]],
+                subtitle_ids,
                 severity="REVIEW",
                 category="chinese_allocation",
                 target="chinese",
@@ -358,6 +346,10 @@ def _allocation_unresolved_marks(directory: Path) -> List[SubtitleReviewMark]:
         "number_allocation_mismatch",
         "semantic_loss",
         "unnatural_chinese_fragment",
+        "dangling_preposition",
+        "english_word_order",
+        "modifier_head_split",
+        "punctuation_discontinuity",
     }
     marks: List[SubtitleReviewMark] = []
     for entry in _as_list(unresolved):
@@ -372,7 +364,7 @@ def _allocation_unresolved_marks(directory: Path) -> List[SubtitleReviewMark]:
             continue
         _append_marks(
             marks,
-            [subtitle_ids[0]],
+            subtitle_ids,
             severity="REVIEW",
             category="chinese_allocation",
             target="chinese",

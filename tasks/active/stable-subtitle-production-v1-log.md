@@ -1,5 +1,43 @@
 # Progress Log
 
+## 2026-08-17 Balanced Same-Screen Wrap And Manual Split Fallback
+
+- Replaced first-fit article English wrapping with all-profile comparison using
+  measured pixel-width balance. Page-turn-only tight-pause evidence no longer
+  distorts a same-screen line break; lexical, entity, numeric, and other atomic
+  protections remain unchanged.
+- Added a user-confirmed high-risk fallback for `split into N pages`. Strict and
+  REVIEW planning still run first. If both fail, the confirmed proposal uses
+  only authoritative timed-word boundaries and records the original HARD
+  evidence for manual review; it does not change parent English, IDs, timing, or
+  audio.
+- Added the separate three-English-line/one-Chinese-line vertical origin and
+  bumped the display planner to v24 so stale page layout caches are not reused.
+- Read-only oil replay kept 163 pages and two three-line pages, reduced pages
+  below a 0.60 two-line balance ratio from 23 to 18, and reduced extreme ratios
+  below 0.45 from eight to two. Focused layout, manual-editor, and GUI tests pass;
+  the complete regression command also passes.
+
+## 2026-08-16 Audit Repair: Page Quality, Review Closure, Cache Identity
+
+- Added parent-bound page-Chinese checks for repeated facts and significant
+  expansion, upgraded the page allocation contract to v6 and prompt to v5, and
+  retained the existing failed-parent-only Pro retry owner.
+- Upgraded the display planner to v23. Raw atomic syntax evidence survives
+  pause/continuation relaxation and cannot beat a safe one- or two-line plan.
+  A verified complete continuation remains available only to replace the
+  emergency three-line fallback.
+- Routed high-confidence semantic-group findings into the existing local retry
+  and made the editor mark all affected IDs using the producer's confidence.
+- Bound article-analysis cache, GUI context, resume data, and the stable-run
+  fingerprint to the source article plus schema, prompt, and policy identity.
+- Read-only replay of the 140-parent oil manual package produced 156 pages,
+  selected zero relaxed-atomic boundaries, and found the known `S0117` and
+  `S0136` page expansions. The inspected production artifact hashes did not
+  change.
+- Focused suites and the complete regression command pass. Verification made
+  no paid request and did not write production subtitle or video artifacts.
+
 ## 2026-08-16 Concise Chinese And 48px Article Typography
 
 - Fresh production A/B compared oil v6 run
@@ -2543,3 +2581,81 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
   zero stale-Chinese rows; four English-boundary review rows remain unchanged.
 - Manual editor tests and the complete regression command pass. The replay was
   read-only and did not modify production output.
+
+## 2026-08-17 Single-Cue Chinese Gate Recovery
+
+- Reproduced the 84% stable-artifact failure from the immutable run state and
+  cached LLM responses for `肠道菌群，能人为操控吗？`.
+- Identified `G0163 / S0194`: a valid `...不等于...` translation of
+  `Just because ... does not mean ...` was falsely labelled `semantic_loss`.
+- Added general negative-entailment recognition and preserved any non-empty
+  one-cue authoritative translation when a heuristic quality finding remains;
+  unresolved evidence stays reviewable instead of becoming missing Chinese.
+- Read-only cache replay covers 180 groups and 217 fixed IDs with zero empty
+  allocation. Focused regressions, the stable-caption suite, the complete
+  regression command, and diff checks pass.
+
+## 2026-08-17 Display-Page Chinese Candidate Fallback Recovery
+
+- Reproduced the subsequent 96% failure from the saved
+  `work-dir\肠道菌群，能人为操控吗？` artifacts without making a model request or
+  rewriting production output.
+- Confirmed the failure owner was page-Chinese candidate selection: 217 fixed
+  IDs and 33 paginated parent contracts were complete. The Flash result had
+  zero hard errors and six REVIEW findings; the optional Pro retry introduced
+  expansion or repetition in several parents and was incorrectly promoted to
+  an episode-wide blocker.
+- Reclassified page-local continuation/fluency findings as REVIEW while keeping
+  structural, semantic, identity, token-boundary, and hard speed errors
+  blocking. Added a candidate fallback so a failed or worse optional Pro retry
+  retains the complete initial projection and records the rejected evidence.
+- Added regressions for REVIEW-vs-semantic blocking and for preserving a usable
+  Flash projection after a worse Pro candidate. Real artifact replay passes
+  33/33 parents with zero hard errors and six REVIEW findings. The complete
+  regression command and `git diff --check` exit zero.
+
+## 2026-08-17 Last-Row Editing, Manual Six-Page, Niulai, And Media Mute
+
+- Removed the last-row boundary pre-rejection and reused the existing upper-edge
+  mapping. A single fixed cue with multiple display pages can now adjust its
+  internal edge; invalid rows still fail closed.
+- Queued split/repage/merge actions with `QTimer.singleShot(0, ...)` after the
+  context menu callback and captured stable IDs only, preventing a synchronous
+  Qt model reset inside the native menu event loop.
+- Kept automatic planning at four pages and added a separate explicit-manual
+  maximum of six pages. The on-demand candidate workspace now searches up to
+  that manual limit; automatic runs still never enumerate five/six-page output.
+- Upgraded article ASR correction to v5. Article-evidenced, locally anchored
+  `new lie -> Niulai` spans may merge before IDs freeze while ordinary phrases
+  remain protected; high-signal scope-rejected `Yulai` is projected for review.
+- Added parent-level `media_muted`, which implies `display_suppressed`. Manual
+  save materializes exact cue intervals with FFmpeg `volume`, binds original
+  media/cue/timing/ledger/decision/derived hashes, preserves total duration,
+  and rejects tail-trim coexistence or tampering. Synthesis now resolves the
+  manifest-owned derived media inside the worker before rendering.
+- Focused manual-editor, real FFmpeg mute, stable-publication/UI, and synthesis
+  safety tests pass. A follow-up audit also closed direct-SRT derived-media
+  bypass, restored the mute media contract through undo/redo, and queued all
+  context-menu merge paths by stable IDs. The final complete regression and
+  `git diff --check` both exit zero.
+
+## 2026-08-17 Manual Multiword Surface, Combined Derivation, And Copy
+
+- Added a raw-to-display span projection for deliberate many-to-one English
+  correction. The raw word ledger and every timing/identity field remain
+  immutable; pagination retains raw first/last word IDs while rendering the
+  projected display tokens.
+- Routed ordinary one-word edits, parent merges, formal boundary changes,
+  tail deletion, render-plan rebuild, save/reload, and undo/redo through the
+  same display projection. A boundary or tail cut cannot split a display span.
+- Replaced the old mute/tail-trim mutual exclusion with one schema-v2 media
+  derivation decision containing ordered mute intervals and an optional cut.
+  FFmpeg applies `volume`, `atrim`, and `asetpts` in one pass from original
+  media; legacy mute-only packages prefer their recorded original on upgrade.
+- Added whole-row extended selection, `Ctrl+C`, and `复制英文`. Selected English
+  is copied in display order without invoking model writeback or manual-final
+  history.
+- Added regressions for span preservation through a separate word edit and
+  parent merge, atomic tail cuts, legacy-source recovery, and read-only
+  multi-row copy. Focused editor, UI/publication, synthesis-safety,
+  page-translation, and readability suites pass.

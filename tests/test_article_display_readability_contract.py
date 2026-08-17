@@ -213,8 +213,8 @@ def _page_starts(plan):
 
 def test_candidate_workspace_is_read_only_and_bounded():
     cue = _cue(
-        "S0007",
         "The domestic alternative has improved at a staggering rate, especially in the last decade.",
+        "S0007",
     )
     before = deepcopy(cue.__dict__)
     workspace = podcast_learning_video.build_article_display_page_candidate_workspace(
@@ -226,6 +226,48 @@ def test_candidate_workspace_is_read_only_and_bounded():
     assert 0 < len(workspace["candidates"]) <= 3
     assert all(2 <= candidate["page_count"] <= 4 for candidate in workspace["candidates"])
     assert cue.__dict__ == before
+
+
+def test_candidate_workspace_allows_explicit_manual_six_page_search():
+    cue = _cue(
+        "one two three four five six seven eight nine ten eleven twelve",
+        "S0008",
+    )
+    candidates = [
+        {
+            "page_count": page_count,
+            "quality_cost": float(page_count),
+            "plan": {},
+            "pages": [],
+        }
+        for page_count in range(2, 7)
+    ]
+    with patch.object(
+        podcast_learning_video,
+        "_build_article_english_page_plan",
+        return_value={
+            "status": "candidate_bundle",
+            "preferred_page_count": 2,
+            "candidate_mode": "strict",
+            "candidates": candidates,
+        },
+    ) as builder:
+        workspace = (
+            podcast_learning_video.build_article_display_page_candidate_workspace(
+                cue,
+                min_page_count=2,
+                max_page_count=6,
+            )
+        )
+
+    assert builder.call_args.kwargs["max_page_count"] == 6
+    assert [candidate["page_count"] for candidate in workspace["candidates"]] == [
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
 
 
 def _production_word_timing(words, word_ids, start_ms, end_ms):
@@ -696,6 +738,191 @@ def test_reference_style_wrap_prefers_balanced_two_lines_before_wide_single_line
     assert not podcast_learning_video._has_discouraged_caption_break(text, lines)
 
 
+def test_same_screen_wrap_does_not_favor_a_short_punctuation_prefix():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    text = "But, you know, not by a massive increase in production."
+    lines = podcast_learning_video._article_fixed_english_lines(
+        draw,
+        text,
+        font_size=56,
+        relax_same_screen_syntax=True,
+    )
+
+    assert lines == [
+        "But, you know, not",
+        "by a massive increase in production.",
+    ]
+    widths = [podcast_learning_video.text_w(draw, line, podcast_learning_video.article_en_font(56, 600)) for line in lines]
+    assert min(widths) / max(widths) >= 0.50
+
+
+def test_hyphenated_word_is_not_a_barrier_after_the_complete_token():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    text = "Since China's self-interest temporarily saved the market,"
+    lines = podcast_learning_video._article_fixed_english_lines(
+        draw,
+        text,
+        font_size=56,
+        boundary_penalty=lambda split: 7_200 if split in {3, 5} else 12_000,
+        relax_same_screen_syntax=True,
+    )
+
+    assert lines == [
+        "Since China's self-interest",
+        "temporarily saved the market,",
+    ]
+
+
+def test_extreme_same_screen_imbalance_can_use_a_single_line_fallback():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    text = "No, you use massive pre-existing terrestrial infrastructure."
+    cue = _cue(text, "S0025")
+
+    def fake_layout(_draw, _text, _key=None, *, font_size, **_kwargs):
+        if font_size == 50:
+            return [text]
+        return ["No, you use", "massive pre-existing terrestrial infrastructure."]
+
+    with patch.object(
+        podcast_learning_video,
+        "_article_fixed_english_lines",
+        side_effect=fake_layout,
+    ):
+        layout = podcast_learning_video._article_final_page_layout(
+            draw,
+            cue,
+            text.split(),
+            0,
+            len(text.split()),
+        )
+
+    assert layout == (50, [text])
+
+
+def test_three_english_lines_and_one_chinese_line_use_separate_vertical_origin():
+    assert podcast_learning_video.article_subtitle_origins(3, 1) == (552, 774)
+    assert podcast_learning_video.article_subtitle_origins(3, 2) == (552, 746)
+
+
+def test_manual_page_proposal_requires_explicit_hard_boundary_override():
+    text = "One two three four five six seven eight nine ten eleven twelve."
+    words = text.split()
+    cue = _cue(
+        text,
+        "S0026",
+        word_timing=tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * 0.45,
+                "end": index * 0.45 + 0.35,
+            }
+            for index, word in enumerate(words)
+        ),
+        display_boundary_evidence={
+            str(index): {
+                "hard_issues": ["atomic_of_complement_split"],
+                "soft_issues": [],
+                "pause_ms": 100,
+            }
+            for index in range(1, len(words))
+        },
+    )
+
+    try:
+        podcast_learning_video.propose_article_manual_page_word_ranges(
+            cue,
+            2,
+            allow_review_boundary=True,
+        )
+    except podcast_learning_video.RenderStructuralOverflowError as exc:
+        assert any(
+            item.get("reason") == "manual_page_count_has_no_safe_partition"
+            for item in exc.errors
+        )
+    else:
+        raise AssertionError("automatic and review planning must keep hard cuts blocked")
+
+    ranges = podcast_learning_video.propose_article_manual_page_word_ranges(
+        cue,
+        2,
+        allow_review_boundary=True,
+        allow_hard_boundary=True,
+    )
+
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == len(words) - 1
+    assert ranges[0][1] + 1 == ranges[1][0]
+    assert abs(
+        (ranges[0][1] - ranges[0][0] + 1)
+        - (ranges[1][1] - ranges[1][0] + 1)
+    ) <= 2
+
+
+def test_automatic_page_limit_stays_four_while_manual_can_request_six():
+    assert podcast_learning_video.ARTICLE_VISUAL_PAGE_MAX_PAGES == 4
+    assert podcast_learning_video.ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES == 6
+    words = [f"word{index}" for index in range(24)]
+    cue = _cue(
+        " ".join(words),
+        "S0027",
+        word_timing=tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * 0.55,
+                "end": index * 0.55 + 0.4,
+            }
+            for index, word in enumerate(words)
+        ),
+    )
+
+    six_spans = [(index * 4, (index + 1) * 4) for index in range(6)]
+    with patch.object(
+        podcast_learning_video,
+        "_partition_article_english_pages",
+        return_value=six_spans,
+    ), patch.object(
+        podcast_learning_video,
+        "_schedule_article_page_boundaries",
+        return_value=([index * 2.0 for index in range(7)], ""),
+    ):
+        ranges = podcast_learning_video.propose_article_manual_page_word_ranges(
+            cue,
+            6,
+            allow_review_boundary=True,
+            allow_hard_boundary=True,
+        )
+
+    automatic_page_counts = []
+
+    def reject_automatic(
+        _draw,
+        _cue_value,
+        _words,
+        page_count,
+        _timing,
+        _font_size,
+        *_args,
+        **_kwargs,
+    ):
+        automatic_page_counts.append(int(page_count))
+        return None
+
+    with patch.object(
+        podcast_learning_video,
+        "_partition_article_english_pages",
+        side_effect=reject_automatic,
+    ):
+        podcast_learning_video._build_article_english_page_plan(
+            cue,
+            ImageDraw.Draw(Image.new("RGB", (1920, 1080))),
+        )
+
+    assert len(ranges) == 6
+    assert max(automatic_page_counts) == 4
+
+
 def test_production_candidate_bundle_keeps_a_bounded_visual_frontier():
     text = (
         "Customers save money every day, stores grow quickly across China, "
@@ -829,6 +1056,46 @@ def test_medium_review_boundary_can_beat_static_font_reduction_on_quality():
     assert plan["font_fallback"] == {"used": False}
     assert plan["pages"][1]["boundary_before"]["classification"] == "review"
     assert plan["pages"][1]["boundary_before"]["confidence"] == "medium"
+    assert " ".join(page["en"] for page in plan["pages"]) == text
+
+
+def test_relaxed_raw_hard_boundary_cannot_beat_strict_static_layout():
+    text = (
+        "Research teams evaluate modern systems and recommend practical methods "
+        "for classroom use worldwide."
+    )
+    words = text.split()
+    timing = tuple(
+        {
+            "word_id": index,
+            "surface": word,
+            "start": index * 0.5,
+            "end": index * 0.5 + 0.35,
+        }
+        for index, word in enumerate(words)
+    )
+    cue = _cue(
+        text,
+        "S9003",
+        word_timing=timing,
+        display_boundary_evidence={
+            str(index): {
+                "hard_issues": ["subject_predicate_split"],
+                "soft_issues": [],
+                "pause_ms": 200,
+            }
+            for index in range(1, len(words))
+        },
+    )
+
+    relaxed = podcast_learning_video._article_display_boundary_decision(cue, 5)
+    plan = _plan(cue)
+
+    assert relaxed["classification"] == "review"
+    assert relaxed["raw_hard_issue_codes"] == ["subject_predicate_split"]
+    assert relaxed["relaxed_raw_hard"] is True
+    assert len(plan["pages"]) == 1
+    assert plan["font_size"]["english"] in {50, 52, 54, 56}
     assert " ".join(page["en"] for page in plan["pages"]) == text
 
 
@@ -2096,18 +2363,6 @@ def test_automatic_multipage_plan_assigns_font_from_each_final_page():
 def test_high_pressure_single_pages_promote_only_complete_review_partitions():
     cases = (
         (
-            "S9501",
-            (
-                "There was this young woman lamenting that her parents spent "
-                "over 2 million yuan to send her abroad."
-            ),
-            {5: 540},
-            (
-                "There was this young woman lamenting",
-                "that her parents spent over 2 million yuan to send her abroad.",
-            ),
-        ),
-        (
             "S9502",
             (
                 "and two extra years of networking with local professors who "
@@ -2147,6 +2402,25 @@ def test_high_pressure_single_pages_promote_only_complete_review_partitions():
         assert tuple(page["english"] for page in plan["pages"]) == expected_pages
         assert all(page["english_font_size"] == 56 for page in plan["pages"])
         assert plan["pages"][1]["boundary_before"]["classification"] == "review"
+
+
+def test_high_pressure_pause_does_not_outrank_a_strict_single_page():
+    text = (
+        "There was this young woman lamenting that her parents spent "
+        "over 2 million yuan to send her abroad."
+    )
+    _, cue = _syntax_backed_cue(
+        text,
+        "S9501",
+        word_timing=_word_timing_with_gaps(text, {5: 540}),
+    )
+
+    plan = podcast_learning_video.build_article_display_page_blueprint(
+        [cue]
+    )["render_plans"][0]
+
+    assert tuple(page["english"] for page in plan["pages"]) == (text,)
+    assert plan["pages"][0]["english_font_size"] == 56
 
 
 def test_high_pressure_secondary_review_rejects_incomplete_phrase_boundaries():
@@ -2426,6 +2700,43 @@ def test_same_screen_line_wrap_keeps_atomic_language_units_hard():
             modifier_split,
         )
         >= podcast_learning_video.CAPTION_HARD_BREAK_PENALTY
+    )
+
+
+def test_same_screen_wrap_ignores_page_turn_only_timing_warning():
+    text = (
+        "they feed that curated, highly structured data to a new, smaller "
+        "model, the student."
+    )
+    cue = _cue(text, "S9606")
+    split = text.split().index("to")
+    decision = podcast_learning_video._article_display_boundary_decision(
+        cue,
+        split,
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    assert decision["issue_codes"] == ["unsupported_tight_page_transition"]
+    assert podcast_learning_video._article_line_boundary_penalty(cue, split) == 0
+    assert (
+        podcast_learning_video._article_page_planning_line_boundary_penalty(
+            cue,
+            split,
+        )
+        > 0
+    )
+    assert podcast_learning_video._article_final_page_layout(
+        draw,
+        cue,
+        text.split(),
+        0,
+        len(text.split()),
+    ) == (
+        56,
+        [
+            "they feed that curated, highly structured data",
+            "to a new, smaller model, the student.",
+        ],
     )
 
 
@@ -3132,6 +3443,8 @@ def test_forced_verb_complement_split_ranks_below_subject_predicate_fallback():
 
 
 if __name__ == "__main__":
+    test_candidate_workspace_is_read_only_and_bounded()
+    test_candidate_workspace_allows_explicit_manual_six_page_search()
     test_display_planning_does_not_mutate_frozen_cue_identity_text_or_timing()
     test_visual_planning_reuses_the_complete_frozen_page_projection()
     test_subject_predicate_boundary_is_not_used_for_efficiency_gap_page_change()
@@ -3143,9 +3456,16 @@ if __name__ == "__main__":
     test_page_span_score_prefers_balanced_legal_boundary_when_risk_is_equal()
     test_page_span_frontier_retains_distinct_safe_visual_partitions()
     test_reference_style_wrap_prefers_balanced_two_lines_before_wide_single_line()
+    test_same_screen_wrap_does_not_favor_a_short_punctuation_prefix()
+    test_hyphenated_word_is_not_a_barrier_after_the_complete_token()
+    test_extreme_same_screen_imbalance_can_use_a_single_line_fallback()
+    test_three_english_lines_and_one_chinese_line_use_separate_vertical_origin()
+    test_manual_page_proposal_requires_explicit_hard_boundary_override()
+    test_automatic_page_limit_stays_four_while_manual_can_request_six()
     test_production_candidate_bundle_keeps_a_bounded_visual_frontier()
     test_production_candidates_score_the_same_font_used_by_final_reflow()
     test_medium_review_boundary_can_beat_static_font_reduction_on_quality()
+    test_relaxed_raw_hard_boundary_cannot_beat_strict_static_layout()
     test_article_english_font_profile_has_a_strict_50px_floor()
     test_font_floor_regression_cues_render_at_50px_without_emergency_warnings()
     test_checkpoint_hard_page_cues_have_readable_frozen_plans()
@@ -3169,6 +3489,7 @@ if __name__ == "__main__":
     test_blueprint_keeps_56px_when_a_safe_page_plan_exists()
     test_automatic_multipage_plan_assigns_font_from_each_final_page()
     test_high_pressure_single_pages_promote_only_complete_review_partitions()
+    test_high_pressure_pause_does_not_outrank_a_strict_single_page()
     test_high_pressure_secondary_review_rejects_incomplete_phrase_boundaries()
     test_secondary_page_promotion_distinguishes_safe_and_attached_boundaries()
     test_complete_from_gerund_page_beats_single_50px_fallback()

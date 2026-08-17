@@ -21,6 +21,7 @@ from app.core.subtitle_processor.stable_artifacts import (
     resolve_manifest_owned_path,
     validate_manifest_artifact,
 )
+from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
 from app.core.utils.logger import setup_logger
 from app.core.utils.podcast_learning_video import render_podcast_learning_video
 from app.core.utils.video_utils import (
@@ -256,12 +257,109 @@ def resolve_synthesis_package_inputs(
         or ""
     )
     tail_trim = override.get("tail_trim") or manifest.get("tail_trim") or {}
-    if tail_trim:
-        expected_hash = str(tail_trim.get("derived_media_sha256") or "")
+    media_mute = override.get("media_mute") or manifest.get("media_mute") or {}
+    media_derivation = (
+        override.get("media_derivation")
+        or manifest.get("media_derivation")
+        or {}
+    )
+    if media_derivation and (tail_trim or media_mute):
+        raise RuntimeError("稳定字幕包不能同时包含 v2 媒体派生和旧媒体编辑记录。")
+    if tail_trim and media_mute:
+        raise RuntimeError("稳定字幕包不能同时包含尾部裁剪和区间静音。")
+    if media_derivation:
+        intervals = list(media_derivation.get("mute_intervals") or [])
+        raw_cut = media_derivation.get("cut_ms")
+        try:
+            cut_ms = int(raw_cut) if raw_cut is not None else None
+            previous_end = -1
+            intervals_valid = True
+            for item in intervals:
+                start_ms = int(item.get("start_ms", -1))
+                end_ms = int(item.get("end_ms", 0))
+                subtitle_id = str(item.get("subtitle_id") or "").strip()
+                if (
+                    not subtitle_id
+                    or start_ms < 0
+                    or end_ms <= start_ms
+                    or start_ms < previous_end
+                    or (cut_ms is not None and end_ms > cut_ms)
+                ):
+                    intervals_valid = False
+                    break
+                previous_end = end_ms
+        except (AttributeError, TypeError, ValueError):
+            cut_ms = None
+            intervals_valid = False
+        decision_payload = {
+            "schema_version": 2,
+            "source_media_sha256": str(
+                media_derivation.get("source_media_sha256") or ""
+            ),
+            "source_word_ledger_hash": str(
+                media_derivation.get("source_word_ledger_hash") or ""
+            ),
+            "cut_ms": cut_ms,
+            "mute_intervals": intervals,
+        }
+        if (
+            int(media_derivation.get("schema_version") or 0) != 2
+            or (cut_ms is None and not intervals)
+            or (raw_cut is not None and cut_ms is None)
+            or (cut_ms is not None and cut_ms <= 0)
+            or not intervals_valid
+            or not decision_payload["source_media_sha256"]
+            or not decision_payload["source_word_ledger_hash"]
+            or str(media_derivation.get("decision_hash") or "")
+            != stable_payload_hash(decision_payload)
+        ):
+            raise RuntimeError("媒体派生包中的区间、切点或决策哈希无效。")
+    elif media_mute:
+        intervals = list(media_mute.get("intervals") or [])
+        decision_payload = {
+            "schema_version": int(media_mute.get("schema_version") or 0),
+            "source_media_sha256": str(
+                media_mute.get("source_media_sha256") or ""
+            ),
+            "source_word_ledger_hash": str(
+                media_mute.get("source_word_ledger_hash") or ""
+            ),
+            "intervals": intervals,
+        }
+        interval_ids = [
+            str(item.get("subtitle_id") or "")
+            for item in intervals
+            if isinstance(item, dict)
+        ]
+        try:
+            intervals_valid = all(
+                int(item.get("start_ms", -1)) >= 0
+                and int(item.get("end_ms", 0))
+                > int(item.get("start_ms", -1))
+                for item in intervals
+            )
+        except (AttributeError, TypeError, ValueError):
+            intervals_valid = False
+        if (
+            not intervals
+            or len(interval_ids) != len(intervals)
+            or not intervals_valid
+            or any(not subtitle_id for subtitle_id in interval_ids)
+            or interval_ids
+            != [str(value) for value in media_mute.get("muted_subtitle_ids") or []]
+            or not decision_payload["source_media_sha256"]
+            or not decision_payload["source_word_ledger_hash"]
+            or str(media_mute.get("decision_hash") or "")
+            != stable_payload_hash(decision_payload)
+        ):
+            raise RuntimeError("区间静音包中的字幕范围或决策哈希无效。")
+    if media_derivation or tail_trim or media_mute:
+        active_derivation = media_derivation or tail_trim or media_mute
+        expected_hash = str(active_derivation.get("derived_media_sha256") or "")
         derived_media = resolve_manifest_owned_path(
             selected,
             manifest,
-            str(tail_trim.get("derived_media_path") or ""),
+            str(active_derivation.get("derived_media_path") or ""),
             expected_hash,
         )
         if (
@@ -277,7 +375,10 @@ def resolve_synthesis_package_inputs(
                 ) != derived_media
             )
         ):
-            raise RuntimeError("尾部裁剪包中的派生音频路径或哈希无效。")
+            label = "媒体派生" if media_derivation else (
+                "区间静音" if media_mute else "尾部裁剪"
+            )
+            raise RuntimeError(f"{label}包中的派生音频路径或哈希无效。")
         # A caller may still hold the original media selected before saving.
         # The trim package owns the derived audio and must override that stale input.
         resolved_media = str(derived_media.resolve())
@@ -299,8 +400,35 @@ def synthesis_package_has_tail_trim(manifest_path: str | Path) -> bool:
     return bool(
         isinstance(manifest, dict)
         and (
+            manifest.get("media_derivation")
+            or (manifest.get("manual_final_override") or {}).get(
+                "media_derivation"
+            )
+            or
             manifest.get("tail_trim")
             or (manifest.get("manual_final_override") or {}).get("tail_trim")
+        )
+    )
+
+
+def synthesis_package_has_media_mute(manifest_path: str | Path) -> bool:
+    path = Path(manifest_path)
+    if not path.is_file() or path.suffix.lower() != ".json":
+        return False
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(manifest, dict)
+        and (
+            manifest.get("media_derivation")
+            or (manifest.get("manual_final_override") or {}).get(
+                "media_derivation"
+            )
+            or
+            manifest.get("media_mute")
+            or (manifest.get("manual_final_override") or {}).get("media_mute")
         )
     )
 
@@ -513,14 +641,31 @@ class VideoSynthesisThread(QThread):
             ):
                 raise RuntimeError("人工草稿只能使用文章单词模板合成。")
 
-            if synthesis_package_has_tail_trim(subtitle_file) and not podcast_learning_template:
-                raise RuntimeError("尾部裁剪终稿第一版只能使用静态播客模板合成。")
+            selected_subtitle = Path(subtitle_file)
+            package_manifest = (
+                selected_subtitle
+                if selected_subtitle.suffix.lower() == ".json"
+                else find_stable_manifest_for_artifact(selected_subtitle)
+            )
+            package_input = str(package_manifest or subtitle_file)
+            has_tail_trim = synthesis_package_has_tail_trim(package_input)
+            has_media_mute = synthesis_package_has_media_mute(package_input)
+            if (has_tail_trim or has_media_mute) and not podcast_learning_template:
+                label = "隐藏并静音" if has_media_mute else "尾部裁剪"
+                raise RuntimeError(f"{label}终稿第一版只能使用静态播客模板合成。")
 
             if not need_video:
                 logger.info(f"不需要合成视频，跳过")
                 self.progress.emit(100, self.tr("合成完成"))
                 self.finished.emit(self.task)
                 return
+
+            if package_manifest is not None:
+                video_file, subtitle_file = resolve_synthesis_package_inputs(
+                    package_manifest,
+                    video_file,
+                    allow_manual_draft=manual_draft_mode,
+                )
 
             ensure_synthesis_subtitle_not_blocked(
                 subtitle_file,

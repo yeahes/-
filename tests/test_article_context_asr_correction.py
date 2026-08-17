@@ -5,8 +5,12 @@ from pathlib import Path
 
 from app.core.article_context import (
     ARTICLE_ANALYSIS_META_KEY,
+    ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
     ARTICLE_RAW_RESPONSE_KEY,
     analyze_article_text,
+    article_analysis_cache_key,
+    article_analysis_prompt_hash,
+    article_text_hash,
     apply_article_asr_corrections,
     build_article_asr_review_artifact,
     build_article_glossary,
@@ -1192,6 +1196,104 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             }
         )
 
+    def test_article_work_context_corrects_split_title_but_not_unrelated_phrase(self):
+        article = (
+            'The animated film "Niulai" unexpectedly went viral. '
+            'Hashtags such as "Niulai box office surges 1000 times" and '
+            '"How did Niulai pass censorship" became trending topics.'
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "books_and_works": [
+                    {
+                        "canonical_name": "Niulai",
+                        "aliases": [],
+                        "category": "film",
+                    }
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Hashtags", 0, 100),
+            ASRDataSeg("like,", 100, 200),
+            ASRDataSeg("new", 200, 300),
+            ASRDataSeg("lie", 300, 400),
+            ASRDataSeg("box", 400, 500),
+            ASRDataSeg("office", 500, 600),
+            ASRDataSeg("surges.", 600, 700),
+            ASRDataSeg("Separately,", 800, 900),
+            ASRDataSeg("a", 900, 1000),
+            ASRDataSeg("new", 1000, 1100),
+            ASRDataSeg("lie", 1100, 1200),
+            ASRDataSeg("spread", 1200, 1300),
+            ASRDataSeg("yesterday.", 1300, 1400),
+            ASRDataSeg("How", 1500, 1600),
+            ASRDataSeg("did", 1600, 1700),
+            ASRDataSeg("new", 1700, 1800),
+            ASRDataSeg("lie", 1800, 1900),
+            ASRDataSeg("past", 1900, 2000),
+            ASRDataSeg("censorship?", 2000, 2100),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads(
+                (Path(tmp) / "correction_log.json").read_text(encoding="utf-8")
+            )
+
+        corrected_text = " ".join(segment.text for segment in corrected.segments)
+        self.assertIn("Niulai box office surges.", corrected_text)
+        self.assertIn("a new lie spread yesterday.", corrected_text)
+        self.assertIn("How did Niulai past censorship?", corrected_text)
+        applied = [
+            item
+            for item in logs
+            if item.get("applied") and item.get("candidate_text") == "Niulai"
+        ]
+        self.assertEqual(len(applied), 2)
+        self.assertTrue(all(item.get("book_title_context_match") for item in applied))
+        self.assertEqual(
+            [(segment.start_time, segment.end_time) for segment in corrected.segments if segment.text == "Niulai"],
+            [(200, 400), (1700, 1900)],
+        )
+
+    def test_scope_rejected_high_signal_title_candidate_reaches_review_artifact(self):
+        frozen = ASRDataSeg("Yulai appears.", 100, 500)
+        frozen.subtitle_id = "S0001"
+        artifact = build_article_asr_review_artifact(
+            [
+                {
+                    "candidate_id": "candidate-yulai",
+                    "applied": False,
+                    "result": "review_only",
+                    "reason": "ordinary_text_not_article_proper_noun_scope",
+                    "entity_gate_passed": True,
+                    "final_confidence": 0.84,
+                    "start_time": 100,
+                    "end_time": 300,
+                    "original_text": "Yulai",
+                    "candidate_text": "Niulai",
+                    "candidate_token_count": 1,
+                    "original_token_count": 1,
+                    "source_key": "books_and_works",
+                    "category": "film",
+                    "evidence": {"evidence_sentence": 'The film "Niulai" opened.'},
+                }
+            ],
+            [frozen],
+            word_ledger_hash="ledger-hash",
+            source_file_hash="source-hash",
+        )
+
+        self.assertEqual(artifact["item_count"], 1)
+        self.assertEqual(artifact["items"][0]["subtitle_ids"], ["S0001"])
+        self.assertEqual(artifact["items"][0]["suggested_text"], "Niulai")
+
     def test_save_article_artifacts_writes_raw_response_and_audit(self):
         article = "DeepSeek was founded by Liang Wenfeng."
         context = {
@@ -1235,6 +1337,13 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             "places": [],
             "technical_terms": [],
             "numbers_and_dates": [],
+            ARTICLE_ANALYSIS_META_KEY: {
+                "article_text_hash": article_text_hash("Cached summary text."),
+                "prompt_hash": article_analysis_prompt_hash(),
+                "analysis_prompt_hash": article_analysis_prompt_hash(),
+                "analysis_prompt_policy_version": ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+                "analysis_cache_key": article_analysis_cache_key("Cached summary text."),
+            },
         }
 
         context = analyze_article_text(
@@ -1245,6 +1354,34 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
 
         self.assertTrue(context[ARTICLE_ANALYSIS_META_KEY]["cache_used"])
         self.assertEqual(context["summary"], "Cached summary")
+        self.assertEqual(
+            context[ARTICLE_ANALYSIS_META_KEY]["article_text_hash"],
+            article_text_hash("Cached summary text."),
+        )
+        self.assertEqual(
+            context[ARTICLE_ANALYSIS_META_KEY]["analysis_prompt_hash"],
+            article_analysis_prompt_hash(),
+        )
+        self.assertEqual(
+            context[ARTICLE_ANALYSIS_META_KEY]["analysis_prompt_policy_version"],
+            ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+        )
+
+    def test_article_analysis_cache_key_includes_prompt_policy_identity(self):
+        article = "The same article text."
+
+        current = article_analysis_cache_key(article)
+        changed_policy = article_analysis_cache_key(
+            article,
+            prompt_policy_version="article-context-analysis-test-version",
+        )
+        changed_prompt = article_analysis_cache_key(
+            article,
+            prompt="A materially different analysis prompt.",
+        )
+
+        self.assertNotEqual(current, changed_policy)
+        self.assertNotEqual(current, changed_prompt)
 
     def test_overlapping_candidates_keep_highest_score_for_same_range(self):
         low = _candidate(

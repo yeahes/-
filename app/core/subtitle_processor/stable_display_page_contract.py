@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+from collections import Counter
 from typing import Any, Mapping, Sequence
 
 from app.core.subtitle_processor.chinese_token_boundaries import (
     chinese_token_boundaries,
+    chinese_tokens,
 )
 
 
 DISPLAY_PAGE_SCHEMA_VERSION = 2
-DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v22"
-DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v4"
+DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v24"
+DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v5"
 DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION = "display-page-translation-source-echo-v1"
-DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v5"
+DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v6"
 
 
 class DisplayPageContractError(ValueError):
@@ -479,6 +482,101 @@ def _response_rows(response: object) -> list[Mapping[str, Any]]:
     return rows
 
 
+def _translation_content(text: object) -> str:
+    return "".join(
+        re.findall(r"[\u4e00-\u9fffA-Za-z0-9%$¥￥]+", str(text or "").lower())
+    )
+
+
+def _translation_content_tokens(text: object) -> tuple[str, ...] | None:
+    tokens = chinese_tokens(str(text or ""))
+    if tokens is None:
+        return None
+    return tuple(
+        normalized
+        for token in tokens
+        if (normalized := _translation_content(token))
+    )
+
+
+def _nonoverlapping_phrase_count(
+    tokens: Sequence[str], phrase: Sequence[str]
+) -> int:
+    if not phrase or len(tokens) < len(phrase):
+        return 0
+    count = 0
+    index = 0
+    width = len(phrase)
+    target = tuple(phrase)
+    while index + width <= len(tokens):
+        if tuple(tokens[index : index + width]) == target:
+            count += 1
+            index += width
+        else:
+            index += 1
+    return count
+
+
+def _repeated_parent_phrase(source: str, aggregate: str) -> str:
+    source_tokens = _translation_content_tokens(source)
+    aggregate_tokens = _translation_content_tokens(aggregate)
+    if not source_tokens or not aggregate_tokens:
+        return ""
+    max_width = min(6, len(source_tokens))
+    for width in range(max_width, 1, -1):
+        for start in range(0, len(source_tokens) - width + 1):
+            phrase = source_tokens[start : start + width]
+            phrase_text = "".join(phrase)
+            if len(re.findall(r"[\u4e00-\u9fff]", phrase_text)) < 4:
+                continue
+            if _nonoverlapping_phrase_count(source_tokens, phrase) != 1:
+                continue
+            if _nonoverlapping_phrase_count(aggregate_tokens, phrase) >= 2:
+                return phrase_text
+    return ""
+
+
+def _parent_projection_quality_errors(
+    parent_subtitle_id: str,
+    source: str,
+    aggregate: str,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    repeated_phrase = _repeated_parent_phrase(source, aggregate)
+    if repeated_phrase:
+        errors.append(
+            {
+                "code": "page_translation_parent_meaning_repeated",
+                "parent_subtitle_id": parent_subtitle_id,
+                "repeated_phrase": repeated_phrase,
+            }
+        )
+
+    source_content = _translation_content(source)
+    aggregate_content = _translation_content(aggregate)
+    growth = len(aggregate_content) - len(source_content)
+    growth_limit = max(8, math.ceil(len(source_content) * 0.35))
+    extra_characters = Counter(aggregate_content) - Counter(source_content)
+    extra_chinese_count = sum(
+        count
+        for character, count in extra_characters.items()
+        if "\u4e00" <= character <= "\u9fff"
+    )
+    if source_content and growth >= growth_limit and extra_chinese_count >= 4:
+        errors.append(
+            {
+                "code": "page_translation_parent_meaning_expanded",
+                "parent_subtitle_id": parent_subtitle_id,
+                "source_content_length": len(source_content),
+                "aggregate_content_length": len(aggregate_content),
+                "growth": growth,
+                "allowed_growth": growth_limit - 1,
+                "extra_chinese_count": extra_chinese_count,
+            }
+        )
+    return errors
+
+
 def validate_page_translation_response(
     contract: Mapping[str, Any],
     response: object,
@@ -575,6 +673,16 @@ def validate_page_translation_response(
             for page in parent.get("pages") or []
         ]
         aggregate_chinese = "".join(page["zh"] for page in pages)
+        source_chinese = re.sub(
+            r"\s+", "", str(parent.get("source_chinese") or "")
+        )
+        errors.extend(
+            _parent_projection_quality_errors(
+                str(parent.get("parent_subtitle_id") or ""),
+                source_chinese,
+                aggregate_chinese,
+            )
+        )
         token_boundaries = chinese_token_boundaries(aggregate_chinese)
         if token_boundaries is None:
             errors.append(
@@ -601,9 +709,7 @@ def validate_page_translation_response(
                 {
                     "parent_subtitle_id": parent.get("parent_subtitle_id"),
                     "parent_english_hash": _text_hash(parent.get("english")),
-                    "source_parent_chinese": re.sub(
-                        r"\s+", "", str(parent.get("source_chinese") or "")
-                    ),
+                    "source_parent_chinese": source_chinese,
                     "source_parent_chinese_hash": _text_hash(parent.get("source_chinese")),
                     "render_parent_chinese_hash": _text_hash(aggregate_chinese),
                     "word_start": parent.get("word_start"),
