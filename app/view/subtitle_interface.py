@@ -576,9 +576,12 @@ class SubtitleTableModel(QAbstractTableModel):
         if segment.get("display_page_chinese_stale") and not segment.get(
             "display_page_chinese_confirmed"
         ):
+            draft_kind = str(
+                segment.get("display_page_chinese_draft_kind") or ""
+            )
+            parent_fallback = draft_kind == "parent_chinese_fallback"
             local_split_proposal = (
-                str(segment.get("display_page_chinese_draft_kind") or "")
-                == "local_parent_split_proposal"
+                draft_kind == "local_parent_split_proposal"
             )
             marks.append(
                 SubtitleReviewMark(
@@ -587,16 +590,23 @@ class SubtitleTableModel(QAbstractTableModel):
                     category="manual_chinese_review",
                     target="chinese",
                     code=(
-                        "local_parent_split_proposal"
+                        "parent_chinese_fallback"
+                        if parent_fallback
+                        else "local_parent_split_proposal"
                         if local_split_proposal
                         else "stale_page_chinese_draft"
                     ),
                     reason=(
-                        "这里显示的是程序按父字幕中文和英文页词数生成的本地建议稿；"
-                        "请逐页编辑或确认，未确认时不会用于正式成片。"
-                        if local_split_proposal
-                        else "这里显示的是父字幕更新前的分页中文旧稿；请逐页编辑或确认，"
+                        "这里显示的是父字幕中文预览，不是逐页中文；请按每屏英文填写，"
                         "未确认时不会用于正式成片。"
+                        if parent_fallback
+                        else (
+                            "这里显示的是程序按父字幕中文和英文页词数生成的本地建议稿；"
+                            "请逐页编辑或确认，未确认时不会用于正式成片。"
+                            if local_split_proposal
+                            else "这里显示的是父字幕更新前的分页中文旧稿；请逐页编辑或确认，"
+                            "未确认时不会用于正式成片。"
+                        )
                     ),
                 )
             )
@@ -2268,7 +2278,10 @@ class SubtitleInterface(QWidget):
         self.cancel_button.show()
 
         if need_create_task:
-            self.task = TaskFactory.create_subtitle_task(file_path=self.subtitle_path)
+            self.task = TaskFactory.recreate_subtitle_task(
+                self.task,
+                file_path=self.subtitle_path,
+            )
         self.subtitle_optimization_thread = SubtitleThread(self.task)
         self._active_subtitle_attempt_id = self.subtitle_optimization_thread.attempt_id
         self.subtitle_optimization_thread.finished.connect(

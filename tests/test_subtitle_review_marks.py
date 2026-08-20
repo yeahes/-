@@ -392,6 +392,34 @@ def test_table_marks_only_the_relevant_english_or_chinese_column():
     assert "subject_finite_verb_split" not in model.data(english, Qt.ToolTipRole)
 
 
+def test_parent_chinese_fallback_is_explicitly_marked_as_unconfirmed_preview():
+    model = SubtitleTableModel(
+        {
+            "1": {
+                "start_time": 0,
+                "end_time": 1000,
+                "original_subtitle": "A failed page plan.",
+                "translated_subtitle": "父字幕中文",
+                "manual_cue_id": "S0001",
+                "display_page_id": "S0001.P01",
+                "display_page_chinese_stale": True,
+                "display_page_chinese_draft_kind": "parent_chinese_fallback",
+                "display_page_chinese_confirmed": False,
+            }
+        }
+    )
+
+    model_index = model.index(0, 3)
+    marks = model._marks_for_segment(model._data["1"])
+    assert {
+        (mark.severity, mark.category, mark.target, mark.code)
+        for mark in marks
+    } == {
+        ("REVIEW", "manual_chinese_review", "chinese", "parent_chinese_fallback")
+    }
+    assert "不是逐页中文" in model.data(model_index, Qt.ToolTipRole)
+
+
 def test_review_marks_include_final_timeline_fallback_for_matching_subtitle_id():
     with tempfile.TemporaryDirectory() as temp_dir:
         artifact_dir = Path(temp_dir)

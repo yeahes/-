@@ -1,6 +1,212 @@
 # Current State
 
-Last updated: 2026-08-17
+Last updated: 2026-08-19
+
+## 2026-08-19 Title-Atomic Pages And Page-Projection Gates
+
+- Display-page boundary planning now treats multi-word work titles, named
+  entities, numeric title forms, and two titles joined by `and`/`or` as atomic
+  spans. A page cannot start with the joiner or split inside the title. Once a
+  complete title ends, a separate controlled review boundary is still allowed
+  so the following independent idea is not forced into the title page.
+- Page-translation validation now rejects two deterministic projection defects:
+  repeating a fact on adjacent pages and placing a condition after a completed
+  question. The rejection is scoped to the affected parent; valid parents keep
+  their page Chinese and the failed parent remains an explicit review artifact.
+- The read-only replay of the saved Dreamcore corrected ASR covers 202 parents
+  and all 2,198 ledger words in order. The current planner produces 247 pages:
+  238 at 56px, four at 54px, five at 52px, zero at 50px, and zero three-line
+  English pages. `S0111` now keeps `Journey to the West` and `Escape from the
+  21 st Century` intact on one page; the following culture phrase starts on
+  the next page.
+- The old checkpoint's cached page Chinese for `S0111` is intentionally
+  rejected by the new page-projection gate, so that checkpoint remains blocked
+  until the affected page translation is regenerated. Full semantic
+  translation, ASR, alignment, IDs, word spans, and timing are reusable; a
+  rerun only needs to request affected page-translation batches.
+- Focused title-boundary and page-projection tests pass. The complete offline
+  `runtime\python.exe scripts\run_regression.py` command and
+  `git diff --check` both pass.
+
+## 2026-08-19 Formal English And Normal-Font Page Replay
+
+- The current production pre-ID boundary owner was replayed locally from the
+  saved `中式梦核：千禧一代的怀旧密码` corrected ASR. It produced 202
+  sequential frozen parents, preserved all 2,198 ledger words in exact order,
+  and reduced the ten hard boundaries present in the old 216-parent artifact
+  to zero.
+- Feeding those new parent spans and the saved final word ledger into the
+  current display planner produced 245 renderable pages with no structural
+  overflow: 236 pages at 56px, four at 54px, five at 52px, no 50px page, and
+  no three-line English page. The old frozen-parent `S0015` failure therefore
+  does not survive the current pre-ID segmentation path.
+- This was an English-boundary and display-geometry replay. A short local
+  Chinese placeholder was used only to keep translation out of the proof;
+  no ASR, alignment, LLM, translation, synthesis, network request, paid cache,
+  or production artifact was invoked or modified.
+- Focused stable-caption and article-readability suites pass, the complete
+  offline `runtime\python.exe scripts\run_regression.py` run completes all 26
+  stages, and `git diff --check` passes.
+
+## 2026-08-19 Article Chinese Subtitle Typography
+
+- Article-template Chinese subtitles now use a fixed 50px design size instead
+  of 48px. Adjacent glyphs use -2% of the rendered font size as letter
+  spacing; the article-specific width measurement, wrapping, and per-glyph
+  drawing paths share this value.
+- Ordinary subtitles, concept-card detail text, subtitle IDs, timing, and page
+  translation contracts are unchanged. The article layout profile records
+  `chinese_font_size: 50` and `chinese_letter_spacing: -0.02`.
+- A visual check is available at
+  `output/article-subtitle-zh-spacing-audit/article-subtitle-zh-50px-minus2-20260819.png`.
+
+## 2026-08-19 Article Vocabulary And Opening Title Fonts
+
+- Article vocabulary-card Chinese meanings use bundled
+  `SourceHanSerifCN-SemiBold.otf` at weight 600. Opening Chinese topic titles
+  continue to use `SourceHanSerifCN-Bold.otf` at weight 700; changing the card
+  meaning therefore does not weaken the opening title.
+- Vocabulary-card English phrases and overview English words use bundled
+  Source Serif Pro SemiBold. English subtitles remain Roboto Slab SemiBold.
+- English and numeric runs embedded in Chinese vocabulary explanations use
+  bundled Roboto Slab Regular, while Chinese runs retain Chill Yunmo Gothic
+  Medium. Mixed-script measurement, wrapping, and drawing share the same font
+  selection, so embedded English cannot create post-layout overflow.
+- Combined visual verification is available at
+  `output/article-vocab-common-audit/all-vocab-typography-color-updates.png`.
+  It includes the Source Serif Pro card expression, the `#2A3F5D` Chinese
+  meaning, a mixed Chinese/Roboto Slab explanation, and the `#556780` Chinese
+  subtitle in one production-size frame.
+
+## 2026-08-19 Vocabulary Meaning Line Breaking
+
+- Article vocabulary-card Chinese meanings now wrap only at deterministic
+  Chinese token or punctuation boundaries. A two-line result prefers a second
+  line at least as wide as the first while keeping the shorter line at least
+  two-thirds of the longer line.
+- A line cannot end or begin with an attached function word such as `的`, `与`,
+  `和`, or `为`. English lexical tokens remain indivisible.
+- The meaning fitter still prefers one line and searches 34px down to 24px,
+  but it no longer truncates an overflowing third line. Content that cannot fit
+  completely now raises an explicit vocabulary-meaning overflow error.
+- Updated extreme-case rendering:
+  `output/article-vocab-serif-extreme-audit/extreme-cases-contact-sheet-20260819.png`.
+
+## 2026-08-19 Vocabulary English Phrase Line Breaking
+
+- The article vocabulary card no longer forces every English expression onto
+  one line while shrinking from 58px to 20px. Multi-word expressions retain a
+  normal one-line fit down to 46px, then wrap at whitespace into at most two
+  balanced lines while keeping a 32px design-size floor.
+- Hyphenated words and other lexical tokens remain indivisible. Only a single
+  unbroken word may use the existing 20px emergency floor; a multi-word phrase
+  that still cannot fit in two lines now reports an explicit phrase-overflow
+  error instead of becoming tiny or losing text.
+- Vocabulary data, selection, timing, cache identity, subtitles, and synthesis
+  ownership are unchanged. The updated extreme-case rendering is available at
+  `output/article-vocab-serif-extreme-audit/extreme-cases-contact-sheet-20260819.png`.
+
+## 2026-08-19 Vocabulary Explanation Weight And Color
+
+- Article vocabulary-card Chinese explanations use the existing Chill Yunmo
+  Gothic Medium face at weight 500. Chinese meanings use Source Han Serif CN
+  SemiBold at weight 600, preserving a clear meaning-over-explanation hierarchy.
+- Chinese meanings use `#2A3F5D` (`RGBA 42,63,93,255`), matching the ordinary
+  English subtitle color. Explanation text and article-template Chinese
+  subtitles share `#556780` (`RGBA 85,103,128,255`), so those two rendering
+  paths cannot drift independently. The meaning is now the darker layer while
+  the lower-weight explanation remains visually secondary.
+- The updated concept-card sample is available at
+  `output/article-vocab-serif-extreme-audit/03-long-concept-detail.png`.
+
+## 2026-08-19 Podcast Font And Logo Directories
+
+- All bundled podcast-template `.ttf` and `.otf` files now live under
+  `resource/podcast_template/fonts/`. Neither the podcast-template root nor
+  `article_vocab/` contains loose font files alongside image assets.
+- Source Serif Pro SemiBold is bundled from Adobe's official `2.000R` release;
+  its license is stored under `resource/podcast_template/fonts/licenses/`.
+- User-selectable brand logos have a dedicated directory at
+  `resource/podcast_template/article_vocab/logos/`. The synthesis-page Logo
+  browser always opens this directory directly and creates it if missing.
+- The saved configuration remains an absolute selected-file path. Logo image
+  validation, optional empty-Logo behavior, rendering, and task snapshots are
+  unchanged.
+
+## 2026-08-19 Failed Page-Plan Parent-Chinese Preview
+
+- When the fixed-font display-page planner fails, the editor now keeps the
+  frozen parent Chinese visible in actual-page mode as an explicit
+  `parent_chinese_fallback` draft instead of replacing the page model with an
+  unavailable row or blank page Chinese.
+- The fallback is display-only and remains unconfirmed. It cannot be accepted
+  by the single-page or bulk confirmation actions as page-local Chinese;
+  manually entered page Chinese is still required before formal publication.
+- The stable artifact status remains `ERROR`, page-level translation is not
+  fabricated, and synthesis/publication gates remain unchanged. English,
+  subtitle IDs, word spans, timing, and the authoritative parent translation
+  are unchanged.
+- Focused fallback tests cover both an unrenderable editable seed and a
+  partial multi-page artifact; the real failed `中式梦核：千禧一代的怀旧密码`
+  checkpoint now loads 243 visible pages with zero blank Chinese rows; only
+  the 54 pages that need page-local replacement are marked pending.
+
+## 2026-08-19 OpenCode Go Flash-Only Role Configuration
+
+- OpenCode Go now uses `deepseek-v4-flash` for complete semantic translation,
+  fixed-ID allocation, and display-page translation.
+- DeepSeek official settings remain unchanged: Pro owns complete semantic
+  translation while Flash owns ordinary allocation and page translation.
+- The selected model is part of the stable Chinese-cache identity. Existing
+  Pro results are not silently reused for the OpenCode Go Flash route; restart
+  the application before creating a new task so the persisted settings load.
+
+## 2026-08-19 Normal-Font Floor And Editable Long-Caption Seeds
+
+- New automatic article pages use only 56/54/52px and at most two English
+  lines. The 50px size remains readable only for an already-frozen legacy
+  artifact; it is no longer an automatic fallback.
+- The planner still searches strict and reviewed word-ledger partitions first.
+  If no complete normal-font plan exists, it fails closed with
+  `render_structural_overflow` and writes a partial blueprint containing an
+  `editable_seed: true`, `renderable: false` parent. It does not manufacture a
+  grammar-fragment page, shrink to 50px, or hide the failed parent.
+- The manual editor recognizes that seed and can explicitly propose two to six
+  timed-word pages. The parent English, subtitle ID, word ledger, word times,
+  parent timing, and Chinese authority remain frozen; page Chinese must still
+  be filled or confirmed before formal publication.
+- Planner/renderer font selection now shares the same 56/54/52 automatic
+  contract. Legacy 50px validation is isolated to the compatibility path.
+  The page contract is `article-fixed-font-pages-v27`, so stale page-layout and
+  page-Chinese caches are rebuilt while ASR, full-translation, and fixed-ID
+  allocation caches remain independently reusable.
+- Focused page-translation, stable-caption, and manual-editor tests pass, as
+  does `runtime\python.exe scripts\run_regression.py` (offline; no paid model
+  request). The regression log's `disk full` message is from an intentional
+  mocked atomic-write failure test, not a real volume-capacity failure.
+
+## 2026-08-18 Translation Request Cost Containment
+
+- Pro remains the complete semantic-group translation owner; Flash remains the
+  ordinary fixed-ID and display-page allocation owner. No English, ID, word
+  ledger, timing, pagination, Chinese-quality gate, or synthesis contract was
+  relaxed to reduce cost.
+- A partially valid full-translation batch now keeps and caches every group
+  whose ID, source echo, and non-empty Chinese are valid. Only unresolved groups
+  retry in bounded 8/4/2/1 batches instead of one Pro request per group.
+- Full-translation repair is capped at 12 requests per run. Residual missing
+  groups remain explicit structure errors instead of triggering an unbounded
+  paid retry loop.
+- The screen editor constructs the OpenAI client with `max_retries=0`; the
+  application retry loop is the sole owner, preventing SDK retries from
+  multiplying page/allocation retry attempts.
+- Every stable translation/cache request is checkpointed to
+  `llm-request-ledger.json` with model, task, attempt, latency and provider token
+  usage, including prompt-cache and reasoning tokens when supplied. The run
+  manifest contains an aggregate by model and task.
+- Focused retry/cache/model-routing tests, the complete stable-caption rule
+  suite, and `runtime\python.exe scripts\run_regression.py` pass without
+  external requests.
 
 ## 2026-08-17 Conservative Cross-Page-Count Readability Selection
 
@@ -3290,3 +3496,199 @@ Result:
   page contract, or timeline.
 - Focused manual-editor, publication/UI, synthesis-safety, page-translation,
   and display-readability contracts pass before the final unified regression.
+
+## 2026-08-18 Long-Caption Readability Policy V26
+
+- Automatic article-page planning now treats up to 14 English words as the
+  comfortable one-page range, 15 words as a measured review range, and 16 or
+  more words as a multi-page priority. Pixel width, fixed-font layout, spoken
+  duration, page balance, and frozen boundary evidence still decide the final
+  plan; word count alone never authorizes a cut.
+- Normal automatic layouts use 56, 54, then 52px. Existing 50px artifacts still
+  reopen, and a new plan may use 50px only after every complete 56/54/52 plan
+  fails. That emergency path writes an explicit review warning instead of
+  silently treating 50px as an ordinary candidate.
+- A producer-side boundary heuristic no longer classifies a pronoun such as
+  `you` as the noun head of a preceding determiner. The renderer also accepts a
+  punctuated, terminally complete personal-pronoun clause as a page start. The
+  real `S0080` sentence now renders as 6+11 words at 56px instead of one 17-word
+  page at 50px; real determiner+noun, subject/predicate, preposition/object, and
+  verb/complement boundaries remain protected.
+- Read-only replay of `烂到爆红：一部动画的逆袭` changed 201 pages to 203,
+  reduced pages over 16 words from 7 to 4, reduced pages below 56px from 19 to
+  14, and reduced three-line pages from 3 to 2. Pages over 14 words stayed at
+  19; review boundaries increased from 9 to 11. Five 50px emergency pages
+  remain because every larger-font alternative would introduce a hard or
+  review-only language boundary.
+- Fixed English, subtitle IDs, word ownership, word timestamps, parent cue
+  timing, parent Chinese, and the manifest-owned synthesis path are unchanged.
+  The existing manual-final package was read only and was not regenerated.
+- Stable caption, page-translation, article-readability, manual-final editor,
+  synthesis-safety, syntax, and the complete unified regression all pass.
+
+## 2026-08-18 Final Parent-Cue Display Chaining
+
+- The frozen-ledger final cue timeline is now the sole owner of short-gap
+  display compensation. It does not re-enable the original pre-ledger
+  `ASRData.optimize_timing()` path and does not add a renderer or SRT patch.
+- When adjacent word envelopes have a positive pause below 1000ms and padded
+  cue ranges still leave a gap, the final timeline closes it at a shared
+  boundary. It retains the original project's approximate 75/25 allocation,
+  while limiting the incoming cue to at most 200ms of lead-in.
+- A 1000ms-or-longer word pause remains visible. The compensation never
+  shortens an existing display range and does not change word timestamps,
+  English, Chinese, subtitle IDs, word spans, pagination, or audio.
+- Post-alignment coverage reconciliation is now a read-only audit. Its former
+  midpoint retiming path was removed so no second stage can overwrite the
+  authoritative final timeline. Refreshing the final artifact preserves the
+  exact boundary-reconciliation evidence.
+- Read-only replay of the latest 173-cue animation manual-final artifact reduced
+  69 positive display gaps to one retained long pause. There were zero cue
+  overlaps; the maximum incoming lead was 200ms; final timeline validation,
+  ID order, and word ranges all passed unchanged.
+
+## 2026-08-18 Manual-Final Timeline Rebuild On Save
+
+- Formal parent-boundary moves still update only continuous frozen word
+  ownership while editing. Before any manual-final output or derived mute audio
+  is written, save now rebuilds parent display timing through the same
+  frozen-ledger final timeline used by normal production.
+- The rebuilt timing is shared by derived mute intervals, parent SRT, actual-page
+  plans and maps, and `final-cue-timeline.json`. Save rejects an invalid rebuilt
+  timeline instead of publishing independently timed artifacts.
+- Display-page boundary moves do not change parent word ownership or create a
+  second timing policy. Hidden/muted parents remain represented in the complete
+  ID timeline; merged parents and a tail-trimmed fixed prefix use their current
+  continuous word ranges.
+- Read-only replay of the latest 174-parent animation manual final closed the
+  three display gaps reintroduced by formal boundary edits: `S0048/S0049`
+  (220ms), `S0062/S0063` (40ms), and `S0125/S0126` (280ms). The 1040ms word
+  pause at `S0107/S0108` remained a 740ms display pause. Validation passed with
+  no text, ID, word-range, word-time, or overlap change.
+- Existing manual-final packages do not need ASR, translation, or pagination to
+  be rerun. Reopen the saved manual-final subtitle package and save it again to
+  publish a new generation with the rebuilt authoritative timing.
+
+## 2026-08-18 Optional Article-Template Brand Logo
+
+- The synthesis page exposes a `品牌 Logo` image path only while the article
+  vocabulary template is active. The selected path is persisted in
+  `PodcastTemplateLogo` and frozen into each `SynthesisConfig`, so changing the
+  field cannot alter a synthesis task that is already running.
+- An empty path is authoritative and draws no Logo. There is no implicit
+  Economist or other built-in brand fallback. A selected file that is missing
+  or unreadable blocks synthesis with a direct error instead of silently
+  changing the visible brand.
+- The renderer loads the selected asset once, preserves its aspect ratio, and
+  centers it inside the existing 100x50 design-unit cover safe area. It does
+  not stretch or crop wide, square, or portrait assets.
+- Path selection belongs to synthesis configuration; pixel sizing and
+  placement belong to the article renderer. Subtitle text, IDs, timing,
+  pagination, vocabulary planning, manifest ownership, and FFmpeg encoding
+  settings are unchanged.
+
+## 2026-08-18 Article Vocabulary Chinese Typography Clarity
+
+- The softness was present in the current simplified card, not the retired
+  phonetic/part-of-speech/TIP layout. The current card draws directly on the
+  1920x1080 canvas; there is no intermediate bitmap scale causing blur.
+- Chinese glosses and concept notes now use the bundled Medium 500 face rather
+  than Regular 400. Concept notes use a 28px design size with a 22px fallback
+  floor, up from 26px/20px.
+- Concept-note color changed from `RGB(122,132,147)` to `RGB(96,108,124)`.
+  Against the `RGB(251,246,237)` card background, calculated contrast rises
+  from about 3.52:1 to 4.96:1. No stroke or sharpening filter was added.
+- The existing two-line fitting contract remains authoritative. All ten
+  concept cards in the complete local vocabulary cache fit within the width
+  and two-line limits at the new maximum size.
+- Three focused typography/wrapping tests and the complete
+  `runtime\python.exe scripts\run_regression.py` pass. The visual comparison is
+  `output/current-vocab-font-audit/article-vocab-typography-comparison-20260818.png`.
+- Vocabulary selection, cache schema, card timing, subtitles, fixed IDs,
+  SRT/ASS, manifest ownership, and FFmpeg settings are unchanged.
+
+## 2026-08-18 OpenCode Go Provider Isolation
+
+- `OpenCode Go` is now a first-class LLM service with independent Base URL,
+  API key, ordinary model, and full-translation model settings. Defaults are
+  `https://opencode.ai/zen/go/v1`, `deepseek-v4-flash`, and
+  `deepseek-v4-pro` respectively.
+- One resolver now owns provider routing for subtitle task snapshots, article
+  analysis, vocabulary cards, manual Chinese polish, and allocation-only
+  replay. Selecting OpenCode Go cannot read or overwrite DeepSeek official
+  credentials.
+- The visible service list is now DeepSeek, OpenCode Go, OpenAI, SiliconCloud,
+  and Ollama. LM Studio, Gemini, ChatGLM, and the public service are no longer
+  selectable; their legacy fields remain deserializable for safe settings-file
+  migration.
+- The failed `英伟达的硅基大决战` run used an OpenCode Go endpoint through the
+  DeepSeek slot and assigned `deepseek-v4-pro` to every role. Its final word
+  timeline passed, but all three display-page requests timed out and left 25
+  parent IDs without publishable page Chinese. The isolated Go defaults restore
+  Flash ownership for ordinary allocation and page translation.
+- Provider configuration tests, task-context tests, stable-caption tests, the
+  complete `runtime\python.exe scripts\run_regression.py`, and
+  `git diff --check` pass without a paid API request. No English, ID, word,
+  timing, pagination, or synthesis contract changed.
+
+## 2026-08-18 Recoverable Display-Page Translation Batches
+
+- The `英伟达的硅基大决战` 96% failure was caused by one oversized
+  display-page Chinese request: 25 multipage parents and 51 actual pages were
+  retried as one indivisible unit. A timeout discarded every otherwise valid
+  result from that attempt. The frozen English plan itself was unchanged
+  between the compared runs.
+- Display-page translation now uses batches of at most six parent subtitles
+  and twelve actual pages. Each valid batch has its own cache identity. If a
+  later batch times out, completed earlier batches remain reusable and the next
+  run requests only the missing batch.
+- A valid cache created by the previous whole-contract implementation is still
+  checked first. Batch results are merged in source order and must pass the
+  original complete contract before publication; page IDs, parent IDs, English,
+  word ranges, timing, and Chinese source mapping remain frozen.
+- Regression coverage proves partial-batch cache survival, missing-batch-only
+  retry, complete-contract validation after merge, and legacy whole-cache
+  reuse. Tests are offline and make no DeepSeek or OpenCode Go request.
+
+## 2026-08-20 Display-Page Failure Isolation And Editor Retry Context
+
+- Audited the real `中式梦核：千禧一代的怀旧密码` failure: the first six-parent
+  page-translation batch returned no usable rows, but the batch loop treated it
+  as complete. The later retry then reported all 37 multipage parents instead
+  of the six affected parents.
+- Batch responses are now validated before rows are retained. Complete parents
+  survive an incomplete sibling batch; identifiable missing/duplicate page IDs
+  retry only their owning parents. The merged contract still must be complete
+  before parent Chinese can be published, so this does not weaken the synthesis
+  gate.
+- Failed editor previews show the parent Chinese reference only on the first
+  page; later pages stay blank and unconfirmed instead of repeating a full
+  parent translation as if it were page-local Chinese.
+- The editor retry action now rebuilds current subtitle settings while inheriting
+  the same input task's source audio, article text/context, article switches,
+  output mode, and manual-review requirement. A different imported subtitle
+  cannot inherit that context. Article context is also written back to the task
+  after validated analysis, and disabled article stages no longer register a
+  stale old context artifact.
+- Focused task-context, page-contract, editor, and readability tests and the
+  complete offline regression pass; no paid request or production output was
+  changed.
+
+## 2026-08-20 Tail-Trim Timeline And Frozen-Page Reconciliation
+
+- A manual tail deletion now caps the last final cue's display end at the
+  authoritative media cut. Normal 260ms tail padding may end earlier at that
+  explicit cut, but the cue must still cover its last retained word envelope;
+  a cut inside spoken audio remains a blocking timeline error.
+- When a valid frozen page plan is reused after tail deletion, only its outer
+  display edges are reconciled: the first page starts with the current parent
+  cue and the last page ends with it. Page IDs, English, word ranges, internal
+  boundaries, Chinese, and font/layout decisions remain unchanged.
+- The explicit media cut owns the final edge even when less than the ordinary
+  150ms display minimum remains. This exception applies only to the last cue
+  of a tail-trimmed package and never relaxes word coverage, order, overlap,
+  or ordinary subtitle/page validation.
+- Regression coverage saves a tail-trimmed multipage package, reloads its page
+  artifact through the synthesis loader, and verifies one shared final end for
+  the SRT cue, frozen page, and media cut. Focused tests and the complete
+  offline `scripts/run_regression.py` pass without external model requests.

@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.core.bk_asr.asr_data import ASRDataSeg
+from app.core.llm_service_config import resolve_llm_service_config
 from app.core.storage.cache_manager import CacheManager
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
 
@@ -148,12 +149,10 @@ def _resolve_llm_credentials(args) -> tuple[str, str, str]:
     if base_url and api_key:
         return base_url, api_key, source
 
-    from app.common.config import cfg
-
-    cfg_base_url = str(cfg.deepseek_api_base.value or "").strip()
-    cfg_api_key = str(cfg.deepseek_api_key.value or "").strip()
-    if cfg_base_url and cfg_api_key:
-        return cfg_base_url, cfg_api_key, "app_config.deepseek"
+    llm_runtime = resolve_llm_service_config()
+    if llm_runtime.base_url and llm_runtime.api_key:
+        source_name = llm_runtime.service.name.lower()
+        return llm_runtime.base_url, llm_runtime.api_key, f"app_config.{source_name}"
     return base_url, api_key, source
 
 
@@ -176,7 +175,9 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_url, api_key, credential_source = _resolve_llm_credentials(args)
     if not (base_url and api_key):
-        raise ValueError("OPENAI_BASE_URL/OPENAI_API_KEY are missing and DeepSeek app config is empty")
+        raise ValueError(
+            "OPENAI_BASE_URL/OPENAI_API_KEY are missing and the selected app LLM config is empty"
+        )
     os.environ["OPENAI_BASE_URL"] = base_url
     os.environ["OPENAI_API_KEY"] = api_key
 

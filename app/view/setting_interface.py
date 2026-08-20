@@ -296,6 +296,17 @@ class SettingInterface(ScrollArea):
                 "default_base": "https://api.deepseek.com/v1",
                 "default_models": ["deepseek-v4-flash", "deepseek-v4-pro"],
             },
+            LLMServiceEnum.OPENCODE_GO: {
+                "prefix": "opencode_go",
+                "api_key_cfg": cfg.opencode_go_api_key,
+                "api_base_cfg": cfg.opencode_go_api_base,
+                "model_cfg": cfg.opencode_go_model,
+                "full_translation_model_cfg": (
+                    cfg.opencode_go_full_translation_model
+                ),
+                "default_base": "https://opencode.ai/zen/go/v1",
+                "default_models": ["deepseek-v4-flash"],
+            },
             LLMServiceEnum.OLLAMA: {
                 "prefix": "ollama",
                 "api_key_cfg": cfg.ollama_api_key,
@@ -303,38 +314,6 @@ class SettingInterface(ScrollArea):
                 "model_cfg": cfg.ollama_model,
                 "default_base": "http://localhost:11434/v1",
                 "default_models": ["qwen2.5:7b"],
-            },
-            LLMServiceEnum.LM_STUDIO: {
-                "prefix": "LM Studio",
-                "api_key_cfg": cfg.lm_studio_api_key,
-                "api_base_cfg": cfg.lm_studio_api_base,
-                "model_cfg": cfg.lm_studio_model,
-                "default_base": "http://localhost:1234/v1",
-                "default_models": ["qwen2.5:7b"],
-            },
-            LLMServiceEnum.GEMINI: {
-                "prefix": "gemini",
-                "api_key_cfg": cfg.gemini_api_key,
-                "api_base_cfg": cfg.gemini_api_base,
-                "model_cfg": cfg.gemini_model,
-                "default_base": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                "default_models": ["gemini-2.0-flash-exp"],
-            },
-            LLMServiceEnum.CHATGLM: {
-                "prefix": "chatglm",
-                "api_key_cfg": cfg.chatglm_api_key,
-                "api_base_cfg": cfg.chatglm_api_base,
-                "model_cfg": cfg.chatglm_model,
-                "default_base": "https://open.bigmodel.cn/api/paas/v4",
-                "default_models": ["glm-4-flash"],
-            },
-            LLMServiceEnum.PUBLIC: {
-                "prefix": "public",
-                "api_key_cfg": cfg.public_api_key,
-                "api_base_cfg": cfg.public_api_base,
-                "model_cfg": cfg.public_model,
-                "default_base": "https://api.public-model.com/v1",
-                "default_models": ["public-model"],
             },
         }
 
@@ -345,23 +324,18 @@ class SettingInterface(ScrollArea):
         for service, config in service_configs.items():
             prefix = config["prefix"]
 
-            # 如果是公益模型，只添加配置不创建卡片
-            if service == LLMServiceEnum.PUBLIC:
-                self.llm_service_configs[service] = {
-                    "cards": [],
-                    "api_base": None,
-                    "api_key": None,
-                    "model": None,
-                }
-                continue
-
             # 创建API Key卡片
             api_key_card = LineEditSettingCard(
                 config["api_key_cfg"],
                 FIF.FINGERPRINT,
                 self.tr("API Key"),
                 self.tr(f"输入您的 {service.value} API Key"),
-                "sk-" if service != LLMServiceEnum.OLLAMA else "",
+                (
+                    ""
+                    if service
+                    in {LLMServiceEnum.OLLAMA, LLMServiceEnum.OPENCODE_GO}
+                    else "sk-"
+                ),
                 self.llmGroup,
             )
             setattr(self, f"{prefix}_api_key_card", api_key_card)
@@ -397,7 +371,14 @@ class SettingInterface(ScrollArea):
                     full_translation_model_cfg,
                     FIF.LANGUAGE,
                     self.tr("完整翻译模型"),
-                    self.tr("稳定字幕用它翻译完整语义组；建议选择 Pro，普通分配仍使用上方模型"),
+                    self.tr(
+                        "稳定字幕用它翻译完整语义组；"
+                        + (
+                            "OpenCode Go 当前固定使用 Flash"
+                            if service == LLMServiceEnum.OPENCODE_GO
+                            else "建议选择 Pro，普通分配仍使用上方模型"
+                        )
+                    ),
                     config["default_models"],
                     self.llmGroup,
                 )
@@ -633,27 +614,9 @@ class SettingInterface(ScrollArea):
         if not service_config:
             return
 
-        # 如果是公益模型，使用配置文件中的值
-        if current_service == LLMServiceEnum.PUBLIC:
-            api_base = cfg.public_api_base.value
-            api_key = cfg.public_api_key.value
-            model = cfg.public_model.value
-        else:
-            api_base = (
-                service_config["api_base"].lineEdit.text()
-                if service_config["api_base"]
-                else ""
-            )
-            api_key = (
-                service_config["api_key"].lineEdit.text()
-                if service_config["api_key"]
-                else ""
-            )
-            model = (
-                service_config["model"].comboBox.currentText()
-                if service_config["model"]
-                else ""
-            )
+        api_base = service_config["api_base"].lineEdit.text()
+        api_key = service_config["api_key"].lineEdit.text()
+        model = service_config["model"].comboBox.currentText()
 
         # 检查 API Base 是否属于网址
         if not api_base.startswith("http"):
@@ -737,20 +700,12 @@ class SettingInterface(ScrollArea):
             for card in self.llm_service_configs[current_service]["cards"]:
                 card.setVisible(True)
 
-            # 为OLLAMA和LM_STUDIO设置默认API Key
+            # 为 Ollama 设置本地占位 API Key。
             service_config = self.llm_service_configs[current_service]
             if current_service == LLMServiceEnum.OLLAMA and service_config["api_key"]:
                 # 如果API Key为空，设置默认值"ollama"
                 if not service_config["api_key"].lineEdit.text():
                     service_config["api_key"].lineEdit.setText("ollama")
-            if (
-                current_service == LLMServiceEnum.LM_STUDIO
-                and service_config["api_key"]
-            ):
-                # 如果API Key为空，设置默认值 "lm-studio"
-                if not service_config["api_key"].lineEdit.text():
-                    service_config["api_key"].lineEdit.setText("lm-studio")
-
             # 如果是OPENAI服务，显示官方API链接卡片
             if current_service == LLMServiceEnum.OPENAI:
                 self.openaiOfficialApiCard.setVisible(True)

@@ -16,7 +16,7 @@ from app.core.subtitle_processor.chinese_token_boundaries import (
 
 
 DISPLAY_PAGE_SCHEMA_VERSION = 2
-DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v25"
+DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v27"
 DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v5"
 DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION = "display-page-translation-source-echo-v1"
 DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v6"
@@ -460,7 +460,8 @@ def page_translation_request_payload(contract: Mapping[str, Any]) -> list[dict[s
     return payload
 
 
-def _response_rows(response: object) -> list[Mapping[str, Any]]:
+def page_translation_response_rows(response: object) -> list[Mapping[str, Any]]:
+    """Flatten supported model response shapes without changing row contents."""
     rows: list[Mapping[str, Any]] = []
 
     def visit(node: object) -> None:
@@ -577,6 +578,94 @@ def _parent_projection_quality_errors(
     return errors
 
 
+def _page_projection_quality_errors(
+    parent_subtitle_id: str,
+    pages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reject deterministic page-order defects before rendering.
+
+    Page Chinese is a synchronized projection, not a second parent
+    translation.  A later condition following a completed question is
+    therefore an order reversal, and an entire fact-bearing page repeated on
+    its neighbour is not a harmless continuation.  These checks intentionally
+    avoid trying to judge general fluency locally; the model/editor still own
+    that part of the contract.
+    """
+    errors: list[dict[str, Any]] = []
+    normalized_pages = [
+        re.sub(r"\s+", "", str(page.get("zh") or ""))
+        for page in pages
+    ]
+    content_pages = [
+        re.sub(r"[\s，。！？；：、,.!?;:]+", "", text)
+        for text in normalized_pages
+    ]
+    generic_fragments = {
+        "这个",
+        "那个",
+        "他们",
+        "我们",
+        "因此",
+        "所以",
+        "就是",
+        "也就是说",
+        "这意味着",
+    }
+
+    for index, (left, right, left_content, right_content) in enumerate(
+        zip(
+            normalized_pages,
+            normalized_pages[1:],
+            content_pages,
+            content_pages[1:],
+        ),
+        start=1,
+    ):
+        if not left or not right:
+            continue
+        left_english = " ".join(str(pages[index - 1].get("english") or "").split())
+        right_english = " ".join(str(pages[index].get("english") or "").split())
+        shorter = left_content if len(left_content) <= len(right_content) else right_content
+        other = right_content if len(left_content) <= len(right_content) else left_content
+        if (
+            len(shorter) >= 8
+            and shorter in other
+            and shorter not in generic_fragments
+            and len(re.findall(r"[\u4e00-\u9fff]", shorter)) >= 8
+        ):
+            errors.append(
+                {
+                    "code": "page_translation_adjacent_meaning_repeated",
+                    "parent_subtitle_id": parent_subtitle_id,
+                    "previous_page_index": index,
+                    "repeated_phrase": shorter,
+                }
+            )
+
+        if (
+            re.search(r"[？?]$", left)
+            and not re.search(r"[?]$", left_english)
+            and re.match(
+                r"(?:when|if|because|since|once|while|as)\b",
+                right_english,
+                re.IGNORECASE,
+            )
+            and re.match(
+                r"(?:当|如果|若|一旦|因为|由于|既然|在[^。！？]{1,16}时)",
+                right,
+            )
+        ):
+            errors.append(
+                {
+                    "code": "page_translation_clause_order_reversed",
+                    "parent_subtitle_id": parent_subtitle_id,
+                    "previous_page_index": index,
+                    "reason": "completed_question_precedes_later_condition",
+                }
+            )
+    return errors
+
+
 def validate_page_translation_response(
     contract: Mapping[str, Any],
     response: object,
@@ -589,16 +678,34 @@ def validate_page_translation_response(
         for page in parent.get("pages") or []
     ]
     expected_ids = [str(page.get("display_page_id") or "") for page in expected_pages]
-    rows = _response_rows(response)
+    parent_id_by_page_id = {
+        str(page.get("display_page_id") or ""): str(
+            parent.get("parent_subtitle_id") or ""
+        )
+        for parent in contract.get("parents") or []
+        for page in parent.get("pages") or []
+    }
+    rows = page_translation_response_rows(response)
     returned_ids = [str(row.get("display_page_id") or "").strip() for row in rows]
     duplicate_ids = sorted({page_id for page_id in returned_ids if returned_ids.count(page_id) > 1})
     missing_ids = sorted(set(expected_ids) - set(returned_ids))
     unknown_ids = sorted(set(returned_ids) - set(expected_ids))
     errors: list[dict[str, Any]] = []
+    invalid_parent_ids: set[str] = set()
     if duplicate_ids:
         errors.append({"code": "page_translation_id_duplicate", "ids": duplicate_ids})
+        invalid_parent_ids.update(
+            parent_id_by_page_id[page_id]
+            for page_id in duplicate_ids
+            if page_id in parent_id_by_page_id
+        )
     if missing_ids:
         errors.append({"code": "page_translation_id_missing", "ids": missing_ids})
+        invalid_parent_ids.update(
+            parent_id_by_page_id[page_id]
+            for page_id in missing_ids
+            if page_id in parent_id_by_page_id
+        )
     if unknown_ids:
         errors.append({"code": "page_translation_id_unknown", "ids": unknown_ids})
     if len(returned_ids) != len(expected_ids):
@@ -627,6 +734,7 @@ def validate_page_translation_response(
                     "display_page_id": page_id,
                 }
             )
+            invalid_parent_ids.add(parent_id_by_page_id.get(page_id, ""))
         if require_source_echo:
             source_echo = " ".join(str(row.get("source_english") or "").split())
             expected_english = " ".join(expected_english_by_id.get(page_id, "").split())
@@ -637,6 +745,7 @@ def validate_page_translation_response(
                         "display_page_id": page_id,
                     }
                 )
+                invalid_parent_ids.add(parent_id_by_page_id.get(page_id, ""))
             elif source_echo.split() != expected_english.split():
                 errors.append(
                     {
@@ -646,24 +755,20 @@ def validate_page_translation_response(
                         "returned": source_echo,
                     }
                 )
+                invalid_parent_ids.add(parent_id_by_page_id.get(page_id, ""))
         by_id[page_id] = chinese
-
-    if errors:
-        return {
-            "schema_version": DISPLAY_PAGE_SCHEMA_VERSION,
-            "status": "ERROR",
-            "contract_hash": contract.get("contract_hash"),
-            "planner_version": contract.get("planner_version"),
-            "layout_profile": dict(contract.get("layout_profile") or {}),
-            "render_plans": [
-                dict(plan) for plan in contract.get("render_plans") or []
-            ],
-            "errors": errors,
-            "parents": [],
-        }
 
     validated_parents: list[dict[str, Any]] = []
     for parent in contract.get("parents") or []:
+        parent_id = str(parent.get("parent_subtitle_id") or "")
+        parent_page_ids = [
+            str(page.get("display_page_id") or "")
+            for page in parent.get("pages") or []
+        ]
+        if parent_id in invalid_parent_ids or any(
+            page_id not in by_id for page_id in parent_page_ids
+        ):
+            continue
         parent_error_count = len(errors)
         pages = [
             {
@@ -688,7 +793,7 @@ def validate_page_translation_response(
             errors.append(
                 {
                     "code": "page_translation_chinese_tokenizer_unavailable",
-                    "parent_subtitle_id": parent.get("parent_subtitle_id"),
+                    "parent_subtitle_id": parent_id,
                 }
             )
         else:
@@ -704,6 +809,12 @@ def validate_page_translation_response(
                             "boundary_offset": offset,
                         }
                     )
+        errors.extend(
+            _page_projection_quality_errors(
+                str(parent.get("parent_subtitle_id") or ""),
+                pages,
+            )
+        )
         if len(errors) == parent_error_count:
             validated_parents.append(
                 {

@@ -79,11 +79,23 @@ class LLMServiceEnum(Enum):
     OPENAI = "OpenAI"
     SILICON_CLOUD = "SiliconCloud"
     DEEPSEEK = "DeepSeek"
+    OPENCODE_GO = "OpenCode Go"
     OLLAMA = "Ollama"
+    # Legacy configuration identifiers. They remain deserializable so an old
+    # settings file can migrate safely, but are not offered in the current UI.
     LM_STUDIO = "LM Studio"
     GEMINI = "Gemini"
     CHATGLM = "ChatGLM"
     PUBLIC = "软件公益模型"
+
+
+AVAILABLE_LLM_SERVICES = (
+    LLMServiceEnum.DEEPSEEK,
+    LLMServiceEnum.OPENCODE_GO,
+    LLMServiceEnum.OPENAI,
+    LLMServiceEnum.SILICON_CLOUD,
+    LLMServiceEnum.OLLAMA,
+)
 
 
 class TranscribeModelEnum(Enum):
@@ -587,6 +599,7 @@ class SynthesisConfig:
     podcast_template_title: str = ""
     podcast_template_background: str = ""
     podcast_template_cover: str = ""
+    podcast_template_logo: str = ""
     podcast_template_date: str = ""
     subtitle_render_mode: str = "ASS样式"
     subtitle_layout: str = "译文在上"

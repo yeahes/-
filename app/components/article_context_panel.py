@@ -20,6 +20,7 @@ from app.core.article_context import (
     build_translation_context_prompt,
     empty_article_context,
 )
+from app.core.llm_service_config import resolve_llm_service_config
 
 
 class ArticleContextPanel(QFrame):
@@ -188,10 +189,11 @@ class ArticleContextPanel(QFrame):
         self.summary_label.setText(self.tr("正在分析"))
         self.analyze_button.setEnabled(False)
         self.clear_button.setEnabled(False)
+        llm_runtime = resolve_llm_service_config()
         llm_config = ArticleLLMConfig(
-            base_url=cfg.deepseek_api_base.value,
-            api_key=cfg.deepseek_api_key.value,
-            model=cfg.deepseek_model.value,
+            base_url=llm_runtime.base_url,
+            api_key=llm_runtime.api_key,
+            model=llm_runtime.model,
         )
         self.article_analysis_thread = ArticleContextThread(
             article_text,

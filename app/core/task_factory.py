@@ -5,10 +5,10 @@ from typing import Optional
 from app.common.config import cfg
 from app.config import MODEL_PATH, SUBTITLE_STYLE_PATH
 from app.core.output_paths import media_result_video_dir
+from app.core.llm_service_config import resolve_llm_service_config
 from app.core.entities import (
     LANGUAGES,
     FullProcessTask,
-    LLMServiceEnum,
     SplitTypeEnum,
     SubtitleConfig,
     SubtitleTask,
@@ -169,64 +169,17 @@ class TaskFactory:
         else:
             split_type = "semantic"
 
-        # 根据当前选择的LLM服务获取对应的配置
-        current_service = cfg.llm_service.value
-        if current_service == LLMServiceEnum.OPENAI:
-            base_url = cfg.openai_api_base.value
-            api_key = cfg.openai_api_key.value
-            llm_model = cfg.openai_model.value
-        elif current_service == LLMServiceEnum.SILICON_CLOUD:
-            base_url = cfg.silicon_cloud_api_base.value
-            api_key = cfg.silicon_cloud_api_key.value
-            llm_model = cfg.silicon_cloud_model.value
-        elif current_service == LLMServiceEnum.DEEPSEEK:
-            base_url = cfg.deepseek_api_base.value
-            api_key = cfg.deepseek_api_key.value
-            llm_model = cfg.deepseek_model.value
-        elif current_service == LLMServiceEnum.OLLAMA:
-            base_url = cfg.ollama_api_base.value
-            api_key = cfg.ollama_api_key.value
-            llm_model = cfg.ollama_model.value
-        elif current_service == LLMServiceEnum.LM_STUDIO:
-            base_url = cfg.lm_studio_api_base.value
-            api_key = cfg.lm_studio_api_key.value
-            llm_model = cfg.lm_studio_model.value
-        elif current_service == LLMServiceEnum.GEMINI:
-            base_url = cfg.gemini_api_base.value
-            api_key = cfg.gemini_api_key.value
-            llm_model = cfg.gemini_model.value
-        elif current_service == LLMServiceEnum.CHATGLM:
-            base_url = cfg.chatglm_api_base.value
-            api_key = cfg.chatglm_api_key.value
-            llm_model = cfg.chatglm_model.value
-        elif current_service == LLMServiceEnum.PUBLIC:
-            base_url = cfg.public_api_base.value
-            api_key = cfg.public_api_key.value
-            llm_model = cfg.public_model.value
-        else:
-            base_url = ""
-            api_key = ""
-            llm_model = ""
-
-        full_translation_model = llm_model
-        if current_service == LLMServiceEnum.DEEPSEEK:
-            configured_full_model = str(
-                getattr(
-                    getattr(cfg, "deepseek_full_translation_model", None),
-                    "value",
-                    "",
-                )
-                or ""
-            ).strip()
-            full_translation_model = configured_full_model or llm_model
+        llm_runtime = resolve_llm_service_config()
 
         config = SubtitleConfig(
             # 翻译配置
-            base_url=base_url,
-            api_key=api_key,
-            llm_model=llm_model,
-            screen_subtitle_full_translation_model=full_translation_model,
-            screen_subtitle_allocation_review_model=llm_model,
+            base_url=llm_runtime.base_url,
+            api_key=llm_runtime.api_key,
+            llm_model=llm_runtime.model,
+            screen_subtitle_full_translation_model=(
+                llm_runtime.full_translation_model
+            ),
+            screen_subtitle_allocation_review_model=llm_runtime.model,
             deeplx_endpoint=cfg.deeplx_endpoint.value,
             # 翻译服务
             translator_service=cfg.translator_service.value,
@@ -282,6 +235,42 @@ class TaskFactory:
         )
 
     @staticmethod
+    def recreate_subtitle_task(
+        previous_task: SubtitleTask,
+        *,
+        file_path: str,
+    ) -> SubtitleTask:
+        """Rebuild current-config subtitle settings without losing task context.
+
+        Context is inherited only when the editor is retrying the same subtitle
+        input. Importing a different file must start an isolated task.
+        """
+        previous_path = Path(str(getattr(previous_task, "subtitle_path", ""))).resolve()
+        current_path = Path(str(file_path)).resolve()
+        same_input = previous_path == current_path
+        if not same_input:
+            return TaskFactory.create_subtitle_task(file_path=file_path)
+        return TaskFactory.create_subtitle_task(
+            file_path=file_path,
+            video_path=getattr(previous_task, "video_path", None),
+            need_next_task=bool(getattr(previous_task, "need_next_task", False)),
+            article_reference_text=str(
+                getattr(previous_task, "article_reference_text", "") or ""
+            ),
+            article_context_data=getattr(previous_task, "article_context_data", None),
+            use_article_reference_assist=bool(
+                getattr(previous_task, "use_article_reference_assist", False)
+            ),
+            use_article_translation_terms=bool(
+                getattr(previous_task, "use_article_translation_terms", False)
+            ),
+            source_audio_path=getattr(previous_task, "source_audio_path", None),
+            require_manual_review_before_synthesis=bool(
+                getattr(previous_task, "require_manual_review_before_synthesis", False)
+            ),
+        )
+
+    @staticmethod
     def create_synthesis_task(
         video_path: str,
         subtitle_path: str,
@@ -334,6 +323,7 @@ class TaskFactory:
             podcast_template_title=cfg.podcast_template_title.value,
             podcast_template_background=cfg.podcast_template_background.value,
             podcast_template_cover=cfg.podcast_template_cover.value,
+            podcast_template_logo=cfg.podcast_template_logo.value,
             podcast_template_date=cfg.podcast_template_date.value,
             subtitle_render_mode=cfg.subtitle_render_mode.value,
             subtitle_layout=cfg.subtitle_layout.value,

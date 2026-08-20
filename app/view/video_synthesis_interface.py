@@ -25,6 +25,7 @@ from qfluentwidgets import (
 
 from app.common.config import cfg
 from app.common.signal_bus import signalBus
+from app.config import RESOURCE_PATH
 from app.core.entities import (
     SupportedAudioFormats,
     SupportedSubtitleFormats,
@@ -44,6 +45,9 @@ from app.core.subtitle_processor.manual_final_subtitle_editor import (
 
 current_dir = Path(__file__).parent.parent
 SUBTITLE_STYLE_DIR = current_dir / "resource" / "subtitle_style"
+PODCAST_LOGO_DIR = (
+    RESOURCE_PATH / "podcast_template" / "article_vocab" / "logos"
+)
 
 
 class VideoSynthesisInterface(QWidget):
@@ -171,6 +175,19 @@ class VideoSynthesisInterface(QWidget):
         self.podcast_cover_layout.addWidget(self.podcast_cover_input)
         self.podcast_cover_layout.addWidget(self.podcast_cover_button)
         self.config_layout.addLayout(self.podcast_cover_layout)
+
+        self.podcast_logo_layout = QHBoxLayout()
+        self.podcast_logo_layout.setSpacing(15)
+        self.podcast_logo_label = BodyLabel(self.tr("品牌 Logo"), self)
+        self.podcast_logo_input = LineEdit(self)
+        self.podcast_logo_input.setPlaceholderText(
+            self.tr("可选；留空不显示 Logo")
+        )
+        self.podcast_logo_button = PushButton(self.tr("浏览"))
+        self.podcast_logo_layout.addWidget(self.podcast_logo_label)
+        self.podcast_logo_layout.addWidget(self.podcast_logo_input)
+        self.podcast_logo_layout.addWidget(self.podcast_logo_button)
+        self.config_layout.addLayout(self.podcast_logo_layout)
 
         self.main_layout.addWidget(self.config_card)
 
@@ -356,6 +373,8 @@ class VideoSynthesisInterface(QWidget):
         )
         self.podcast_cover_button.clicked.connect(self.choose_podcast_cover)
         self.podcast_cover_input.editingFinished.connect(self.save_podcast_cover)
+        self.podcast_logo_button.clicked.connect(self.choose_podcast_logo)
+        self.podcast_logo_input.editingFinished.connect(self.save_podcast_logo)
         # 合成和文件夹相关信号
         self.synthesize_button.clicked.connect(
             lambda: self.start_video_synthesis(need_create_task=True)
@@ -380,6 +399,7 @@ class VideoSynthesisInterface(QWidget):
         self.podcast_title_input.setPlainText(cfg.podcast_template_title.value)
         self.podcast_background_input.setText(cfg.podcast_template_background.value)
         self.podcast_cover_input.setText(cfg.podcast_template_cover.value)
+        self.podcast_logo_input.setText(cfg.podcast_template_logo.value)
         self.update_podcast_template_fields()
 
     def set_layout_visible(self, layout, visible: bool):
@@ -401,6 +421,7 @@ class VideoSynthesisInterface(QWidget):
         self.set_layout_visible(self.podcast_title_layout, enabled)
         self.set_layout_visible(self.podcast_background_layout, enabled and not is_article)
         self.set_layout_visible(self.podcast_cover_layout, enabled and is_article)
+        self.set_layout_visible(self.podcast_logo_layout, enabled and is_article)
 
     def on_soft_subtitle_changed(self, checked: bool):
         """处理软字幕选项变更"""
@@ -459,6 +480,9 @@ class VideoSynthesisInterface(QWidget):
     def save_podcast_cover(self):
         cfg.set(cfg.podcast_template_cover, self.podcast_cover_input.text().strip())
 
+    def save_podcast_logo(self):
+        cfg.set(cfg.podcast_template_logo, self.podcast_logo_input.text().strip())
+
     def choose_podcast_background(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -480,6 +504,18 @@ class VideoSynthesisInterface(QWidget):
         if file_path:
             self.podcast_cover_input.setText(file_path)
             self.save_podcast_cover()
+
+    def choose_podcast_logo(self):
+        PODCAST_LOGO_DIR.mkdir(parents=True, exist_ok=True)
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr("选择品牌 Logo"),
+            str(PODCAST_LOGO_DIR),
+            self.tr("图片文件") + " (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        if file_path:
+            self.podcast_logo_input.setText(file_path)
+            self.save_podcast_logo()
 
     def choose_subtitle_file(self):
         # 构建文件过滤器

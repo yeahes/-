@@ -1,0 +1,6 @@
+Source Serif Pro Semibold
+
+Upstream: https://github.com/adobe-fonts/source-serif
+Release: 2.000R
+Font file: OTF/SourceSerifPro-Semibold.otf
+License: SourceSerifPro-LICENSE.txt

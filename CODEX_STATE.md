@@ -1,37 +1,39 @@
 # Project State
 Status: complete
-Last verified: 2026-08-17 23:31:32 Asia/Shanghai
+Last verified: 2026-08-20 06:16:50 Asia/Shanghai
 Branch: main
-Verified HEAD: 9e1d0b32f4ccf8039176818b3e87c76f8aed2aa5
-Working tree: clean except untracked local audit output under `output/`
+Verified HEAD: ab6ea58035ddbab1afe4a3631c28de8886f29332
+Working tree: modified source/test/documentation files plus existing unrelated output/font changes
 
 ## Current Goal
-Improve long-caption automatic pagination without changing frozen subtitle authority.
+Keep a tail-trimmed manual-final package valid from editor save through synthesis reload.
 
 ## Confirmed Facts
-- The v25 planner keeps the existing whole-episode sequence pass, then promotes only an already validated cross-page-count candidate that objectively dominates its baseline.
-- Promoted pages retain fixed English, IDs, ledger ownership, word times, parent timing, parent Chinese, and synthesis authority.
-- The oil replay changes only S0059 (9+8), S0081 (8+8), and S0135 (10+4 to one 14-word page).
-- Pages over 14 words fall 21 to 19; pages below 56px fall 16 to 14; three-line pages stay at 3.
+- The failed package had a valid manifest but three final ends: S0201 SRT
+  `755009ms`, S0201.P02 `755064ms`, and media cut `754959ms`.
+- Tail deletion now caps the last final cue at the media cut while preserving
+  its retained word envelope.
+- Frozen page reuse preserves IDs, text, word ranges, internal boundaries,
+  Chinese, and layout; only the first/last parent edges are reconciled.
+- The saved package reloads through the production synthesis page-artifact
+  loader with one shared final cue/page/media end.
 
 ## Approved Decisions
-- Keep automatic promotion conservative; unresolved long captions remain manual-review work.
-- Rebuild only v24 page-layout/page-Chinese cache identity; preserve unrelated ASR and translation caches.
+- Do not relax ordinary page validation or change normal pagination/timing.
 
 ## Relevant Paths
-- `app/core/utils/podcast_learning_video.py`
-- `app/core/subtitle_processor/stable_display_page_contract.py`
-- `tests/test_article_display_readability_contract.py`
-- `output/article-page-shadow-20260817/oil-market-v25-production-audit.json`
+- `docs/handoffs/2026-08-20-tail-trim-page-timing.md`
 
 ## Last Verification
-- Article readability, stable page-Chinese, and complete `scripts/run_regression.py` suites passed; `git diff --check` passed.
+- Focused timeline and complete manual-editor suites pass.
+- `runtime\python.exe scripts\run_regression.py` completed all stages offline.
+- `git diff --check` passes; no external model request was made.
 
 ## Next Action
-Restart the GUI and run one new audio through the normal workflow to validate v25 on unseen material.
+Restart the GUI, reopen the current manual-final subtitle package, save it once, then synthesize again.
 
 ## Do Not Regress
-- Do not mutate fixed English, subtitle IDs, word ledger/times, cue timing, parent Chinese, or manifest-owned synthesis input.
+- Preserve fixed English, IDs, word ledger, word envelopes, page text, and fail-closed publication.
 
 ## Unknowns
-- Blind-sample behavior on a fresh unseen audio has not yet been measured.
+- The user's current unsaved GUI state cannot be migrated automatically; save must run once under the fixed code.

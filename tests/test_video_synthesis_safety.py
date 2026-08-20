@@ -614,6 +614,48 @@ def test_multiline_podcast_title_is_preserved_by_ui_and_task_snapshot():
     assert task.synthesis_config.podcast_template_title == title
 
 
+def test_article_logo_path_is_empty_by_default_and_persisted_by_ui():
+    assert SynthesisConfig().podcast_template_logo == ""
+
+    logo_input = MagicMock()
+    logo_input.text.return_value = "  C:/brand/logos/channel.png  "
+    interface = SimpleNamespace(podcast_logo_input=logo_input)
+    view_cfg = MagicMock()
+
+    with patch("app.view.video_synthesis_interface.cfg", view_cfg):
+        VideoSynthesisInterface.save_podcast_logo(interface)
+
+    view_cfg.set.assert_called_once_with(
+        view_cfg.podcast_template_logo,
+        "C:/brand/logos/channel.png",
+    )
+
+
+def test_article_logo_picker_starts_in_dedicated_logo_directory():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        logo_dir = Path(temp_dir) / "article_vocab" / "logos"
+        logo_input = MagicMock()
+        interface = SimpleNamespace(
+            podcast_logo_input=logo_input,
+            save_podcast_logo=MagicMock(),
+            tr=lambda value: value,
+        )
+
+        with patch(
+            "app.view.video_synthesis_interface.PODCAST_LOGO_DIR",
+            logo_dir,
+        ), patch(
+            "app.view.video_synthesis_interface.QFileDialog.getOpenFileName",
+            return_value=("", ""),
+        ) as choose_file:
+            VideoSynthesisInterface.choose_podcast_logo(interface)
+
+        assert logo_dir.is_dir()
+        assert choose_file.call_args.args[2] == str(logo_dir)
+        logo_input.setText.assert_not_called()
+        interface.save_podcast_logo.assert_not_called()
+
+
 def test_manual_draft_gate_only_allows_page_quality_blockers():
     allowed_reasons = (
         "render_structural_overflow",
@@ -1332,6 +1374,8 @@ if __name__ == "__main__":
     test_english_only_podcast_tasks_use_isolated_output_names_for_both_templates()
     test_english_only_action_persists_and_enables_podcast_template()
     test_multiline_podcast_title_is_preserved_by_ui_and_task_snapshot()
+    test_article_logo_path_is_empty_by_default_and_persisted_by_ui()
+    test_article_logo_picker_starts_in_dedicated_logo_directory()
     test_manual_draft_gate_only_allows_page_quality_blockers()
     test_manual_draft_gate_rejects_unknown_blockers_and_tampered_srt()
     test_manual_draft_gate_rejects_tampered_timeline_or_word_ledger()

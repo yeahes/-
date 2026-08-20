@@ -21,6 +21,7 @@ from qfluentwidgets import (
 
 from app.config import WORK_PATH, SETTINGS_PATH
 from ..core.entities import (
+    AVAILABLE_LLM_SERVICES,
     LLMServiceEnum,
     SplitTypeEnum,
     TargetLanguageEnum,
@@ -69,8 +70,8 @@ class Config(QConfig):
     llm_service = OptionsConfigItem(
         "LLM",
         "LLMService",
-        LLMServiceEnum.PUBLIC,
-        OptionsValidator(LLMServiceEnum),
+        LLMServiceEnum.DEEPSEEK,
+        OptionsValidator(AVAILABLE_LLM_SERVICES),
         EnumSerializer(LLMServiceEnum),
     )
 
@@ -91,6 +92,17 @@ class Config(QConfig):
     deepseek_api_key = ConfigItem("LLM", "DeepSeek_API_Key", "")
     deepseek_api_base = ConfigItem(
         "LLM", "DeepSeek_API_Base", "https://api.deepseek.com/v1"
+    )
+
+    opencode_go_model = ConfigItem(
+        "LLM", "OpenCodeGo_Model", "deepseek-v4-flash"
+    )
+    opencode_go_full_translation_model = ConfigItem(
+        "LLM", "OpenCodeGo_Full_Translation_Model", "deepseek-v4-flash"
+    )
+    opencode_go_api_key = ConfigItem("LLM", "OpenCodeGo_API_Key", "")
+    opencode_go_api_base = ConfigItem(
+        "LLM", "OpenCodeGo_API_Base", "https://opencode.ai/zen/go/v1"
     )
 
     ollama_model = ConfigItem("LLM", "Ollama_Model", "llama2")
@@ -327,6 +339,9 @@ class Config(QConfig):
     )
     podcast_template_cover = ConfigItem(
         "Video", "PodcastTemplateCover", ""
+    )
+    podcast_template_logo = ConfigItem(
+        "Video", "PodcastTemplateLogo", ""
     )
     podcast_template_date = ConfigItem(
         "Video", "PodcastTemplateDate", "Jul 23rd 2026"

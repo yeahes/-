@@ -17,8 +17,12 @@ from app.core.subtitle_processor.word_timing_trust import (
 
 
 SUBTITLE_ID_RE = re.compile(r"S\d{4}")
+DISPLAY_LEAD_IN_MS = 40
+DISPLAY_TAIL_PADDING_MS = 260
 TARGET_DISPLAY_DURATION_MS = 700
 HARD_MIN_DISPLAY_DURATION_MS = 150
+SHORT_GAP_CHAIN_THRESHOLD_MS = 1000
+MAX_CHAINED_NEXT_LEAD_MS = 200
 
 
 def reconcile_frozen_word_ledger(words: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -102,6 +106,7 @@ def derive_final_cue_timeline(
     expected_subtitle_ids: Sequence[str],
     lead_in_ms: int,
     tail_padding_ms: int,
+    display_end_cap_ms: int | None = None,
 ) -> Dict[str, Any]:
     """Derive final cue times from frozen word ranges.
 
@@ -176,16 +181,30 @@ def derive_final_cue_timeline(
 
     boundary_repairs = _resolve_display_padding_overlaps(records, errors)
     boundary_repairs.extend(
+        _chain_short_display_gaps(
+            records,
+            threshold_ms=SHORT_GAP_CHAIN_THRESHOLD_MS,
+            max_next_lead_ms=MAX_CHAINED_NEXT_LEAD_MS,
+        )
+    )
+    boundary_repairs.extend(
         _extend_short_display_ranges(
             records,
             target_duration_ms=TARGET_DISPLAY_DURATION_MS,
         )
     )
+    if display_end_cap_ms is not None and records:
+        _cap_final_display_end(
+            records,
+            int(display_end_cap_ms),
+            errors,
+        )
     validation = validate_final_cue_timeline(
         records,
         expected_subtitle_ids=expected_ids,
         words=words,
         prior_errors=errors,
+        allow_final_short_display=display_end_cap_ms is not None,
     )
     return {
         "schema_version": 1,
@@ -204,6 +223,7 @@ def final_cue_timeline_artifact(
     *,
     expected_subtitle_ids: Sequence[str],
     prior_errors: Sequence[Mapping[str, Any]] | None = None,
+    boundary_reconciliations: Sequence[Mapping[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Serialize and validate existing final cue times without rewriting them."""
     errors = [dict(item) for item in prior_errors or []]
@@ -233,9 +253,40 @@ def final_cue_timeline_artifact(
         "expected_subtitle_ids": [str(value or "") for value in expected_subtitle_ids],
         "returned_subtitle_ids": [record["subtitle_id"] for record in records],
         "records": records,
-        "boundary_reconciliations": [],
+        "boundary_reconciliations": [
+            dict(item) for item in boundary_reconciliations or []
+        ],
         "validation": validation,
     }
+
+
+def _cap_final_display_end(
+    records: List[Dict[str, Any]],
+    cap_ms: int,
+    errors: List[Dict[str, Any]],
+) -> None:
+    """Keep the final visible cue inside an explicit media tail cut.
+
+    A tail trim is chosen in a safe pause between the last retained and first
+    removed words.  The normal display padding must not extend past that
+    boundary, but it must still cover the retained cue's own word envelope.
+    The latter is reported as an error instead of cutting spoken audio.
+    """
+    final = records[-1]
+    old_end = int(final["end_ms"])
+    capped_end = min(old_end, max(0, int(cap_ms)))
+    envelope_end = int(final["word_envelope_end_ms"])
+    if capped_end < envelope_end:
+        errors.append(
+            {
+                "code": "final_timeline_display_end_before_word_envelope",
+                "subtitle_id": str(final.get("subtitle_id") or ""),
+                "display_end_cap_ms": int(cap_ms),
+                "word_envelope_end_ms": envelope_end,
+            }
+        )
+    if capped_end != old_end:
+        final["end_ms"] = capped_end
 
 
 def validate_final_cue_timeline(
@@ -244,6 +295,7 @@ def validate_final_cue_timeline(
     expected_subtitle_ids: Sequence[str],
     words: Sequence[Mapping[str, Any]],
     prior_errors: Sequence[Mapping[str, Any]] | None = None,
+    allow_final_short_display: bool = False,
 ) -> Dict[str, Any]:
     """Validate ID coverage, word spans, own-word coverage, and order."""
     errors = [dict(item) for item in prior_errors or []]
@@ -292,7 +344,8 @@ def validate_final_cue_timeline(
     previous_subtitle_id = ""
     previous_word_end = -1
     covered_word_ids: List[int] = []
-    for record in records:
+    final_record_index = len(records) - 1
+    for record_index, record in enumerate(records):
         subtitle_id = str(record.get("subtitle_id") or "")
         start = int(record.get("start_ms") or 0)
         end = int(record.get("end_ms") or 0)
@@ -355,7 +408,10 @@ def validate_final_cue_timeline(
                     "cue_range": [start, end],
                 }
             )
-        elif end - start < HARD_MIN_DISPLAY_DURATION_MS:
+        elif (
+            end - start < HARD_MIN_DISPLAY_DURATION_MS
+            and not (allow_final_short_display and record_index == final_record_index)
+        ):
             errors.append(
                 {
                     "code": "final_timeline_display_duration_invalid",
@@ -545,6 +601,69 @@ def _resolve_display_padding_overlaps(
                 "old_left_end_ms": old_left_end,
                 "old_right_start_ms": old_right_start,
                 "new_boundary_ms": boundary,
+            }
+        )
+    return repairs
+
+
+def _chain_short_display_gaps(
+    records: List[Dict[str, Any]],
+    *,
+    threshold_ms: int,
+    max_next_lead_ms: int,
+) -> List[Dict[str, Any]]:
+    """Close short parent-cue gaps without moving authoritative word times.
+
+    The original VideoCaptioner timing pass assigned roughly three quarters of
+    a short pause to the outgoing subtitle and one quarter to the incoming
+    subtitle.  Here that behavior is constrained by the frozen word ledger:
+    the shared boundary stays between both word envelopes, never shortens the
+    existing padded display ranges, and caps how early the next cue may appear.
+    """
+    repairs: List[Dict[str, Any]] = []
+    threshold = max(0, int(threshold_ms))
+    next_lead_cap = max(0, int(max_next_lead_ms))
+    if threshold <= 0:
+        return repairs
+
+    for left, right in zip(records, records[1:]):
+        old_left_end = int(left["end_ms"])
+        old_right_start = int(right["start_ms"])
+        old_display_gap = old_right_start - old_left_end
+        if old_display_gap <= 0:
+            continue
+
+        left_word_end = int(left["word_envelope_end_ms"])
+        right_word_start = int(right["word_envelope_start_ms"])
+        word_gap = right_word_start - left_word_end
+        if word_gap <= 0 or word_gap >= threshold:
+            continue
+
+        original_style_boundary = left_word_end + (word_gap * 3) // 4
+        earliest_next_start = max(0, right_word_start - next_lead_cap)
+        lower_bound = max(
+            old_left_end,
+            min(old_right_start, earliest_next_start),
+        )
+        upper_bound = old_right_start
+        boundary = min(
+            upper_bound,
+            max(lower_bound, original_style_boundary),
+        )
+
+        left["end_ms"] = boundary
+        right["start_ms"] = boundary
+        repairs.append(
+            {
+                "code": "final_timeline_short_gap_chained",
+                "left_subtitle_id": str(left.get("subtitle_id") or ""),
+                "right_subtitle_id": str(right.get("subtitle_id") or ""),
+                "word_gap_ms": word_gap,
+                "old_display_gap_ms": old_display_gap,
+                "old_left_end_ms": old_left_end,
+                "old_right_start_ms": old_right_start,
+                "new_boundary_ms": boundary,
+                "next_lead_ms": right_word_start - boundary,
             }
         )
     return repairs

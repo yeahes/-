@@ -1,7 +1,18 @@
 # Task: Manual Long-Caption Workspace
 
 Status: in_progress
-Last reviewed: 2026-08-15 00:26:59 Asia/Shanghai
+Last reviewed: 2026-08-19 07:14:07 Asia/Shanghai
+
+## 2026-08-19 Failed Page-Plan Parent-Chinese Preview
+
+- A failed fixed-font display-page plan no longer becomes an empty actual-page
+  view. The editor keeps each frozen English page and shows the parent Chinese
+  as an explicit `parent_chinese_fallback` draft.
+- Fallback text is review-only: single-page and bulk confirmation cannot mark
+  it as page-local Chinese. The user must edit each page or provide a validated
+  page translation before publication; the formal synthesis gate is unchanged.
+- Recovery logic treats this preview as blank for exact identity-matched undo
+  drafts, so existing manual history recovery remains lossless.
 
 ## Goal
 
@@ -208,6 +219,36 @@ phrase, or change frozen IDs, English, word ownership, timing, or parent
 Chinese. The 140-cue oil replay changed three parents, reduced over-14-word and
 low-font pages without adding three-line pages, and passed the focused page,
 page-Chinese, and complete regression suites.
+
+2026-08-18 automatic-planner increment: planner v26 uses a 14-word comfortable
+target, measures 15-word cues before changing page count, and prioritizes a
+natural multi-page plan from 16 words. Normal automatic typography is limited
+to 56/54/52px; 50px remains a compatibility path for already-frozen legacy
+artifacts only. A general pronoun-boundary fix restores punctuated main-clause
+starts such as `this, | you ...` without weakening genuine determiner+noun
+protection. On the 184-parent animation replay, pages over 16 words fell from
+7 to 4, pages below 56px from 19 to 14, and three-line pages from 3 to 2;
+total pages increased from 201 to 203 and review boundaries from 9 to 11. The
+complete unified regression passes.
+
+2026-08-19 automatic-planner increment: planner v27 makes the 56/54/52px
+normal-font floor authoritative for new automatic pages. A complete parent
+that cannot be partitioned into grammar-safe, two-line pages at those sizes is
+not forced into a 50px or three-line page. The stable artifact keeps the
+parent's English, ID, word ledger, timing, and Chinese while recording an
+`editable_seed` with `renderable: false`; the editor can then create an
+explicit two-to-six-page, timed-word manual proposal and fill page Chinese.
+Legacy 50px pages remain readable only through compatibility validation. The
+page contract is `article-fixed-font-pages-v27`; focused page, manual-editor,
+stable-caption, and complete regression suites pass.
+
+2026-08-18 manual-final timing increment: manual save now rebuilds current
+parent cues through the sole frozen-ledger final timeline before creating mute
+audio, SRT, actual-page maps, or timeline artifacts. A real 174-parent replay
+closed the three short gaps reintroduced by formal word-boundary moves while
+preserving the 1040ms long word pause, all fixed IDs, word ranges, word times,
+text, hidden/muted state, and zero overlap. Existing manual packages can obtain
+the correction by reopening and saving; no ASR or translation rerun is needed.
 
 ### 5. Optional AI boundary fallback
 

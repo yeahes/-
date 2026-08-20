@@ -52,6 +52,11 @@ from app.core.subtitle_processor.stable_pipeline_contracts import (
     canonical_word_ledger_hash,
     stable_payload_hash,
 )
+from app.core.subtitle_processor.final_cue_timeline import (
+    DISPLAY_LEAD_IN_MS,
+    DISPLAY_TAIL_PADDING_MS,
+    derive_final_cue_timeline,
+)
 from app.core.utils.video_utils import staged_media_output
 
 
@@ -2871,7 +2876,11 @@ class ManualFinalSubtitleSession:
             str(row.get("display_page_id") or ""): row
             for row in current_rows
             if str(row.get("display_page_id") or "")
-            and not str(row.get("translated_subtitle") or "").strip()
+            and (
+                not str(row.get("translated_subtitle") or "").strip()
+                or str(row.get("display_page_chinese_draft_kind") or "")
+                == "parent_chinese_fallback"
+            )
             and not row.get("display_page_unavailable")
         }
         if not missing_by_page_id:
@@ -4677,6 +4686,13 @@ class ManualFinalSubtitleSession:
             raise ManualFinalSubtitleEditError("找不到可确认的实际分页中文。")
         if not str(target.get("translated_subtitle") or "").strip():
             raise ManualFinalSubtitleEditError("当前实际分页中文为空，不能确认。")
+        if (
+            str(target.get("display_page_chinese_draft_kind") or "")
+            == "parent_chinese_fallback"
+        ):
+            raise ManualFinalSubtitleEditError(
+                "当前显示的是父字幕中文预览，不能直接确认；请按每屏英文填写分页中文。"
+            )
         if target.get("display_page_chinese_confirmed"):
             return {"changed": False, "display_page_id": str(page_id)}
         target["display_page_chinese_confirmed"] = True
@@ -4735,6 +4751,8 @@ class ManualFinalSubtitleSession:
             for row in visible_rows
             if row.get("chinese_review_required")
             and str(row.get("translated_subtitle") or "").strip()
+            and str(row.get("display_page_chinese_draft_kind") or "")
+            != "parent_chinese_fallback"
         ]
         boundary_ids = [
             str(row.get("display_page_id") or "")
@@ -6711,6 +6729,12 @@ class ManualFinalSubtitleSession:
             if cue.get("display_suppressed"):
                 self._display_page_preview_cache.pop(parent_id, None)
                 continue
+            # A failed display-page blueprint still owns the frozen parent
+            # English/Chinese mapping.  Keep its one-page editable seed in
+            # the editor instead of converting it into an "unavailable"
+            # parent row.  The page is deliberately marked as an unconfirmed
+            # display-only draft below; it is never accepted by the formal
+            # page contract or synthesis gate.
             plan["english"] = self._display_words_text(
                 int(cue["word_start"]),
                 int(cue["word_end"]),
@@ -6726,6 +6750,12 @@ class ManualFinalSubtitleSession:
                 except (KeyError, TypeError, ValueError):
                     continue
             parent_page_prefix = f"{parent_id}.P"
+            parent_fallback_chinese = str(
+                source_plan.get("parent_chinese_fallback")
+                or source_plan.get("chinese")
+                or cue.get("translated_subtitle")
+                or ""
+            ).strip()
             parent_cache_key = stable_payload_hash(
                 {
                     "source_word_ledger_hash": self.source_word_ledger_hash,
@@ -6790,7 +6820,7 @@ class ManualFinalSubtitleSession:
                     for page in source_plan.get("pages") or []
                     if isinstance(page, Mapping)
                 ]
-                if not source_pages or len(override_starts) not in {0, 1, 2, 3}:
+                if not source_pages or not 0 <= len(override_starts) <= 5:
                     continue
                 boundaries = [int(cue["word_start"]), *override_starts]
                 ranges = [
@@ -6924,7 +6954,7 @@ class ManualFinalSubtitleSession:
                         and str(page.get("display_page_id") or "")
                         and str(chinese or "").strip()
                     }
-            for raw_page in raw_pages:
+            for raw_page_index, raw_page in enumerate(raw_pages):
                 if not isinstance(raw_page, Mapping):
                     pages = []
                     break
@@ -7023,18 +7053,37 @@ class ManualFinalSubtitleSession:
                         )
                         if chinese_stale_draft:
                             chinese_draft_kind = "stale_artifact_page_draft"
-                if len(raw_pages) == 1 and (
-                    not chinese or chinese_stale_draft
+                if (
+                    not chinese
+                    and allow_incomplete_page_chinese
+                    and parent_fallback_chinese
+                    and raw_page_index == 0
+                    and (
+                        len(raw_pages) > 1
+                        or (
+                            source_plan.get("editable_seed")
+                            and not source_plan.get("renderable", True)
+                        )
+                    )
                 ):
-                    chinese = str(cue.get("translated_subtitle") or "")
-                    chinese_stale_draft = bool(
+                    # Show the complete parent translation once as a reference.
+                    # Repeating it on every failed page looks like valid
+                    # page-local Chinese and makes the review state misleading.
+                    chinese = parent_fallback_chinese
+                    chinese_stale_draft = True
+                    chinese_draft_kind = "parent_chinese_fallback"
+                if len(raw_pages) == 1:
+                    if not chinese:
+                        chinese = str(cue.get("translated_subtitle") or "")
+                    if (
                         chinese
+                        and not chinese_stale_draft
                         and edited
                         and edited.get("chinese_stale_unconfirmed")
                         and str(edited.get("chinese_draft_kind") or "")
                         == "formal_boundary_reflow_draft"
-                    )
-                    if chinese_stale_draft:
+                    ):
+                        chinese_stale_draft = True
                         chinese_draft_kind = (
                             chinese_draft_kind or "formal_boundary_reflow_draft"
                         )
@@ -7125,6 +7174,7 @@ class ManualFinalSubtitleSession:
         self._validate_cues()
         self._validate_display_page_boundary_overrides()
         self._validate_no_silent_display_page_state_loss()
+        final_cue_timeline = self._rebuild_authoritative_cue_timeline()
         # Loading an older manual package may retain its legacy semantic hash.
         # Every newly published generation upgrades to the canonical contract.
         self.source_word_ledger_hash = self._semantic_word_ledger_hash(
@@ -7272,7 +7322,10 @@ class ManualFinalSubtitleSession:
                 else "正在复用冻结分页；边界变化时才重新规划全片"
             ),
         )
-        render_contract = self._write_manual_render_contract(artifact_dir)
+        render_contract = self._write_manual_render_contract(
+            artifact_dir,
+            final_cue_timeline=final_cue_timeline,
+        )
         review_summary = self.display_page_review_summary()
         report(70, "实际分页检查完成，正在写入双语字幕")
         self._write_bilingual_srt(srt_path)
@@ -8115,7 +8168,7 @@ class ManualFinalSubtitleSession:
                     for page in raw_plan.get("pages") or []
                     if isinstance(page, Mapping)
                 ]
-                if not source_pages or len(override_starts) not in {0, 1, 2, 3}:
+                if not source_pages or not 0 <= len(override_starts) <= 5:
                     raise ManualFinalSubtitleEditError(
                         "manual_page_translation_required: 人工分页边界数量无效。"
                     )
@@ -8186,6 +8239,16 @@ class ManualFinalSubtitleSession:
                     raise ManualFinalSubtitleEditError(
                         "manual_page_translation_required: 冻结分页的页内排版无法升级。"
                     ) from exc
+                # A tail trim (or another parent-local timing edit) can change
+                # the cue envelope while the frozen page spans remain valid.
+                # Keep the page IDs, word ranges, and interior boundaries
+                # frozen, but reconcile only the two outer display edges with
+                # the current authoritative parent cue.
+                frozen_pages = list(plan.get("pages") or [])
+                if self.tail_trim and frozen_pages:
+                    frozen_pages[0]["start_ms"] = int(cue["start_time"])
+                    frozen_pages[-1]["end_ms"] = int(cue["end_time"])
+                    plan["pages"] = frozen_pages
             if (
                 cue is None
                 or parent_id != source_parent_id
@@ -8279,7 +8342,64 @@ class ManualFinalSubtitleSession:
             )
         return {"parents": parents, "render_plans": plans}
 
-    def _write_manual_render_contract(self, artifact_dir: Path) -> Dict[str, Any]:
+    def _rebuild_authoritative_cue_timeline(self) -> Dict[str, Any]:
+        expected_ids = [str(cue.get("cue_id") or "") for cue in self.cues]
+        timeline = derive_final_cue_timeline(
+            [
+                {
+                    "subtitle_id": str(cue.get("cue_id") or ""),
+                    "word_start": int(cue["word_start"]),
+                    "word_end": int(cue["word_end"]),
+                }
+                for cue in self.cues
+            ],
+            self.word_ledger,
+            expected_subtitle_ids=expected_ids,
+            lead_in_ms=DISPLAY_LEAD_IN_MS,
+            tail_padding_ms=DISPLAY_TAIL_PADDING_MS,
+            display_end_cap_ms=(
+                int(self.tail_trim["cut_ms"])
+                if self.tail_trim and self.tail_trim.get("cut_ms") is not None
+                else None
+            ),
+        )
+        validation = dict(timeline.get("validation") or {})
+        if str(validation.get("status") or "") != "PASS":
+            error_codes = sorted(
+                {
+                    str(item.get("code") or "final_timeline_invalid")
+                    for item in validation.get("errors") or []
+                    if isinstance(item, Mapping)
+                }
+            )
+            detail = ", ".join(error_codes[:6])
+            raise ManualFinalSubtitleEditError(
+                "人工终稿时间轴无法从固定词账本安全重建。"
+                + (f"（{detail}）" if detail else "")
+            )
+
+        records_by_id = {
+            str(record.get("subtitle_id") or ""): record
+            for record in timeline.get("records") or []
+            if isinstance(record, Mapping)
+        }
+        if set(records_by_id) != set(expected_ids):
+            raise ManualFinalSubtitleEditError(
+                "人工终稿时间轴没有完整覆盖当前固定字幕 ID。"
+            )
+        for cue in self.cues:
+            record = records_by_id[str(cue.get("cue_id") or "")]
+            cue["start_time"] = int(record["start_ms"])
+            cue["end_time"] = int(record["end_ms"])
+        self._validate_cues()
+        return timeline
+
+    def _write_manual_render_contract(
+        self,
+        artifact_dir: Path,
+        *,
+        final_cue_timeline: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         from app.core.subtitle_processor.stable_display_page_contract import (
             DISPLAY_PAGE_PLANNER_VERSION,
             DISPLAY_PAGE_SCHEMA_VERSION,
@@ -8294,6 +8414,14 @@ class ManualFinalSubtitleSession:
             build_article_display_page_blueprint,
         )
 
+        timeline = copy.deepcopy(
+            dict(final_cue_timeline or self._rebuild_authoritative_cue_timeline())
+        )
+        timeline_records_by_id = {
+            str(record.get("subtitle_id") or ""): dict(record)
+            for record in timeline.get("records") or []
+            if isinstance(record, Mapping)
+        }
         boundary_payload = self._validated_display_boundary_evidence()
         boundary_items = dict(boundary_payload.get("boundaries") or {})
         records = []
@@ -8304,13 +8432,17 @@ class ManualFinalSubtitleSession:
             word_end = int(cue["word_end"])
             display_suppressed = bool(cue.get("display_suppressed"))
             media_muted = bool(cue.get("media_muted"))
+            timeline_record = timeline_records_by_id.get(subtitle_id)
+            if timeline_record is None:
+                raise ManualFinalSubtitleEditError(
+                    "人工终稿时间轴缺少当前固定字幕 ID。"
+                )
             records.append(
                 {
+                    **timeline_record,
                     "subtitle_id": subtitle_id,
                     "word_start": word_start,
                     "word_end": word_end,
-                    "start_ms": int(cue["start_time"]),
-                    "end_ms": int(cue["end_time"]),
                     "original": str(cue["original_subtitle"]),
                     "translated": str(cue.get("translated_subtitle") or ""),
                     "display_suppressed": display_suppressed,
@@ -8349,15 +8481,7 @@ class ManualFinalSubtitleSession:
                 )
             )
 
-        timeline = {
-            "schema_version": 1,
-            "records": records,
-            "validation": {
-                "status": "PASS",
-                "error_count": 0,
-                "errors": [],
-            },
-        }
+        timeline["records"] = records
         layout_profile = article_display_page_layout_profile()
         render_block_reason = ""
         blueprint: Dict[str, Any] = {}

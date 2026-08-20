@@ -698,6 +698,7 @@ class VideoSynthesisThread(QThread):
                     title_text=self.task.synthesis_config.podcast_template_title,
                     background_path=self.task.synthesis_config.podcast_template_background,
                     cover_path=self.task.synthesis_config.podcast_template_cover,
+                    logo_path=self.task.synthesis_config.podcast_template_logo,
                     date_text=self.task.synthesis_config.podcast_template_date,
                     progress_callback=self.progress_callback,
                     cancel_check=self.is_cancelled,

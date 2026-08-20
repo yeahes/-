@@ -673,6 +673,62 @@ def test_move_suffix_updates_text_ranges_and_timing_from_word_ledger():
         assert session.cues[1]["chinese_review_required"] is True
 
 
+def test_save_rebuilds_short_gap_compensation_after_formal_boundary_move():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        for word in session.word_ledger[8:]:
+            word["start_ms"] += 500
+            word["end_ms"] += 500
+        session.cues[1]["end_time"] += 500
+        evidence_path = session.artifact_dir / "display-boundary-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["word_ledger_hash"] = session._formal_word_ledger_hash(
+            session.word_ledger
+        )
+        _write_json(evidence_path, evidence)
+
+        session.move_suffix_to_next(0, 1)
+        assert session.cues[1]["start_time"] - session.cues[0]["end_time"] == 500
+
+        saved = session.save_to_source_folder()
+        timeline = json.loads(
+            Path(saved["artifact_dir"], "final-cue-timeline.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        left, right = timeline["records"]
+        assert left["end_ms"] == right["start_ms"] == 1175
+        assert any(
+            item["code"] == "final_timeline_short_gap_chained"
+            and item["left_subtitle_id"] == "S0001"
+            and item["right_subtitle_id"] == "S0002"
+            for item in timeline["boundary_reconciliations"]
+        )
+
+        saved_cues = parse_srt(Path(saved["subtitle_path"]))
+        assert round(saved_cues[0].end * 1000) == 1175
+        assert round(saved_cues[1].start * 1000) == 1175
+        display_artifact = json.loads(
+            Path(
+                saved["artifact_dir"], "display-page-translations.json"
+            ).read_text(encoding="utf-8")
+        )
+        plans = {
+            plan["parent_subtitle_id"]: plan
+            for plan in display_artifact["render_plans"]
+        }
+        assert plans["S0001"]["pages"][-1]["end_ms"] == 1175
+        assert plans["S0002"]["pages"][0]["start_ms"] == 1175
+        page_map = json.loads(
+            Path(saved["display_page_map_path"]).read_text(encoding="utf-8")
+        )
+        mapped_pages = {
+            page["parent_subtitle_id"]: page for page in page_map["pages"]
+        }
+        assert mapped_pages["S0001"]["end_ms"] == 1175
+        assert mapped_pages["S0002"]["start_ms"] == 1175
+
+
 def test_formal_boundary_move_keeps_actual_pages_and_visible_chinese_drafts():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
@@ -3128,9 +3184,6 @@ def test_hide_and_mute_save_round_trip_binds_derived_audio_and_timeline():
         source_media.write_bytes(b"original-audio-placeholder")
         source_hash = file_sha256(source_media)
         before_ledger = copy.deepcopy(session.word_ledger)
-        before_times = [
-            (cue["start_time"], cue["end_time"]) for cue in session.cues
-        ]
         session.source_media_path = source_media.resolve()
         session.set_cue_hidden_and_media_muted("S0002", True)
 
@@ -3140,7 +3193,7 @@ def test_hide_and_mute_save_round_trip_binds_derived_audio_and_timeline():
                 {
                     "subtitle_id": "S0002",
                     "start_ms": 900,
-                    "end_ms": 1200,
+                    "end_ms": 1600,
                 }
             ]
             shutil.copyfile(source_path, output_path)
@@ -3159,7 +3212,7 @@ def test_hide_and_mute_save_round_trip_binds_derived_audio_and_timeline():
         assert derived_media.is_file()
         assert derived_media.resolve() != source_media.resolve()
         assert derivation["mute_intervals"] == [
-            {"subtitle_id": "S0002", "start_ms": 900, "end_ms": 1200}
+            {"subtitle_id": "S0002", "start_ms": 900, "end_ms": 1600}
         ]
         assert derivation["source_media_sha256"] == source_hash
         assert derivation["derived_media_sha256"] == file_sha256(derived_media)
@@ -3170,7 +3223,7 @@ def test_hide_and_mute_save_round_trip_binds_derived_audio_and_timeline():
         assert session.word_ledger == before_ledger
         assert [
             (cue["start_time"], cue["end_time"]) for cue in session.cues
-        ] == before_times
+        ] == [(0, 900), (900, 1600)]
 
         reloaded = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
         assert reloaded.cues[1]["display_suppressed"] is True
@@ -4116,6 +4169,94 @@ def test_actual_page_tail_trim_keeps_prior_page_and_undo_restores_all():
         assert session.to_model_data() == before_rows
 
 
+def test_tail_trim_reconciles_frozen_page_end_with_final_cue_and_media_cut():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_media = root / "episode.m4a"
+        session, _, _ = _tail_trim_session_fixture(root, source_media)
+        source_media.write_bytes(b"audio-placeholder")
+        _write_display_page_preview_artifact(session)
+        page_artifact_path = session.artifact_dir / "display-page-translations.json"
+        page_artifact = json.loads(page_artifact_path.read_text(encoding="utf-8"))
+        session.cues[0]["translated_subtitle"] = "示例一，示例二"
+        page_artifact["parents"][0]["pages"][0]["zh"] = "示例一，"
+        page_artifact["parents"][0]["pages"][1]["zh"] = "示例二"
+        page_artifact["render_plans"][0]["chinese"] = "示例一，示例二"
+        for plan in page_artifact["render_plans"]:
+            for page in plan["pages"]:
+                page["english_lines"] = [page["english"]]
+                page["english_width"] = 1260
+        plans_by_parent = {
+            plan["parent_subtitle_id"]: plan
+            for plan in page_artifact["render_plans"]
+        }
+        for parent in page_artifact["parents"]:
+            plan_pages = plans_by_parent[parent["parent_subtitle_id"]]["pages"]
+            for page, plan_page in zip(parent["pages"], plan_pages):
+                page.update(
+                    {
+                        "word_start": plan_page["word_start"],
+                        "word_end": plan_page["word_end"],
+                        "english": plan_page["english"],
+                    }
+                )
+        _write_json(page_artifact_path, page_artifact)
+
+        decision = session.trim_tail_from_cue(1)
+        timeline = session._rebuild_authoritative_cue_timeline()
+        final_record = timeline["records"][-1]
+        assert final_record["end_ms"] == decision["cut_ms"]
+        assert final_record["end_ms"] >= final_record["word_envelope_end_ms"]
+
+        blueprint = session._blueprint_from_frozen_display_page_edits()
+        assert blueprint is not None
+        final_page = blueprint["render_plans"][0]["pages"][-1]
+        assert final_page["end_ms"] == session.cues[-1]["end_time"]
+        assert final_page["end_ms"] == decision["cut_ms"]
+
+        with patch(
+            "app.core.subtitle_processor.manual_final_subtitle_editor."
+            "_materialize_tail_trim_audio",
+            side_effect=lambda source, output, _cut: shutil.copyfile(source, output),
+        ):
+            saved = session.save_to_source_folder(source_media_path=source_media)
+        saved_subtitle = Path(saved["subtitle_path"])
+        render_cues = parse_srt(saved_subtitle)
+        assert attach_article_word_timing(render_cues, saved_subtitle) is True
+        loaded = load_article_display_page_translation_artifact(
+            render_cues,
+            saved_subtitle,
+        )
+        if not loaded:
+            manifest = json.loads(
+                Path(saved["manifest_path"]).read_text(encoding="utf-8")
+            )
+            artifact = json.loads(
+                Path(manifest["display_page_translation_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            failures = []
+            podcast_learning_video.apply_article_display_page_translation_artifact(
+                render_cues,
+                artifact,
+                failure_items=failures,
+            )
+            raise AssertionError(
+                "saved page artifact did not reload: "
+                f"failures={failures} "
+                f"schema={artifact.get('schema_version')} "
+                f"status={artifact.get('status')} "
+                f"planner={artifact.get('planner_version')} "
+                f"errors={artifact.get('errors')} "
+                f"parents={artifact.get('parents')}"
+            )
+        assert render_cues[-1].article_page_plan is not None
+        assert round(render_cues[-1].article_page_plan["pages"][-1]["end"] * 1000) == (
+            decision["cut_ms"]
+        )
+
+
 def test_tail_trim_save_materializes_real_audio_and_reuses_exact_decision():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -5043,9 +5184,20 @@ def test_partial_page_artifact_keeps_valid_pages_and_failed_parent_review_row():
             "of date.",
         ]
         assert all(row["manual_cue_id"] == "S0002" for row in failed_pages)
-        assert all(row["translated_subtitle"] == "" for row in failed_pages)
+        assert [row["translated_subtitle"] for row in failed_pages] == [
+            "中文二",
+            "",
+        ]
         assert all(row["display_page_unavailable"] is False for row in failed_pages)
         assert all(row["display_page_review_required"] is True for row in failed_pages)
+        assert [row["display_page_chinese_stale"] for row in failed_pages] == [
+            True,
+            False,
+        ]
+        assert failed_pages[0]["display_page_chinese_draft_kind"] == (
+            "parent_chinese_fallback"
+        )
+        assert failed_pages[1]["display_page_chinese_draft_kind"] == ""
         assert all(
             "page_translation_chinese_token_split"
             in row["display_page_issue_codes"]
@@ -5226,6 +5378,92 @@ def test_parent_split_allows_explicit_high_risk_manual_fallback():
         assert session.display_page_boundary_overrides["S0001"] == [
             int(rows[1]["word_start"])
         ]
+
+
+def test_unrenderable_parent_seed_can_be_split_without_a_frozen_page_plan():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        cue = session.cues[0]
+        seed_artifact = {
+            "schema_version": 2,
+            "status": "ERROR",
+            "planner_version": (
+                stable_display_page_contract.DISPLAY_PAGE_PLANNER_VERSION
+            ),
+            "layout_profile": (
+                podcast_learning_video.article_display_page_layout_profile()
+            ),
+            "errors": [
+                {
+                    "code": "display_page_blueprint_invalid",
+                    "parent_subtitle_id": "S0001",
+                    "reason": "no_complete_normal_font_page_partition",
+                }
+            ],
+            "parents": [],
+            "render_plans": [
+                {
+                    "parent_subtitle_id": "S0001",
+                    "english": cue["original_subtitle"],
+                    "chinese": cue["translated_subtitle"],
+                    "word_start": cue["word_start"],
+                    "word_end": cue["word_end"],
+                    "english_font_size": 52,
+                    "font_fallback": {"used": False},
+                    "editable_seed": True,
+                    "renderable": False,
+                    "pages": [
+                        {
+                            "display_page_id": "S0001.P01",
+                            "word_start": cue["word_start"],
+                            "word_end": cue["word_end"],
+                            "english": cue["original_subtitle"],
+                        }
+                    ],
+                }
+            ],
+        }
+        seed_path = session.artifact_dir / "display-page-translations.json"
+        _write_json(seed_path, seed_artifact)
+        manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
+        manifest["display_page_translation_path"] = str(seed_path)
+        manifest["display_page_translation_sha256"] = file_sha256(seed_path)
+        _write_json(session.manifest_path, manifest)
+
+        before_rows = list(session.to_model_data().values())
+        assert len(before_rows) == 1
+        assert before_rows[0]["display_page_unavailable"] is False
+        assert before_rows[0]["display_page_id"] == "S0001.P01"
+        assert before_rows[0]["translated_subtitle"] == cue["translated_subtitle"]
+        assert before_rows[0]["display_page_chinese_stale"] is True
+        assert before_rows[0]["display_page_chinese_draft_kind"] == (
+            "parent_chinese_fallback"
+        )
+        assert before_rows[0]["display_page_chinese_confirmed"] is False
+        try:
+            session.confirm_display_page_chinese("S0001.P01")
+        except ManualFinalSubtitleEditError as exc:
+            assert "父字幕中文预览" in str(exc)
+        else:
+            raise AssertionError("parent Chinese fallback must not be confirmed as page Chinese")
+
+        result = session.split_parent_into_display_pages(
+            "S0001",
+            2,
+            allow_high_risk=True,
+        )
+        rows = list(session.to_model_data().values())
+
+        assert result["changed"] is True
+        assert len(rows) == 2
+        assert all(row["display_page_unavailable"] is False for row in rows)
+        assert all(
+            row["english_font_size"] in {56, 54, 52}
+            for row in rows
+        )
+        assert " ".join(row["original_subtitle"] for row in rows) == (
+            cue["original_subtitle"]
+        )
 
 
 def test_explicit_manual_parent_split_can_reach_six_pages():
@@ -5678,6 +5916,7 @@ if __name__ == "__main__":
     test_stale_actual_page_import_opens_current_parent_package_without_reusing_old_pages()
     test_stale_actual_page_import_recovers_only_identity_matched_chinese_as_draft()
     test_move_prefix_and_undo_restore_exact_prior_boundary()
+    test_save_rebuilds_short_gap_compensation_after_formal_boundary_move()
     test_undo_redo_round_trip_and_new_edit_truncates_redo_branch()
     test_recovery_draft_round_trip_is_atomic_and_manifest_bound()
     test_merge_only_combines_adjacent_continuous_word_ranges()
@@ -5708,6 +5947,7 @@ if __name__ == "__main__":
     test_tail_trim_preview_is_pure_and_trim_undo_preserves_frozen_prefix()
     test_result_directory_recovers_one_exact_sibling_source_media()
     test_actual_page_tail_trim_keeps_prior_page_and_undo_restores_all()
+    test_tail_trim_reconciles_frozen_page_end_with_final_cue_and_media_cut()
     test_tail_trim_save_materializes_real_audio_and_reuses_exact_decision()
     test_reloaded_tail_trim_undo_restores_original_media_and_full_package()
     test_save_persists_manual_override_and_synthesis_uses_it()
@@ -5725,6 +5965,7 @@ if __name__ == "__main__":
     test_manual_save_upgrades_old_page_layout_without_replanning_pages()
     test_unconfirmed_manual_split_proposals_can_move_boundary_but_save_stays_blocked()
     test_parent_split_allows_explicit_high_risk_manual_fallback()
+    test_unrenderable_parent_seed_can_be_split_without_a_frozen_page_plan()
     test_explicit_manual_parent_split_can_reach_six_pages()
     test_manual_page_soft_override_preserves_hard_page_invariants()
     test_numeric_phrase_moves_as_one_unit_in_both_directions()

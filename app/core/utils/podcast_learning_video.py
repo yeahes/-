@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from openai import OpenAI
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
-from app.core.entities import LLMServiceEnum
+from app.core.llm_service_config import resolve_llm_service_config
 from app.core.subtitle_processor.stable_display_planner import (
     plan_word_page_span_frontier,
     plan_word_page_spans,
@@ -66,54 +66,26 @@ ARTICLE_CARD_CONTAINER = (251, 246, 237, 255)  # #FBF6ED
 
 TEMPLATE_DIR = RESOURCE_PATH / "podcast_template"
 ARTICLE_TEMPLATE_DIR = TEMPLATE_DIR / "article_vocab"
+TEMPLATE_FONT_DIR = TEMPLATE_DIR / "fonts"
+ARTICLE_LOGO_DIR = ARTICLE_TEMPLATE_DIR / "logos"
 BACKGROUND = TEMPLATE_DIR / "background.png"
 AVATAR_SOURCE = TEMPLATE_DIR / "hosts.png"
-FONT_GANTARI = TEMPLATE_DIR / "Gantari-wght.ttf"
-FONT_READEX_MEDIUM = (
-    ARTICLE_TEMPLATE_DIR / "ReadexPro-Medium.ttf"
-    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-Medium.ttf").exists()
-    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
+FONT_GANTARI = TEMPLATE_FONT_DIR / "Gantari-wght.ttf"
+FONT_READEX_MEDIUM = TEMPLATE_FONT_DIR / "ReadexPro-Medium.ttf"
+FONT_READEX_SEMIBOLD = TEMPLATE_FONT_DIR / "ReadexPro-SemiBold.ttf"
+FONT_READEX_BOLD = TEMPLATE_FONT_DIR / "ReadexPro-Bold.ttf"
+FONT_READEX_REGULAR = TEMPLATE_FONT_DIR / "ReadexPro-Regular.ttf"
+FONT_ROBOTO_SLAB_REGULAR = TEMPLATE_FONT_DIR / "RobotoSlab-Regular.ttf"
+FONT_ROBOTO_SLAB_SEMIBOLD = TEMPLATE_FONT_DIR / "RobotoSlab-SemiBold.ttf"
+FONT_SOURCE_SERIF_PRO_SEMIBOLD = TEMPLATE_FONT_DIR / "SourceSerifPro-Semibold.otf"
+FONT_SOURCE_HAN_SERIF_CN_BOLD = TEMPLATE_FONT_DIR / "SourceHanSerifCN-Bold.otf"
+FONT_SOURCE_HAN_SERIF_CN_SEMIBOLD = (
+    TEMPLATE_FONT_DIR / "SourceHanSerifCN-SemiBold.otf"
 )
-FONT_READEX_SEMIBOLD = (
-    ARTICLE_TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
-    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-SemiBold.ttf").exists()
-    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
-)
-FONT_READEX_BOLD = (
-    ARTICLE_TEMPLATE_DIR / "ReadexPro-Bold.ttf"
-    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-Bold.ttf").exists()
-    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
-)
-FONT_READEX_REGULAR = (
-    ARTICLE_TEMPLATE_DIR / "ReadexPro-Regular.ttf"
-    if (ARTICLE_TEMPLATE_DIR / "ReadexPro-Regular.ttf").exists()
-    else TEMPLATE_DIR / "ReadexPro-SemiBold.ttf"
-)
-FONT_HANCHAN_BOLD = (
-    ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicBold.otf"
-    if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicBold.otf").exists()
-    else TEMPLATE_DIR / "ChillYunmoGothicBold.otf"
-)
-FONT_HANCHAN_HEAVY = (
-    ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicHeavy.otf"
-    if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicHeavy.otf").exists()
-    else FONT_HANCHAN_BOLD
-)
-FONT_HANCHAN_MEDIUM = (
-    ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicMedium.otf"
-    if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicMedium.otf").exists()
-    else TEMPLATE_DIR / "ChillYunmoGothicMedium.otf"
-)
-FONT_HANCHAN_REGULAR = (
-    ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicRegular.otf"
-    if (ARTICLE_TEMPLATE_DIR / "ChillYunmoGothicRegular.otf").exists()
-    else TEMPLATE_DIR / "ChillYunmoGothicRegular.otf"
-)
-ARTICLE_LOGO = (
-    ARTICLE_TEMPLATE_DIR / "economist_logo.png"
-    if (ARTICLE_TEMPLATE_DIR / "economist_logo.png").exists()
-    else TEMPLATE_DIR / "economist_logo.png"
-)
+FONT_HANCHAN_BOLD = TEMPLATE_FONT_DIR / "ChillYunmoGothicBold.otf"
+FONT_HANCHAN_HEAVY = TEMPLATE_FONT_DIR / "ChillYunmoGothicHeavy.otf"
+FONT_HANCHAN_MEDIUM = TEMPLATE_FONT_DIR / "ChillYunmoGothicMedium.otf"
+FONT_HANCHAN_REGULAR = TEMPLATE_FONT_DIR / "ChillYunmoGothicRegular.otf"
 ARTICLE_TIP_ICON = ARTICLE_TEMPLATE_DIR / "Vector.png"
 FONT_DIR = Path.home() / "AppData" / "Local" / "Microsoft" / "Windows" / "Fonts"
 FONT_DOUYIN = FONT_DIR / "douyinmeihaoti.otf"
@@ -130,6 +102,18 @@ TITLE_MAX_FONT_SIZE = 70
 TITLE_MIN_FONT_SIZE = 40
 BLUE = (0, 234, 255, 255)
 ARTICLE_BLUE = (47, 111, 237, 255)
+ARTICLE_SUBTITLE_ZH_COLOR = (85, 103, 128, 255)
+ARTICLE_VOCAB_MEANING_COLOR = (42, 63, 93, 255)
+ARTICLE_VOCAB_MEANING_FONT_WEIGHT = 600
+ARTICLE_VOCAB_DETAIL_COLOR = ARTICLE_SUBTITLE_ZH_COLOR
+ARTICLE_VOCAB_DETAIL_FONT_SIZE = 28
+ARTICLE_VOCAB_DETAIL_MIN_FONT_SIZE = 22
+ARTICLE_VOCAB_DETAIL_FONT_WEIGHT = 500
+ARTICLE_VOCAB_PHRASE_MAX_FONT_SIZE = 58
+ARTICLE_VOCAB_PHRASE_SINGLE_LINE_MIN_FONT_SIZE = 46
+ARTICLE_VOCAB_PHRASE_MIN_FONT_SIZE = 32
+ARTICLE_VOCAB_UNBROKEN_WORD_MIN_FONT_SIZE = 20
+ARTICLE_VOCAB_PHRASE_LINE_BALANCE_RATIO = 0.55
 MUTED = (153, 153, 153, 255)
 WHITE = (245, 248, 255, 255)
 TITLE_FILL = (255, 255, 255, 179)
@@ -158,13 +142,22 @@ VOCAB_MIN_CARDS_PER_EPISODE = 3
 VOCAB_MAX_CARDS_PER_EPISODE = 22
 VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 3
 ARTICLE_SUBTITLE_EN_FONT_SIZE = 56
-ARTICLE_SUBTITLE_ZH_FONT_SIZE = 48
-ARTICLE_SUBTITLE_EN_FALLBACK_SIZES = (56, 54, 52, 50)
+ARTICLE_SUBTITLE_ZH_FONT_SIZE = 50
+# Percentage of the rendered font size applied between adjacent glyphs.
+# This is intentionally scoped to the article template subtitle renderer;
+# ordinary subtitles and vocabulary cards keep their existing spacing.
+ARTICLE_SUBTITLE_ZH_LETTER_SPACING = -0.02
+ARTICLE_SUBTITLE_EN_LINE_HEIGHT_MULTIPLIER = 1.22
+# Every newly planned page keeps a 52px floor. The legacy 50px size is accepted
+# only while validating or reopening an already-frozen artifact.
+ARTICLE_SUBTITLE_EN_FALLBACK_SIZES = (56, 54, 52)
 ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES: tuple[int, ...] = ()
+ARTICLE_SUBTITLE_EN_LEGACY_FALLBACK_SIZES: tuple[int, ...] = (50,)
 ARTICLE_SUBTITLE_EN_ALLOWED_SIZES = (
     *ARTICLE_SUBTITLE_EN_FALLBACK_SIZES,
-    *ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES,
+    *ARTICLE_SUBTITLE_EN_LEGACY_FALLBACK_SIZES,
 )
+ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES = ARTICLE_SUBTITLE_EN_FALLBACK_SIZES
 ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE = min(ARTICLE_SUBTITLE_EN_FALLBACK_SIZES)
 ARTICLE_SUBTITLE_EN_MIN_SIZE = min(ARTICLE_SUBTITLE_EN_ALLOWED_SIZES)
 ARTICLE_SUBTITLE_ZH_MIN_SIZE = ARTICLE_SUBTITLE_ZH_FONT_SIZE
@@ -226,6 +219,8 @@ ARTICLE_PAGE_ATOMIC_BOUNDARY_ISSUES = frozenset(
 ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS = 16
 ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS = 14
 ARTICLE_VISUAL_PAGE_PREFERRED_WORDS = 12
+ARTICLE_VISUAL_PAGE_REVIEW_WORDS = 15
+ARTICLE_VISUAL_PAGE_SPLIT_PRIORITY_WORDS = 16
 ARTICLE_VISUAL_PAGE_MIN_WORDS = 4
 ARTICLE_VISUAL_PAGE_MAX_PAGES = 4
 # Automatic planning stays conservative. An explicit editor action may use
@@ -328,6 +323,32 @@ ARTICLE_PAGE_CONTINUATION_START_WORDS = frozenset(
     | {"and", "but", "nor", "or", "so", "yet"}
 )
 MANUAL_DRAFT_PAGE_SCHEMA_VERSION = 1
+# A display page may begin or end between ordinary clauses, but not inside a
+# multiword work/person/place name.  This is deliberately inferred from the
+# surface form rather than maintained as a sample-specific title list: title
+# case, numeric tokens, and the small set of lower-case title connectors are
+# enough to cover forms such as ``Escape from the 21 st Century`` while leaving
+# coordinated titles (``Journey to the West and Escape ...``) separable.
+ARTICLE_TITLE_CONNECTOR_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "of",
+        "on",
+        "onto",
+        "the",
+        "to",
+        "with",
+    }
+)
+ARTICLE_TITLE_NUMERIC_SUFFIXES = frozenset({"s", "st", "nd", "rd", "th"})
 ARTICLE_PAGE_OBJECT_DETERMINERS = frozenset(
     {"a", "an", "the", "this", "that", "these", "those", "my", "your", "our", "their", "its"}
 )
@@ -356,6 +377,9 @@ ARTICLE_PAGE_COMPLETE_WH_CLAUSE_START_WORDS = frozenset(
         "whose",
         "why",
     }
+)
+ARTICLE_PAGE_COMPLETE_SUBJECT_START_WORDS = frozenset(
+    {"he", "i", "it", "she", "they", "we", "you"}
 )
 ENGLISH_VISUAL_MODIFIER_SUFFIXES = (
     "able", "al", "ant", "ary", "ed", "ent", "ful", "ic", "ical", "ible",
@@ -631,8 +655,18 @@ class RenderStructuralOverflowError(RuntimeError):
 
     code = "render_structural_overflow"
 
-    def __init__(self, errors: list[dict]):
+    def __init__(
+        self,
+        errors: list[dict],
+        *,
+        partial_blueprint: Mapping[str, object] | None = None,
+    ):
         self.errors = list(errors)
+        self.partial_blueprint = (
+            copy.deepcopy(dict(partial_blueprint))
+            if isinstance(partial_blueprint, Mapping)
+            else {}
+        )
         details = "; ".join(
             f"cue={error.get('cue_index')} reason={error.get('reason')}"
             for error in self.errors
@@ -756,6 +790,23 @@ def article_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
     return font(FONT_GANTARI, size, weight)
 
 
+def article_subtitle_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
+    """Return the article subtitle face without changing card/title typography."""
+    size = acx(size)
+    if weight >= 600 and FONT_ROBOTO_SLAB_SEMIBOLD.exists():
+        return font(FONT_ROBOTO_SLAB_SEMIBOLD, size, weight)
+    if FONT_ROBOTO_SLAB_REGULAR.exists():
+        return font(FONT_ROBOTO_SLAB_REGULAR, size, weight)
+    return article_en_font(round(size / ARTICLE_SCALE_X), weight)
+
+
+def article_vocab_phrase_font(size: int) -> ImageFont.FreeTypeFont:
+    """Return the bundled Source Serif Pro SemiBold face for card expressions."""
+    if FONT_SOURCE_SERIF_PRO_SEMIBOLD.exists():
+        return font(FONT_SOURCE_SERIF_PRO_SEMIBOLD, acx(size), 600)
+    return article_subtitle_en_font(size, 600)
+
+
 def article_cjk_font(size: int, weight: int = 700) -> ImageFont.FreeTypeFont:
     size = acx(size)
     if weight >= 800 and FONT_HANCHAN_HEAVY.exists():
@@ -767,6 +818,29 @@ def article_cjk_font(size: int, weight: int = 700) -> ImageFont.FreeTypeFont:
     if FONT_HANCHAN_REGULAR.exists():
         return font(FONT_HANCHAN_REGULAR, size, weight)
     return font(FONT_DOUYIN if FONT_DOUYIN.exists() else FONT_YAHEI, size)
+
+
+def article_source_han_serif_cn_bold_font(size: int) -> ImageFont.FreeTypeFont:
+    """Return the bundled Source Han Serif CN Bold face for opening titles."""
+    if FONT_SOURCE_HAN_SERIF_CN_BOLD.exists():
+        return font(FONT_SOURCE_HAN_SERIF_CN_BOLD, acx(size), 700)
+    return article_cjk_font(size, 700)
+
+
+def article_vocab_meaning_font(size: int) -> ImageFont.FreeTypeFont:
+    """Return the bundled 600-weight serif face for vocabulary meanings."""
+    if FONT_SOURCE_HAN_SERIF_CN_SEMIBOLD.exists():
+        return font(
+            FONT_SOURCE_HAN_SERIF_CN_SEMIBOLD,
+            acx(size),
+            ARTICLE_VOCAB_MEANING_FONT_WEIGHT,
+        )
+    return article_source_han_serif_cn_bold_font(size)
+
+
+def article_vocab_detail_font(size: int) -> ImageFont.FreeTypeFont:
+    """Return the medium-weight face used by vocabulary explanations."""
+    return article_cjk_font(size, ARTICLE_VOCAB_DETAIL_FONT_WEIGHT)
 
 
 def article_mixed_font(size: int, weight: int = 400) -> ImageFont.FreeTypeFont:
@@ -789,6 +863,28 @@ def text_h(draw: ImageDraw.ImageDraw, text: str, fnt: ImageFont.FreeTypeFont) ->
         return 0
     box = draw.textbbox((0, 0), text, font=fnt)
     return box[3] - box[1]
+
+
+def article_subtitle_zh_letter_spacing_px(
+    fnt: ImageFont.FreeTypeFont,
+) -> float:
+    """Return article subtitle letter spacing in rendered pixels."""
+    return float(fnt.size) * ARTICLE_SUBTITLE_ZH_LETTER_SPACING
+
+
+def article_subtitle_zh_text_w(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+) -> int:
+    """Measure article Chinese subtitles including negative glyph spacing."""
+    width = text_w(draw, text, fnt)
+    if len(text) <= 1:
+        return width
+    return max(
+        0,
+        round(width + article_subtitle_zh_letter_spacing_px(fnt) * (len(text) - 1)),
+    )
 
 
 def parse_ts(ts: str) -> float:
@@ -1321,26 +1417,8 @@ def build_vocab_semantic_groups(cues: list[Cue]) -> list[VocabSemanticGroup]:
 
 
 def current_llm_config() -> tuple[str, str, str]:
-    from app.common.config import cfg
-
-    service = cfg.llm_service.value
-    if service == LLMServiceEnum.OPENAI:
-        return cfg.openai_api_base.value, cfg.openai_api_key.value, cfg.openai_model.value
-    if service == LLMServiceEnum.SILICON_CLOUD:
-        return cfg.silicon_cloud_api_base.value, cfg.silicon_cloud_api_key.value, cfg.silicon_cloud_model.value
-    if service == LLMServiceEnum.DEEPSEEK:
-        return cfg.deepseek_api_base.value, cfg.deepseek_api_key.value, cfg.deepseek_model.value
-    if service == LLMServiceEnum.OLLAMA:
-        return cfg.ollama_api_base.value, cfg.ollama_api_key.value, cfg.ollama_model.value
-    if service == LLMServiceEnum.LM_STUDIO:
-        return cfg.lm_studio_api_base.value, cfg.lm_studio_api_key.value, cfg.lm_studio_model.value
-    if service == LLMServiceEnum.GEMINI:
-        return cfg.gemini_api_base.value, cfg.gemini_api_key.value, cfg.gemini_model.value
-    if service == LLMServiceEnum.CHATGLM:
-        return cfg.chatglm_api_base.value, cfg.chatglm_api_key.value, cfg.chatglm_model.value
-    if service == LLMServiceEnum.PUBLIC:
-        return cfg.public_api_base.value, cfg.public_api_key.value, cfg.public_model.value
-    return "", "", ""
+    llm_runtime = resolve_llm_service_config()
+    return llm_runtime.base_url, llm_runtime.api_key, llm_runtime.model
 
 
 def extract_json_array(text: str):
@@ -2469,7 +2547,7 @@ def _article_line_balance_ratio(
 ) -> float:
     if len(lines) != 2:
         return 1.0
-    font = article_en_font(int(font_size), 600)
+    font = article_subtitle_en_font(int(font_size), 600)
     widths = [text_w(draw, str(line), font) for line in lines]
     widest = max(widths, default=0)
     return min(widths) / widest if widest else 1.0
@@ -2526,8 +2604,40 @@ def _caption_complete_page_clause_start(words: list[str], split: int) -> bool:
         in (
             ARTICLE_PAGE_COMPLETE_CONTINUATION_START_WORDS
             | ARTICLE_PAGE_COMPLETE_WH_CLAUSE_START_WORDS
+            | ARTICLE_PAGE_COMPLETE_SUBJECT_START_WORDS
         )
         and _caption_has_terminal_completion(remaining)
+    )
+
+
+def _caption_complete_clausal_subject_before_copula(
+    words: list[str],
+    split: int,
+) -> bool:
+    """Recognize a complete clausal subject before a copular predicate."""
+    if split <= 0 or split >= len(words):
+        return False
+    left = [
+        re.sub(r"[^A-Za-z']", "", word).lower()
+        for word in words[:split]
+    ]
+    while left and left[0] in {"and", "but", "exactly", "so", "well"}:
+        left.pop(0)
+    clausal_markers = {
+        "that", "what", "whether", "which", "who", "whom", "whose",
+    }
+    subject_pronouns = ARTICLE_PAGE_COMPLETE_SUBJECT_START_WORDS | {
+        "me", "him", "her", "them", "us",
+    }
+    return bool(
+        len(left) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and (
+            left[0] in ARTICLE_PAGE_COMPLETE_WH_CLAUSE_START_WORDS
+            or any(word in clausal_markers for word in left[1:])
+        )
+        and left[-1]
+        and left[-1] not in LINE_BREAK_AVOID_AFTER_WORDS
+        and left[-1] not in subject_pronouns
     )
 
 
@@ -3009,7 +3119,7 @@ def fit_article_en_font(
     font_size: int = ARTICLE_SUBTITLE_EN_FONT_SIZE,
 ) -> ImageFont.FreeTypeFont:
     """Return the explicit font chosen by the frozen page plan."""
-    return article_en_font(int(font_size), 600)
+    return article_subtitle_en_font(int(font_size), 600)
 
 
 def article_visual_page_count(cue: Cue | None) -> int:
@@ -3242,7 +3352,7 @@ def _article_fixed_english_lines(
     # fixed-word contract. Word count now affects ranking only; it cannot
     # reject a page that fits the measured two-line region.
     _ = enforce_word_limit
-    fnt = article_en_font(int(font_size), 600)
+    fnt = article_subtitle_en_font(int(font_size), 600)
     score_intrinsic = intrinsic_penalty
     if score_intrinsic is None and relax_same_screen_syntax:
         score_intrinsic = _article_intrinsic_line_break_penalty
@@ -3344,10 +3454,10 @@ def _article_fixed_english_lines(
                     ((layout_tier, layout_score, width), list(lines))
                 )
             if candidates:
-                # Two-word lines and a third 50px line are last-resort
-                # fallbacks. Every two-line width is exhausted before the
-                # three-line pass. The existing 50px emergency syntax review
-                # remains unchanged and is still audited downstream.
+                # Two-word lines are a last-resort wrapping candidate. New
+                # automatic pages never use a third line or 50px; legacy
+                # artifacts are validated through the explicit compatibility
+                # path instead of being regenerated here.
                 return min(candidates, key=lambda item: item[0])[1]
     return []
 
@@ -3357,7 +3467,7 @@ def _article_english_layout_width(
     lines: Sequence[str],
     font_size: int,
 ) -> int:
-    fnt = article_en_font(font_size, 600)
+    fnt = article_subtitle_en_font(font_size, 600)
     measured = max((text_w(draw, line, fnt) for line in lines), default=0)
     for width in (
         ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
@@ -3369,12 +3479,90 @@ def _article_english_layout_width(
     return ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH
 
 
+def _article_wrap_zh_by_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap article Chinese subtitles using the same spacing as rendering."""
+    lines: list[str] = []
+    current = ""
+    for char in text:
+        candidate = current + char
+        if current and article_subtitle_zh_text_w(draw, candidate, fnt) > max_width:
+            lines.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def wrap_article_zh(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap article Chinese text with punctuation-aware negative letter spacing."""
+    text = text.strip()
+    if not text:
+        return []
+    if article_subtitle_zh_text_w(draw, text, fnt) <= max_width:
+        return [text]
+
+    comma_positions = [m.end() for m in re.finditer(r"[，,]", text)]
+    if comma_positions:
+        midpoint = len(text) / 2
+        split_at = min(comma_positions, key=lambda pos: abs(pos - midpoint))
+        left = text[:split_at].strip()
+        right = text[split_at:].strip()
+        if len(left) >= 6 and len(right) >= 6:
+            lines: list[str] = []
+            for part in (left, right):
+                if article_subtitle_zh_text_w(draw, part, fnt) <= max_width:
+                    lines.append(part)
+                else:
+                    lines.extend(
+                        _article_wrap_zh_by_width(draw, part, fnt, max_width)
+                    )
+            return lines
+
+    return _article_wrap_zh_by_width(draw, text, fnt, max_width)
+
+
+def draw_article_zh_line(
+    draw: ImageDraw.ImageDraw,
+    center_x: int,
+    y: int,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    fill,
+) -> None:
+    """Draw one centered article Chinese line with per-glyph letter spacing."""
+    if not text:
+        return
+    advances = [draw.textlength(char, font=fnt) for char in text]
+    spacing = article_subtitle_zh_letter_spacing_px(fnt)
+    total_advance = sum(advances) + spacing * max(0, len(text) - 1)
+    cursor = float(center_x) - total_advance / 2
+    for char, advance in zip(text, advances):
+        draw.text((round(cursor), y), char, font=fnt, fill=fill, anchor="la")
+        cursor += advance + spacing
+
+
 def _article_fixed_chinese_lines(draw: ImageDraw.ImageDraw, text: str) -> list[str]:
     if not text:
         return []
     fnt = article_cjk_font(ARTICLE_SUBTITLE_ZH_FONT_SIZE, 700)
-    lines = wrap_zh(draw, text, fnt, acx(ARTICLE_SUBTITLE_ZH_WIDTH))
-    if len(lines) > 2 or any(text_w(draw, line, fnt) > acx(ARTICLE_SUBTITLE_ZH_WIDTH) for line in lines):
+    lines = wrap_article_zh(draw, text, fnt, acx(ARTICLE_SUBTITLE_ZH_WIDTH))
+    if len(lines) > 2 or any(
+        article_subtitle_zh_text_w(draw, line, fnt)
+        > acx(ARTICLE_SUBTITLE_ZH_WIDTH)
+        for line in lines
+    ):
         return []
     return lines
 
@@ -3390,19 +3578,22 @@ def _article_preferred_readability_page_count(
     """Choose page count from display load, before evaluating break quality."""
     if not words:
         return 1
-    english_font = article_en_font(font_size, 600)
+    english_font = article_subtitle_en_font(font_size, 600)
     english_pixels = text_w(draw, " ".join(words), english_font)
     english_capacity = max(1, 2 * acx(ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH))
     english_pixel_pages = max(1, math.ceil(english_pixels / english_capacity))
-    english_word_pages = max(
-        1,
-        math.ceil(len(words) / ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS),
-    )
+    if len(words) <= ARTICLE_VISUAL_PAGE_REVIEW_WORDS:
+        english_word_pages = 1
+    else:
+        english_word_pages = max(
+            2,
+            math.ceil(len(words) / ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS),
+        )
 
     chinese_pages = 1
     if chinese:
         chinese_font = article_cjk_font(ARTICLE_SUBTITLE_ZH_FONT_SIZE, 700)
-        chinese_pixels = text_w(draw, chinese, chinese_font)
+        chinese_pixels = article_subtitle_zh_text_w(draw, chinese, chinese_font)
         chinese_capacity = max(1, 2 * acx(ARTICLE_SUBTITLE_ZH_WIDTH))
         chinese_pages = max(1, math.ceil(chinese_pixels / chinese_capacity))
 
@@ -3428,6 +3619,120 @@ def _article_preferred_readability_page_count(
             duration_pages,
         ),
     )
+
+
+def _article_title_entity_spans(words: Sequence[str]) -> tuple[tuple[int, int], ...]:
+    """Infer multiword title/name spans from stable surface tokens.
+
+    The display planner receives frozen words, not a model-generated title
+    list.  A conservative surface heuristic is therefore preferable to a
+    growing allowlist: a span must contain at least two title-case/numeric
+    components and a lower-case title connector, a numeric token, or adjacent
+    title-case components.  ``and``/``or`` deliberately terminate a span so
+    two coordinated works can still be separated between titles.
+    """
+    if not words:
+        return ()
+
+    def surface(index: int) -> str:
+        return str(words[index] or "").strip("\"'`([{<")
+
+    def token(index: int) -> str:
+        return re.sub(r"[^A-Za-z0-9']", "", surface(index))
+
+    def lower(index: int) -> str:
+        return token(index).lower()
+
+    def is_title_or_numeric(index: int) -> bool:
+        value = token(index)
+        return bool(
+            value
+            and (
+                re.fullmatch(r"[A-Z][A-Za-z0-9']*", value)
+                or re.fullmatch(r"\d+(?:\.\d+)?", value)
+            )
+        )
+
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(words):
+        if not is_title_or_numeric(index):
+            index += 1
+            continue
+        start = index
+        components = 1
+        has_connector = False
+        has_numeric = bool(re.fullmatch(r"\d+(?:\.\d+)?", token(index)))
+        cursor = index + 1
+        while cursor < len(words):
+            current = lower(cursor)
+            if (
+                current in ARTICLE_TITLE_NUMERIC_SUFFIXES
+                and re.fullmatch(r"\d+(?:\.\d+)?", token(cursor - 1))
+            ):
+                components += 1
+                has_numeric = True
+                cursor += 1
+                continue
+            if is_title_or_numeric(cursor):
+                components += 1
+                has_numeric = has_numeric or bool(
+                    re.fullmatch(r"\d+(?:\.\d+)?", token(cursor))
+                )
+                cursor += 1
+                continue
+            if current in ARTICLE_TITLE_CONNECTOR_WORDS:
+                lookahead = cursor + 1
+                while (
+                    lookahead < len(words)
+                    and lower(lookahead) in ARTICLE_TITLE_CONNECTOR_WORDS
+                ):
+                    lookahead += 1
+                if lookahead < len(words) and is_title_or_numeric(lookahead):
+                    has_connector = True
+                    cursor = lookahead
+                    continue
+            break
+        starts_with_numeric = bool(
+            re.fullmatch(r"\d+(?:\.\d+)?", token(start))
+        )
+        if cursor > start + 1 and (
+            has_connector
+            or (not starts_with_numeric and (has_numeric or components >= 3))
+        ):
+            spans.append((start, cursor))
+            index = cursor
+        else:
+            index += 1
+    return tuple(spans)
+
+
+def _article_boundary_inside_title_entity(
+    words: Sequence[str],
+    split: int,
+) -> bool:
+    """Return whether a page cut falls inside an inferred title/name span."""
+    return any(start < split < end for start, end in _article_title_entity_spans(words))
+
+
+def _article_boundary_between_title_entities(
+    words: Sequence[str],
+    split: int,
+) -> bool:
+    """Return whether a cut would strand the join between two coordinated titles."""
+    spans = _article_title_entity_spans(words)
+    for left_start, left_end in spans:
+        if left_end != split or split >= len(words):
+            continue
+        connector = re.sub(r"[^A-Za-z]", "", str(words[split] or "")).lower()
+        if connector not in {"and", "or"}:
+            continue
+        if any(
+            right_start == split + 1 and right_end - right_start >= 3
+            for right_start, right_end in spans
+        ):
+            return True
+    return False
 
 
 def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
@@ -3464,6 +3769,10 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         and previous in {"and", "but", "nor", "or", "so", "yet"}
     ):
         hard_issues.add("dangling_coordinator_page_split")
+    if _article_boundary_inside_title_entity(words, split):
+        hard_issues.add("protected_work_title_split")
+    if _article_boundary_between_title_entities(words, split):
+        hard_issues.add("protected_work_title_join_split")
 
     pause_ms = item.get("pause_ms")
     if pause_ms is None and len(cue.word_timing) == len(words):
@@ -3485,6 +3794,21 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         words,
         split,
     )
+    title_entity_end = any(
+        end == split and end - start >= 3
+        for start, end in _article_title_entity_spans(words)
+    )
+    title_entity_join = _article_boundary_between_title_entities(words, split)
+    complete_title_restart = bool(
+        title_entity_end
+        and not title_entity_join
+        and min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and following not in (
+            LINE_BREAK_AVOID_BEFORE_WORDS
+            | ARTICLE_PAGE_PHRASE_START_WORDS
+        )
+        and not _caption_boundary_has_stranded_dependency(words, split)
+    )
     complete_wh_clause_start = bool(
         following in ARTICLE_PAGE_COMPLETE_WH_CLAUSE_START_WORDS
         and complete_page_clause_start
@@ -3495,6 +3819,13 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
             "short_verb_complement_split",
             "verb_complement_split",
         }
+    )
+    complete_content_clause_start = bool(
+        following == "that"
+        and complete_page_clause_start
+        and min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and issue_codes
+        and issue_codes <= {"object_content_clause_split"}
     )
     complete_clause_restart = bool(
         complete_page_clause_start
@@ -3522,6 +3853,15 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         and int(pause_ms) >= ARTICLE_PAGE_STRONG_PAUSE_REVIEW_MS
         and issue_codes
         and issue_codes <= {"coordinated_constituent_split"}
+    )
+    punctuated_coordinated_gerund_restart = bool(
+        following.endswith("ing")
+        and punctuation_boundary
+        and min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and _caption_has_terminal_completion(words[split:])
+        and pause_ms is not None
+        and int(pause_ms) >= ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS
+        and issue_codes == {"coordinated_constituent_split"}
     )
     balanced_predicate_restart = bool(
         min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
@@ -3567,6 +3907,10 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         classification = "review"
         confidence = "medium"
         relaxation_reason = "complete_wh_clause_start"
+    elif complete_content_clause_start:
+        classification = "review"
+        confidence = "medium"
+        relaxation_reason = "complete_content_clause_start"
     elif strong_pause_reviews_clause_boundary:
         classification = "review"
         confidence = "high"
@@ -3574,6 +3918,7 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
     elif (
         complete_clause_restart
         or coordinated_phrase_restart
+        or punctuated_coordinated_gerund_restart
         or balanced_predicate_restart
     ):
         classification = "review"
@@ -3581,8 +3926,16 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         relaxation_reason = (
             "balanced_predicate_restart"
             if balanced_predicate_restart
-            else "complete_clause_restart"
+            else (
+                "punctuated_coordinated_gerund_restart"
+                if punctuated_coordinated_gerund_restart
+                else "complete_clause_restart"
+            )
         )
+    elif complete_title_restart:
+        classification = "review"
+        confidence = "medium"
+        relaxation_reason = "complete_title_restart"
     elif atomic:
         classification = "hard"
         confidence = "high"
@@ -3637,6 +3990,7 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
             classification == "review"
             and atomic
             and not complete_wh_clause_start
+            and not complete_content_clause_start
             and not punctuation_boundary
         ),
         "relaxation_reason": relaxation_reason,
@@ -3651,7 +4005,12 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
             or balanced_predicate_restart
         ),
         "complete_page_clause_start": complete_page_clause_start,
+        "complete_content_clause_start": complete_content_clause_start,
+        "complete_title_restart": complete_title_restart,
         "balanced_predicate_restart": balanced_predicate_restart,
+        "punctuated_coordinated_gerund_restart": (
+            punctuated_coordinated_gerund_restart
+        ),
         "tight_complete_phrase_start": tight_complete_phrase_start,
     }
 
@@ -3680,23 +4039,6 @@ def _article_line_boundary_penalty(cue: Cue, split: int) -> int:
     }.get(str(decision.get("confidence") or "low"), 0)
 
 
-def _article_page_planning_line_boundary_penalty(cue: Cue, split: int) -> int:
-    """Retain v18 line feasibility while page spans are being selected."""
-    decision = _article_display_boundary_decision(cue, split)
-    issue_codes = set(decision.get("issue_codes") or [])
-    if "verb_preposition_complement_split" in issue_codes:
-        return CAPTION_HARD_BREAK_PENALTY
-    if decision.get("classification") == "hard":
-        return DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY
-    if decision.get("classification") != "review":
-        return 0
-    return {
-        "high": DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY,
-        "medium": DISPLAY_PAGE_REVIEW_PENALTY,
-        "low": DISPLAY_PAGE_LOW_CONFIDENCE_REVIEW_PENALTY,
-    }.get(str(decision.get("confidence") or "low"), 0)
-
-
 def _article_forced_continuation_decision(
     cue: Cue,
     words: list[str],
@@ -3714,9 +4056,9 @@ def _article_forced_continuation_decision(
         return decision
     issue_codes = set(decision.get("issue_codes") or [])
     reviewable = {
-        "atomic_of_complement_split",
         "clause_introducer_split",
         "dependency_phrase_entrance_split",
+        "object_attached_modifier_split",
         "short_verb_complement_split",
         "stranded_leading_complement_split",
         "verb_complement_split",
@@ -3734,11 +4076,8 @@ def _article_forced_continuation_decision(
         and next_word not in LINE_BREAK_AVOID_BEFORE_WORDS
     )
     forced_subject_predicate = bool(
-        following
-        in {
-            "am", "are", "can", "could", "had", "has", "have", "is",
-            "may", "might", "must", "should", "was", "were", "will", "would",
-        }
+        following in {"am", "are", "is", "was", "were"}
+        and _caption_complete_clausal_subject_before_copula(words, split)
         and split >= ARTICLE_VISUAL_PAGE_MIN_WORDS
         and len(words) - split >= ARTICLE_VISUAL_PAGE_MIN_WORDS
         and issue_codes
@@ -3754,15 +4093,29 @@ def _article_forced_continuation_decision(
             {
                 "high_confidence_modifier_head_split",
                 "protected_syntax_cut",
+                "relative_clause_subject_verb_split",
             }
         )
     complete_phrase = _caption_phrase_start_is_complete(words, split)
     complete_continuation = _caption_complete_continuation_clause(words[split:])
+    predicate_phrase_issues = {
+        "predicate_attached_continuation_split",
+        "predicate_complement_chain_split",
+    }
+    complete_predicate_phrase = bool(
+        complete_phrase
+        and issue_codes & predicate_phrase_issues
+        and issue_codes
+        <= reviewable | predicate_phrase_issues
+    )
     if (
         forced_subject_predicate
         or (
             issue_codes
-            and issue_codes <= reviewable
+            and (
+                issue_codes <= reviewable
+                or complete_predicate_phrase
+            )
             and (complete_phrase or complete_continuation or likely_infinitive_start)
             and (
                 not _caption_boundary_has_stranded_dependency(words, split)
@@ -3804,6 +4157,9 @@ def _article_forced_continuation_decision(
             "forced_subject_predicate": forced_subject_predicate,
             "forced_complete_to_phrase": bool(
                 likely_infinitive_start and not forced_subject_predicate
+            ),
+            "forced_complete_predicate_phrase": bool(
+                complete_predicate_phrase and not forced_subject_predicate
             ),
         }
     return decision
@@ -3942,7 +4298,13 @@ def _article_manual_override_break_rank(
 
     decision = _article_display_boundary_decision(cue, split)
     score = abs(split - target_words) * 240
-    score += max(0, _article_visual_break_penalty(words, split))
+    # ``allow_hard_boundary`` is an explicit editor action: the caller has
+    # already accepted that no grammar-safe automatic cut exists.  Preserve
+    # punctuation/pause preferences, but do not let the automatic hard-break
+    # penalty (often 12,000+) force the suggestion to the final ``N-1 + 1``
+    # split.  A bounded presentation cost keeps natural punctuation ahead of
+    # arbitrary cuts while allowing the requested page counts to balance.
+    score += min(max(0, _article_visual_break_penalty(words, split)), 900)
     if len(word_timing) == len(words):
         pause_ms = max(
             0,
@@ -4000,6 +4362,8 @@ def _article_page_boundary_risk(decision: Mapping, cost: int | float) -> int:
         # substantially safer page restart only when the left page has not
         # stranded the governing verb from that complement.
         risk = min(risk, 2)
+    elif decision.get("forced_complete_predicate_phrase"):
+        risk = min(risk, 2)
     elif decision.get("forced_display_continuation"):
         risk = max(risk, 4)
     if decision.get("forced_subject_predicate"):
@@ -4023,6 +4387,8 @@ ARTICLE_BOUNDARY_ISSUE_LABELS_ZH = {
     "short_verb_complement_split": "动词和补语被拆开",
     "verb_complement_split": "动词和补语被拆开",
     "atomic_of_complement_split": "of 固定补语被拆开",
+    "protected_work_title_split": "多词作品名或专名被拆开",
+    "protected_work_title_join_split": "并列作品名连接处被拆开",
     "protected_syntax_cut": "命中受保护的语法结构",
     "forced_complete_continuation_page_split": "没有完全安全的切点，使用了受控兜底",
     "forced_subject_predicate_page_split": "没有完全安全的切点，在主谓附近使用了受控兜底",
@@ -4094,6 +4460,13 @@ def _article_page_break_is_forbidden(
         punctuation_boundary and complete_page_clause_start
     )
     issue_codes = set((boundary_decision or {}).get("issue_codes") or [])
+    complete_preposition_gerund_page = bool(
+        (boundary_decision or {}).get("forced_complete_predicate_phrase")
+        and following in {"by", "from", "into"}
+        and split + 1 < len(words)
+        and re.sub(r"[^A-Za-z']", "", words[split + 1]).lower().endswith("ing")
+        and _caption_has_terminal_completion(words[split:])
+    )
     pause_ms = (boundary_decision or {}).get("pause_ms")
     strong_pause_evidence = bool(
         (boundary_decision or {}).get("strong_pause_evidence")
@@ -4131,16 +4504,25 @@ def _article_page_break_is_forbidden(
         and following in ARTICLE_PAGE_PHRASE_START_WORDS
         and pause_ms is not None
         and int(pause_ms) <= ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS
-        and issue_codes
-        & {
-            "dependency_phrase_entrance_split",
-            "object_attached_modifier_split",
-            "verb_preposition_complement_split",
-        }
+        and (
+            issue_codes
+            & {
+                "object_attached_modifier_split",
+                "verb_preposition_complement_split",
+            }
+            or (boundary_decision or {}).get("classification") == "hard"
+        )
+        and not complete_preposition_gerund_page
     ):
         # Parser-backed tight complements remain atomic even when the relaxed
         # continuation planner is evaluating an otherwise complete phrase.
         return True
+    if (boundary_decision or {}).get("complete_title_restart"):
+        # A complete named/work span is an explicit visual unit.  Once it has
+        # ended, allow the following independent phrase to start a page even
+        # when the parser reports a broader subject/predicate warning at the
+        # same word boundary.
+        return False
     if (boundary_decision or {}).get("forced_display_continuation"):
         return False
     if (
@@ -4264,7 +4646,7 @@ def _article_page_span_balance_cost(
     target_words = len(words) / page_count
     word_delta = (span_word_count - target_words) / max(target_words, 1.0)
 
-    fnt = article_en_font(font_size, 600)
+    fnt = article_subtitle_en_font(font_size, 600)
     total_pixels = text_w(draw, " ".join(words), fnt)
     span_pixels = text_w(draw, " ".join(words[start:end]), fnt)
     target_pixels = total_pixels / page_count
@@ -4367,15 +4749,14 @@ def _partition_article_english_pages(
         lines = (
             list(span_layout(start, end, font_size, paginated))
             if span_layout is not None
-            else _article_fixed_english_lines(
+            else _article_same_screen_english_lines(
                 draw,
-                " ".join(page_words),
-                font_size=font_size,
+                cue,
+                words,
+                start,
+                end,
+                font_size,
                 enforce_word_limit=paginated,
-                boundary_penalty=lambda local_split: _article_page_planning_line_boundary_penalty(
-                    cue,
-                    start + local_split,
-                ),
             )
         )
         if allow_manual_override:
@@ -4500,33 +4881,61 @@ def _schedule_article_page_boundaries(
     return boundaries, ""
 
 
+def _article_same_screen_english_lines(
+    draw: ImageDraw.ImageDraw,
+    cue: Cue,
+    words: Sequence[str],
+    start: int,
+    end: int,
+    font_size: int,
+    *,
+    enforce_word_limit: bool = True,
+) -> list[str]:
+    """Resolve one visible page through the sole same-screen wrap contract."""
+    return _article_fixed_english_lines(
+        draw,
+        " ".join(words[start:end]),
+        font_size=int(font_size),
+        enforce_word_limit=enforce_word_limit,
+        boundary_penalty=lambda split, base=start: (
+            _article_line_boundary_penalty(cue, base + split)
+        ),
+        relax_same_screen_syntax=True,
+        intrinsic_penalty=lambda page_words, split, base=start: (
+            _article_same_screen_intrinsic_line_break_penalty(
+                cue,
+                page_words,
+                split,
+                base + split,
+            )
+        ),
+    )
+
+
 def _article_final_page_layout(
     draw: ImageDraw.ImageDraw,
     cue: Cue,
     words: Sequence[str],
     start: int,
     end: int,
+    *,
+    allow_legacy_fallback: bool = False,
 ) -> tuple[int, list[str]] | None:
     """Keep the preferred font whenever the page fits within two lines."""
-    text = " ".join(words[start:end])
     return _article_choose_page_layout_by_font(
         draw,
-        lambda font_size: _article_fixed_english_lines(
+        lambda font_size: _article_same_screen_english_lines(
             draw,
-            text,
-            font_size=font_size,
-            boundary_penalty=lambda split, base=start: (
-                _article_line_boundary_penalty(cue, base + split)
-            ),
-            relax_same_screen_syntax=True,
-            intrinsic_penalty=lambda page_words, split, base=start: (
-                _article_same_screen_intrinsic_line_break_penalty(
-                    cue,
-                    page_words,
-                    split,
-                    base + split,
-                )
-            ),
+            cue,
+            words,
+            start,
+            end,
+            font_size,
+        ),
+        font_sizes=(
+            ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
+            if allow_legacy_fallback
+            else ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES
         ),
     )
 
@@ -4538,28 +4947,25 @@ def _article_planning_final_page_layout(
     start: int,
     end: int,
 ) -> tuple[int, list[str]] | None:
-    """Use the v18 feasibility contract while selecting page boundaries."""
-    text = " ".join(words[start:end])
-    return _article_choose_page_layout_by_font(
+    """Use the same same-screen layout contract as the frozen renderer."""
+    return _article_final_page_layout(
         draw,
-        lambda font_size: _article_fixed_english_lines(
-            draw,
-            text,
-            font_size=font_size,
-            boundary_penalty=lambda split, base=start: (
-                _article_page_planning_line_boundary_penalty(cue, base + split)
-            ),
-        ),
+        cue,
+        words,
+        start,
+        end,
     )
 
 
 def _article_choose_page_layout_by_font(
     draw: ImageDraw.ImageDraw,
     layout_for_font: Callable[[int], list[str]],
+    *,
+    font_sizes: Sequence[int] = ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES,
 ) -> tuple[int, list[str]] | None:
     """Keep 56px unless it is severely imbalanced and a smaller size is one line."""
     first: tuple[int, list[str]] | None = None
-    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+    for font_size in font_sizes:
         lines = layout_for_font(int(font_size))
         if not lines:
             continue
@@ -4603,13 +5009,22 @@ def _finalize_article_same_screen_layout(
     for page in pages:
         start = int(page["word_start"])
         end = int(page["word_end"]) + 1
-        layout = _article_final_page_layout(draw, cue, words, start, end)
-        if layout is None:
-            return finalized
-        font_size, lines = layout
         previous_font_size = int(
             page.get("english_font_size") or ARTICLE_SUBTITLE_EN_FONT_SIZE
         )
+        layout = _article_final_page_layout(
+            draw,
+            cue,
+            words,
+            start,
+            end,
+            allow_legacy_fallback=(
+                previous_font_size in ARTICLE_SUBTITLE_EN_LEGACY_FALLBACK_SIZES
+            ),
+        )
+        if layout is None:
+            return finalized
+        font_size, lines = layout
         previous_lines = [
             " ".join(str(line or "").split())
             for line in page.get("en_lines") or []
@@ -4839,17 +5254,14 @@ def _build_article_english_page_plan(
         key = (start, end, font_size, paginated)
         if key not in layout_cache:
             layout_cache[key] = tuple(
-                _article_fixed_english_lines(
+                _article_same_screen_english_lines(
                     draw,
-                    " ".join(words[start:end]),
-                    font_size=font_size,
+                    cue,
+                    words,
+                    start,
+                    end,
+                    font_size,
                     enforce_word_limit=paginated,
-                    boundary_penalty=lambda local_split, base=start: (
-                        _article_page_planning_line_boundary_penalty(
-                            cue,
-                            base + local_split,
-                        )
-                    ),
                 )
             )
         return layout_cache[key]
@@ -4881,6 +5293,14 @@ def _build_article_english_page_plan(
             False,
         )
     )
+    automatic_floor_static_lines = list(
+        span_layout(
+            0,
+            len(words),
+            ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
+            False,
+        )
+    )
     base_preferred_page_count = _article_preferred_readability_page_count(
         draw,
         words,
@@ -4888,7 +5308,15 @@ def _build_article_english_page_plan(
         font_size=ARTICLE_SUBTITLE_EN_FONT_SIZE,
         cue_duration_ms=max(0, round((float(cue.end) - float(cue.start)) * 1000)),
     )
-    if not base_static_lines and len(words) > ARTICLE_VISUAL_PAGE_PREFERRED_WORDS:
+    if (
+        not base_static_lines
+        and (
+            len(words) >= ARTICLE_VISUAL_PAGE_REVIEW_WORDS
+            or not automatic_floor_static_lines
+        )
+    ):
+        # Long-pixel cues should try a natural 56px multi-page projection
+        # before accepting a smaller one-page fallback.
         base_preferred_page_count = max(2, base_preferred_page_count)
     base_duration_ms = max(
         0,
@@ -4905,6 +5333,7 @@ def _build_article_english_page_plan(
         page_count: int,
         forced_continuation: bool,
         review_boundary_candidate: bool = False,
+        emergency_font_candidate: bool = False,
     ) -> tuple[dict | None, str]:
         if (
             page_count == 1
@@ -4918,7 +5347,14 @@ def _build_article_english_page_plan(
         # here prevents a nominal 56/52px candidate from becoming 50px only
         # after whole-episode selection.
         page_layouts = [
-            _article_final_page_layout(draw, cue, words, start, end)
+            _article_final_page_layout(
+                draw,
+                cue,
+                words,
+                start,
+                end,
+                allow_legacy_fallback=emergency_font_candidate,
+            )
             for start, end in spans
         ]
         if any(layout is None for layout in page_layouts):
@@ -5006,7 +5442,7 @@ def _build_article_english_page_plan(
         for index, (start, end) in enumerate(spans):
             layout_lines = english_layouts[index]
             layout_font_size = page_font_sizes[index]
-            layout_font = article_en_font(layout_font_size, 600)
+            layout_font = article_subtitle_en_font(layout_font_size, 600)
             measured_line_widths = [
                 text_w(draw, line, layout_font) for line in layout_lines
             ]
@@ -5199,6 +5635,7 @@ def _build_article_english_page_plan(
                 "font_reduction": font_reduction,
                 "forced_continuation": forced_continuation,
                 "review_boundary_candidate": review_boundary_candidate,
+                "emergency_font_candidate": emergency_font_candidate,
                 "risk_score": risk_score,
                 "high_risk_count": high_risk_count,
                 "medium_risk_count": medium_risk_count,
@@ -5224,29 +5661,16 @@ def _build_article_english_page_plan(
             "",
         )
 
-    for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+    def collect_candidates(
+        font_sizes: Sequence[int],
+        *,
+        emergency_font_candidate: bool,
+    ) -> None:
         bounded_max_page_count = min(max(1, int(max_page_count)), len(words))
-        for page_count in range(1, bounded_max_page_count + 1):
-            attempt_diagnostics: set[str] = set()
-            strict_partitions = _partition_article_english_pages(
-                draw,
-                cue,
-                words,
-                page_count,
-                cue.word_timing,
-                font_size,
-                diagnostics=attempt_diagnostics,
-                span_layout=span_layout,
-                span_balance=span_balance,
-                max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
-            )
-            partition_modes = []
-            if strict_partitions:
-                partition_modes.append((strict_partitions, False, False))
-            if page_count > 1 and (
-                not strict_partitions or enumerate_high_pressure_alternatives
-            ):
-                forced_partitions = _partition_article_english_pages(
+        for font_size in font_sizes:
+            for page_count in range(1, bounded_max_page_count + 1):
+                attempt_diagnostics: set[str] = set()
+                strict_partitions = _partition_article_english_pages(
                     draw,
                     cue,
                     words,
@@ -5254,47 +5678,84 @@ def _build_article_english_page_plan(
                     cue.word_timing,
                     font_size,
                     diagnostics=attempt_diagnostics,
-                    allow_forced_continuation=True,
                     span_layout=span_layout,
                     span_balance=span_balance,
                     max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
                 )
-                if forced_partitions:
-                    partition_modes.append((forced_partitions, True, False))
-                review_partitions = _partition_article_english_pages(
-                    draw,
-                    cue,
-                    words,
-                    page_count,
-                    cue.word_timing,
-                    font_size,
-                    diagnostics=attempt_diagnostics,
-                    allow_review_boundary=True,
-                    span_layout=span_layout,
-                    span_balance=span_balance,
-                    max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
-                )
-                if review_partitions:
-                    partition_modes.append((review_partitions, False, True))
-            if not partition_modes:
-                failure_reasons.update(
-                    attempt_diagnostics or {"no_complete_legal_page_partition"}
-                )
-                continue
-            for partitions, forced_continuation, review_boundary_candidate in (
-                partition_modes
-            ):
-                for spans in partitions:
-                    candidate, failure_reason = candidate_from_spans(
-                        spans,
+                partition_modes = []
+                if strict_partitions:
+                    partition_modes.append((strict_partitions, False, False))
+                if page_count > 1 and (
+                    not strict_partitions or enumerate_high_pressure_alternatives
+                ):
+                    forced_partitions = _partition_article_english_pages(
+                        draw,
+                        cue,
+                        words,
                         page_count,
-                        forced_continuation,
-                        review_boundary_candidate,
+                        cue.word_timing,
+                        font_size,
+                        diagnostics=attempt_diagnostics,
+                        allow_forced_continuation=True,
+                        span_layout=span_layout,
+                        span_balance=span_balance,
+                        max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
                     )
-                    if candidate is None:
-                        failure_reasons.add(failure_reason)
-                        continue
-                    candidates.append(candidate)
+                    if forced_partitions:
+                        partition_modes.append((forced_partitions, True, False))
+                    review_partitions = _partition_article_english_pages(
+                        draw,
+                        cue,
+                        words,
+                        page_count,
+                        cue.word_timing,
+                        font_size,
+                        diagnostics=attempt_diagnostics,
+                        allow_review_boundary=True,
+                        span_layout=span_layout,
+                        span_balance=span_balance,
+                        max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
+                    )
+                    if review_partitions:
+                        partition_modes.append((review_partitions, False, True))
+                if not partition_modes:
+                    failure_reasons.update(
+                        attempt_diagnostics
+                        or {"no_complete_legal_page_partition"}
+                    )
+                    continue
+                for partitions, forced_continuation, review_boundary_candidate in (
+                    partition_modes
+                ):
+                    for spans in partitions:
+                        candidate, failure_reason = candidate_from_spans(
+                            spans,
+                            page_count,
+                            forced_continuation,
+                            review_boundary_candidate,
+                            emergency_font_candidate,
+                        )
+                        if candidate is None:
+                            failure_reasons.add(failure_reason)
+                            continue
+                        candidates.append(candidate)
+
+    collect_candidates(
+        ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES,
+        emergency_font_candidate=False,
+    )
+    complete_normal_font_candidates = [
+        candidate
+        for candidate in candidates
+        if not int(candidate.get("incomplete_review_count") or 0)
+        and int(candidate.get("relaxed_raw_hard_count") or 0) <= 1
+    ]
+    if (
+        (candidates and not complete_normal_font_candidates)
+        or (not candidates and not automatic_floor_static_lines)
+    ):
+        failure_reasons.add("no_complete_normal_font_page_partition")
+    candidates = complete_normal_font_candidates
 
     if candidates:
         deduplicated: dict[tuple, dict] = {}
@@ -5415,6 +5876,46 @@ def _build_article_english_page_plan(
                     for page in candidate.get("plan", {}).get("pages") or []
                 )
             )
+        complete_phrase_fallbacks = [
+            candidate
+            for candidate in candidates
+            if int(candidate.get("relaxed_raw_hard_count") or 0)
+            > minimum_relaxed_raw_hard_count
+            and (
+                bool(candidate.get("forced_continuation"))
+                or any(
+                    bool(
+                        (page.get("boundary_before") or {}).get(
+                            "complete_title_restart"
+                        )
+                    )
+                    for page in candidate.get("plan", {}).get("pages", [])[1:]
+                )
+            )
+            and not int(candidate.get("incomplete_review_count") or 0)
+            and all(
+                str((page.get("boundary_before") or {}).get("classification") or "allow")
+                == "allow"
+                or bool(
+                    (page.get("boundary_before") or {}).get(
+                        "forced_complete_to_phrase"
+                    )
+                    or (page.get("boundary_before") or {}).get(
+                        "forced_complete_predicate_phrase"
+                    )
+                    or (page.get("boundary_before") or {}).get(
+                        "complete_title_restart"
+                    )
+                )
+                for page in candidate.get("plan", {}).get("pages", [])[1:]
+            )
+        ]
+        eligible_signatures = {id(candidate) for candidate in eligible_candidates}
+        eligible_candidates.extend(
+            candidate
+            for candidate in complete_phrase_fallbacks
+            if id(candidate) not in eligible_signatures
+        )
         # Page count is a reading-load decision. Break rewards and penalties
         # are deliberately absent here; they select a boundary only after the
         # number of pages is fixed.
@@ -5544,8 +6045,9 @@ def _build_article_english_page_plan(
                 )
             ):
                 # Avoid structurally uncertain page turns. A low-confidence
-                # turn may still beat the deepest 50px fallback, but not the
-                # normal 54/52px fallback range.
+                # turn may not be used to manufacture a new below-floor page;
+                # if 56/54/52px cannot produce a complete plan, the parent is
+                # handed to the manual editable-seed path.
                 selected_page_count = 1
             return by_page_count, selected_page_count
 
@@ -5614,6 +6116,7 @@ def _build_article_english_page_plan(
         "missing_or_mismatched_word_ledger",
         "no_word_boundary_with_minimum_page_duration",
         "cue_duration_below_page_minimum",
+        "no_complete_normal_font_page_partition",
         "hard_page_boundary",
         "fixed_font_span_unreadable",
         "no_complete_legal_page_partition",
@@ -5659,7 +6162,7 @@ def _article_high_pressure_review_candidates(
     *,
     total_word_count: int,
 ) -> list[dict]:
-    """Promote only complete 56px expansions over the least-page baseline."""
+    """Promote complete normal-font expansions over a dense baseline."""
     available_page_counts = [
         int(candidate.get("page_count") or 0)
         for candidate in candidates
@@ -5749,6 +6252,10 @@ def _article_high_pressure_review_candidates(
                 or total_word_count > ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
             )
         )
+        restores_automatic_floor = bool(
+            baseline_font_floor < ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
+            and candidate_font_floor >= ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE
+        )
         removes_three_line_fallback = bool(
             baseline_uses_three_lines
             and pages
@@ -5757,7 +6264,11 @@ def _article_high_pressure_review_candidates(
         )
         if (
             int(candidate.get("page_count") or 0) <= baseline_page_count
-            or not (restores_preferred_font or removes_three_line_fallback)
+            or not (
+                restores_preferred_font
+                or restores_automatic_floor
+                or removes_three_line_fallback
+            )
             or int(candidate.get("severe_risk_count") or 0)
             or not pages
         ):
@@ -5839,8 +6350,6 @@ def _article_secondary_review_boundary_is_complete(
     classification = str(decision.get("classification") or "")
     if classification == "reject":
         return False
-    if _article_nonoverridable_atomic_page_boundary_issues(decision):
-        return False
     issue_codes = {
         str(issue or "") for issue in decision.get("issue_codes") or []
     }
@@ -5849,12 +6358,63 @@ def _article_secondary_review_boundary_is_complete(
         return False
     first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
     complete_from_gerund = _article_complete_from_gerund_restart(right_page)
+    complete_participial_restart = _article_complete_participial_restart(
+        right_page
+    )
+    complete_temporal_range_restart = _article_complete_temporal_range_restart(
+        right_page
+    )
+    complete_temporal_adjunct = bool(
+        first_word in ARTICLE_PAGE_OPTIONAL_TEMPORAL_ADJUNCT_START_WORDS
+        and issue_codes
+        and issue_codes
+        <= {
+            "dependency_phrase_entrance_split",
+            "forced_complete_continuation_page_split",
+            "object_attached_modifier_split",
+            "predicate_attached_continuation_split",
+        }
+        and len(words) >= ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+        and _caption_has_terminal_completion(words)
+    )
+    complete_forced_predicate = bool(
+        decision.get("forced_subject_predicate")
+        and len(words) >= ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+        and _caption_has_terminal_completion(words)
+    )
+    atomic_issues = _article_nonoverridable_atomic_page_boundary_issues(
+        decision
+    )
+    if complete_forced_predicate:
+        atomic_issues -= {
+            "subject_finite_verb_split",
+            "subject_predicate_split",
+        }
+    if complete_participial_restart:
+        atomic_issues.discard("post_noun_participial_modifier_split")
+    if complete_temporal_adjunct:
+        atomic_issues -= {
+            "dependency_phrase_entrance_split",
+            "object_attached_modifier_split",
+            "predicate_attached_continuation_split",
+        }
+    if decision.get("complete_title_restart"):
+        atomic_issues -= {
+            "subject_finite_verb_split",
+            "subject_predicate_split",
+        }
+    if atomic_issues:
+        return False
     if issue_codes & {
         "clause_introducer_split",
         "object_attached_modifier_split",
         "post_noun_participial_modifier_split",
         "verb_preposition_complement_split",
-    } and not complete_from_gerund:
+    } and not (
+        complete_from_gerund
+        or complete_participial_restart
+        or complete_temporal_adjunct
+    ):
         return False
     # Strictly allowed boundaries have already passed the page-level syntax
     # contract.  Only review boundaries need additional restart evidence.
@@ -5865,7 +6425,14 @@ def _article_secondary_review_boundary_is_complete(
         and int(decision.get("pause_ms") or 0)
         >= ARTICLE_PAGE_SECONDARY_REVIEW_STRONG_PAUSE_MS
         or decision.get("complete_page_clause_start")
+        or decision.get("balanced_predicate_restart")
+        or decision.get("punctuated_coordinated_gerund_restart")
         or decision.get("tight_complete_phrase_start")
+        or complete_forced_predicate
+        or complete_participial_restart
+        or complete_temporal_adjunct
+        or complete_temporal_range_restart
+        or decision.get("complete_title_restart")
         or first_word in {"that", "who", "which"}
     )
 
@@ -5873,6 +6440,7 @@ def _article_secondary_review_boundary_is_complete(
 def _article_complete_from_gerund_restart(
     right_page: Mapping[str, object],
 ) -> bool:
+    """Recognize a complete preposition-plus-gerund continuation page."""
     decision = right_page.get("boundary_before") or {}
     words = str(right_page.get("en") or "").split()
     if len(words) < 2:
@@ -5881,8 +6449,66 @@ def _article_complete_from_gerund_restart(
     second_word = re.sub(r"[^A-Za-z]+", "", words[1]).casefold()
     return bool(
         decision.get("tight_complete_phrase_start")
-        and first_word == "from"
+        and first_word in {"by", "from", "into"}
         and second_word.endswith("ing")
+    )
+
+
+def _article_complete_participial_restart(
+    right_page: Mapping[str, object],
+) -> bool:
+    """Allow a complete visible ``growing ...`` continuation for review."""
+    decision = right_page.get("boundary_before") or {}
+    issue_codes = {
+        str(issue or "") for issue in decision.get("issue_codes") or []
+    }
+    words = str(right_page.get("en") or "").split()
+    if (
+        len(words) < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+        or issue_codes
+        not in (
+            {"post_noun_participial_modifier_split"},
+            {"unsupported_tight_page_transition"},
+        )
+    ):
+        return False
+    first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
+    last_word = re.sub(r"[^A-Za-z]+", "", words[-1]).casefold()
+    return bool(
+        first_word.endswith(("ed", "ing"))
+        and (
+            _caption_has_terminal_completion(words)
+            or (last_word.endswith("s") and not last_word.endswith("ss"))
+        )
+    )
+
+
+def _article_complete_temporal_range_restart(
+    right_page: Mapping[str, object],
+) -> bool:
+    """Recognize a complete ``this year to ...`` range continuation."""
+    decision = right_page.get("boundary_before") or {}
+    if set(decision.get("issue_codes") or []) != {
+        "unsupported_tight_page_transition"
+    }:
+        return False
+    words = str(right_page.get("en") or "").split()
+    normalized = [
+        re.sub(r"[^A-Za-z0-9.]+", "", word).casefold()
+        for word in words
+    ]
+    if (
+        len(normalized) < ARTICLE_VISUAL_PAGE_MIN_WORDS
+        or not _caption_has_terminal_completion(words)
+        or normalized[0] not in {"last", "next", "this"}
+        or normalized[1]
+        not in {"day", "decade", "month", "quarter", "week", "year"}
+        or "to" not in normalized[2:]
+    ):
+        return False
+    to_index = normalized.index("to", 2)
+    return any(
+        re.match(r"^\d", word or "") for word in normalized[to_index + 1 :]
     )
 
 
@@ -5895,6 +6521,7 @@ def _article_secondary_boundary_needs_three_line_escape(
         str(decision.get("classification") or "") == "allow"
         or not decision.get("tight_complete_phrase_start")
         or _article_complete_from_gerund_restart(right_page)
+        or decision.get("forced_complete_predicate_phrase")
     ):
         return False
     words = str(right_page.get("en") or "").split()
@@ -6442,16 +7069,74 @@ def article_display_page_layout_profile() -> dict:
         "english_emergency_fallback_sizes": list(
             ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES
         ),
+        "english_legacy_readable_sizes": list(
+            ARTICLE_SUBTITLE_EN_LEGACY_FALLBACK_SIZES
+        ),
         "english_normal_min_size": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
-        "english_min_size": ARTICLE_SUBTITLE_EN_MIN_SIZE,
+        "english_min_size": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
         "chinese_font_size": ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        "chinese_letter_spacing": ARTICLE_SUBTITLE_ZH_LETTER_SPACING,
         "english_preferred_line_width": ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH,
         "english_comfortable_width": ARTICLE_SUBTITLE_EN_COMFORTABLE_WIDTH,
         "english_width": ARTICLE_SUBTITLE_EN_WIDTH,
         "english_wide_safe_width": ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
         "chinese_width": ARTICLE_SUBTITLE_ZH_WIDTH,
+        "comfortable_page_words": ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS,
+        "review_page_words": ARTICLE_VISUAL_PAGE_REVIEW_WORDS,
+        "split_priority_page_words": ARTICLE_VISUAL_PAGE_SPLIT_PRIORITY_WORDS,
         "max_lines": 2,
         "minimum_page_duration_ms": ARTICLE_PAGE_MIN_DURATION_MS,
+    }
+
+
+def _article_editable_page_seed_plan(
+    cue: Cue,
+    errors: Sequence[Mapping[str, object]],
+) -> dict | None:
+    """Retain immutable parent authority when no renderable plan exists."""
+    words = _article_boundary_words(cue)
+    timing = list(cue.word_timing or ())
+    if (
+        not cue.subtitle_id
+        or not words
+        or len(words) != len(timing)
+    ):
+        return None
+    try:
+        word_start = int(timing[0]["word_id"])
+        word_end = _article_timing_word_end(timing[-1])
+    except (KeyError, TypeError, ValueError):
+        return None
+    reasons = [
+        str(error.get("reason") or "render_structural_overflow")
+        for error in errors
+        if str(error.get("cue_index") or "") == str(cue.index)
+    ]
+    return {
+        "parent_subtitle_id": str(cue.subtitle_id),
+        "english": str(cue.en or ""),
+        "chinese": str(cue.zh or ""),
+        "word_start": word_start,
+        "word_end": word_end,
+        "english_font_size": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
+        "font_fallback": {"used": False},
+        "editable_seed": True,
+        "renderable": False,
+        "failure_reasons": sorted(set(reasons)),
+        "pages": [
+            {
+                "display_page_id": display_page_id(str(cue.subtitle_id), 1),
+                "word_start": word_start,
+                "word_end": word_end,
+                "english": " ".join(words),
+                "start_ms": round(float(cue.start) * 1000),
+                "end_ms": round(float(cue.end) * 1000),
+                "english_lines": [],
+                "english_font_size": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
+                "english_width": ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
+                "boundary_before": {},
+            }
+        ],
     }
 
 
@@ -6459,7 +7144,7 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
     """Return only multi-page parents after final word timing is frozen."""
     draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
     errors: list[dict] = []
-    bundles: list[dict] = []
+    bundle_entries: list[tuple[Cue, dict]] = []
     for cue in cues:
         bundle = _build_article_english_page_plan(
             cue,
@@ -6469,28 +7154,27 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
         if bundle.get("status") != "candidate_bundle":
             errors.extend(bundle.get("errors") or [])
             continue
-        bundles.append(bundle)
-    if errors:
-        raise RenderStructuralOverflowError(errors)
+        bundle_entries.append((cue, bundle))
     selected_candidates = _select_article_page_plan_sequence(
-        [bundle["candidates"] for bundle in bundles]
+        [bundle["candidates"] for _cue, bundle in bundle_entries]
     )
-    if len(selected_candidates) != len(cues):
-        raise RenderStructuralOverflowError(
-            [{"cue_index": "all", "reason": "display_page_sequence_unavailable"}]
+    if len(selected_candidates) != len(bundle_entries):
+        errors.append(
+            {"cue_index": "all", "reason": "display_page_sequence_unavailable"}
         )
+        selected_candidates = []
     selected_candidates = [
         _select_article_dominant_readability_candidate(
             cue,
             selected,
             bundle.get("shadow_candidates") or (),
         )
-        for cue, bundle, selected in zip(cues, bundles, selected_candidates)
+        for (cue, bundle), selected in zip(bundle_entries, selected_candidates)
     ]
 
     parents: list[dict] = []
     render_plans: list[dict] = []
-    for cue, bundle, selected in zip(cues, bundles, selected_candidates):
+    for (cue, bundle), selected in zip(bundle_entries, selected_candidates):
         plan = _finalize_article_sequence_candidate(selected, bundle)
         plan = _finalize_article_same_screen_layout(cue, draw, plan)
         pages = list(plan.get("pages") or [])
@@ -6547,7 +7231,35 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
             }
         )
     if errors:
-        raise RenderStructuralOverflowError(errors)
+        plans_by_parent = {
+            str(plan.get("parent_subtitle_id") or ""): plan
+            for plan in render_plans
+            if str(plan.get("parent_subtitle_id") or "")
+        }
+        for cue in cues:
+            parent_id = str(cue.subtitle_id or "")
+            if parent_id in plans_by_parent:
+                continue
+            seed = _article_editable_page_seed_plan(cue, errors)
+            if seed is not None:
+                plans_by_parent[parent_id] = seed
+        partial_blueprint = {
+            "schema_version": DISPLAY_PAGE_SCHEMA_VERSION,
+            "status": "ERROR",
+            "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
+            "layout_profile": article_display_page_layout_profile(),
+            "parents": [],
+            "render_plans": [
+                plans_by_parent[parent_id]
+                for parent_id in [str(cue.subtitle_id or "") for cue in cues]
+                if parent_id in plans_by_parent
+            ],
+            "errors": [dict(error) for error in errors],
+        }
+        raise RenderStructuralOverflowError(
+            errors,
+            partial_blueprint=partial_blueprint,
+        )
     return {
         "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
         "layout_profile": article_display_page_layout_profile(),
@@ -6595,6 +7307,16 @@ def build_article_display_page_candidate_workspace(
         for candidate in bundle.get("candidates") or []
         if lower <= int(candidate.get("page_count") or 0) <= upper
     ]
+    if not selected:
+        # The production bundle may intentionally expose only the selected
+        # page count. For a manual workspace, fall back to the read-only
+        # shadow frontier so a 15-word review cue can still be inspected as
+        # a two-page proposal without changing production authority.
+        selected = [
+            candidate
+            for candidate in bundle.get("shadow_candidates") or []
+            if lower <= int(candidate.get("page_count") or 0) <= upper
+        ]
     selected.sort(
         key=lambda candidate: (
             int(candidate.get("page_count") or 0),
@@ -6642,7 +7364,7 @@ def propose_article_manual_page_word_ranges(
     draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
     attempted_reasons: set[str] = set()
     for allow_forced_continuation in (False, True):
-        for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        for font_size in ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES:
             diagnostics: set[str] = set()
             spans = _partition_article_english_pages(
                 draw,
@@ -6670,7 +7392,7 @@ def propose_article_manual_page_word_ranges(
             ]
 
     if allow_review_boundary:
-        for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        for font_size in ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES:
             diagnostics: set[str] = set()
             spans = _partition_article_english_pages(
                 draw,
@@ -6698,7 +7420,7 @@ def propose_article_manual_page_word_ranges(
             ]
 
     if allow_hard_boundary:
-        for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+        for font_size in ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES:
             diagnostics: set[str] = set()
             spans = _partition_article_english_pages(
                 draw,
@@ -6874,7 +7596,14 @@ def rebuild_article_frozen_page_plan_from_word_ranges(
 
     draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
     selected_layouts = [
-        _article_final_page_layout(draw, cue, words, local_start, local_end)
+        _article_final_page_layout(
+            draw,
+            cue,
+            words,
+            local_start,
+            local_end,
+            allow_legacy_fallback=False,
+        )
         for local_start, local_end in local_spans
     ]
     if any(layout is None for layout in selected_layouts):
@@ -7067,10 +7796,11 @@ def _article_plan_from_frozen_artifact(
                 )
             ),
         )
-        frozen_lines = [
-            " ".join(str(line or "").split())
-            for line in raw_page.get("english_lines") or []
-        ]
+        # Line breaks are renderer-owned.  A frozen page produced before a
+        # typography-only change may still carry the previous face's lines;
+        # keep its immutable word span and timing, but publish the lines
+        # measured with the current subtitle font.
+        frozen_lines = list(expected_lines)
         expected_width = _article_english_layout_width(
             draw,
             expected_lines,
@@ -7079,8 +7809,6 @@ def _article_plan_from_frozen_artifact(
         boundary_before = dict(raw_page.get("boundary_before") or {})
         if (
             not expected_lines
-            or frozen_lines != expected_lines
-            or english_width != expected_width
             or (page_index > 0 and boundary_before.get("classification") == "hard")
         ):
             return None
@@ -7121,7 +7849,7 @@ def _article_plan_from_frozen_artifact(
                 "end": end_ms / 1000.0,
                 "en_lines": frozen_lines,
                 "english_font_size": page_font_size,
-                "en_width": english_width,
+                "en_width": expected_width,
                 "boundary_before": boundary_before,
                 "line_wrap_review": bool(
                     _has_discouraged_caption_break(
@@ -7349,7 +8077,7 @@ def build_article_manual_draft_page_plan(
             timed_boundaries = _manual_draft_page_boundaries(cue, spans)
             if timed_boundaries is None:
                 continue
-            for font_size in ARTICLE_SUBTITLE_EN_ALLOWED_SIZES:
+            for font_size in ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES:
                 layouts = [
                     _article_fixed_english_lines(
                         draw,
@@ -8004,6 +8732,183 @@ def wrap_article_title_text(
     return lines or [""]
 
 
+ARTICLE_VOCAB_MEANING_LINE_BALANCE_RATIO = 2 / 3
+ARTICLE_VOCAB_MEANING_EDGE_PARTICLES = frozenset(
+    "的与和及或但而并把被将让使为对从向给由因比像"
+)
+
+
+class ArticleVocabularyMeaningOverflowError(RuntimeError):
+    """Raised when a vocabulary meaning cannot fit without losing text."""
+
+
+class ArticleVocabularyPhraseOverflowError(RuntimeError):
+    """Raised when an English card phrase cannot fit without tiny text."""
+
+
+def wrap_article_vocab_phrase(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap an English card phrase at whitespace into at most two lines."""
+    phrase = " ".join(str(text).split())
+    if not phrase or text_w(draw, phrase, fnt) <= max_width:
+        return [phrase]
+
+    words = phrase.split()
+    candidates: list[tuple[tuple[int, int, int], list[str]]] = []
+    for split in range(1, len(words)):
+        before = " ".join(words[:split])
+        after = " ".join(words[split:])
+        before_width = text_w(draw, before, fnt)
+        after_width = text_w(draw, after, fnt)
+        if before_width > max_width or after_width > max_width:
+            continue
+        break_penalty = _article_intrinsic_line_break_penalty(words, split)
+        candidates.append(
+            (
+                (
+                    0 if break_penalty < CAPTION_HARD_BREAK_PENALTY else 1,
+                    abs(after_width - before_width),
+                    0 if after_width >= before_width else 1,
+                ),
+                [before, after],
+            )
+        )
+    return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else []
+
+
+def fit_article_vocab_phrase_font(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int = 540,
+) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+    """Keep phrases readable by wrapping before shrinking below normal size."""
+    phrase = " ".join(str(text).split())
+    rendered_max_width = acx(max_width)
+    factory = article_vocab_phrase_font
+    if not phrase:
+        return factory(ARTICLE_VOCAB_PHRASE_MAX_FONT_SIZE), [""]
+
+    words = phrase.split()
+    if len(words) == 1:
+        for size in range(
+            ARTICLE_VOCAB_PHRASE_MAX_FONT_SIZE,
+            ARTICLE_VOCAB_UNBROKEN_WORD_MIN_FONT_SIZE - 1,
+            -2,
+        ):
+            fnt = factory(size)
+            if text_w(draw, phrase, fnt) <= rendered_max_width:
+                return fnt, [phrase]
+        raise ArticleVocabularyPhraseOverflowError(
+            "文章单词卡英文单词超出可用宽度，请缩短词条"
+        )
+
+    for size in range(
+        ARTICLE_VOCAB_PHRASE_MAX_FONT_SIZE,
+        ARTICLE_VOCAB_PHRASE_SINGLE_LINE_MIN_FONT_SIZE - 1,
+        -2,
+    ):
+        fnt = factory(size)
+        if text_w(draw, phrase, fnt) <= rendered_max_width:
+            return fnt, [phrase]
+
+    fallback: tuple[ImageFont.FreeTypeFont, list[str]] | None = None
+    for size in range(
+        ARTICLE_VOCAB_PHRASE_MAX_FONT_SIZE,
+        ARTICLE_VOCAB_PHRASE_MIN_FONT_SIZE - 1,
+        -2,
+    ):
+        fnt = factory(size)
+        lines = wrap_article_vocab_phrase(draw, phrase, fnt, rendered_max_width)
+        if len(lines) != 2:
+            continue
+        widths = [text_w(draw, line, fnt) for line in lines]
+        if fallback is None:
+            fallback = (fnt, lines)
+        longest = max(widths)
+        if longest and min(widths) / longest >= ARTICLE_VOCAB_PHRASE_LINE_BALANCE_RATIO:
+            return fnt, lines
+    if fallback is not None:
+        return fallback
+    raise ArticleVocabularyPhraseOverflowError(
+        "文章单词卡英文短语无法在两行内清晰显示，请缩短词条"
+    )
+
+
+def wrap_article_vocab_meaning(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    fnt: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> list[str]:
+    """Wrap a vocabulary meaning at safe lexical boundaries into two lines."""
+    meaning = str(text).strip()
+    if not meaning or text_w(draw, meaning, fnt) <= max_width:
+        return [meaning]
+
+    candidates: list[tuple[tuple[int, int, int], list[str]]] = []
+    for offset in _article_title_break_offsets(meaning):
+        if offset in {0, len(meaning)}:
+            continue
+        before = meaning[:offset].strip()
+        after = meaning[offset:].strip()
+        if not before or not after:
+            continue
+        if (
+            before[-1] in ARTICLE_VOCAB_MEANING_EDGE_PARTICLES
+            or after[0] in ARTICLE_VOCAB_MEANING_EDGE_PARTICLES
+        ):
+            continue
+        before_width = text_w(draw, before, fnt)
+        after_width = text_w(draw, after, fnt)
+        if before_width > max_width or after_width > max_width:
+            continue
+
+        shorter = min(before_width, after_width)
+        longer = max(before_width, after_width)
+        balanced = bool(
+            longer
+            and shorter / longer >= ARTICLE_VOCAB_MEANING_LINE_BALANCE_RATIO
+        )
+        score = (
+            0 if after_width >= before_width and balanced else 1,
+            0 if after_width >= before_width else 1,
+            abs(after_width - before_width),
+        )
+        candidates.append((score, [before, after]))
+
+    return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else []
+
+
+def fit_article_vocab_meaning_font(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int = 500,
+    max_size: int = 34,
+    min_size: int = 24,
+) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+    """Fit a complete meaning; never truncate an overflowing third line."""
+    rendered_max_width = acx(max_width)
+    for size in range(max_size, min_size - 1, -2):
+        fnt = article_vocab_meaning_font(size)
+        lines = wrap_article_vocab_meaning(
+            draw,
+            text,
+            fnt,
+            rendered_max_width,
+        )
+        if lines and len(lines) <= 2 and all(
+            text_w(draw, line, fnt) <= rendered_max_width for line in lines
+        ):
+            return fnt, lines
+    raise ArticleVocabularyMeaningOverflowError(
+        "文章单词卡中文释义无法在两行内完整显示，请缩短释义"
+    )
+
+
 def _article_concept_semantic_break_offsets(
     text: str,
     safe_offsets: Sequence[int],
@@ -8085,6 +8990,200 @@ def wrap_article_concept_detail(
     return wrap_article_mixed_text(draw, paragraph, fnt, max_width)[:2]
 
 
+def article_vocab_detail_mixed_tokens(text: str) -> list[str]:
+    """Tokenize a Chinese explanation without breaking English expressions."""
+    return re.findall(
+        r"[A-Za-z0-9]+(?:['/-][A-Za-z0-9]+)*|\s+|.",
+        str(text).strip(),
+    )
+
+
+def article_vocab_detail_mixed_font(
+    token: str,
+    size: int,
+) -> ImageFont.FreeTypeFont:
+    """Use Roboto Slab for Latin text and the existing Medium face for CJK."""
+    if re.search(r"[A-Za-z0-9]", token):
+        return article_subtitle_en_font(size, 400)
+    return article_vocab_detail_font(size)
+
+
+def article_vocab_detail_mixed_width(
+    draw: ImageDraw.ImageDraw,
+    tokens: Sequence[str],
+    size: int,
+) -> int:
+    return sum(
+        text_w(draw, token, article_vocab_detail_mixed_font(token, size))
+        for token in tokens
+    )
+
+
+def _wrap_article_vocab_detail_tokens_by_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    size: int,
+    max_width: int,
+) -> list[list[str]]:
+    lines: list[list[str]] = []
+    current: list[str] = []
+    for token in article_vocab_detail_mixed_tokens(text):
+        candidate = [*current, token]
+        if (
+            current
+            and token not in "，。！？；：、,.!?;:)]}】》〉」』"
+            and article_vocab_detail_mixed_width(draw, candidate, size) > max_width
+        ):
+            lines.append(current)
+            current = [token.lstrip()]
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines or [[]]
+
+
+def wrap_article_vocab_detail_mixed_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    size: int,
+    max_width: int,
+    *,
+    prefer_semantic_break: bool,
+) -> list[list[str]]:
+    """Wrap mixed-script explanations using the fonts used for final drawing."""
+    paragraph = str(text).strip()
+    full_tokens = article_vocab_detail_mixed_tokens(paragraph)
+    if not paragraph or article_vocab_detail_mixed_width(
+        draw,
+        full_tokens,
+        size,
+    ) <= max_width:
+        return [full_tokens]
+
+    safe_offsets = _article_title_break_offsets(paragraph)
+    semantic_offsets = (
+        _article_concept_semantic_break_offsets(paragraph, safe_offsets)
+        if prefer_semantic_break
+        else set()
+    )
+    candidates: list[tuple[tuple[int, int, int], list[list[str]]]] = []
+    for offset in safe_offsets:
+        if offset in {0, len(paragraph)}:
+            continue
+        before = paragraph[:offset].rstrip()
+        after = paragraph[offset:].lstrip()
+        if (
+            not before
+            or not after
+            or after[0] in ARTICLE_MIXED_AVOID_LINE_START
+            or after[0] in "，。！？；：、,.!?;:)]}】》〉」』"
+        ):
+            continue
+        before_tokens = article_vocab_detail_mixed_tokens(before)
+        after_tokens = article_vocab_detail_mixed_tokens(after)
+        before_width = article_vocab_detail_mixed_width(draw, before_tokens, size)
+        after_width = article_vocab_detail_mixed_width(draw, after_tokens, size)
+        if before_width > max_width or after_width > max_width:
+            continue
+        candidates.append(
+            (
+                (
+                    0 if offset in semantic_offsets else 1,
+                    0 if after_width >= before_width else 1,
+                    abs(after_width - before_width),
+                ),
+                [before_tokens, after_tokens],
+            )
+        )
+    if candidates:
+        return min(candidates, key=lambda candidate: candidate[0])[1]
+    return _wrap_article_vocab_detail_tokens_by_width(
+        draw,
+        paragraph,
+        size,
+        max_width,
+    )
+
+
+def fit_article_vocab_detail_mixed_font(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    max_width: int,
+    max_lines: int,
+    max_size: int,
+    min_size: int,
+    prefer_semantic_break: bool,
+) -> tuple[int, list[list[str]]]:
+    rendered_max_width = acx(max_width)
+    for size in range(max_size, min_size - 1, -2):
+        lines = wrap_article_vocab_detail_mixed_text(
+            draw,
+            text,
+            size,
+            rendered_max_width,
+            prefer_semantic_break=prefer_semantic_break,
+        )
+        if len(lines) <= max_lines and all(
+            article_vocab_detail_mixed_width(draw, line, size)
+            <= rendered_max_width
+            for line in lines
+        ):
+            return size, lines
+    return min_size, wrap_article_vocab_detail_mixed_text(
+        draw,
+        text,
+        min_size,
+        rendered_max_width,
+        prefer_semantic_break=prefer_semantic_break,
+    )[:max_lines]
+
+
+def _coalesce_article_vocab_detail_tokens(tokens: Sequence[str]) -> list[str]:
+    runs: list[str] = []
+    run_is_latin: bool | None = None
+    for token in tokens:
+        token_is_latin = bool(re.search(r"[A-Za-z0-9]", token))
+        if runs and token_is_latin == run_is_latin:
+            runs[-1] += token
+        else:
+            runs.append(token)
+            run_is_latin = token_is_latin
+    return runs
+
+
+def draw_article_vocab_detail_mixed_line(
+    draw: ImageDraw.ImageDraw,
+    center_x: int,
+    y: int,
+    tokens: Sequence[str],
+    size: int,
+    fill: tuple[int, int, int, int],
+) -> None:
+    runs = _coalesce_article_vocab_detail_tokens(tokens)
+    if not runs:
+        return
+    fonts = [article_vocab_detail_mixed_font(run, size) for run in runs]
+    widths = [text_w(draw, run, fnt) for run, fnt in zip(runs, fonts)]
+    cursor = center_x - sum(widths) // 2
+    baseline = y + max(
+        (text_h(draw, run, fnt) for run, fnt in zip(runs, fonts)),
+        default=0,
+    )
+    for run, fnt, width in zip(runs, fonts, widths):
+        draw_stroked_text(
+            draw,
+            (cursor, baseline),
+            run,
+            fnt,
+            fill,
+            anchor="ls",
+            stroke_width=0,
+        )
+        cursor += width
+
+
 def rebalance_article_mixed_lines(
     draw: ImageDraw.ImageDraw,
     lines: list[str],
@@ -8135,7 +9234,7 @@ def article_tip_mixed_tokens(text: str) -> list[str]:
 
 def article_tip_mixed_font(token: str, size: int) -> ImageFont.FreeTypeFont:
     if re.search(r"[A-Za-z0-9]", token):
-        return article_en_font(size, 400)
+        return article_subtitle_en_font(size, 400)
     return article_cjk_font(size, 400)
 
 
@@ -8244,24 +9343,49 @@ def paste_rounded(img: Image.Image, src: Image.Image, box: tuple[int, int, int, 
     img.paste(src, (x0, y0), mask)
 
 
-def draw_economist_logo(img: Image.Image, position: tuple[int, int] = (31, 33)) -> None:
-    x, y = position
-    if ARTICLE_LOGO.exists():
-        try:
-            logo = Image.open(ARTICLE_LOGO).convert("RGBA").resize((acx(100), acy(50)), Image.Resampling.LANCZOS)
-            img.alpha_composite(logo, (x, y))
-            return
-        except Exception:
-            pass
-    d = ImageDraw.Draw(img, "RGBA")
-    d.rectangle((x, y, x + acx(100), y + acy(50)), fill=(229, 0, 0, 255))
-    logo_font = article_mixed_font(18)
-    draw_stroked_text(d, (x + acx(50), y + acy(25)), "The\nEconomist", logo_font, (255, 255, 255, 255), anchor="mm", stroke_width=0)
+def load_article_logo(logo_path: str) -> Image.Image | None:
+    """Load one optional brand asset into the article template's safe area."""
+    normalized_path = str(logo_path or "").strip()
+    if not normalized_path:
+        return None
+
+    path = Path(normalized_path).expanduser()
+    if not path.is_file():
+        raise RuntimeError(f"品牌 Logo 文件不存在：{path}")
+    try:
+        with Image.open(path) as source:
+            logo = source.convert("RGBA")
+    except Exception as exc:
+        raise RuntimeError(f"无法读取品牌 Logo：{path}（{exc}）") from exc
+    if logo.width <= 0 or logo.height <= 0:
+        raise RuntimeError(f"品牌 Logo 尺寸无效：{path}")
+    return ImageOps.contain(
+        logo,
+        (acx(100), acy(50)),
+        Image.Resampling.LANCZOS,
+    )
 
 
-def decorate_article_cover(article_image: Image.Image, _date_text: str) -> Image.Image:
+def draw_article_logo(
+    img: Image.Image,
+    logo: Image.Image | None,
+    position: tuple[int, int] = (0, 0),
+) -> None:
+    if logo is None:
+        return
+    safe_width, safe_height = acx(100), acy(50)
+    x = position[0] + max(0, (safe_width - logo.width) // 2)
+    y = position[1] + max(0, (safe_height - logo.height) // 2)
+    img.alpha_composite(logo, (x, y))
+
+
+def decorate_article_cover(
+    article_image: Image.Image,
+    _date_text: str,
+    logo: Image.Image | None = None,
+) -> Image.Image:
     cover = article_image.convert("RGBA").copy()
-    draw_economist_logo(cover, (0, 0))
+    draw_article_logo(cover, logo, (0, 0))
     return cover
 
 
@@ -8278,7 +9402,7 @@ def _draw_article_vocab_card_legacy(img: Image.Image, item: dict | None, rect: t
     content_left = 940
     content_right = 1560
     word_font = fit_article_font_to_width(
-        d, word, 340, 68, 44, lambda size: article_en_font(size, 700)
+        d, word, 340, 68, 44, article_vocab_phrase_font
     )
     word_x = acx(content_left)
     phonetic_path = FONT_CAMBRIA if FONT_CAMBRIA.exists() else FONT_SEGOE
@@ -8306,7 +9430,7 @@ def _draw_article_vocab_card_legacy(img: Image.Image, item: dict | None, rect: t
         2,
         34,
         26,
-        lambda size: article_cjk_font(size, 400),
+        article_vocab_meaning_font,
         wrap_zh,
     )
     pos_font_factory = (
@@ -8381,7 +9505,7 @@ def _draw_article_vocab_card_legacy(img: Image.Image, item: dict | None, rect: t
     meaning_start_y = meaning_center_y - (len(meaning_lines[:2]) - 1) * meaning_gap // 2
     meaning_x = pos_rect[2] + acx(14)
     for idx, line in enumerate(meaning_lines[:2]):
-        draw_stroked_text(d, (meaning_x, meaning_start_y + idx * meaning_gap), line, meaning_font, (79, 91, 107, 255), anchor="lm", stroke_width=0)
+        draw_stroked_text(d, (meaning_x, meaning_start_y + idx * meaning_gap), line, meaning_font, ARTICLE_VOCAB_MEANING_COLOR, anchor="lm", stroke_width=0)
 
     for idx, line in enumerate(definition_lines[:2]):
         draw_stroked_text(d, (acx(content_left), acy(definition_y + idx * 32)), line, def_font, (122, 132, 147, 255), stroke_width=0)
@@ -8412,7 +9536,7 @@ def _draw_article_vocab_card_legacy(img: Image.Image, item: dict | None, rect: t
             acy(tip_zh_y + index * 25),
             line,
             tip_zh_size,
-            (79, 91, 107, 255),
+            ARTICLE_VOCAB_DETAIL_COLOR,
         )
 
 
@@ -8425,49 +9549,33 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
     detail = str(item.get("detail") or "").strip()
     is_concept = vocab_card_type(item) == "concept" and bool(detail)
 
-    phrase_font = fit_article_font_to_width(
-        d,
-        phrase,
-        540,
-        58,
-        20,
-        lambda size: article_en_font(size, 700),
-    )
-    phrase_lines = [phrase]
-    meaning_font, meaning_lines = fit_article_wrapped_font(
-        d,
-        meaning,
-        500,
-        2,
-        34,
-        24,
-        lambda size: article_cjk_font(size, 400),
-        wrap_article_mixed_text,
-    )
-    detail_lines: list[str] = []
+    phrase_font, phrase_lines = fit_article_vocab_phrase_font(d, phrase)
+    meaning_font, meaning_lines = fit_article_vocab_meaning_font(d, meaning)
+    detail_lines: list[list[str]] = []
+    detail_size = 0
     detail_font = None
     if is_concept:
-        detail_font, detail_lines = fit_article_wrapped_font(
+        detail_size, detail_lines = fit_article_vocab_detail_mixed_font(
             d,
             detail,
-            500,
-            2,
-            26,
-            20,
-            lambda size: article_cjk_font(size, 400),
-            wrap_article_concept_detail,
+            max_width=500,
+            max_lines=2,
+            max_size=ARTICLE_VOCAB_DETAIL_FONT_SIZE,
+            min_size=ARTICLE_VOCAB_DETAIL_MIN_FONT_SIZE,
+            prefer_semantic_break=True,
         )
+        detail_font = article_vocab_detail_font(detail_size)
     elif detail:
-        detail_font, detail_lines = fit_article_wrapped_font(
+        detail_size, detail_lines = fit_article_vocab_detail_mixed_font(
             d,
             detail,
-            500,
-            1,
-            24,
-            18,
-            lambda size: article_en_font(size, 500),
-            wrap_en,
+            max_width=500,
+            max_lines=1,
+            max_size=24,
+            min_size=18,
+            prefer_semantic_break=False,
         )
+        detail_font = article_vocab_detail_font(detail_size)
 
     phrase_gap = int(phrase_font.size * 1.18)
     meaning_gap = int(meaning_font.size * 1.28)
@@ -8498,22 +9606,21 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
             (center_x, cursor_y),
             line,
             meaning_font,
-            (79, 91, 107, 255),
+            ARTICLE_VOCAB_MEANING_COLOR,
             anchor="ma",
             stroke_width=0,
         )
         cursor_y += meaning_gap
     if detail_lines and detail_font:
         cursor_y += group_gap
-        for line in detail_lines:
-            draw_stroked_text(
+        for line_tokens in detail_lines:
+            draw_article_vocab_detail_mixed_line(
                 d,
-                (center_x, cursor_y),
-                line,
-                detail_font,
-                (122, 132, 147, 255),
-                anchor="ma",
-                stroke_width=0,
+                center_x,
+                cursor_y,
+                line_tokens,
+                detail_size,
+                ARTICLE_VOCAB_DETAIL_COLOR,
             )
             cursor_y += detail_gap
 
@@ -8530,7 +9637,14 @@ def _draw_article_vocab_review_bar_legacy(
     word = str(item.get("word") or "").strip().capitalize()
     pos = str(item.get("pos") or "").strip()
     meaning = str(item.get("meaning") or "").strip()
-    word_font = fit_article_font_to_width(d, word, 190, 32, 22, lambda size: article_en_font(size, 700))
+    word_font = fit_article_font_to_width(
+        d,
+        word,
+        190,
+        32,
+        22,
+        article_vocab_phrase_font,
+    )
     pos_font = article_en_font(16, 600)
     word_width = text_w(d, word, word_font)
     pos_width = text_w(d, pos, pos_font) if pos else 0
@@ -8544,7 +9658,7 @@ def _draw_article_vocab_review_bar_legacy(
         max_meaning_width,
         24,
         17,
-        lambda size: article_cjk_font(size, 400),
+        article_vocab_meaning_font,
     )
     meaning_width = text_w(d, meaning, meaning_font)
     content_width = word_width + pos_width + meaning_width + acx(72)
@@ -8559,7 +9673,7 @@ def _draw_article_vocab_review_bar_legacy(
         draw_stroked_text(d, (pos_x, center_y), pos, pos_font, (122, 132, 147, 255), anchor="lm", stroke_width=0)
     divider_x = pos_x + pos_width + acx(16)
     d.line((divider_x, center_y - acy(18), divider_x, center_y + acy(18)), fill=(202, 215, 237, 255), width=1)
-    draw_stroked_text(d, (divider_x + acx(16), center_y), meaning, meaning_font, (79, 91, 107, 255), anchor="lm", stroke_width=0)
+    draw_stroked_text(d, (divider_x + acx(16), center_y), meaning, meaning_font, ARTICLE_VOCAB_MEANING_COLOR, anchor="lm", stroke_width=0)
 
 
 def draw_article_vocab_review_bar(
@@ -8578,7 +9692,7 @@ def draw_article_vocab_review_bar(
         500,
         34,
         16,
-        lambda size: article_en_font(size, 700),
+        article_vocab_phrase_font,
     )
     phrase_lines = [phrase]
     meaning_font = fit_article_font_to_width(
@@ -8587,7 +9701,7 @@ def draw_article_vocab_review_bar(
         440,
         26,
         18,
-        lambda size: article_cjk_font(size, 400),
+        article_vocab_meaning_font,
     )
     phrase_gap = int(phrase_font.size * 1.15)
     total_height = len(phrase_lines) * phrase_gap + acy(26) + meaning_font.size
@@ -8611,7 +9725,7 @@ def draw_article_vocab_review_bar(
         (center_x, cursor_y),
         meaning,
         meaning_font,
-        (79, 91, 107, 255),
+        ARTICLE_VOCAB_MEANING_COLOR,
         anchor="ma",
         stroke_width=0,
     )
@@ -8648,7 +9762,7 @@ def draw_article_vocab_placeholder(img: Image.Image, rect: tuple[int, int, int, 
         (acx(content_left), acy(202)),
         "重点词会随当前意群出现",
         body_font,
-        (79, 91, 107, 255),
+        ARTICLE_VOCAB_DETAIL_COLOR,
         stroke_width=0,
     )
 
@@ -8690,7 +9804,9 @@ def draw_article_opening_topic_panel(
         3,
         52,
         24,
-        (lambda size: article_cjk_font(size, 800)) if has_cjk else (lambda size: article_en_font(size, 700)),
+        article_source_han_serif_cn_bold_font
+        if has_cjk
+        else (lambda size: article_en_font(size, 700)),
         wrap_article_title_text,
     )
     line_gap = int(title_font.size * 1.25)
@@ -8761,11 +9877,19 @@ def draw_article_vocab_overview(
     # cards.  Give all translations one shared type scale for a calmer grid.
     meaning_font = fit_article_font_to_width(
         d,
-        max(meanings, key=lambda value: text_w(d, value, article_cjk_font(54, 400)), default=""),
+        max(
+            meanings,
+            key=lambda value: text_w(
+                d,
+                value,
+                article_vocab_meaning_font(54),
+            ),
+            default="",
+        ),
         330,
         46,
         30,
-        lambda size: article_cjk_font(size, 400),
+        article_vocab_meaning_font,
     )
     # Use the widest gloss to place a single left-aligned Chinese column. This
     # keeps all rows aligned while letting the longest item reach the right edge.
@@ -8781,9 +9905,9 @@ def draw_article_vocab_overview(
         # generic design-width helper: the overview card is drawn at a native
         # intermediate size before its final resize.
         word_available_width = max(1, meaning_x - word_x - word_to_meaning_gap)
-        word_font = article_en_font(20, 700)
+        word_font = article_vocab_phrase_font(20)
         for size in range(68, 19, -2):
-            candidate_font = article_en_font(size, 700)
+            candidate_font = article_vocab_phrase_font(size)
             if text_w(d, word, candidate_font) <= word_available_width:
                 word_font = candidate_font
                 break
@@ -8797,7 +9921,7 @@ def draw_article_vocab_overview(
         word_y = center_y - ((word_box[1] + word_box[3]) // 2)
         meaning_y = center_y - ((meaning_box[1] + meaning_box[3]) // 2)
         draw_stroked_text(d, (word_x, word_y), word, word_font, (42, 63, 93, 255), stroke_width=0)
-        draw_stroked_text(d, (meaning_x, meaning_y), meaning, meaning_font, (79, 91, 107, 255), stroke_width=0)
+        draw_stroked_text(d, (meaning_x, meaning_y), meaning, meaning_font, ARTICLE_VOCAB_MEANING_COLOR, stroke_width=0)
 
     for index in range(6):
         dot_x = 126 + index * 46
@@ -8818,12 +9942,13 @@ def draw_article_frame(
     date_text: str = "Jul 23rd 2026",
     display_time: float | None = None,
     english_only: bool = False,
+    logo: Image.Image | None = None,
 ) -> Image.Image:
     img = Image.new("RGBA", (ARTICLE_WIDTH, ARTICLE_HEIGHT), (247, 243, 234, 255))
     d = ImageDraw.Draw(img, "RGBA")
 
     draw_article_panel(img, article_rect(16, 16, 900, 530), acx(16), ARTICLE_CARD_CONTAINER)
-    cover = decorate_article_cover(article_image, date_text)
+    cover = decorate_article_cover(article_image, date_text, logo)
     paste_rounded(img, cover, article_rect(31, 33, 885, 513), acx(8))
 
     vocab_rect = article_rect(916, 16, 1584, 530)
@@ -8863,8 +9988,8 @@ def draw_article_frame(
         highlight_ranges = highlight_ranges_for_lines(en_lines, key)
         zh_width = ARTICLE_SUBTITLE_ZH_WIDTH
         zh_font = fit_article_zh_font(d, visual_zh, acx(zh_width)) if visual_zh else None
-        zh_lines = wrap_zh(d, visual_zh, zh_font, acx(zh_width)) if visual_zh else []
-        en_gap = int(en_font.size * 1.16)
+        zh_lines = wrap_article_zh(d, visual_zh, zh_font, acx(zh_width)) if visual_zh else []
+        en_gap = int(en_font.size * ARTICLE_SUBTITLE_EN_LINE_HEIGHT_MULTIPLIER)
         zh_gap = 58
         en_count = max(1, len(en_lines))
         zh_count = max(0, len(zh_lines))
@@ -8887,9 +10012,16 @@ def draw_article_frame(
                 line_x = acx(en_x) + (acx(en_width) - text_w(d, line, en_font)) // 2
                 draw_stroked_text(d, (line_x, acy(en_y) + idx * en_gap), line, en_font, fill, stroke_width=0)
         if zh_lines and not english_only:
-            zh_fill = with_alpha((65, 81, 104, 255), subtitle_alpha)
+            zh_fill = with_alpha(ARTICLE_SUBTITLE_ZH_COLOR, subtitle_alpha)
             for idx, line in enumerate(zh_lines):
-                draw_stroked_text(d, (ARTICLE_WIDTH // 2, acy(zh_y) + idx * acy(zh_gap)), line, zh_font, zh_fill, anchor="ma", stroke_width=0)
+                draw_article_zh_line(
+                    d,
+                    ARTICLE_WIDTH // 2,
+                    acy(zh_y) + idx * acy(zh_gap),
+                    line,
+                    zh_font,
+                    zh_fill,
+                )
     return img
 
 
@@ -8935,11 +10067,13 @@ def render_podcast_learning_video(
     process_callback: Callable[[object | None], None] | None = None,
     allow_manual_draft: bool = False,
     english_only: bool = False,
+    logo_path: str = "",
 ) -> None:
     cues = parse_srt(subtitle_path)
     if not cues:
         raise RuntimeError("字幕文件没有可用内容")
     is_article_template = template_style == "文章单词"
+    article_logo = load_article_logo(logo_path) if is_article_template else None
     if is_article_template:
         # Reject any unreadable fixed-font page before a vocabulary request or
         # ffmpeg process can create a partial output.
@@ -9081,6 +10215,7 @@ def render_podcast_learning_video(
                                 date_text,
                                 t,
                                 english_only,
+                                article_logo,
                             ).convert("RGB")
                         else:
                             frame = draw_frame(

@@ -708,6 +708,7 @@ class SubtitleThread(QThread):
                     context = empty_article_context()
 
         context = enrich_article_context_with_evidence(context, article_text)
+        self.task.article_context_data = dict(context)
         try:
             save_article_artifacts(output_dir, article_text, context)
         except Exception as exc:
@@ -1716,11 +1717,18 @@ class SubtitleThread(QThread):
             article_context_resumed = article_context is not None
             if article_context is None:
                 article_context = self._resolve_article_context(subtitle_config, article_output_dir)
+            if self._article_reference_enabled() and self._has_article_context(article_context):
+                self.task.article_context_data = dict(article_context)
+            article_artifact_paths = (
+                (article_output_dir / "article_context.json",)
+                if self._article_reference_enabled()
+                else ()
+            )
             self._complete_stage(
                 "article_context",
                 "分析参考原文",
                 stage_started,
-                artifact_paths=(article_output_dir / "article_context.json",),
+                artifact_paths=article_artifact_paths,
                 details={"resumed": article_context_resumed},
             )
             article_translation_prompt = ""

@@ -105,11 +105,20 @@ Rules:
   hedges, and speaker stance. The target budget is soft; this is concise
   translation, not summarization or character truncation.
 - Allocation maps the full Chinese meaning back to fixed global subtitle IDs.
-- Under the DeepSeek role policy, complete semantic-group translation uses the
-  configured full-translation model (normally Pro). Ordinary fixed-ID
-  allocation uses the configured allocation/review model (normally Flash),
-  while a deterministic high-risk quality retry escalates only its affected
-  group to the full-translation model.
+- Under the configured two-model role policy (supported by DeepSeek and
+  OpenCode Go), complete semantic-group translation uses the configured
+  full-translation model. DeepSeek official currently uses Pro for this role
+  and Flash for ordinary allocation/page translation; OpenCode Go currently
+  uses Flash for every translation role. A deterministic high-risk quality
+  retry still uses the configured full-translation model for the affected
+  group.
+- A full-translation batch may publish a validated subset when the provider
+  omits other group IDs. Valid ID/source-echo/translation records are cached as
+  a resumable checkpoint; duplicate, unknown, empty, or source-mismatched
+  records are discarded. Only missing groups enter bounded `8 -> 4 -> 2 -> 1`
+  repair batches, with at most 12 repair requests per run.
+- The screen editor disables OpenAI SDK retries. Application code is the only
+  retry owner, so one recorded external attempt equals one provider request.
 - English IDs, timing, and order are immutable during Chinese translation.
 - Missing Chinese is a validation issue.
 - LLM allocation responses must include `subtitle_id` for each returned Chinese line.
@@ -149,6 +158,12 @@ Rules:
   upstream times.
 - A padding overlap may be reconciled only at a shared boundary that stays
   between the adjacent word envelopes.
+- The same final cue timeline owns parent-cue chaining. When adjacent frozen
+  word envelopes have a positive pause below 1000ms and the padded display
+  ranges still leave a visible gap, the outgoing cue receives roughly 75% of
+  that pause and the incoming cue may start early by at most 200ms. Both cues
+  meet at one shared display boundary. A word pause of 1000ms or more remains
+  visible; word timestamps and word envelopes never move.
 - The final cue timeline also owns short display-range repair. It first
   preserves a 150ms hard minimum for every internal cue, then uses only
   non-word time between adjacent word envelopes to approach a 700ms soft
@@ -156,6 +171,8 @@ Rules:
   without overlap or cutting speech, final export fails with an explicit
   timeline error.
 - Do not change English text, Chinese text, subtitle ID, word range, or order.
+- Later stabilization stages may audit display coverage but must not retime a
+  cue already published by the final timeline.
 - Missing, duplicate, unknown, or synthetic final timeline IDs are ERRORs and
   block export.
 
@@ -174,14 +191,18 @@ If deterministic page-Chinese validation fails, only the complete page set of
 the affected parent IDs is retried. Already validated parents remain frozen;
 the local result must pass its sub-contract and the merged response must pass
 the original full contract before the page projection is attached. Under the
-DeepSeek role policy the ordinary page request uses the allocation/review model
+configured two-model role policy the ordinary page request uses the
+allocation/review model
 and a naturalness or semantic retry uses the full-translation model. A residual
 non-blocking continuation after that retry stays explicit REVIEW evidence and
 cannot replace the authoritative parent translation.
-Missing, duplicate, unknown, or cardinality-mismatched page IDs instead retry
-the complete contract: the validator intentionally exposes no partial parent
-authority for those structural failures. A retry request failure preserves the
-initial accepted parents and records its exact parent scope for manual review.
+Missing, duplicate, or cardinality-mismatched page IDs are scoped to the
+affected parent whenever the page IDs identify that parent. Unknown IDs or
+otherwise unscoped malformed responses still retry the complete contract.
+The validator retains independently complete parents as review-only evidence
+while the full artifact remains `ERROR`; only a complete merged contract can
+update authoritative parent Chinese. A retry request failure preserves the
+accepted parents and records its exact parent scope for manual review.
 
 ## Stage 5: Validation and Artifacts
 
@@ -204,6 +225,7 @@ Outputs:
 - `final-cue-timeline.json`
 - `display-page-translations.json`
 - `english-boundary-audit.json`
+- `llm-request-ledger.json`
 - `run-state.json`
 
 Run-state rules:
@@ -215,6 +237,16 @@ Run-state rules:
   fingerprint match; otherwise the normal stage executes.
 - Existing LLM batch caches may be reused under their current cache keys, but
   completion order never controls translation or subtitle writeback order.
+- Display-page Chinese requests are bounded to at most six parent subtitles
+  and twelve actual pages per batch. Each valid batch is cached independently,
+  so a later timeout does not discard earlier completed work and a rerun asks
+  only for batches that are still missing. A valid legacy whole-contract cache
+  remains reusable; all batch rows are merged and validated once against the
+  original complete display-page contract before publication.
+- `llm-request-ledger.json` is atomically updated after each cache lookup or
+  external request. It records task, model, attempt, latency, provider token
+  usage, prompt-cache tokens, and reasoning tokens when returned by the API;
+  it never stores prompts or API credentials.
 - A malformed optional allocation-quality retry is rejected locally. The
   original complete fixed-ID allocation remains authoritative, while the
   failed candidate and unresolved quality issue remain review evidence. This
@@ -308,6 +340,11 @@ Rule:
   SRT, word ledger, final cue timeline, page translations, edit history, and a
   SHA-256-bound `stable-final-manifest.json`. It never overwrites the original
   stable package.
+- Before media derivation or subtitle export, manual-final save rebuilds every
+  current parent display range from its continuous frozen-word span through the
+  same final-cue timeline as normal production. Derived mute intervals, parent
+  SRT, page plans/maps, and `final-cue-timeline.json` therefore consume one
+  authoritative timing result after a formal parent-boundary move.
 - A manual English correction may replace the surface of one frozen word ID,
   or map one continuous range of two or more frozen word IDs to one
   presentation-only surface. The raw ledger text, word IDs, order, word times,
@@ -517,7 +554,7 @@ Rule:
 - The article-template renderer must verify the stable manifest, final cue
   timeline, word ledger, and any required display-page translation artifact
   before synthesis. The manifest binds the page artifact by SHA-256 and page
-  contract hash. It plans 56px English and 46px Chinese pages inside each
+  contract hash. It plans 56px English and 48px Chinese pages inside each
   frozen cue. The complete whole-episode plan is frozen before page Chinese is
   accepted. Once validated, that plan is the only renderer authority; a
   per-cue renderer call cannot replace its page spans, font, or page IDs.
@@ -543,10 +580,11 @@ Rule:
   itself force a readable 56px two-line cue to paginate.
   A high-pressure static or multipage baseline (over 14 words on a page,
   longer than 5.2 seconds, or below 56px) receives a bounded secondary review.
-  A complete all-56px partition takes precedence over smaller-font options. If
-  no all-56px plan exists, a complete partition may still replace a 50px
-  three-line fallback when it does not reduce the font floor and every page is
-  at most two lines. Every promoted page keeps at least six words and 900ms.
+  A complete all-56px partition takes precedence over smaller-font options.
+  Automatic planning then permits only 54px and 52px as smaller normal sizes.
+  If no complete 56/54/52px plan exists, it emits an explicit
+  `render_structural_overflow` editable seed instead of regenerating a 50px or
+  three-line page. Every promoted page keeps at least six words and 900ms.
   Complete `to ...` and `from + gerund` restarts are reviewed fallbacks;
   incomplete lexical, noun-attached, clause-introducer, and modifier boundaries
   remain ineligible regardless of density.
@@ -560,19 +598,20 @@ Rule:
   a complete right page, and at least 180ms of verified pause may enter the
   medium-review tier. A restart at 600ms remains high-confidence audit
   evidence, but its acoustic support lowers its selection cost. Lexical
-  dependencies remain hard. Three English lines are permitted only at 50px
-  after every two-line layout at 56/54/52/50px fails. Missing or mismatched
-  timing, minimum-font overflow, or an unschedulable page raises
+  dependencies remain hard. New automatic pages are limited to two English
+  lines and 56/54/52px. A legacy 50px artifact may be reopened and validated
+  for compatibility, but is never produced by the current planner. Missing or
+  mismatched timing, minimum-font overflow, or an unschedulable page raises
   `render_structural_overflow` before ffmpeg starts.
-  Every selected final page independently chooses the largest legal size from
-  56/54/52/50px after its word span is frozen. The parent font field is only a
+  Every selected final page independently chooses the largest automatic size
+  from 56/54/52px after its word span is frozen. The parent font field is only a
   summary equal to the smallest child-page size; it cannot force a short child
   page to inherit the smaller size needed by another page. Automatic planning,
   manual page splitting, frozen-artifact validation, editor preview, and final
   rendering consume the same per-page font value.
   After those page spans, IDs, Chinese assignments, and page times are frozen,
   a renderer-only pass compares every legal width profile for the same page at
-  56/54/52/50px and selects its same-screen one- or two-line English layout.
+  56/54/52px and selects its same-screen one- or two-line English layout.
   Pixel-width balance is scored after lexical and frozen syntax protection, so
   punctuation cannot win merely by leaving an extreme short line. A warning
   that only means `unsupported_tight_page_transition` is ignored here because
@@ -584,14 +623,15 @@ Rule:
   or timing.
   Article-template Chinese uses a fixed 48px font, at most two lines, and the
   existing 1455-design-pixel safe width.
-  The page contract version is `article-fixed-font-pages-v25`, so page-layout
+  The page contract version is `article-fixed-font-pages-v27`, so page-layout
   and page-translation caches from earlier planner versions cannot be reused;
   unchanged ASR, full-translation, and fixed-ID allocation caches remain
   independently reusable under their own fingerprints.
   Raw hard/atomic syntax evidence remains attached when an acoustic or
   continuation fallback makes a boundary reviewable. Candidates without such
-  relaxed atomic evidence are selected first; a verified complete continuation
-  can re-enter only to replace an emergency three-line layout.
+  relaxed atomic evidence are selected first. If no normal-font candidate is
+  renderable, the failed parent remains visible to the editor as an editable
+  seed; it is not hidden or silently forced into an emergency three-line page.
   Page Chinese uses `fixed-parent-page-allocation-v6`. Its aggregate projection
   is checked against the authoritative parent Chinese for repeated meaning and
   significant expansion before the existing parent-local retry is accepted.

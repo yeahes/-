@@ -26,7 +26,7 @@
 - A visual page prefers 12 words and treats 16 words as a soft budget. A page
   that exceeds 16 words remains legal when its measured selected-font layout
   fits and a shorter partition would create a worse grammar or timing boundary.
-- A single page over 16 words, or one that needs 52/50px, receives one
+- A single page over 16 words, or one that needs 52px, receives one
   conservative secondary review. A reviewed two-or-more-page plan may replace
   it only when every page has at least six words, lasts at least 900ms, fits at
   56px, and every new boundary starts a complete clause or has a verified
@@ -44,7 +44,7 @@
   punctuation. This remains a review candidate with a planning penalty; the
   renderer prefers a more complete boundary whenever one is feasible.
 - Article English uses 56px by default. The planner evaluates the explicit
-  56/54/52/50px sequence together with one-to-four-page layouts. A smaller
+  56/54/52px sequence together with one-to-four-page layouts. A smaller
   static layout may beat a page turn only when that page turn carries stronger
   structural risk; low-confidence hints remain soft and cannot by themselves
   force major font reduction. The selected size and reason must be recorded in
@@ -59,15 +59,17 @@
   better. An unchanged or equally ranked break must retain the existing larger
   font. This final line reflow cannot change parent English, page count, page
   word spans, Chinese allocation, subtitle IDs, or any timing field.
-- A 50px page may use three English lines only after every grammar-safe two-line
-  layout at 56/54/52/50px has failed. Other font sizes remain limited to two
-  lines. The renderer must never reduce English below 50px.
+- New automatic pages never use 50px or three English lines. If every
+  grammar-safe two-line layout at 56/54/52px fails, the parent receives an
+  explicit `render_structural_overflow` editable seed. A legacy 50px page may
+  still be reopened and validated for compatibility, but the current planner
+  never creates one.
 - The planner first exhausts strict layouts. Only when none can fit may a
   complete visible continuation phrase or clause use a reviewed page boundary.
   The fallback cannot split a lexical atom, silently become an allowed
   boundary, or change the parent cue; it is recorded as a high-risk editor
   review. This is preferable to blocking an otherwise renderable long cue or
-  shrinking below 50px.
+  shrinking below 52px.
 - Page count is chosen first from measured English/Chinese load, the soft word
   budget, and duration. Break rewards cannot create another page. Within the
   selected count, display boundaries retain separate allowed, low, medium,
@@ -140,7 +142,11 @@ Bad cut points:
 
 - Final display timing may extend subtitles for readability.
 - Final timing must not overlap adjacent subtitles.
-- Short spoken beats can be bridged to the next subtitle when the gap is small.
+- A positive word pause below 1000ms may be closed at one shared display
+  boundary. The incoming cue may begin at most 200ms before its first word;
+  pauses of 1000ms or more remain visible.
+- Display chaining cannot change word timestamps, fixed English/Chinese, IDs,
+  word ownership, page planning, or audio.
 - A large blank gap must be treated as a possible ASR/timing issue and reported.
 
 ## Validation Policy
@@ -284,8 +290,9 @@ Manual draft synthesis:
 - Draft pagination may use a REVIEW-labelled relaxed phrase/clause boundary
   only after the strict planner fails, but that choice must be made and
   persisted when the manual package is saved. It still uses token-safe Chinese
-  boundaries and the 56/54/52/50px English font set; raw character splitting
-  and silent font reduction remain forbidden.
+  boundaries and the 56/54/52px automatic English font set; raw character
+  splitting and silent font reduction remain forbidden. A legacy 50px page is
+  accepted only when it is already frozen in the imported artifact.
 - The editor and draft renderer must consume the same SHA-256-bound draft page
   artifact. Runtime synthesis cannot create a replacement page plan. Missing,
   tampered, or cross-package page artifacts block before ffmpeg.

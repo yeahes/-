@@ -224,6 +224,7 @@ class StablePublicationTests(unittest.TestCase):
         for cue in session.cues:
             cue["start_time"] = session._word_start_time(int(cue["word_start"]))
             cue["end_time"] = session._word_end_time(int(cue["word_end"]))
+        session._rebuild_authoritative_cue_timeline()
         session.cues[0]["translated_subtitle"] = "系统可靠，人工可控。"
 
         boundary_items = dict(evidence["boundaries"])

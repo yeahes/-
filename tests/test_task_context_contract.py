@@ -264,6 +264,46 @@ class TaskContextContractTests(unittest.TestCase):
             )
 
             self.assertEqual(resolved["summary"], "Analysis for A")
+            self.assertEqual(thread.task.article_context_data["summary"], "Analysis for A")
+
+    def test_subtitle_retry_rebuild_inherits_context_only_for_same_input(self):
+        previous = TaskFactory.create_subtitle_task(
+            "episode.srt",
+            video_path="episode.m4a",
+            need_next_task=True,
+            source_audio_path="source-episode.m4a",
+            article_reference_text="Article A",
+            article_context_data={"summary": "Analysis A"},
+            use_article_reference_assist=True,
+            use_article_translation_terms=True,
+            require_manual_review_before_synthesis=True,
+        )
+
+        retry = TaskFactory.recreate_subtitle_task(
+            previous,
+            file_path="episode.srt",
+        )
+
+        self.assertEqual(retry.video_path, previous.video_path)
+        self.assertEqual(retry.need_next_task, previous.need_next_task)
+        self.assertEqual(retry.source_audio_path, previous.source_audio_path)
+        self.assertEqual(retry.article_reference_text, previous.article_reference_text)
+        self.assertIs(retry.article_context_data, previous.article_context_data)
+        self.assertTrue(retry.use_article_reference_assist)
+        self.assertTrue(retry.use_article_translation_terms)
+        self.assertTrue(retry.require_manual_review_before_synthesis)
+
+        unrelated = TaskFactory.recreate_subtitle_task(
+            previous,
+            file_path="another-episode.srt",
+        )
+        self.assertIsNone(unrelated.video_path)
+        self.assertIsNone(unrelated.source_audio_path)
+        self.assertEqual(unrelated.article_reference_text, "")
+        self.assertIsNone(unrelated.article_context_data)
+        self.assertFalse(unrelated.use_article_reference_assist)
+        self.assertFalse(unrelated.use_article_translation_terms)
+        self.assertFalse(unrelated.require_manual_review_before_synthesis)
 
     def test_subtitle_stage_enriches_cached_entities_before_asr_and_translation(self):
         article = (
