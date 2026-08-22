@@ -1321,7 +1321,7 @@ def test_medium_review_page_boundary_can_beat_static_font_reduction_on_quality()
     assert " ".join(page["en"] for page in plan["pages"]) == text
 
 
-def test_unsupported_tight_page_transition_loses_to_same_font_static_layout():
+def test_attached_clause_page_transition_loses_to_same_font_static_layout():
     text = (
         "Just to make the older machines do something they were never "
         "designed to do."
@@ -1335,8 +1335,8 @@ def test_unsupported_tight_page_transition_loses_to_same_font_static_layout():
     plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
 
     assert decision["classification"] == "review"
-    assert decision["confidence"] == "low"
-    assert "unsupported_tight_page_transition" in decision["issue_codes"]
+    assert decision["confidence"] == "medium"
+    assert "dependency_phrase_entrance_split" in decision["issue_codes"]
     assert plan["status"] == "ok"
     assert len(plan["pages"]) == 1
     assert plan["font_size"]["english"] == 56
@@ -4734,7 +4734,7 @@ if __name__ == "__main__":
     test_screenshot_page_boundaries_consume_frozen_boundary_evidence()
     test_real_syntax_evidence_steers_results_from_without_injected_fixture_issue()
     test_medium_review_page_boundary_can_beat_static_font_reduction_on_quality()
-    test_unsupported_tight_page_transition_loses_to_same_font_static_layout()
+    test_attached_clause_page_transition_loses_to_same_font_static_layout()
     test_complete_phrase_page_starts_remain_eligible_without_a_pause()
     test_atomic_of_and_dangling_coordinator_page_boundaries_are_hard()
     test_strong_pause_keeps_hard_boundary_as_last_resort_not_preferred_split()

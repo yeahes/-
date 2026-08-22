@@ -382,7 +382,21 @@ ARTICLE_PAGE_NOMINAL_OBJECT_START_WORDS = frozenset(
     | {"all", "any", "each", "either", "enough", "every", "few", "many", "more", "most", "much", "neither", "no", "several", "some"}
 )
 ARTICLE_PAGE_OF_QUANTIFIER_HEAD_WORDS = frozenset(
-    {"all", "any", "each", "either", "every", "few", "many", "most", "much", "neither", "no", "some"}
+    {
+        "all",
+        "any",
+        "each",
+        "either",
+        "every",
+        "few",
+        "half",
+        "many",
+        "most",
+        "much",
+        "neither",
+        "no",
+        "some",
+    }
 )
 ARTICLE_PAGE_TO_INFINITIVE_HEADS = frozenset(
     {
@@ -2729,9 +2743,22 @@ def _article_complete_prepositional_continuation_shape(
     }
     quantifier_head_of_phrase = bool(
         following == "of"
-        and split >= 2
-        and re.sub(r"[^A-Za-z']", "", words[split - 2]).casefold()
-        in ARTICLE_PAGE_OF_QUANTIFIER_HEAD_WORDS
+        and (
+            (
+                split >= 1
+                and re.sub(
+                    r"[^A-Za-z']", "", words[split - 1]
+                ).casefold()
+                in ARTICLE_PAGE_OF_QUANTIFIER_HEAD_WORDS
+            )
+            or (
+                split >= 2
+                and re.sub(
+                    r"[^A-Za-z']", "", words[split - 2]
+                ).casefold()
+                in ARTICLE_PAGE_OF_QUANTIFIER_HEAD_WORDS
+            )
+        )
     )
     issue_shape_is_supported = bool(
         issue_codes
