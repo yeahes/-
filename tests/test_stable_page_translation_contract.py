@@ -639,7 +639,7 @@ def test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages():
         ]
     }
 
-    def boundaries(text):
+    def boundaries(text, **_kwargs):
         return {1, 2} if text == "甲乙" else {3}
 
     with patch(
@@ -660,8 +660,164 @@ def test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages():
             "parent_subtitle_id": "S0002",
             "display_page_id": "S0002.P01",
             "boundary_offset": 1,
+            "split_token": "留学生",
         }
     ]
+
+
+def test_hmm_only_function_word_join_is_not_a_page_token_split():
+    parent_chinese = (
+        "但合法重组庞大供应链、变更官方原产国以降低关税负担，"
+        "是公认的商业做法。"
+    )
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0003",
+                "english": (
+                    "Legally restructuring supply chains changes origin "
+                    "and reduces tariff liability"
+                ),
+                "chinese": parent_chinese,
+                "word_start": 0,
+                "word_end": 8,
+                "pages": [
+                    {
+                        "display_page_id": "S0003.P01",
+                        "word_start": 0,
+                        "word_end": 4,
+                        "english": "Legally restructuring supply chains changes",
+                    },
+                    {
+                        "display_page_id": "S0003.P02",
+                        "word_start": 5,
+                        "word_end": 8,
+                        "english": "origin and reduces tariff liability",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article"},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0003.P01",
+                    "zh": "但合法重组庞大供应链、变更官方原产国",
+                },
+                {
+                    "display_page_id": "S0003.P02",
+                    "zh": "以降低关税负担，是公认的商业做法。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_source_owned_name_plus_one_grammar_character_is_not_added_meaning():
+    parent_chinese = (
+        "原文称，纳瓦罗没搞懂全球贸易传统规则的复杂成因，就急着拆掉。"
+    )
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0004",
+                "english": (
+                    "Navarro is trying to tear down traditional trade rules "
+                    "without understanding why they exist"
+                ),
+                "chinese": parent_chinese,
+                "word_start": 0,
+                "word_end": 12,
+                "pages": [
+                    {
+                        "display_page_id": "S0004.P01",
+                        "word_start": 0,
+                        "word_end": 6,
+                        "english": (
+                            "Navarro is trying to tear down traditional trade rules"
+                        ),
+                    },
+                    {
+                        "display_page_id": "S0004.P02",
+                        "word_start": 7,
+                        "word_end": 12,
+                        "english": "without understanding why they exist",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article"},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0004.P01",
+                    "zh": "原文称，纳瓦罗正急着拆掉全球贸易传统规则，",
+                },
+                {
+                    "display_page_id": "S0004.P02",
+                    "zh": "却没搞懂这些规则的复杂成因。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_source_owned_name_does_not_hide_new_multi_character_meaning():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0005",
+                "english": "Navarro does not understand the rules",
+                "chinese": "纳瓦罗没搞懂这些规则。",
+                "word_start": 0,
+                "word_end": 5,
+                "pages": [
+                    {
+                        "display_page_id": "S0005.P01",
+                        "word_start": 0,
+                        "word_end": 2,
+                        "english": "Navarro does not",
+                    },
+                    {
+                        "display_page_id": "S0005.P02",
+                        "word_start": 3,
+                        "word_end": 5,
+                        "english": "understand the rules",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article"},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0005.P01", "zh": "纳瓦罗操纵这些规则，"},
+                {"display_page_id": "S0005.P02", "zh": "却没搞懂。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_parent_meaning_added"
+        and "操纵" in (error.get("added_tokens") or [])
+        for error in artifact["errors"]
+    )
 
 
 def test_page_translation_retry_contract_contains_only_failed_parent_pages():
@@ -3231,8 +3387,8 @@ def test_display_page_semantics_use_authoritative_parent_chinese_not_english_sca
 
 
 def test_display_page_prompt_makes_parent_chinese_the_semantic_ceiling():
-    assert DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION == "display-page-translation-v8"
-    assert DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION == "fixed-parent-page-allocation-v8"
+    assert DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION == "display-page-translation-v9"
+    assert DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION == "fixed-parent-page-allocation-v9"
     assert "semantic ceiling" in DISPLAY_PAGE_TRANSLATION_PROMPT
     assert "Never restore a concept from the English" in DISPLAY_PAGE_TRANSLATION_PROMPT
     assert "Do not introduce a new multi-character content word" in DISPLAY_PAGE_TRANSLATION_PROMPT
@@ -3258,6 +3414,12 @@ def test_display_page_retry_prompt_constrains_arbitrary_validator_tokens():
                 "code": "page_translation_id_missing",
                 "ids": [f"{case['subtitle_id']}.P02"],
             },
+            {
+                "code": "page_translation_chinese_token_split",
+                "parent_subtitle_id": case["subtitle_id"],
+                "display_page_id": f"{case['subtitle_id']}.P01",
+                "split_token": "留学生",
+            },
         ],
     )
 
@@ -3265,6 +3427,7 @@ def test_display_page_retry_prompt_constrains_arbitrary_validator_tokens():
     assert '["背景", "结论"]' in prompt
     assert "Do not replace them with synonyms" in prompt
     assert f'["{case["subtitle_id"]}.P02"]' in prompt
+    assert '"留学生" entirely on one page' in prompt
     assert "English is placement evidence only" in prompt
 
 
@@ -4560,6 +4723,9 @@ if __name__ == "__main__":
     test_page_translation_rejects_missing_duplicate_and_unknown_page_ids()
     test_missing_page_retains_other_complete_parent_for_scoped_retry()
     test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages()
+    test_hmm_only_function_word_join_is_not_a_page_token_split()
+    test_source_owned_name_plus_one_grammar_character_is_not_added_meaning()
+    test_source_owned_name_does_not_hide_new_multi_character_meaning()
     test_page_translation_retry_contract_contains_only_failed_parent_pages()
     test_structural_page_response_retries_only_identifiable_missing_parent()
     test_page_translation_cache_key_invalidates_semantic_page_contract_changes()

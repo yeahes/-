@@ -17,9 +17,9 @@ from app.core.subtitle_processor.chinese_token_boundaries import (
 
 DISPLAY_PAGE_SCHEMA_VERSION = 2
 DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v30"
-DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v8"
+DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v9"
 DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION = "display-page-translation-source-echo-v1"
-DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v8"
+DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v9"
 
 
 _NEUTRAL_PAGE_PROJECTION_BINDING_TOKENS = frozenset(
@@ -615,13 +615,39 @@ def _novel_parent_content_tokens(
             # A reordered source phrase can occasionally be segmented at a
             # different boundary. Exact source containment is still source-
             # owned wording, while a new multi-character token is not.
-            if token in source_content or chinese_count < 2:
+            if (
+                token in source_content
+                or chinese_count < 2
+                or _source_token_plus_one_chinese_character(
+                    source_content,
+                    token,
+                )
+            ):
                 continue
         elif not re.fullmatch(r"[a-z0-9%$¥￥]{2,}", token):
             continue
         seen.add(token)
         novel.append(token)
     return tuple(novel)
+
+
+def _source_token_plus_one_chinese_character(
+    source_content: str,
+    token: str,
+) -> bool:
+    """Recognize a tokenizer-joined single-character grammar adjustment.
+
+    The projection contract already treats a standalone Chinese character as
+    non-fact-bearing. HMM tokenization can attach that character to a source-
+    owned name or phrase (for example, ``name + aspect marker``), which must
+    not turn the same permitted adjustment into a multi-character addition.
+    """
+    if not re.fullmatch(r"[\u4e00-\u9fff]+", token) or len(token) < 3:
+        return False
+    return (
+        (len(token[:-1]) >= 2 and token[:-1] in source_content)
+        or (len(token[1:]) >= 2 and token[1:] in source_content)
+    )
 
 
 def _parent_projection_quality_errors(
@@ -684,20 +710,33 @@ def _source_owned_token_crosses_boundary(
     source: str,
     aggregate: str,
     boundary_offset: int,
-) -> bool:
+) -> str:
     """Only the frozen parent may prove that a page edge bisects a Chinese word."""
     source_tokens = _translation_content_tokens(source)
     aggregate_tokens = chinese_tokens(aggregate)
     if source_tokens is None or aggregate_tokens is None:
-        return False
+        return ""
     source_token_set = set(source_tokens)
+    dictionary_boundaries = chinese_token_boundaries(aggregate, hmm=False)
     offset = 0
     for token in aggregate_tokens:
         next_offset = offset + len(token)
         if offset < boundary_offset < next_offset:
-            return _translation_content(token) in source_token_set
+            normalized = _translation_content(token)
+            if normalized not in source_token_set:
+                return ""
+            # Jieba HMM can invent a joined token around a common one-character
+            # grammar word (for example, ``国以``). The dictionary tokenizer
+            # is independent evidence that this boundary is legal. A lexical
+            # word such as ``留学生`` remains whole in both modes and blocks.
+            if (
+                dictionary_boundaries is not None
+                and boundary_offset in dictionary_boundaries
+            ):
+                return ""
+            return normalized
         offset = next_offset
-    return False
+    return ""
 
 
 def _page_projection_quality_errors(
@@ -923,20 +962,21 @@ def validate_page_translation_response(
             offset = 0
             for page in pages[:-1]:
                 offset += len(page["zh"])
-                if (
-                    offset not in token_boundaries
-                    and _source_owned_token_crosses_boundary(
+                split_token = ""
+                if offset not in token_boundaries:
+                    split_token = _source_owned_token_crosses_boundary(
                         source_chinese,
                         aggregate_chinese,
                         offset,
                     )
-                ):
+                if split_token:
                     errors.append(
                         {
                             "code": "page_translation_chinese_token_split",
                             "parent_subtitle_id": parent.get("parent_subtitle_id"),
                             "display_page_id": page.get("display_page_id"),
                             "boundary_offset": offset,
+                            "split_token": split_token,
                         }
                     )
         errors.extend(

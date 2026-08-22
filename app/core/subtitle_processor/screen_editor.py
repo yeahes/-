@@ -428,7 +428,7 @@ DISPLAY_PAGE_TRANSLATION_PROMPT = """
 You are assigning a display-only Simplified Chinese projection to fixed visual
 pages below one frozen parent subtitle ID.
 
-Version: display-page-translation-v8
+Version: display-page-translation-v9
 
 The English page IDs, English text, order, word ownership, and timing are
 immutable. Re-express the supplied full_translation as one concise Chinese
@@ -458,7 +458,8 @@ Rules:
   limited to: 以及、这些、那些、其中、来自、出自、介于. 源于 is allowed only
   when full_translation already states the same causal relation; 也就是 is
   allowed only when it already states the same explanatory relation. Prefer
-  punctuation or single-character grammar when no listed binding word fits.
+  punctuation or one single-character grammar marker when no listed binding
+  word fits. That marker may attach to an adjacent Chinese name or phrase.
 - Do not reveal a later English page's information on an earlier Chinese page.
 - Reorder Chinese clauses when English and natural Chinese use different order.
 - Prefer a page that reads naturally on its own when its frozen English page is
@@ -2732,6 +2733,15 @@ class ScreenSubtitleEditor:
                     f"{scope}: keep the source phrase "
                     f"{json.dumps(repeated_phrase, ensure_ascii=False)} exactly once "
                     "across all of its pages."
+                )
+            split_token = str(error.get("split_token") or "").strip()
+            if split_token:
+                page_id = str(error.get("display_page_id") or "").strip()
+                page_scope = f" at {page_id}" if page_id else ""
+                corrections.append(
+                    f"{scope}{page_scope}: keep the Chinese word "
+                    f"{json.dumps(split_token, ensure_ascii=False)} entirely on "
+                    "one page; move the page boundary without changing its wording."
                 )
             missing_ids = [
                 str(page_id).strip()

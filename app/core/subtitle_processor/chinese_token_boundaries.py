@@ -35,25 +35,31 @@ def _tokenizer():
     return _TOKENIZER
 
 
-def chinese_tokens(text: str) -> tuple[str, ...] | None:
+def chinese_tokens(text: str, *, hmm: bool = True) -> tuple[str, ...] | None:
     """Return deterministic tokens only when they reconstruct the exact input."""
     try:
         raw = str(text)
-        tokens = tuple(str(token) for token in _tokenizer().cut(raw, HMM=True))
+        tokens = tuple(
+            str(token) for token in _tokenizer().cut(raw, HMM=bool(hmm))
+        )
         return tokens if "".join(tokens) == raw else None
     except Exception:
         logger.exception("Chinese display tokenizer unavailable")
         return None
 
 
-def chinese_token_boundaries(text: str) -> dict[int, tuple[int, int]] | None:
+def chinese_token_boundaries(
+    text: str,
+    *,
+    hmm: bool = True,
+) -> dict[int, tuple[int, int]] | None:
     """Map every token-end character offset to adjacent token lengths.
 
     ``None`` means tokenization was unavailable or did not reconstruct the
     exact input. Callers that enforce a page contract must fail closed in that
     case instead of falling back to arbitrary character offsets.
     """
-    tokens = chinese_tokens(text)
+    tokens = chinese_tokens(text, hmm=hmm)
     if tokens is None:
         return None
     try:
