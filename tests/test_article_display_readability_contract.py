@@ -3488,6 +3488,41 @@ def test_three_line_fallback_promotes_complete_two_page_alternative():
         assert all(len(page["english_lines"]) <= 2 for page in plan["pages"])
 
 
+def test_forced_predicate_page_accepts_complete_adverb_preposition_phrase():
+    text = (
+        "You're getting plugged directly into the most aggressive expansion "
+        "engine in the modern food and beverage industry."
+    )
+    _, cue = _syntax_backed_cue(
+        text,
+        "S9523",
+        word_timing=_word_timing_with_gaps(text),
+    )
+    words = podcast_learning_video._article_boundary_words(cue)
+    split = words.index("into")
+
+    decision = podcast_learning_video._article_forced_continuation_decision(
+        cue,
+        words,
+        split,
+    )
+
+    assert decision["classification"] == "review"
+    assert decision["forced_complete_predicate_phrase"]
+    assert "verb_adverb_preposition_split" in decision["issue_codes"]
+    assert not podcast_learning_video._article_nonoverridable_atomic_page_boundary_issues(
+        decision
+    )
+
+    decision["issue_codes"] = [
+        *decision["issue_codes"],
+        "numeric_unit_or_noun_split",
+    ]
+    assert podcast_learning_video._article_nonoverridable_atomic_page_boundary_issues(
+        decision
+    ) == {"numeric_unit_or_noun_split"}
+
+
 def test_complete_prepositional_and_coordinated_continuations_survive_page_filter():
     cases = (
         (

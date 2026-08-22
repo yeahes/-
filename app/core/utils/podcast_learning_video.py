@@ -4369,6 +4369,7 @@ def _article_forced_continuation_decision(
     predicate_phrase_issues = {
         "predicate_attached_continuation_split",
         "predicate_complement_chain_split",
+        "verb_adverb_preposition_split",
     }
     complete_predicate_phrase = bool(
         complete_phrase
@@ -6659,6 +6660,7 @@ def _article_nonoverridable_atomic_page_boundary_issues(
         atomic_issues -= {
             "predicate_attached_continuation_split",
             "predicate_complement_chain_split",
+            "verb_adverb_preposition_split",
         }
     return atomic_issues
 
