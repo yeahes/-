@@ -125,6 +125,17 @@ Rules:
   a resumable checkpoint; duplicate, unknown, empty, or source-mismatched
   records are discarded. Only missing groups enter bounded `8 -> 4 -> 2 -> 1`
   repair batches, with at most 12 repair requests per run.
+- Initial full-translation work uses rolling batches of at most eight semantic
+  groups and at most two in-flight requests. Each initial batch gets one HTTP
+  attempt; every valid completion is validated and written to its unit cache
+  before another batch is admitted.
+- Two consecutive retryable provider failures open the full-translation
+  circuit and prevent unstarted batches from being submitted. Already in-flight
+  requests may finish and valid results are still cached. One successful batch
+  resets an earlier isolated failure; a non-retryable error or exhausted request
+  budget stops admission immediately. Missing groups are reported as
+  `semantic_full_translation_provider_unavailable` and a rerun resumes from the
+  completed unit caches.
 - The screen editor disables OpenAI SDK retries. Application code is the only
   retry owner, so one recorded external attempt equals one provider request.
 - English IDs, timing, and order are immutable during Chinese translation.

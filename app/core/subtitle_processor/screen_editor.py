@@ -132,6 +132,8 @@ SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translatio
 SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK = (
     "screen_subtitle_semantic_full_translation_unit_v1"
 )
+SEMANTIC_FULL_TRANSLATION_INITIAL_BATCH_LIMIT = 8
+SEMANTIC_FULL_TRANSLATION_CIRCUIT_BREAKER_FAILURES = 2
 SEMANTIC_FULL_TRANSLATION_RETRY_BATCH_SIZES = (8, 4, 2, 1)
 SEMANTIC_FULL_TRANSLATION_REPAIR_REQUEST_LIMIT = 12
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_CACHE_TASK = (
@@ -18887,60 +18889,49 @@ class ScreenSubtitleEditor:
         pending_payload = [
             entry for entry in payload if int(entry["id"]) not in result
         ]
-        payload_chunks = self._semantic_allocation_payload_chunks(pending_payload)
-        cache_hits = len(result)
-        self._emit_progress_event(
-            "full_translation",
-            completed=0,
-            total=len(payload_chunks),
-            cache_hits=cache_hits,
-            retries=0,
+        initial_batch_size = min(
+            SEMANTIC_FULL_TRANSLATION_INITIAL_BATCH_LIMIT,
+            max(1, int(self.allocation_batch_size or 16)),
         )
-        # A worker may only issue HTTP and parse JSON.  Cache writes, audit
-        # history, stable-ID merging, and progress are applied below in batch
-        # order by the main thread.
-        if self.allocation_max_concurrency <= 1 or len(payload_chunks) <= 1:
-            full_results = {}
-            for batch_index, payload_chunk in enumerate(payload_chunks, 1):
-                prompt = self._compose_prompt(
-                    SEMANTIC_FULL_TRANSLATION_PROMPT,
-                    source_text=" ".join(str(entry.get("full_english") or "") for entry in payload_chunk),
-                )
-                full_results[batch_index] = (
-                    payload_chunk,
-                    self._request_semantic_full_translation_chunk(
-                        prompt, payload_chunk, cache_task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK
-                    ),
-                    "",
-                    [],
-                )
-        else:
-            full_results: Dict[int, tuple[Sequence[Dict], Optional[object], str, List[Dict[str, Any]]]] = {}
-            workers = min(self.allocation_max_concurrency, len(payload_chunks))
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {}
-                for batch_index, payload_chunk in enumerate(payload_chunks, 1):
-                    prompt = self._compose_prompt(
-                        SEMANTIC_FULL_TRANSLATION_PROMPT,
-                        source_text=" ".join(str(entry.get("full_english") or "") for entry in payload_chunk),
-                    )
-                    future = executor.submit(
-                        self._request_semantic_full_translation_api_only,
-                        prompt,
-                        payload_chunk,
-                        cache_task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
-                    )
-                    futures[future] = (batch_index, payload_chunk)
-                for future in as_completed(futures):
-                    batch_index, payload_chunk = futures[future]
-                    try:
-                        data, error_message, attempts = future.result()
-                    except Exception as exc:
-                        data, error_message, attempts = None, str(exc), []
-                    full_results[batch_index] = (payload_chunk, data, error_message, attempts)
+        payload_chunks = [
+            list(pending_payload[index : index + initial_batch_size])
+            for index in range(0, len(pending_payload), initial_batch_size)
+        ]
+        cache_hits = len(result)
+        request_started = time.perf_counter()
+        completed_batches = 0
+        failed_batches = 0
+        provider_failure_streak = 0
+        circuit_open = False
+        circuit_reason = ""
 
-        for batch_index in range(1, len(payload_chunks) + 1):
-            payload_chunk, data, error_message, attempts = full_results[batch_index]
+        def emit_progress(*, active_batches: int = 0) -> None:
+            self._emit_progress_event(
+                "full_translation",
+                completed=completed_batches,
+                total=len(payload_chunks),
+                cache_hits=cache_hits,
+                retries=0,
+                active_batches=active_batches,
+                failed_batches=failed_batches,
+                circuit_open=circuit_open,
+                elapsed_seconds=round(
+                    max(0.0, time.perf_counter() - request_started), 3
+                ),
+            )
+
+        def apply_batch_result(
+            batch_index: int,
+            payload_chunk: Sequence[Dict],
+            data: Optional[object],
+            error_message: str,
+            attempts: Sequence[Mapping[str, Any]],
+        ) -> None:
+            nonlocal completed_batches
+            nonlocal failed_batches
+            nonlocal provider_failure_streak
+            nonlocal circuit_open
+            nonlocal circuit_reason
             for attempt_record in attempts:
                 self._record_llm_request(
                     task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
@@ -18969,17 +18960,162 @@ class ScreenSubtitleEditor:
                 )
             chunk_translations = self._semantic_full_translations_from_response(data, payload=payload_chunk)
             result.update(chunk_translations)
-            self._store_semantic_full_translation_units(
-                {int(entry["id"]): entry for entry in payload_chunk}, chunk_translations
+            if chunk_translations:
+                self._store_semantic_full_translation_units(
+                    {int(entry["id"]): entry for entry in payload_chunk},
+                    chunk_translations,
+                )
+            completed_batches += 1
+
+            if data is not None:
+                provider_failure_streak = 0
+                return
+
+            failed_batches += 1
+            message = str(error_message or "semantic_full_translation_request_failed")
+            if message == "translation_request_budget_exhausted":
+                circuit_open = True
+                circuit_reason = message
+                return
+            if self._is_retryable_allocation_error(message):
+                provider_failure_streak += 1
+                circuit_reason = message
+                if provider_failure_streak >= SEMANTIC_FULL_TRANSLATION_CIRCUIT_BREAKER_FAILURES:
+                    circuit_open = True
+                return
+            circuit_open = True
+            circuit_reason = message
+
+        emit_progress()
+        if payload_chunks:
+            workers = min(
+                max(1, int(getattr(self, "allocation_max_concurrency", 1) or 1)),
+                len(payload_chunks),
             )
-            latest = self._last_llm_raw_returns[-1] if self._last_llm_raw_returns else {}
-            cache_hits += int(bool(latest.get("task") == SEMANTIC_FULL_TRANSLATION_CACHE_TASK and latest.get("cache_hit")))
-            self._emit_progress_event(
-                "full_translation", completed=batch_index, total=len(payload_chunks), cache_hits=cache_hits, retries=0,
-                configured_concurrency=self.allocation_max_concurrency,
-            )
+            if workers == 1:
+                for batch_index, payload_chunk in enumerate(payload_chunks, 1):
+                    prompt = self._compose_prompt(
+                        SEMANTIC_FULL_TRANSLATION_PROMPT,
+                        source_text=" ".join(
+                            str(entry.get("full_english") or "")
+                            for entry in payload_chunk
+                        ),
+                    )
+                    ledger_start = len(self._llm_request_ledger)
+                    data = self._request_semantic_full_translation_chunk(
+                        prompt,
+                        payload_chunk,
+                        cache_task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
+                        max_attempts=1,
+                    )
+                    new_records = self._llm_request_ledger[ledger_start:]
+                    error_message = ""
+                    if data is None:
+                        error_message = next(
+                            (
+                                str(record.get("error") or "")
+                                for record in reversed(new_records)
+                                if str(record.get("status") or "") == "error"
+                            ),
+                            "semantic_full_translation_request_failed",
+                        )
+                    apply_batch_result(
+                        batch_index, payload_chunk, data, error_message, []
+                    )
+                    emit_progress()
+                    if circuit_open:
+                        break
+            else:
+                # Only the active window is submitted. HTTP/JSON parsing stays
+                # in workers; stable-ID state and cache commits stay here.
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    next_batch = 0
+                    futures: Dict[Any, tuple[int, Sequence[Dict]]] = {}
+
+                    def submit_next() -> bool:
+                        nonlocal next_batch
+                        if next_batch >= len(payload_chunks) or circuit_open:
+                            return False
+                        batch_index = next_batch + 1
+                        payload_chunk = payload_chunks[next_batch]
+                        next_batch += 1
+                        prompt = self._compose_prompt(
+                            SEMANTIC_FULL_TRANSLATION_PROMPT,
+                            source_text=" ".join(
+                                str(entry.get("full_english") or "")
+                                for entry in payload_chunk
+                            ),
+                        )
+                        future = executor.submit(
+                            self._request_semantic_full_translation_api_only,
+                            prompt,
+                            payload_chunk,
+                            cache_task=SEMANTIC_FULL_TRANSLATION_CACHE_TASK,
+                            max_attempts=1,
+                        )
+                        futures[future] = (batch_index, payload_chunk)
+                        return True
+
+                    for _ in range(workers):
+                        submit_next()
+
+                    while futures:
+                        done, _ = wait(
+                            tuple(futures), timeout=1.0, return_when=FIRST_COMPLETED
+                        )
+                        if not done:
+                            emit_progress(active_batches=len(futures))
+                            continue
+                        for future in sorted(done, key=lambda item: futures[item][0]):
+                            batch_index, payload_chunk = futures.pop(future)
+                            try:
+                                data, error_message, attempts = future.result()
+                            except Exception as exc:
+                                data, error_message, attempts = None, str(exc), []
+                            apply_batch_result(
+                                batch_index,
+                                payload_chunk,
+                                data,
+                                error_message,
+                                attempts,
+                            )
+                            logger.info(
+                                "Semantic full translation batch finished: "
+                                "batch=%s/%s attempts=%s completed=%s error=%s circuit_open=%s",
+                                batch_index,
+                                len(payload_chunks),
+                                len(attempts),
+                                completed_batches,
+                                bool(error_message),
+                                circuit_open,
+                            )
+                            emit_progress(active_batches=len(futures))
+                        while len(futures) < workers and submit_next():
+                            pass
+
+        skipped_batches = max(0, len(payload_chunks) - completed_batches)
+        for key, value in (
+            ("full_translation_initial_batch_size", initial_batch_size),
+            ("full_translation_initial_completed_batch_count", completed_batches),
+            ("full_translation_initial_failed_batch_count", failed_batches),
+            ("full_translation_initial_skipped_batch_count", skipped_batches),
+            ("full_translation_circuit_open", circuit_open),
+        ):
+            self._record_allocation_runtime_stat(key, value)
 
         missing_ids = [int(entry["id"]) for entry in payload if int(entry["id"]) not in result]
+        if circuit_open and missing_ids:
+            labels = [f"G{group_id:04d}" for group_id in missing_ids[:20]]
+            if len(missing_ids) > len(labels):
+                labels.append(f"...+剩余{len(missing_ids) - len(labels)}组")
+            raise RuntimeError(
+                "semantic_full_translation_provider_unavailable: "
+                "完整中文翻译服务连续失败，已停止剩余批次；"
+                f"缺少语义组：{','.join(labels)}。"
+                "已完成的翻译缓存已保留，请稍后直接重试。"
+                f"服务错误：{circuit_reason or 'unknown_provider_error'}"
+            )
+
         if missing_ids:
             logger.warning("语义组完整翻译缺失，按有界小批次重试: %s", missing_ids)
         self._retry_missing_semantic_full_translations(
@@ -19307,6 +19443,7 @@ class ScreenSubtitleEditor:
         payload: Sequence[Dict],
         *,
         cache_task: str,
+        max_attempts: Optional[int] = None,
     ) -> Optional[object]:
         request_model = self._full_translation_model_name()
         cache_key = self._semantic_chinese_cache_key(
@@ -19426,6 +19563,7 @@ class ScreenSubtitleEditor:
                 break
         started = time.perf_counter()
         response = None
+        request_outcome_recorded = False
         try:
             if cache_result:
                 self._llm_cache_used = True
@@ -19438,10 +19576,14 @@ class ScreenSubtitleEditor:
                     elapsed_seconds=time.perf_counter() - started,
                     payload_count=len(payload),
                 )
+                request_outcome_recorded = True
             else:
                 self._record_llm_cache_stat(cache_task, False)
                 data, request_error, attempts = self._request_semantic_full_translation_api_only(
-                    prompt, payload, cache_task=cache_task
+                    prompt,
+                    payload,
+                    cache_task=cache_task,
+                    max_attempts=max_attempts,
                 )
                 for attempt_record in attempts:
                     response = attempt_record.get("response")
@@ -19455,6 +19597,7 @@ class ScreenSubtitleEditor:
                         payload_count=len(payload),
                         error=attempt_record.get("error"),
                     )
+                    request_outcome_recorded = True
                 if data is None:
                     raise RuntimeError(request_error or "semantic_full_translation_request_failed")
                 if self._semantic_full_translation_response_is_cacheable(
@@ -19501,15 +19644,16 @@ class ScreenSubtitleEditor:
             )
             return data
         except Exception as e:
-            self._record_llm_request(
-                task=cache_task,
-                model=request_model,
-                cache_hit=bool(cache_result),
-                elapsed_seconds=time.perf_counter() - started,
-                response=response,
-                payload_count=len(payload),
-                error=e,
-            )
+            if cache_result and not request_outcome_recorded:
+                self._record_llm_request(
+                    task=cache_task,
+                    model=request_model,
+                    cache_hit=True,
+                    elapsed_seconds=time.perf_counter() - started,
+                    response=response,
+                    payload_count=len(payload),
+                    error=e,
+                )
             logger.warning("语义组完整翻译失败: %s", str(e))
             return None
 
@@ -19519,13 +19663,21 @@ class ScreenSubtitleEditor:
         payload: Sequence[Dict],
         *,
         cache_task: str,
+        max_attempts: Optional[int] = None,
     ) -> tuple[Optional[object], str, List[Dict[str, Any]]]:
         """Worker-safe request path: no cache, editor state, or contract mutation."""
         request_model = self._full_translation_model_name()
         attempts: List[Dict[str, Any]] = []
         last_error = ""
-        max_attempts = max(1, int(getattr(self, "translation_request_max_attempts", 3) or 3))
-        for attempt in range(1, max_attempts + 1):
+        configured_max_attempts = max(
+            1, int(getattr(self, "translation_request_max_attempts", 3) or 3)
+        )
+        effective_max_attempts = (
+            configured_max_attempts
+            if max_attempts is None
+            else min(configured_max_attempts, max(1, int(max_attempts)))
+        )
+        for attempt in range(1, effective_max_attempts + 1):
             if not self._claim_translation_attempt(cache_task):
                 return None, "translation_request_budget_exhausted", attempts
             started = time.perf_counter()
@@ -19559,7 +19711,7 @@ class ScreenSubtitleEditor:
                         "error": exc,
                     }
                 )
-                if attempt >= max_attempts or not self._is_retryable_allocation_error(exc):
+                if attempt >= effective_max_attempts or not self._is_retryable_allocation_error(exc):
                     break
                 time.sleep(self._translation_retry_delay_seconds(attempt))
         return None, last_error, attempts

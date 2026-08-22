@@ -77,6 +77,18 @@ After editing:
 5. Update `docs/CURRENT_STATE.md` when behavior changes.
 6. Update the active task log if the change is part of a tracked task.
 
+## Verified Commit Discipline
+
+- Do not commit every exploratory edit. Group one coherent change, run the
+  proportionate focused tests and `git diff --check`, then create one checkpoint
+  commit before using a real GUI/audio run to judge that change.
+- A production result must be attributable to committed source. If source code
+  is still modified, the manifest's `code_commit` identifies only `HEAD` and is
+  not sufficient evidence for the exact implementation that produced the run.
+- Never include `output/`, `work-dir/`, manual finals, caches, or other generated
+  run artifacts in a source checkpoint commit unless the user explicitly asks
+  to version a specific fixture.
+
 ## Do Not
 
 - Do not broadly rewrite `app/core/subtitle_processor/screen_editor.py` for a local issue.

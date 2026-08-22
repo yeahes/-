@@ -4083,3 +4083,29 @@ Result:
 - Boundary/fragment tests pass 72/72, review-mark tests pass 22/22, and the full
   page-translation contract passes 69/69. Full project regression and one new
   GUI production run are delegated to the user by explicit direction.
+
+## 2026-08-22 Full-Translation Provider Circuit Breaker
+
+- Root cause of the latest White House 55% failure was request scheduling, not
+  English segmentation or translation content: all complete-translation
+  batches were submitted eagerly, successful batches were not committed until
+  every future settled, and persistent `500`/`503`/timeout responses could use
+  all 40 attempts before the run stopped.
+- Complete semantic translation now admits rolling batches of at most eight
+  groups with at most two requests in flight. Each initial batch receives one
+  application-owned attempt and every valid completion is written immediately
+  to the existing per-group resumable cache.
+- Two consecutive retryable provider failures open a circuit and leave later
+  batches unstarted. Already in-flight successes are retained, a success after
+  one isolated failure permits normal continuation, and request-budget or
+  non-retryable failures stop immediately.
+- The explicit terminal code is
+  `semantic_full_translation_provider_unavailable`; it lists missing semantic
+  groups and tells the user that completed caches remain reusable. One failed
+  HTTP attempt now creates exactly one request-ledger record.
+- Focused scheduler/ledger tests pass 5/5. The complete stable-caption rules
+  file passes 530/530. The first full regression passed 29/30 and exposed two
+  stale renamed calls in its stable-caption `__main__` harness; after correcting
+  those names, the failed check passes, giving 30/30 verified checks in total.
+  English text, frozen subtitle IDs, word spans, timing, translation prompts,
+  allocation rules, and display pagination are unchanged.

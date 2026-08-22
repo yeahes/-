@@ -1,39 +1,37 @@
 # Project State
 Status: complete
-Last verified: 2026-08-22 20:45:58 Asia/Shanghai
+Last verified: 2026-08-22 22:33:04 Asia/Shanghai
 Branch: main
-Verified HEAD: 04a8000 (tested subtitle-pipeline baseline); 0500b33 records the experiment entry state
-Working tree: comparison documentation pending commit; local output remains untracked
+Verified HEAD: 8bd57b0 (base; modified working tree verified)
+Working tree: verified checkpoint ready to commit; untracked output preserved
 
 ## Current Goal
-Determine through a read-only offline comparison whether pre-ID page feasibility has proven net benefit.
+Bound complete-Chinese-translation failure latency during persistent provider errors while preserving resumable work.
 
 ## Confirmed Facts
-- White House replays 217/217 parents with zero page-count changes on the baseline.
-- Employment `S0029` now replays at 56px; its saved v28 failure is stale and does not require joint planning.
-- Of four current structural targets, local joint search found geometry solutions for two: Chocolate `S0160` and Employment `S0247`; it found none for Chocolate `S0026` or Employment `S0223`.
-- The `S0247` candidates strand `And eventually,` on the preceding parent even though current boundary gates accept them.
-- The `S0160` candidates move `Wow.` or `It is.` across parent boundaries, but the saved artifacts contain no speaker identity needed to prove that move safe.
-- Japanese `S0136` retains its page split and is a page-Chinese/number-anchor issue, not evidence for parent resegmentation.
+- Initial full translation uses batches of at most 8 and at most 2 in-flight requests.
+- Two consecutive retryable provider failures stop new admission; in-flight valid results still cache.
+- One isolated failure may recover; budget exhaustion or non-retryable failure stops immediately.
+- One HTTP attempt creates one ledger record; completed unit caches survive retry.
+- English, IDs, timing, prompts, allocation, and display-page rules are unchanged.
 
 ## Approved Decisions
-- Do not implement pre-ID joint page feasibility unless a read-only experiment proves acceptable net improvement.
-- English, IDs, word ledger, order, and timing remain local and deterministic.
+- Reuse the bounded page-stage scheduler pattern; do not change subtitle-content contracts.
+- Commit each tested logical change before a real GUI/audio comparison; do not commit exploratory edits or generated output.
 
 ## Relevant Paths
-- Result: `docs/handoffs/2026-08-22-offline-joint-planning-comparison.md`
-- Raw ignored output: `output/offline-joint-planning-comparison-20260822/comparison-result.json`
-- Baseline context: `docs/handoffs/2026-08-22-independent-diagnostic-brief.md`
+- Handoff: `docs/handoffs/2026-08-22-full-translation-provider-circuit-breaker.md`
+- Source: `app/core/subtitle_processor/screen_editor.py`
+- Tests: `tests/test_stable_caption_rules.py`
 
 ## Last Verification
-- Core affected tests: 699 passed, 0 failed; focused selector regression passes; syntax and diff checks pass.
-- Offline comparison: 0 API calls, 217 White House parents plus 1,364 local boundary combinations, completed in 215.772s.
+- Focused 5/5; stable-caption pytest 530/530; full regression checks 30/30 after harness-name repair; diff check passes; working-copy GUI PID 9252 started.
 
 ## Next Action
-Do not add the joint gate; first close unfinished-transition validation and speaker-turn ownership, then repeat the same falsifiable comparison.
+Retry White House in the running working-copy GUI to verify live provider behavior and cache resume.
 
 ## Do Not Regress
-- Do not modify `D:/软件缓存/VideoCaptioner`, existing work-dir artifacts, manual finals, or frozen English/ID/timing contracts.
+- Do not modify frozen English/ID/word/timing/page contracts or production work-dir artifacts.
 
 ## Unknowns
-- A wider search may find more geometry solutions, but no current evidence shows they are linguistically safe or beneficial on unseen audio.
+- Current OpenCode Go provider health and fresh GUI end-to-end result.

@@ -1115,6 +1115,37 @@ def test_translation_api_only_retries_only_rate_limit_and_respects_budget():
     assert editor._translation_request_attempts == 2
 
 
+def test_full_translation_chunk_records_failed_external_attempt_once():
+    class ServiceUnavailable(Exception):
+        status_code = 503
+
+    editor = _id_editor()
+    editor.cache_manager = _NoCache()
+    editor.translation_request_max_attempts = 3
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_kwargs: (_ for _ in ()).throw(
+                    ServiceUnavailable("Error code: 503")
+                )
+            )
+        )
+    )
+
+    result = editor._request_semantic_full_translation_chunk(
+        "prompt",
+        [{"id": 1, "full_english": "One."}],
+        cache_task="test-full-translation-ledger",
+        max_attempts=1,
+    )
+
+    assert result is None
+    assert len(editor._llm_request_ledger) == 1
+    assert editor._llm_request_ledger[0]["external_attempt"] is True
+    assert editor._llm_request_ledger[0]["status"] == "error"
+    assert editor._llm_request_ledger[0]["error_type"] == "ServiceUnavailable"
+
+
 def test_display_page_api_only_returns_attempts_without_worker_state_writes():
     class RateLimited(Exception):
         status_code = 429
@@ -1427,7 +1458,7 @@ def test_full_translation_concurrency_merges_out_of_order_batches_by_id():
     groups = [_id_group(index, index - 1, [item]) for index, item in enumerate(items, 1)]
     completions = []
 
-    def request_api(_prompt, payload, *, cache_task):
+    def request_api(_prompt, payload, *, cache_task, **_kwargs):
         ids = [int(entry["id"]) for entry in payload]
         if ids == [1, 2]:
             time.sleep(0.03)
@@ -1453,6 +1484,161 @@ def test_full_translation_concurrency_merges_out_of_order_batches_by_id():
     assert completions[0] == [3, 4]
     assert sorted(result) == [1, 2, 3, 4], (result, completions)
     assert result == {index: f"译文-{index}" for index in range(1, 5)}
+
+
+def test_full_translation_scheduler_stops_after_consecutive_provider_failures():
+    class ServiceUnavailable(Exception):
+        status_code = 503
+
+    editor = _id_editor()
+    editor.allocation_batch_size = 16
+    editor.allocation_max_concurrency = 2
+    editor.cache_manager = _KeyedCache({})
+    items = editor._assign_global_subtitle_ids(_id_items(32))
+    groups = [
+        _id_group(index, index - 1, [item])
+        for index, item in enumerate(items, 1)
+    ]
+    started_batches = []
+    stored_group_ids = []
+    progress_events = []
+    editor.progress_callback = progress_events.append
+    initial_workers_started = threading.Barrier(2)
+    third_batch_started = threading.Event()
+
+    def request_api(_prompt, payload, *, cache_task, **_kwargs):
+        ids = [int(entry["id"]) for entry in payload]
+        started_batches.append(ids)
+        if ids in (list(range(1, 9)), list(range(9, 17))):
+            initial_workers_started.wait(timeout=1)
+        if ids == list(range(1, 9)):
+            error = ServiceUnavailable("Error code: 503")
+            return None, str(error), [{"attempt": 1, "elapsed_seconds": 0.01, "error": error}]
+        if ids == list(range(9, 17)):
+            assert third_batch_started.wait(timeout=1)
+            error = TimeoutError("Request timed out.")
+            return None, str(error), [{"attempt": 1, "elapsed_seconds": 0.03, "error": error}]
+        if ids == list(range(17, 25)):
+            third_batch_started.set()
+            time.sleep(0.08)
+            return (
+                {
+                    "groups": [
+                        {
+                            "id": entry["id"],
+                            "source_english": entry["full_english"],
+                            "full_translation": f"译文-{entry['id']}",
+                        }
+                        for entry in payload
+                    ]
+                },
+                "",
+                [{"attempt": 1, "elapsed_seconds": 0.08, "response": None}],
+            )
+        raise AssertionError(f"circuit breaker admitted an extra batch: {ids}")
+
+    original_store = editor._store_semantic_full_translation_units
+
+    def store_units(payload_by_id, translations):
+        stored_group_ids.append(sorted(translations))
+        return original_store(payload_by_id, translations)
+
+    with patch.object(
+        editor,
+        "_request_semantic_full_translation_api_only",
+        side_effect=request_api,
+    ), patch.object(
+        editor,
+        "_store_semantic_full_translation_units",
+        side_effect=store_units,
+    ):
+        try:
+            editor._translate_semantic_group_full_translations(groups)
+        except RuntimeError as exc:
+            assert str(exc).startswith("semantic_full_translation_provider_unavailable:")
+        else:
+            raise AssertionError("consecutive provider failures must stop full translation")
+
+    assert {tuple(batch) for batch in started_batches[:2]} == {
+        tuple(range(1, 9)),
+        tuple(range(9, 17)),
+    }
+    assert started_batches[-1] == list(range(17, 25))
+    assert list(range(25, 33)) not in started_batches
+    assert list(range(17, 25)) in stored_group_ids
+    assert not any(
+        record["task"].endswith("_retry") for record in editor._llm_request_ledger
+    )
+    assert any(
+        event.get("phase") == "full_translation"
+        and event.get("failed_batches") == 2
+        and event.get("circuit_open") is True
+        for event in progress_events
+    )
+
+
+def test_full_translation_scheduler_continues_after_one_provider_failure():
+    class ServiceUnavailable(Exception):
+        status_code = 503
+
+    editor = _id_editor()
+    editor.allocation_batch_size = 16
+    editor.allocation_max_concurrency = 2
+    editor.cache_manager = _KeyedCache({})
+    items = editor._assign_global_subtitle_ids(_id_items(24))
+    groups = [
+        _id_group(index, index - 1, [item])
+        for index, item in enumerate(items, 1)
+    ]
+    started_batches = []
+    initial_workers_started = threading.Barrier(2)
+
+    def response(payload):
+        return {
+            "groups": [
+                {
+                    "id": entry["id"],
+                    "source_english": entry["full_english"],
+                    "full_translation": f"译文-{entry['id']}",
+                }
+                for entry in payload
+            ]
+        }
+
+    def request_api(_prompt, payload, *, cache_task, **_kwargs):
+        ids = [int(entry["id"]) for entry in payload]
+        started_batches.append(ids)
+        if ids in (list(range(1, 9)), list(range(9, 17))):
+            initial_workers_started.wait(timeout=1)
+        if ids == list(range(1, 9)):
+            error = ServiceUnavailable("Error code: 503")
+            return None, str(error), [{"attempt": 1, "elapsed_seconds": 0.01, "error": error}]
+        if ids == list(range(9, 17)):
+            time.sleep(0.02)
+        return response(payload), "", [{"attempt": 1, "elapsed_seconds": 0.02, "response": None}]
+
+    def repair_missing(*, payload_by_id, result, **_kwargs):
+        missing_ids = [group_id for group_id in payload_by_id if group_id not in result]
+        result.update({group_id: f"译文-{group_id}" for group_id in missing_ids})
+        return 1
+
+    with patch.object(
+        editor,
+        "_request_semantic_full_translation_api_only",
+        side_effect=request_api,
+    ), patch.object(
+        editor,
+        "_retry_missing_semantic_full_translations",
+        side_effect=repair_missing,
+    ):
+        result = editor._translate_semantic_group_full_translations(groups)
+
+    assert sorted(started_batches) == [
+        list(range(1, 9)),
+        list(range(9, 17)),
+        list(range(17, 25)),
+    ]
+    assert result == {index: f"译文-{index}" for index in range(1, 25)}
 
 
 def test_display_page_concurrency_caches_completed_batches_immediately():
@@ -9635,7 +9821,7 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
     def request(prompt, payload, cache_task, **kwargs):
         ids = [entry["id"] for entry in payload]
         calls.append((cache_task, ids))
-        if ids == list(range(1, 13)):
+        if ids == list(range(1, 9)):
             return {
                 "groups": [
                     {
@@ -9660,9 +9846,9 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
         full_translations = editor._translate_semantic_group_full_translations(groups)
 
     assert calls == [
-        ("screen_subtitle_semantic_full_translation_v7", list(range(1, 13))),
-        ("screen_subtitle_semantic_full_translation_v7_retry", list(range(2, 10))),
-        ("screen_subtitle_semantic_full_translation_v7_retry", [10, 11, 12]),
+        ("screen_subtitle_semantic_full_translation_v7", list(range(1, 9))),
+        ("screen_subtitle_semantic_full_translation_v7", [9, 10, 11, 12]),
+        ("screen_subtitle_semantic_full_translation_v7_retry", list(range(2, 9))),
     ]
     assert full_translations == {
         group_id: f"full-{group_id}" for group_id in range(1, 13)
@@ -14798,7 +14984,7 @@ if __name__ == "__main__":
     test_podcast_template_preserves_full_media_duration_when_subtitles_end_early()
     test_podcast_template_uses_frozen_task_configuration()
     test_podcast_english_only_mode_hides_only_chinese_subtitle_for_both_templates()
-    test_article_cover_renders_fixed_gradient_date_and_preserves_empty_opt_out()
+    test_article_cover_renders_unmasked_date_and_preserves_empty_opt_out()
     test_article_brand_logo_is_optional_and_preserves_aspect_ratio()
     test_article_brand_logo_rejects_missing_or_unreadable_files()
     test_article_opening_title_shrinks_to_keep_a_normal_long_title_in_three_lines()
@@ -15010,7 +15196,7 @@ if __name__ == "__main__":
     test_stable_cut_keeps_comma_bracketed_adverb_with_preceding_list_item()
     test_visual_budget_keeps_subject_with_delayed_finite_predicate()
     test_visual_budget_keeps_short_gerundial_manner_phrase_with_main_question()
-    test_visual_temporal_budget_splits_punctuated_fronted_introduction()
+    test_visual_temporal_budget_does_not_override_protected_fronted_introduction()
     test_visual_temporal_budget_splits_complete_punctuated_clauses()
     test_visual_temporal_budget_splits_complete_sentence_terminal()
     test_visual_temporal_budget_splits_complete_imperative_sentence_terminal()
