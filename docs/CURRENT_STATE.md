@@ -1,6 +1,25 @@
 # Current State
 
-Last updated: 2026-08-22
+Last updated: 2026-08-23
+
+## 2026-08-23 Reviewable Five-Word Terminal Display Page
+
+- The same-ledger Chocolate replay exposed a renderer ownership error: the
+  complete, 56px-renderable terminal phrase `for business margins. It is.` had
+  five words and sufficient display time, but the six-word secondary-review
+  preference removed it from the candidate set and converted one watchable
+  `11+5` page plan into `no_complete_normal_font_page_partition`.
+- Six words remains the preferred minimum for optional page-count promotion.
+  A terminal five-word prepositional phrase may now enter only the existing
+  REVIEW fallback when it is sentence-complete and the unchanged fixed-font,
+  lexical, coverage, ordering, and 900ms timing contracts all pass. Four-word
+  tails remain ineligible after the White House `S0017` guard showed that a
+  broader rule could displace its established `5+10` partition with `11+4`.
+- The page planner contract is `article-fixed-font-pages-v30`. Focused real-
+  timing tests pass, including the numeric-range five-word-tail rejection and
+  the genuine structural-overflow case. A full read-only replay of the passing
+  White House artifact produced 217/217 plans with zero changed page/font
+  signatures. The complete article readability contract passes 104/104.
 
 ## 2026-08-22 Equal-Risk Page Boundary Ordering
 

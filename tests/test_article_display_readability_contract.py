@@ -1597,6 +1597,63 @@ def test_extended_numeric_range_does_not_create_a_five_word_tail_page():
     assert all(len(page["en_lines"]) <= 2 for page in plan["pages"])
 
 
+def test_complete_five_word_terminal_phrase_is_a_reviewable_page_fallback():
+    text = (
+        "Wow. Okay, so a hyper-localized, vertically integrated supply chain "
+        "is brilliant for business margins. It is."
+    )
+    words = text.split()
+    timing = _production_word_timing(
+        words,
+        range(1643, 1659),
+        (
+            560015, 560455, 560715, 561116, 561356, 562497, 563017, 563517,
+            563978, 564418, 564858, 565419, 565579, 565939, 566639, 566840,
+        ),
+        (
+            560235, 560695, 560976, 561176, 562417, 562917, 563477, 563938,
+            564278, 564498, 565379, 565539, 565899, 566319, 566699, 566980,
+        ),
+    )
+    _, cue = _syntax_backed_cue(text, "S0160", word_timing=timing)
+    cue.zh = "哇，高度本地化、垂直整合的供应链对利润率极为有利，确实如此。"
+
+    plan = _plan(cue)
+
+    assert [page["en"] for page in plan["pages"]] == [
+        " ".join(words[:11]),
+        "for business margins. It is.",
+    ]
+    assert [len(page["en"].split()) for page in plan["pages"]] == [11, 5]
+    assert all(page["english_font_size"] == 56 for page in plan["pages"])
+    assert all(page["end"] - page["start"] >= 0.9 for page in plan["pages"])
+    assert plan["pages"][1]["boundary_before"]["classification"] == "review"
+    assert any(
+        warning.get("reason") == "review_boundary_fallback"
+        for warning in plan["readability_warnings"]
+    )
+
+
+def test_four_word_prepositional_tail_does_not_replace_balanced_review_pages():
+    text = (
+        "Because this source material involves some heavily politically charged "
+        "policy actions from the Trump administration."
+    )
+    _, cue = _syntax_backed_cue(text, "S0017")
+
+    plan = _plan(cue)
+
+    assert [len(page["en"].split()) for page in plan["pages"]] == [5, 10]
+    assert plan["pages"][1]["en"] == (
+        "some heavily politically charged policy actions from the Trump "
+        "administration."
+    )
+    assert not any(
+        page["en"] == "from the Trump administration."
+        for page in plan["pages"]
+    )
+
+
 def test_no_safe_normal_font_partition_fails_closed_instead_of_using_50px():
     text = (
         "Because it's like a famous restaurant realizing they spend so much money "
@@ -4479,6 +4536,8 @@ if __name__ == "__main__":
     test_punctuated_pronoun_clause_uses_two_56px_pages_before_50px()
     test_punctuated_numeric_model_clause_uses_two_balanced_56px_pages()
     test_extended_numeric_range_does_not_create_a_five_word_tail_page()
+    test_complete_five_word_terminal_phrase_is_a_reviewable_page_fallback()
+    test_four_word_prepositional_tail_does_not_replace_balanced_review_pages()
     test_no_safe_normal_font_partition_fails_closed_instead_of_using_50px()
     test_checkpoint_hard_page_cues_use_normal_fonts_or_fail_for_manual_takeover()
     test_forced_page_break_rank_reuses_the_forced_decision_for_risk()

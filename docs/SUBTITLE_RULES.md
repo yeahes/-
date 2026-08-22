@@ -70,6 +70,13 @@
   boundary, or change the parent cue; it is recorded as a high-risk editor
   review. This is preferable to blocking an otherwise renderable long cue or
   shrinking below 52px.
+- Six words remains the preferred minimum for automatic page-count promotion,
+  not a renderability requirement. When no complete one-page normal-font layout
+  exists, a terminal five-word prepositional phrase may be retained as an
+  explicit REVIEW fallback only when it is sentence-complete, fits at 56px,
+  receives at least 900ms, and all lexical, word-order, and coverage checks pass.
+  A four-word tail remains ineligible because it can displace a more balanced
+  legal partition.
 - Page count is chosen first from measured English/Chinese load, the soft word
   budget, and duration. Break rewards cannot create another page. Within the
   selected count, display boundaries retain separate allowed, low, medium,

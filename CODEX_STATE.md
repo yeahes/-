@@ -1,9 +1,9 @@
 # Project State
 Status: active
-Last verified: 2026-08-23 02:13:53 Asia/Shanghai
+Last verified: 2026-08-23 02:44:20 Asia/Shanghai
 Branch: main
-Verified HEAD: 65c10cb (base; review-identity change verified)
-Working tree: review-identity source/tests/docs modified; unrelated output preserved
+Verified HEAD: e3852e4 (base; five-word page delta verified in working tree)
+Working tree: pagination source/tests/docs modified; unrelated output preserved
 
 ## Current Goal
 Repair the verified causes of reduced automatic subtitle quality in independently tested commits.
@@ -14,6 +14,7 @@ Repair the verified causes of reduced automatic subtitle quality in independentl
 - Chocolate v27/v29 share word-ledger hash `85ba0f98...9199a`; v27 is PASS and v29 is ERROR with different parent/page plans.
 - Local skill `audit-caption-results` collects immutable-run identity, parent/neighbour context, actual pages, page Chinese, marks, and same-ledger A/B evidence without writes.
 - Review queues now require current word-ledger and frozen ID/English/span identity; real White House replay has zero stale semantic-queue marks.
+- Chocolate real-timing replay restores its complete 11+5 page plan; passing White House replay changes 0/217 frozen page/font signatures.
 
 ## Approved Decisions
 - A routine new-run audit checks one raw automatic result; regression claims require the same word ledger.
@@ -25,12 +26,13 @@ Repair the verified causes of reduced automatic subtitle quality in independentl
 - Skill: `C:\Users\19379\.codex\skills\audit-caption-results\SKILL.md`
 - Collector: `C:\Users\19379\.codex\skills\audit-caption-results\scripts\collect_caption_evidence.py`
 - Review identity: `app/core/subtitle_processor/review_evidence_identity.py`
+- Page planner: `app/core/utils/podcast_learning_video.py`
 
 ## Last Verification
-- Review marks 24/24; QA queue 6/6; editor queue action 1/1; real White House stale semantic marks 0.
+- Article readability 104/104; White House frozen-plan guard 217/217 unchanged.
 
 ## Next Action
-Separate soft page-style preferences from hard renderability failures using the Chocolate same-ledger replay.
+Repair the pre-ID English boundary completeness gaps against current-run evidence.
 
 ## Do Not Regress
 - Do not mutate production artifacts or relax word coverage, timing, font, or semantic page ownership.

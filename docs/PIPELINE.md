@@ -684,7 +684,13 @@ Rule:
   or timing.
   Article-template Chinese uses a fixed 48px font, at most two lines, and the
   existing 1455-design-pixel safe width.
-  The page contract version is `article-fixed-font-pages-v28`, so page-layout
+  A terminal five-word prepositional page is a REVIEW fallback rather
+  than a structural error when no complete single-page normal-font layout
+  exists and the short page is sentence-complete, fits at 56px, receives at
+  least 900ms, and preserves every lexical dependency. Six words remains the
+  promotion preference for otherwise optional page-count changes; four-word
+  tails remain ineligible.
+  The page contract version is `article-fixed-font-pages-v30`, so page-layout
   and page-translation caches from earlier planner versions cannot be reused;
   unchanged ASR, full-translation, and fixed-ID allocation caches remain
   independently reusable under their own fingerprints.
