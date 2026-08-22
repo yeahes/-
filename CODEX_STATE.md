@@ -1,39 +1,38 @@
 # Project State
-Status: complete
-Last verified: 2026-08-20 06:16:50 Asia/Shanghai
+Status: active
+Last verified: 2026-08-22 20:31:05 Asia/Shanghai
 Branch: main
-Verified HEAD: ab6ea58035ddbab1afe4a3631c28de8886f29332
-Working tree: modified source/test/documentation files plus existing unrelated output/font changes
+Verified HEAD: 04a8000 (tested subtitle-pipeline baseline)
+Working tree: only local generated output remains untracked after state commit
 
 ## Current Goal
-Keep a tail-trimmed manual-final package valid from editor save through synthesis reload.
+Run a read-only offline comparison to test whether pre-ID pagination feasibility improves English segmentation without regressing passing cases.
 
 ## Confirmed Facts
-- The failed package had a valid manifest but three final ends: S0201 SRT
-  `755009ms`, S0201.P02 `755064ms`, and media cut `754959ms`.
-- Tail deletion now caps the last final cue at the media cut while preserving
-  its retained word envelope.
-- Frozen page reuse preserves IDs, text, word ranges, internal boundaries,
-  Chinese, and layout; only the first/last parent edges are reconciled.
-- The saved package reloads through the production synthesis page-artifact
-  loader with one shared final cue/page/media end.
+- Baseline commit `04a8000` contains the accumulated subtitle pipeline, editor, audit, recovery, documentation, and regression changes.
+- A pre-commit core run initially found one deterministic equal-risk page-selection failure; the two selector layers now preserve verified pause-backed restart evidence ahead of purely visual tie-breakers.
+- Focused regression after the repair passes 699 tests with zero failures; syntax compilation and `git diff --check` pass.
+- Current pre-ID display safety checks syntax and fragment completeness but does not run the authoritative pixel/timing page planner.
+- White House is a passing counterexample; Chocolate `S0026/S0160`, Employment `S0223/S0247`, and Japanese `S0136` represent distinct geometry and page-Chinese failure classes and must not be combined into one score.
 
 ## Approved Decisions
-- Do not relax ordinary page validation or change normal pagination/timing.
+- Do not change production segmentation or pagination until a read-only experiment demonstrates net benefit.
+- English, IDs, word ledger, order, and timing remain local and deterministic; external models remain translation or read-only audit tools.
 
 ## Relevant Paths
-- `docs/handoffs/2026-08-20-tail-trim-page-timing.md`
+- Baseline evidence: `docs/handoffs/2026-08-22-independent-diagnostic-brief.md`
+- Process context: `docs/handoffs/2026-08-22-subtitle-segmentation-translation-pagination-context.md`
+- Owners: `app/core/subtitle_processor/screen_editor.py`, `app/core/utils/podcast_learning_video.py`
 
 ## Last Verification
-- Focused timeline and complete manual-editor suites pass.
-- `runtime\python.exe scripts\run_regression.py` completed all stages offline.
-- `git diff --check` passes; no external model request was made.
+- `pytest` affected core suites: 699 passed, 2 warnings, 0 failed in 908.77s.
+- Focused equal-risk ordering regression: 1 passed; production syntax and cached diff checks pass.
 
 ## Next Action
-Restart the GUI, reopen the current manual-final subtitle package, save it once, then synthesize again.
+Build and run a read-only targeted comparison on known failures plus White House counterexamples, reporting improvements and regressions with explicit denominators.
 
 ## Do Not Regress
-- Preserve fixed English, IDs, word ledger, word envelopes, page text, and fail-closed publication.
+- Do not modify `D:/软件缓存/VideoCaptioner`, existing work-dir artifacts, manual finals, or frozen English/ID/timing contracts.
 
 ## Unknowns
-- The user's current unsaved GUI state cannot be migrated automatically; save must run once under the fixed code.
+- No current evidence proves pre-ID page feasibility has positive net benefit on unseen audio.
