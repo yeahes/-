@@ -690,7 +690,13 @@ Rule:
   least 900ms, and preserves every lexical dependency. Six words remains the
   promotion preference for otherwise optional page-count changes; four-word
   tails remain ineligible.
-  The page contract version is `article-fixed-font-pages-v30`, so page-layout
+  Compatible dependency and participial evidence may describe the same
+  complete renderer-only continuation without becoming two independent
+  blockers. Likewise, an adverb/preposition predicate boundary may enter the
+  forced complete-predicate REVIEW tier only when the entire right page is a
+  complete phrase and no unrelated atomic issue remains. Formal English cue
+  cutting stays HARD at both boundary types.
+  The page contract version is `article-fixed-font-pages-v31`, so page-layout
   and page-translation caches from earlier planner versions cannot be reused;
   unchanged ASR, full-translation, and fixed-ID allocation caches remain
   independently reusable under their own fingerprints.
@@ -699,9 +705,15 @@ Rule:
   relaxed atomic evidence are selected first. If no normal-font candidate is
   renderable, the failed parent remains visible to the editor as an editable
   seed; it is not hidden or silently forced into an emergency three-line page.
-  Page Chinese uses `fixed-parent-page-allocation-v6`. Its aggregate projection
+  Page Chinese uses `fixed-parent-page-allocation-v9`. Its aggregate projection
   is checked against the authoritative parent Chinese for repeated meaning and
   significant expansion before the existing parent-local retry is accepted.
+  One-character Chinese grammar markers may attach to source-owned wording
+  without becoming added meaning. A page boundary rejected only by HMM's
+  invented token join is accepted when dictionary tokenization independently
+  proves that exact boundary; a lexical word kept whole by both tokenizers
+  remains unsplittable. Genuine split errors include the exact Chinese token
+  in the parent-local retry constraint.
   Whole-episode selection adds a renderer-only continuity preference across
   already legal candidates: adjacent pressure changes are penalized after a
   free band, while font and line-count changes are weaker tie-breakers. The

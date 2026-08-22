@@ -1,40 +1,39 @@
 # Project State
 Status: active
-Last verified: 2026-08-23 03:40:10 Asia/Shanghai
+Last verified: 2026-08-23 05:42:38 Asia/Shanghai
 Branch: main
-Verified HEAD: 3e2f2b7 (base; English boundary delta verified in working tree)
-Working tree: English boundary source/tests/docs modified; unrelated output preserved
+Verified HEAD: 119ca93
+Working tree: clean except unrelated untracked output/
 
 ## Current Goal
 Repair the verified causes of reduced automatic subtitle quality in independently tested commits.
 
 ## Confirmed Facts
-- The newest White House raw checkpoint has 221 parents, 271 actual pages, 42 multipage parents, 5 missing page-Chinese IDs, and 5 formal error parents.
-- Local skill `audit-caption-results` collects immutable-run identity, parent/neighbour context, actual pages, page Chinese, marks, and same-ledger A/B evidence without writes.
-- Chocolate real-timing replay restores its complete 11+5 page plan; passing White House replay changes 0/217 frozen page/font signatures.
-- New White House replay removes 6/6 confirmed English defects with 2,586/2,586 ordered words preserved.
-- The stable-caption rule suite passes 538/538; the newly exposed 24-word cue retains its historical 56px three-page plan.
+- White House English replay removes 6/6 confirmed boundary defects with 2,586/2,586 ordered words preserved.
+- Chocolate real-timing replay restores its complete 11+5 display plan; the passing White House guard changes 0/217 frozen page/font signatures.
+- Page-Chinese v9 distinguishes HMM-only function-word joins from lexical word splits and source-owned wording plus one Chinese grammar marker from added meaning.
+- White House frozen-contract replay passes 42/42 multipage parents and 92/92 page-Chinese IDs with zero contract error.
+- Compatible dependency/participial evidence restores the numeric-range 7+10+7 plan; complete predicate evidence restores the expected `into ...` continuation without relaxing unrelated atomic issues.
+- Planner v31 invalidates older page blueprints. Article readability passes 106/106 and the full regression passes 30/30 in 1010.71s.
 
 ## Approved Decisions
 - A routine new-run audit checks one raw automatic result; regression claims require the same word ledger.
-- Skill qualification uses the current result, one same-ledger A/B, and later one historical good-result guard instead of re-auditing every recent case.
-- Keep identity, pagination, parent-boundary, and page-Chinese fixes in separate commits.
+- Identity, pagination, parent-boundary, page-Chinese, quantifier, and cross-stage compatibility fixes remain independently tested commits.
 
 ## Relevant Paths
-- Audit: `docs/audits/2026-08-23/recent-actual-page-quality-audit.md`
-- Skill: `C:\Users\19379\.codex\skills\audit-caption-results\SKILL.md`
-- Collector: `C:\Users\19379\.codex\skills\audit-caption-results\scripts\collect_caption_evidence.py`
-- Review identity: `app/core/subtitle_processor/review_evidence_identity.py`
+- Page translation: `app/core/subtitle_processor/stable_display_page_contract.py`
+- Request/retry owner: `app/core/subtitle_processor/screen_editor.py`
 - Page planner: `app/core/utils/podcast_learning_video.py`
+- Audit: `docs/audits/2026-08-23/recent-actual-page-quality-audit.md`
 
 ## Last Verification
-- Stable-caption rules 538/538; White House 2,586/2,586 words and historical three-page guard pass.
+- `runtime\python.exe scripts\run_regression.py`: 30/30 PASS; focused planner-version guards: 7/7 PASS.
 
 ## Next Action
-Commit the verified English boundary fix, then repair page-Chinese completeness and continuity.
+Restart the application, run one fresh held-out audio through the GUI, and audit its actual bilingual display pages.
 
 ## Do Not Regress
-- Do not mutate production artifacts or relax word coverage, timing, font, or semantic page ownership.
+- Do not mutate production artifacts or relax word coverage, timing, font, semantic ownership, or genuine lexical-word split checks.
 
 ## Unknowns
-- Exact uncommitted source delta between Chocolate planner v27 and v29 is unavailable.
+- Held-out end-to-end GUI quality remains unverified.

@@ -2,6 +2,66 @@
 
 Last updated: 2026-08-23
 
+## 2026-08-23 Cross-Stage Page Evidence Compatibility
+
+- Formal English cutting and renderer-only pagination intentionally consume
+  the same boundary evidence under different policies. The new dependency
+  guards exposed two stale exact-set checks in the renderer: a complete
+  participial page could carry both `dependency_phrase_entrance_split` and
+  `post_noun_participial_modifier_split`, while a complete predicate page
+  could additionally carry `verb_adverb_preposition_split`.
+- Formal cue cutting remains HARD at both boundaries. Renderer pagination may
+  treat the first compatible evidence pair as one complete participial REVIEW
+  page. It may treat the predicate/adverb/preposition evidence as a forced
+  complete predicate REVIEW page only when the entire right page is complete.
+  Any additional atomic issue remains blocking.
+- This restores the numeric-range example to balanced 7+10+7 pages at 56px
+  and restores `into the most aggressive ... industry` as one complete
+  continuation instead of the shorter `in the modern ... industry` tail.
+  The page planner contract is now `article-fixed-font-pages-v31`, so old page
+  blueprints cannot mask the new decision rules.
+- Focused compatibility and cache-version tests pass 7/7. The complete article
+  readability contract passes 106/106, and the full regression passes 30/30
+  in 1010.71 seconds.
+
+## 2026-08-23 Page-Chinese Projection Token Evidence
+
+- The newest White House checkpoint completed every relevant provider request,
+  but deterministic page-Chinese validation rejected `S0083` and `S0097`.
+  The final artifact therefore correctly kept five page IDs empty instead of
+  publishing untrusted text; this was a local contract conflict, not an HTTP
+  failure.
+- Jieba HMM tokenization can join a source-owned name or phrase with one
+  single-character Chinese grammar marker, such as a name followed by `正` or
+  `急`. The same grammar marker was already legal alone, but the joined token
+  was incorrectly reported as new multi-character meaning. Page allocation
+  now recognizes only the narrow `source phrase + one Chinese character`
+  shape. New multi-character content remains blocking.
+- HMM can also invent a lexical token across an otherwise legal page edge,
+  such as joining `国` and the following preposition `以`. A page edge is now
+  accepted when dictionary-mode tokenization independently proves that exact
+  character boundary. A genuine word such as `留学生` remains whole in both
+  modes and still blocks a split.
+- A genuine split error now records the exact `split_token`; the scoped retry
+  prompt tells the model to keep that word on one page. Parent Chinese, page
+  English, IDs, word spans, page times, and render geometry remain immutable.
+- Page Chinese now uses `display-page-translation-v9` and
+  `fixed-parent-page-allocation-v9`, invalidating only page-translation caches.
+  White House frozen-contract replay validates 42/42 multipage parents and
+  92/92 display-page Chinese rows with zero error. The complete page contract
+  passes 73/73.
+
+## 2026-08-23 Quantifier Page-Boundary Guard
+
+- The English dependency repair exposed an older renderer classifier defect:
+  the `of` continuation guard checked only the word two positions before the
+  boundary. It therefore relaxed `half | of` even though the quantifier and
+  complement are atomic.
+- The guard now recognizes both one-token quantifier heads (`half of`) and
+  determiner-plus-noun heads (`every facet of`). Those boundaries remain HARD;
+  unrelated complete prepositional continuations keep their existing REVIEW
+  fallback. The focused cross-stage tests pass 3/3.
+
 ## 2026-08-23 Frozen English Dependency Boundary Completeness
 
 - A complete replay of the newest White House word ledger exposed six formal
@@ -46,11 +106,11 @@ Last updated: 2026-08-23
   lexical, coverage, ordering, and 900ms timing contracts all pass. Four-word
   tails remain ineligible after the White House `S0017` guard showed that a
   broader rule could displace its established `5+10` partition with `11+4`.
-- The page planner contract is `article-fixed-font-pages-v30`. Focused real-
+- The page planner contract is `article-fixed-font-pages-v31`. Focused real-
   timing tests pass, including the numeric-range five-word-tail rejection and
   the genuine structural-overflow case. A full read-only replay of the passing
   White House artifact produced 217/217 plans with zero changed page/font
-  signatures. The complete article readability contract passes 104/104.
+  signatures. The complete article readability contract passes 106/106.
 
 ## 2026-08-22 Equal-Risk Page Boundary Ordering
 

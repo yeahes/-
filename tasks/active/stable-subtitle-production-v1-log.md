@@ -3358,3 +3358,46 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
 - Boundary-focused verification passes 105/105. The complete
   `tests/test_stable_caption_rules.py` suite passes 538/538 in 157.81 seconds.
   Production artifacts, API caches, audio, and `output/` were not modified.
+
+## 2026-08-23 Page-Chinese Token Evidence And Cross-Stage Guard
+
+- Audited the frozen White House page contract after provider-successful
+  responses left `S0083.P01-P02` and `S0097.P01-P03` empty. The initial and
+  residual attempts were rejected as `page_translation_parent_meaning_added`
+  for HMM-joined name/grammar tokens and
+  `page_translation_chinese_token_split` for an HMM-only `国以` token.
+- Corrected the responsibility layer without filling blanks or weakening the
+  semantic ceiling. A source-owned Chinese phrase may carry one attached
+  single-character grammar marker; independent dictionary tokenization may
+  disprove an HMM-only word join at the page edge. Multi-character additions
+  and words such as `留学生` that remain atomic in both modes still fail.
+- Genuine lexical split evidence now includes `split_token`, which becomes a
+  parent-scoped retry instruction. Page translation prompt/algorithm identity
+  advanced to v9, invalidating only affected page caches.
+- White House offline replay passes 42/42 multipage parents and 92/92 page
+  rows with zero error. The complete page-translation suite passes 73/73.
+- The expanded suite exposed an earlier cross-stage renderer issue. Quantifier
+  detection now protects both `half of` and `every facet of`; an attached
+  clause remains medium REVIEW evidence but still loses to a fitting static
+  page. The focused page-boundary guards pass 3/3.
+
+## 2026-08-23 Cross-Stage Page Evidence Compatibility
+
+- The full regression first exposed a 24-word numeric-range cue that regressed
+  from 7+10+7 pages at 56px to 17+7 pages with a 52px first page. Candidate
+  generation still produced the correct spans, but the renderer's
+  participial-completeness predicate accepted either dependency or
+  participial evidence and rejected the compatible pair produced by the new
+  formal English guard.
+- The next full article run exposed the same contract drift for
+  `directly | into ...`: formal cutting correctly added
+  `verb_adverb_preposition_split`, while the renderer's complete-predicate
+  fallback did not recognize that evidence and chose a shorter `in ...` tail.
+- The renderer now recognizes only those two compatible evidence shapes. Both
+  formal boundaries remain HARD, both display fallbacks remain REVIEW, and an
+  additional numeric or lexical atomic issue still blocks the page boundary.
+- Planner identity advanced from v30 to v31 so stale blueprints cannot bypass
+  the new selection. Focused tests pass 7/7, the complete article readability
+  contract passes 106/106, and `scripts/run_regression.py` passes 30/30 in
+  1010.71 seconds. Production audio, subtitle artifacts, API caches, and the
+  untracked `output/` directory were not modified.
