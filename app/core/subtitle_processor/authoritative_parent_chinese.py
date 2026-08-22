@@ -99,18 +99,29 @@ def build_authoritative_parent_chinese_artifact(
                 "A parent Chinese record is missing its frozen word span.",
                 subtitle_id=subtitle_id,
             ) from exc
-        if (
-            not subtitle_id
-            or subtitle_id in seen_ids
-            or not english
-            or not chinese
-            or word_start < 0
-            or word_end < word_start
-        ):
+        invalid_fields: list[str] = []
+        if not subtitle_id:
+            invalid_fields.append("subtitle_id")
+        elif subtitle_id in seen_ids:
+            invalid_fields.append("duplicate_subtitle_id")
+        if not english:
+            invalid_fields.append("english")
+        if not chinese:
+            invalid_fields.append("chinese")
+        if word_start < 0:
+            invalid_fields.append("word_start")
+        if word_end < word_start:
+            invalid_fields.append("word_end")
+        if invalid_fields:
             raise AuthoritativeParentChineseError(
                 "authoritative_parent_chinese_record_invalid",
                 "A parent Chinese record has invalid identity, text, or coverage.",
                 subtitle_id=subtitle_id,
+                invalid_fields=invalid_fields,
+                english=english,
+                chinese=chinese,
+                word_start=word_start,
+                word_end=word_end,
             )
         seen_ids.add(subtitle_id)
         english_hash = _text_hash(english)

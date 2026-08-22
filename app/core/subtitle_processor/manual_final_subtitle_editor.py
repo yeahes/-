@@ -4286,21 +4286,39 @@ class ManualFinalSubtitleSession:
                 boundary_acknowledged = bool(
                     page.get("boundary_review_acknowledged")
                 )
+                has_internal_page_boundary = bool(
+                    int(page.get("page_index") or 0) > 1
+                )
                 boundary_review_required = bool(
                     translation_issue_codes
                     or boundary_classification == "hard"
                     or (
-                        boundary_classification == "review"
-                        or boundary_issue_codes
+                        has_internal_page_boundary
+                        and (
+                            boundary_classification == "review"
+                            or boundary_issue_codes
+                        )
                     )
                     and not boundary_acknowledged
+                )
+                single_page_parent_identity = bool(
+                    len(pages) == 1
+                    and int(page.get("word_start", -1))
+                    == int(cue.get("word_start", -2))
+                    and int(page.get("word_end", -1))
+                    == int(cue.get("word_end", -2))
+                    and re.sub(r"\s+", "", str(page.get("chinese") or ""))
+                    == re.sub(
+                        r"\s+", "", str(cue.get("translated_subtitle") or "")
+                    )
                 )
                 chinese_confirmed = bool(
                     str(page.get("chinese") or "").strip()
                     and not translation_issue_codes
                     and not page.get("chinese_stale_draft")
                     and (
-                        not cue.get("chinese_review_required")
+                        single_page_parent_identity
+                        or not cue.get("chinese_review_required")
                         or page.get("chinese_review_acknowledged")
                     )
                 )
@@ -4337,6 +4355,9 @@ class ManualFinalSubtitleSession:
                         page.get("chinese_draft_kind") or ""
                     ),
                     "display_page_chinese_confirmed": chinese_confirmed,
+                    "display_page_chinese_pending": bool(
+                        not str(page.get("chinese") or "").strip()
+                    ),
                     "chinese_review_required": not chinese_confirmed,
                     "display_suppressed": False,
                     "media_muted": False,
@@ -6601,6 +6622,12 @@ class ManualFinalSubtitleSession:
             and file_sha256(artifact_path) != expected_artifact_hash
         ):
             return {}
+        if str(artifact.get("status") or "") != "PASS" and self.display_page_edits:
+            recovered_artifact = (
+                self._recover_display_page_artifact_from_complete_edits()
+            )
+            if recovered_artifact:
+                return recovered_artifact
         if str(artifact.get("status") or "") != "PASS":
             source_artifact = artifact
             try:
@@ -6630,6 +6657,27 @@ class ManualFinalSubtitleSession:
             ):
                 return self._recover_display_page_artifact_from_complete_edits()
         return dict(artifact)
+
+    def display_page_plan_needs_refresh(self) -> bool:
+        """Return whether a legacy page artifact must be rebuilt after code changes."""
+        if self.display_page_edits or self.display_page_boundary_overrides:
+            # Existing manual page ranges are user-owned and must be checked
+            # by the normal strict save path before any automatic refresh.
+            return False
+        try:
+            from app.core.subtitle_processor.stable_display_page_contract import (
+                DISPLAY_PAGE_PLANNER_VERSION,
+            )
+
+            artifact = self._effective_display_page_artifact()
+        except (ManualFinalSubtitleEditError, OSError):
+            return False
+        return bool(
+            artifact
+            and str(artifact.get("planner_version") or "")
+            and str(artifact.get("planner_version") or "")
+            != DISPLAY_PAGE_PLANNER_VERSION
+        )
 
     def _display_page_previews(self) -> Dict[str, List[Dict[str, Any]]]:
         artifact = self._effective_display_page_artifact()

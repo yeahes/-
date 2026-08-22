@@ -2,6 +2,8 @@ import copy
 import hashlib
 import json
 import tempfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,7 +11,11 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
-from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
+from app.core.subtitle_processor.screen_editor import (
+    DISPLAY_PAGE_TRANSLATION_PROMPT,
+    ScreenSubtitleEditor,
+    ScreenSubtitleItem,
+)
 from app.core.subtitle_processor.authoritative_parent_chinese import (
     AuthoritativeParentChineseError,
     bind_display_page_parent_records,
@@ -19,6 +25,8 @@ from app.core.subtitle_processor.authoritative_parent_chinese import (
     validate_display_page_parent_records,
 )
 from app.core.subtitle_processor.stable_display_page_contract import (
+    DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION,
+    DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION,
     DisplayPageContractError,
     build_display_page_contract,
     display_page_id,
@@ -820,6 +828,18 @@ def test_page_translation_retry_contract_contains_only_failed_parent_pages():
         "S0187": "从宏观政策巨变，拉回到作为个体的你内心的心理转变。",
     }
 
+    final_errors = ScreenSubtitleEditor._final_display_page_retry_errors(
+        merged,
+        [],
+        [
+            {
+                "code": "page_translation_parent_meaning_added",
+                "parent_subtitle_id": "S0187",
+            }
+        ],
+    )
+    assert final_errors == []
+
 
 def test_structural_page_response_retries_only_identifiable_missing_parent():
     case = _cases()["s0078_reordered_chinese"]
@@ -1294,22 +1314,19 @@ def test_strong_pause_keeps_hard_boundary_as_last_resort_not_preferred_split():
     assert decision["confidence"] == "high"
     assert decision["pause_ms"] >= 600
     assert decision["relaxed_raw_hard"] is True
-    # A strong pause may lower the review cost of a hard boundary, but it
-    # must not turn that boundary into an automatic page split.  When no
-    # complete 56/54/52px partition exists, the planner keeps the parent
-    # intact and emits an explicit manual-review seed instead of reviving the
-    # old 50px "fit at all costs" fallback.
-    assert plan["status"] == "render_structural_overflow"
-    assert plan["errors"][0]["reason"] == "no_complete_normal_font_page_partition"
-    assert plan["errors"][0]["attempted_reasons"]
-    assert "fixed_font_span_unreadable" in plan["errors"][0]["attempted_reasons"]
-    assert 50 not in {
-        int(size)
-        for size in (
-            plan.get("font_size") or {}
-        ).values()
-        if str(size).isdigit()
-    }
+    # The strong-pause boundary remains a human REVIEW, never an automatic
+    # safe split. Same-screen line wrapping can now keep every page at the
+    # normal font floor, so the editor must expose a confirmable review rather
+    # than an unconfirmable structural seed.
+    assert plan["status"] == "ok"
+    is_page = next(page for page in plan["pages"] if page["word_start"] == split)
+    assert is_page["boundary_before"]["classification"] == "review"
+    assert is_page["boundary_before"]["confidence"] == "high"
+    assert is_page["boundary_before"]["relaxed_raw_hard"] is True
+    assert all(
+        page["english_font_size"] in {56, 54, 52}
+        for page in plan["pages"]
+    )
 
 
 def test_low_confidence_tight_transition_does_not_force_major_font_reduction():
@@ -1485,6 +1502,56 @@ def test_invalid_page_translation_cache_is_replaced_only_after_validation():
     assert editor._display_page_external_request_count == 1
 
 
+def test_incomplete_fresh_page_response_is_retried_before_leaving_request_contract():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    valid = _response(case)
+    incomplete = {"pages": valid["pages"][:-1]}
+    returned = [incomplete, valid]
+
+    class Cache:
+        def get_llm_result(self, *args, **kwargs):
+            return None
+
+        def set_llm_result(self, *args, **kwargs):
+            return None
+
+    def create(**kwargs):
+        payload = returned.pop(0)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(payload, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.article_context_prompt = ""
+    editor.model = "test-model"
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.translation_request_max_attempts = 3
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._llm_request_ledger = []
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result, cache_hit = editor._request_display_page_translations(contract)
+
+    assert result == valid
+    assert cache_hit is False
+    assert returned == []
+    assert editor._display_page_external_request_count == 2
+
+
 def test_page_translation_requests_use_flash_then_pro_for_quality_retry():
     case = _cases()["s0078_reordered_chinese"]
     contract = _contract(case)
@@ -1542,6 +1609,102 @@ def test_page_translation_requests_use_flash_then_pro_for_quality_retry():
     assert initial_hit is False
     assert retry_hit is False
     assert calls == ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+
+def test_residual_page_retry_shrinks_scope_until_all_parents_are_valid():
+    parents = []
+    for index in range(1, 4):
+        parent_id = f"S{index:04d}"
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": f"English parent {index}.",
+                "chinese": f"第{index}段内容。",
+                "word_start": (index - 1) * 2,
+                "word_end": (index - 1) * 2 + 1,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": (index - 1) * 2,
+                        "word_end": (index - 1) * 2,
+                        "english": f"English parent",
+                        "start_ms": index * 1000,
+                        "end_ms": index * 1000 + 500,
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": (index - 1) * 2 + 1,
+                        "word_end": (index - 1) * 2 + 1,
+                        "english": f"{index}.",
+                        "start_ms": index * 1000 + 500,
+                        "end_ms": index * 1000 + 1000,
+                    }
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"chinese_font_size": 48, "max_lines": 2},
+        planner_version="residual-retry-regression-v1",
+    )
+    baseline = validate_page_translation_response(
+        contract,
+        {"pages": []},
+        require_source_echo=True,
+    )
+    requested_scopes = []
+
+    def request(retry_contract, *, retry_errors=None):
+        requested_scopes.append(
+            [
+                parent["parent_subtitle_id"]
+                for parent in retry_contract.get("parents") or []
+            ]
+        )
+        selected = requested_scopes[-1]
+        returned = selected[:1] if len(requested_scopes) == 1 else selected
+        rows = []
+        for parent in retry_contract.get("parents") or []:
+            if parent["parent_subtitle_id"] not in returned:
+                continue
+            for page_index, page in enumerate(parent["pages"]):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": (
+                            f"第{parent['parent_subtitle_id'][1:].lstrip('0')}段"
+                            if page_index == 0
+                            else "内容。"
+                        ),
+                    }
+                )
+        return {"pages": rows}, False
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor._request_display_page_translations = request
+    editor._display_page_translation_quality_errors = lambda *args: []
+
+    repaired, quality_errors, cache_hit = editor._retry_residual_display_page_errors(
+        contract,
+        baseline,
+        [],
+        cache_hit=True,
+    )
+
+    assert requested_scopes == [
+        ["S0001", "S0002", "S0003"],
+        ["S0002", "S0003"],
+    ]
+    assert repaired["status"] == "PASS"
+    assert repaired["errors"] == []
+    assert [parent["parent_subtitle_id"] for parent in repaired["parents"]] == [
+        "S0001",
+        "S0002",
+        "S0003",
+    ]
+    assert quality_errors == []
+    assert cache_hit is False
 
 
 def test_page_translation_batches_preserve_completed_cache_after_later_timeout():
@@ -1715,7 +1878,122 @@ def test_page_translation_batches_preserve_completed_cache_after_later_timeout()
     )["status"] == "PASS"
 
 
-def test_page_translation_batches_keep_valid_batches_after_successful_empty_batch():
+def test_page_translation_terminal_failure_does_not_start_later_batches():
+    parents = []
+    for index in range(1, 14):
+        parent_id = f"S{index:04d}"
+        word_start = (index - 1) * 4
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": f"alpha {index} beta {index}",
+                "chinese": f"第{index}条完整中文。",
+                "word_start": word_start,
+                "word_end": word_start + 3,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": word_start,
+                        "word_end": word_start + 1,
+                        "english": f"alpha {index}",
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": word_start + 2,
+                        "word_end": word_start + 3,
+                        "english": f"beta {index}",
+                    },
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        planner_version="fail-fast-batch-regression-v1",
+    )
+
+    class Cache:
+        def __init__(self):
+            self.writes = []
+
+        def get_llm_result(self, *_args, **_kwargs):
+            return None
+
+        def set_llm_result(self, _key, value, *_args, **_kwargs):
+            self.writes.append(json.loads(value))
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-flash"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.allocation_max_concurrency = 2
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_request_ledger = []
+    editor._llm_request_ledger_lock = threading.Lock()
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.progress_callback = None
+    started_scopes = []
+    both_started = threading.Barrier(2)
+
+    def request(batch_contract, *, retry_errors=None):
+        parent_ids = [
+            str(parent["parent_subtitle_id"])
+            for parent in batch_contract["parents"]
+        ]
+        started_scopes.append(parent_ids)
+        both_started.wait(timeout=1)
+        if parent_ids[0] == "S0001":
+            return None, "terminal page request failure", []
+        time.sleep(0.03)
+        return (
+            {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": (
+                            f"第{int(parent['parent_subtitle_id'][1:])}条"
+                            if page["display_page_id"].endswith(".P01")
+                            else "完整中文。"
+                        ),
+                    }
+                    for parent in batch_contract["parents"]
+                    for page in parent["pages"]
+                ]
+            },
+            "",
+            [],
+        )
+
+    with patch.object(
+        editor,
+        "_request_display_page_translation_api_only",
+        side_effect=request,
+    ):
+        try:
+            editor._request_display_page_translations(contract)
+        except RuntimeError as exc:
+            assert "batch 1/3" in str(exc)
+        else:
+            raise AssertionError("the terminal batch failure must stop publication")
+
+    assert started_scopes == [
+        [f"S{index:04d}" for index in range(1, 7)],
+        [f"S{index:04d}" for index in range(7, 13)],
+    ]
+    assert len(editor.cache_manager.writes) == 1
+    assert editor.cache_manager.writes[0]["pages"][0]["display_page_id"] == (
+        "S0007.P01"
+    )
+
+
+def test_page_translation_batches_retry_empty_batch_and_keep_other_valid_batch():
     parents = []
     word_cursor = 0
     for index in range(1, 8):
@@ -1763,7 +2041,7 @@ def test_page_translation_batches_keep_valid_batches_after_successful_empty_batc
         payload = json.loads(kwargs["messages"][1]["content"])
         parent_ids = [item["parent_subtitle_id"] for item in payload]
         request_scopes.append(parent_ids)
-        if len(parent_ids) == 6:
+        if len(parent_ids) == 6 and request_scopes.count(parent_ids) == 1:
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content='{"pages": []}'))]
             )
@@ -1819,19 +2097,13 @@ def test_page_translation_batches_keep_valid_batches_after_successful_empty_batc
     assert cache_hit is False
     assert request_scopes == [
         [f"S{index:04d}" for index in range(201, 207)],
+        [f"S{index:04d}" for index in range(201, 207)],
         ["S0207"],
     ]
-    assert artifact["status"] == "ERROR"
+    assert artifact["status"] == "PASS"
     assert [
         parent["parent_subtitle_id"] for parent in artifact["parents"]
-    ] == ["S0207"]
-    retry = ScreenSubtitleEditor._display_page_retry_contract(
-        contract,
-        artifact["errors"],
-    )
-    assert [
-        parent["parent_subtitle_id"] for parent in retry["parents"]
-    ] == [f"S{index:04d}" for index in range(201, 207)]
+    ] == [f"S{index:04d}" for index in range(201, 208)]
 def test_page_translation_source_echo_is_required_for_new_requests():
     case = _cases()["s0078_reordered_chinese"]
     contract = _contract(case)
@@ -1865,7 +2137,7 @@ def test_page_translation_rejects_page_level_chinese_speed_overflow():
             "pages": [
                 {
                     "display_page_id": display_page_id(case["subtitle_id"], 1),
-                    "zh": "这是一段明显无法在不到一秒内舒适读完的中文翻译内容",
+                    "zh": case["pages"][0]["chinese"],
                 },
                 {
                     "display_page_id": display_page_id(case["subtitle_id"], 2),
@@ -1993,6 +2265,202 @@ def test_page_translation_rejects_significant_parent_expansion_but_allows_reorde
     )
 
 
+def test_page_translation_rejects_new_parent_content_below_growth_limit():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0188",
+                "english": (
+                    "That cannot support 300 stores of expansion and tens of "
+                    "millions in recurring revenue."
+                ),
+                "chinese": "这不足以支撑300家门店扩张和数千万的经常性收入。",
+                "word_start": 0,
+                "word_end": 13,
+                "pages": [
+                    {
+                        "display_page_id": "S0188.P01",
+                        "word_start": 0,
+                        "word_end": 6,
+                        "english": "That cannot support 300 stores of expansion",
+                        "start_ms": 0,
+                        "end_ms": 2600,
+                    },
+                    {
+                        "display_page_id": "S0188.P02",
+                        "word_start": 7,
+                        "word_end": 13,
+                        "english": "and tens of millions in recurring revenue.",
+                        "start_ms": 2600,
+                        "end_ms": 5200,
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0188.P01",
+                    "zh": "这不足以支撑300家门店扩张的行为诱因，",
+                },
+                {
+                    "display_page_id": "S0188.P02",
+                    "zh": "以及数千万的经常性收入。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_parent_meaning_added"
+        and error.get("parent_subtitle_id") == "S0188"
+        and set(error.get("added_tokens") or []) >= {"行为", "诱因"}
+        for error in artifact["errors"]
+    )
+
+
+def test_page_translation_allows_neutral_parent_binding_word():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0188",
+                "english": (
+                    "That cannot support 300 stores of expansion and tens of "
+                    "millions in recurring revenue."
+                ),
+                "chinese": "这不足以支撑300家门店扩张和数千万的经常性收入。",
+                "word_start": 0,
+                "word_end": 13,
+                "pages": [
+                    {
+                        "display_page_id": "S0188.P01",
+                        "word_start": 0,
+                        "word_end": 6,
+                        "english": "That cannot support 300 stores of expansion",
+                        "start_ms": 0,
+                        "end_ms": 2600,
+                    },
+                    {
+                        "display_page_id": "S0188.P02",
+                        "word_start": 7,
+                        "word_end": 13,
+                        "english": "and tens of millions in recurring revenue.",
+                        "start_ms": 2600,
+                        "end_ms": 5200,
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0188.P01",
+                    "zh": "这不足以支撑300家门店扩张，",
+                },
+                {
+                    "display_page_id": "S0188.P02",
+                    "zh": "以及数千万的经常性收入。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_page_projection_does_not_invent_a_token_across_two_complete_pages():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0017",
+                "english": "People pay 58 yuan for domestic chocolate.",
+                "chinese": "人们为一块国产巧克力掏出58元。",
+                "word_start": 0,
+                "word_end": 6,
+                "pages": [
+                    {
+                        "display_page_id": "S0017.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "People pay 58 yuan",
+                    },
+                    {
+                        "display_page_id": "S0017.P02",
+                        "word_start": 4,
+                        "word_end": 6,
+                        "english": "for domestic chocolate.",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0017.P01", "zh": "人们掏出58元"},
+                {"display_page_id": "S0017.P02", "zh": "为一块国产巧克力。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_page_projection_allows_grammatical_form_of_existing_relation():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0133",
+                "english": "The reason for local roasting is better control.",
+                "chinese": "是因为本地烘焙能带来更好的掌控。",
+                "word_start": 0,
+                "word_end": 7,
+                "pages": [
+                    {
+                        "display_page_id": "S0133.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "The reason for local roasting",
+                    },
+                    {
+                        "display_page_id": "S0133.P02",
+                        "word_start": 4,
+                        "word_end": 7,
+                        "english": "is better control.",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0133.P01", "zh": "本地烘焙的原因"},
+                {"display_page_id": "S0133.P02", "zh": "是能带来更好的掌控。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
 def test_page_level_continuation_fragment_is_review_not_blocker():
     contract = build_display_page_contract(
         [
@@ -2031,7 +2499,7 @@ def test_page_level_continuation_fragment_is_review_not_blocker():
         contract,
         {
             "pages": [
-                {"display_page_id": "S0111.P01", "zh": "那么，当你把这个数字和Alphabet的说法相比："},
+                {"display_page_id": "S0111.P01", "zh": "那么，把这个数字与Alphabet相比："},
                 {"display_page_id": "S0111.P02", "zh": "也就是在更短时间内投入2050亿美元……"},
             ]
         },
@@ -2515,16 +2983,17 @@ def test_flash_page_fragment_retries_only_parent_and_pro_residual_stays_review()
             }
         )
         rows = []
-        for parent_index, parent in enumerate(payload):
-            prefix = "甲" if parent["parent_subtitle_id"] == cases[0]["subtitle_id"] else "乙"
-            if kwargs["model"] == "deepseek-v4-pro":
-                prefix = "重译甲"
+        fixture_by_parent_id = {
+            case["subtitle_id"]: case for case in cases
+        }
+        for parent in payload:
+            fixture = fixture_by_parent_id[parent["parent_subtitle_id"]]
             for page_index, page in enumerate(parent["pages"], 1):
                 rows.append(
                     {
                         "display_page_id": page["display_page_id"],
                         "source_english": page["english"],
-                        "zh": f"{prefix}{parent_index + 1}{page_index}。",
+                        "zh": fixture["pages"][page_index - 1]["chinese"],
                     }
                 )
         return SimpleNamespace(
@@ -2703,6 +3172,122 @@ def test_display_page_local_fluency_findings_are_review_not_semantic_blockers():
     assert editor._display_page_translation_reviews == []
 
 
+def test_display_page_semantics_use_authoritative_parent_chinese_not_english_scaffolding():
+    contract = {
+        "parents": [
+            {
+                "parent_subtitle_id": "S0015",
+                "english": (
+                    "Because it's like walking into a dollar store during a recession "
+                    "and seeing a line out the door for a 30 artisanal candy bar."
+                ),
+                "source_chinese": (
+                    "这就像在经济衰退期走进一元店，却看到人们排长队买30美元的手工巧克力棒。"
+                ),
+                "pages": [
+                    {
+                        "display_page_id": "S0015.P01",
+                        "english": (
+                            "Because it's like walking into a dollar store during a recession"
+                        ),
+                        "start_ms": 61655,
+                        "end_ms": 65247,
+                    },
+                    {
+                        "display_page_id": "S0015.P02",
+                        "english": (
+                            "and seeing a line out the door for a 30 artisanal candy bar."
+                        ),
+                        "start_ms": 65247,
+                        "end_ms": 69483,
+                    },
+                ],
+            }
+        ]
+    }
+    artifact = {
+        "status": "PASS",
+        "parents": [
+            {
+                "parent_subtitle_id": "S0015",
+                "pages": [
+                    {
+                        "display_page_id": "S0015.P01",
+                        "zh": "这就像在经济衰退期走进一元店",
+                    },
+                    {
+                        "display_page_id": "S0015.P02",
+                        "zh": "却看到人们排长队买30美元的手工巧克力棒。",
+                    },
+                ],
+            }
+        ],
+    }
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+
+    errors = editor._display_page_translation_quality_errors(contract, artifact)
+
+    assert errors == []
+
+
+def test_display_page_prompt_makes_parent_chinese_the_semantic_ceiling():
+    assert DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION == "display-page-translation-v8"
+    assert DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION == "fixed-parent-page-allocation-v8"
+    assert "semantic ceiling" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "Never restore a concept from the English" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "Do not introduce a new multi-character content word" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "a natural Chinese continuation across adjacent pages is allowed" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "merely to make a fragment page stand alone" in DISPLAY_PAGE_TRANSLATION_PROMPT
+
+
+def test_display_page_retry_prompt_constrains_arbitrary_validator_tokens():
+    case = _cases()["s0078_reordered_chinese"]
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+
+    prompt = editor._display_page_translation_request_prompt(
+        _contract(case),
+        retry_errors=[
+            {
+                "code": "page_translation_parent_meaning_added",
+                "parent_subtitle_id": case["subtitle_id"],
+                "added_tokens": ["背景", "结论"],
+            },
+            {
+                "code": "page_translation_id_missing",
+                "ids": [f"{case['subtitle_id']}.P02"],
+            },
+        ],
+    )
+
+    assert f"Parent {case['subtitle_id']}" in prompt
+    assert '["背景", "结论"]' in prompt
+    assert "Do not replace them with synonyms" in prompt
+    assert f'["{case["subtitle_id"]}.P02"]' in prompt
+    assert "English is placement evidence only" in prompt
+
+
+def test_display_page_error_evidence_retains_retry_rejection_reason():
+    errors = ScreenSubtitleEditor._merge_display_page_error_evidence(
+        [{"code": "page_translation_id_missing", "ids": ["S0188.P01", "S0188.P02"]}],
+        [],
+        [
+            {
+                "code": "page_translation_parent_meaning_expanded",
+                "parent_subtitle_id": "S0188",
+                "growth": 10,
+                "allowed_growth": 8,
+            }
+        ],
+    )
+
+    assert [error["code"] for error in errors] == [
+        "page_translation_id_missing",
+        "page_translation_parent_meaning_expanded",
+    ]
+
+
 def test_review_only_initial_page_projection_survives_worse_pro_retry():
     case = _cases()["s0078_reordered_chinese"]
     segment = ASRDataSeg(
@@ -2756,7 +3341,7 @@ def test_review_only_initial_page_projection_survives_worse_pro_retry():
                         "它反复补充父字幕中不存在的大量说明和结论。"
                     )
                 else:
-                    chinese = "第一页。" if page_index == 1 else "第二页。"
+                    chinese = case["pages"][page_index - 1]["chinese"]
                 row = {
                     "display_page_id": page["display_page_id"],
                     "source_english": page["english"],
@@ -3766,6 +4351,30 @@ def test_parent_chinese_authority_binds_exact_id_text_and_word_span():
     assert record["record_hash"]
 
 
+def test_parent_chinese_authority_reports_empty_fixed_id_record_details():
+    try:
+        build_authoritative_parent_chinese_artifact(
+            [
+                {
+                    "subtitle_id": "S0233",
+                    "english": "A fixed English parent.",
+                    "chinese": "",
+                    "word_start": 120,
+                    "word_end": 123,
+                }
+            ],
+            source_word_ledger_hash="ledger-hash",
+            producer="fixed_id_allocation",
+        )
+        assert False, "an empty fixed-ID Chinese record must be rejected"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_record_invalid"
+        assert exc.details["subtitle_id"] == "S0233"
+        assert exc.details["invalid_fields"] == ["chinese"]
+        assert exc.details["word_start"] == 120
+        assert exc.details["word_end"] == 123
+
+
 def test_parent_chinese_authority_rejects_tampered_chinese_and_identity():
     records = [
         {
@@ -3968,17 +4577,27 @@ if __name__ == "__main__":
     test_structural_exception_can_use_actual_pixel_fit_above_sixteen_words()
     test_no_partition_failure_reports_deterministic_attempt_reasons()
     test_invalid_page_translation_cache_is_replaced_only_after_validation()
+    test_incomplete_fresh_page_response_is_retried_before_leaving_request_contract()
     test_page_translation_requests_use_flash_then_pro_for_quality_retry()
+    test_residual_page_retry_shrinks_scope_until_all_parents_are_valid()
     test_page_translation_batches_preserve_completed_cache_after_later_timeout()
-    test_page_translation_batches_keep_valid_batches_after_successful_empty_batch()
+    test_page_translation_batches_retry_empty_batch_and_keep_other_valid_batch()
     test_page_translation_rejects_page_level_chinese_speed_overflow()
     test_page_translation_rejects_repeated_parent_meaning()
     test_page_translation_rejects_significant_parent_expansion_but_allows_reordering()
+    test_page_translation_rejects_new_parent_content_below_growth_limit()
+    test_page_translation_allows_neutral_parent_binding_word()
+    test_page_projection_does_not_invent_a_token_across_two_complete_pages()
+    test_page_projection_allows_grammatical_form_of_existing_relation()
     test_page_level_continuation_fragment_is_review_not_blocker()
     test_page_translation_rejects_repeated_adjacent_fact()
     test_page_translation_rejects_condition_after_completed_question()
     test_page_translation_allows_complete_question_before_new_condition_sentence()
     test_display_page_local_fluency_findings_are_review_not_semantic_blockers()
+    test_display_page_semantics_use_authoritative_parent_chinese_not_english_scaffolding()
+    test_display_page_prompt_makes_parent_chinese_the_semantic_ceiling()
+    test_display_page_retry_prompt_constrains_arbitrary_validator_tokens()
+    test_display_page_error_evidence_retains_retry_rejection_reason()
     test_review_only_initial_page_projection_survives_worse_pro_retry()
     test_renderer_uses_valid_page_mapping_without_proportional_fallback()
     test_renderer_fails_closed_when_paginated_page_mapping_is_missing()

@@ -99,6 +99,8 @@ def build_stable_run_fingerprint(
         "screen_subtitle_max_english",
         "screen_subtitle_allocation_max_concurrency",
         "screen_subtitle_allocation_batch_size",
+        "screen_subtitle_translation_request_budget",
+        "screen_subtitle_translation_request_max_attempts",
         "custom_prompt_text",
     )
     config_payload = {

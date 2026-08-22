@@ -291,10 +291,16 @@ class Config(QConfig):
         "Subtitle", "ScreenSubtitleMaxEnglish", 16, RangeValidator(6, 40)
     )
     screen_subtitle_allocation_max_concurrency = ConfigItem(
-        "Subtitle", "ScreenSubtitleAllocationMaxConcurrency", 3, RangeValidator(1, 10)
+        "Subtitle", "ScreenSubtitleAllocationMaxConcurrency", 2, RangeValidator(1, 10)
     )
     screen_subtitle_allocation_batch_size = ConfigItem(
         "Subtitle", "ScreenSubtitleAllocationBatchSize", 16, RangeValidator(6, 24)
+    )
+    screen_subtitle_translation_request_budget = ConfigItem(
+        "Subtitle", "ScreenSubtitleTranslationRequestBudget", 40, RangeValidator(8, 200)
+    )
+    screen_subtitle_translation_request_max_attempts = ConfigItem(
+        "Subtitle", "ScreenSubtitleTranslationRequestMaxAttempts", 3, RangeValidator(1, 5)
     )
     stable_ts_alignment_enabled = ConfigItem(
         "Subtitle", "StableTsAlignmentEnabled", True, BoolValidator()
@@ -331,6 +337,12 @@ class Config(QConfig):
         "暗色播客",
         OptionsValidator(["暗色播客", "文章单词"]),
     )
+    podcast_template_resolution = OptionsConfigItem(
+        "Video",
+        "PodcastTemplateResolution",
+        "1080p",
+        OptionsValidator(["1080p", "1440p平台上传"]),
+    )
     podcast_template_title = ConfigItem(
         "Video", "PodcastTemplateTitle", "为什么人工智能会改变教育?"
     )
@@ -344,7 +356,7 @@ class Config(QConfig):
         "Video", "PodcastTemplateLogo", ""
     )
     podcast_template_date = ConfigItem(
-        "Video", "PodcastTemplateDate", "Jul 23rd 2026"
+        "Video", "PodcastTemplateDate", ""
     )
 
     # ------------------- 字幕样式配置 -------------------

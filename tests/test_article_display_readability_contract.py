@@ -363,6 +363,26 @@ def test_display_planning_does_not_mutate_frozen_cue_identity_text_or_timing():
     assert (cue.subtitle_id, cue.en, cue.zh, cue.start, cue.end, cue.word_timing) == snapshot
 
 
+def test_numeric_magnitude_is_nonoverridable_at_display_page_boundary():
+    decision = {
+        "classification": "review",
+        "issue_codes": ["numeric_unit_or_noun_split"],
+        "strong_pause_evidence": True,
+        "pause_ms": 900,
+        "balanced_predicate_restart": True,
+    }
+
+    assert podcast_learning_video._article_nonoverridable_atomic_page_boundary_issues(
+        decision
+    ) == {"numeric_unit_or_noun_split"}
+    assert not podcast_learning_video._article_secondary_review_boundary_is_complete(
+        {
+            "en": "billion people suddenly changed the market.",
+            "boundary_before": decision,
+        }
+    )
+
+
 def test_visual_planning_reuses_the_complete_frozen_page_projection():
     text = "Teams compare evidence before approving major policy changes."
     cue = _cue(text, "S9000", "团队会先比较证据，再批准重大政策调整。")
@@ -747,7 +767,7 @@ def test_frozen_page_artifact_records_font_size_and_line_width_for_each_page():
     plan = contract["render_plans"][0]
     assert contract["layout_profile"]["english_font_size"] == 56
     assert contract["layout_profile"]["chinese_font_size"] == 50
-    assert contract["layout_profile"]["chinese_letter_spacing"] == -0.02
+    assert contract["layout_profile"]["chinese_letter_spacing"] == 0.0
     assert contract["layout_profile"]["english_font_fallback_sizes"] == [56, 54, 52]
     assert contract["layout_profile"]["english_emergency_fallback_sizes"] == []
     assert contract["layout_profile"]["english_legacy_readable_sizes"] == [50]
@@ -770,13 +790,13 @@ def test_article_chinese_font_keeps_sixteen_characters_inside_safe_width():
 
     assert len(sample) == 16
     assert podcast_learning_video.ARTICLE_SUBTITLE_ZH_FONT_SIZE == 50
-    assert podcast_learning_video.ARTICLE_SUBTITLE_ZH_LETTER_SPACING == -0.02
+    assert podcast_learning_video.ARTICLE_SUBTITLE_ZH_LETTER_SPACING == 0.0
     assert podcast_learning_video.article_subtitle_zh_text_w(draw, sample, font) <= (
         podcast_learning_video.acx(podcast_learning_video.ARTICLE_SUBTITLE_ZH_WIDTH)
     )
 
 
-def test_article_chinese_subtitle_measurement_applies_negative_letter_spacing():
+def test_article_chinese_subtitle_measurement_uses_default_letter_spacing():
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     font = podcast_learning_video.article_cjk_font(
         podcast_learning_video.ARTICLE_SUBTITLE_ZH_FONT_SIZE,
@@ -784,7 +804,7 @@ def test_article_chinese_subtitle_measurement_applies_negative_letter_spacing():
     )
     sample = "中文字幕字距测试"
 
-    assert podcast_learning_video.article_subtitle_zh_text_w(draw, sample, font) < (
+    assert podcast_learning_video.article_subtitle_zh_text_w(draw, sample, font) == (
         podcast_learning_video.text_w(draw, sample, font)
     )
     assert podcast_learning_video.wrap_article_zh(
@@ -1999,6 +2019,48 @@ def test_display_page_keeps_multiword_work_title_atomic():
     assert outside["complete_title_restart"] is True
 
 
+def test_title_detection_does_not_cross_sentences_or_claim_numeric_condition():
+    words = "Wow. Yeah. If 1.4 billion people changed the market.".split()
+
+    assert podcast_learning_video._article_title_entity_spans(words) == ()
+    assert not podcast_learning_video._article_boundary_inside_title_entity(words, 4)
+
+
+def test_complete_from_gerund_can_relax_verb_preposition_evidence():
+    words = "Demand jumped from eating one bar a year to a much higher level.".split()
+    cue = _cue(" ".join(words), "S9401")
+    split = words.index("from")
+    right_word_id = cue.word_timing[split]["word_id"]
+    cue.display_boundary_evidence = {
+        str(right_word_id): {
+            "hard_issues": [
+                "predicate_attached_continuation_split",
+                "verb_preposition_complement_split",
+            ],
+            "soft_issues": [],
+            "pause_ms": 0,
+        }
+    }
+
+    decision = podcast_learning_video._article_forced_continuation_decision(
+        cue,
+        words,
+        split,
+    )
+
+    assert decision["classification"] == "review"
+    assert decision["forced_complete_predicate_phrase"] is True
+    assert decision["forced_display_continuation"] is True
+    assert podcast_learning_video._article_page_break_score(
+        cue,
+        words,
+        split,
+        len(words) / 2,
+        cue.word_timing,
+        allow_forced_continuation=True,
+    ) is not None
+
+
 def test_page_boundary_risk_preserves_review_confidence_order():
     assert podcast_learning_video._article_page_boundary_risk(
         {"classification": "allow", "confidence": "low"},
@@ -3000,6 +3062,84 @@ def test_secondary_page_promotion_distinguishes_safe_and_attached_boundaries():
             },
         }
     )
+
+    assert not podcast_learning_video._article_secondary_review_boundary_is_complete(
+        {
+            "en": "to Navarro's objections would be the only answer",
+            "boundary_before": {
+                "classification": "review",
+                "issue_codes": ["dependency_phrase_entrance_split"],
+                "tight_complete_phrase_start": True,
+            },
+        }
+    )
+
+
+def test_open_parent_coordinated_comma_restart_beats_dense_single_page():
+    text = (
+        "They analyzed the exact same global trade networks, and they found "
+        "about 40 billion worth of Chinese goods were,"
+    )
+    _, cue = _syntax_backed_cue(
+        text,
+        "S9701",
+        word_timing=_word_timing_with_gaps(text, {7: 60}),
+    )
+
+    plan = _plan(cue)
+
+    assert [page["en"] for page in plan["pages"]] == [
+        "They analyzed the exact same global trade networks,",
+        "and they found about 40 billion worth of Chinese goods were,",
+    ]
+    assert min(page["english_font_size"] for page in plan["pages"]) >= 52
+
+
+def test_parallel_noun_list_uses_comma_page_boundaries_without_splitting_predicate():
+    text = (
+        "Well, the goal would be to constantly monitor the origin of every "
+        "single component, the digital routing of every shipping container, "
+        "and the exact nationality of the capital financing these factories."
+    )
+    words = text.split()
+    _, cue = _syntax_backed_cue(
+        text,
+        "S9702",
+        word_timing=_word_timing_with_gaps(
+            text,
+            {words.index("component,"): 180, words.index("container,"): 361},
+        ),
+    )
+
+    plan = _plan(cue)
+
+    assert [page["word_start"] for page in plan["pages"]] == [0, 14, 21]
+    assert "would be to constantly monitor" in plan["pages"][0]["en"]
+    assert all(page["english_font_size"] == 56 for page in plan["pages"])
+
+
+def test_balanced_predicate_restart_beats_attached_preposition_restart():
+    text = (
+        "Because the only coherent answer to Navarro's objections would be to "
+        "set a strict, legally defined maximum threshold for Chinese content."
+    )
+    words = text.split()
+    _, cue = _syntax_backed_cue(
+        text,
+        "S9703",
+        word_timing=_word_timing_with_gaps(
+            text,
+            {words.index("objections"): 321, words.index("strict,"): 401},
+        ),
+    )
+
+    plan = _plan(cue)
+
+    assert [page["en"] for page in plan["pages"]] == [
+        "Because the only coherent answer to Navarro's objections",
+        "would be to set a strict, legally defined maximum threshold for Chinese content.",
+    ]
+    assert all("strict, legally" in page["en"] for page in plan["pages"][1:])
     assert not podcast_learning_video._article_secondary_review_boundary_is_complete(
         {
             "en": "for Chinese nationals studying in critical fields",
@@ -3271,6 +3411,147 @@ def test_three_line_fallback_promotes_complete_two_page_alternative():
         assert all(len(page["english_lines"]) <= 2 for page in plan["pages"])
 
 
+def test_complete_prepositional_and_coordinated_continuations_survive_page_filter():
+    cases = (
+        (
+            "S9801",
+            "So the company is bypassing foreign giants by internalizing the most critical parts of manufacturing,",
+        ),
+        (
+            "S9802",
+            "A vertically integrated supply chain is brilliant for business margins. It is.",
+        ),
+        (
+            "S9803",
+            "People are aggressively skipping dinners out and forcing large chains into discount wars,",
+        ),
+    )
+    draw = ImageDraw.Draw(
+        Image.new(
+            "RGB",
+            (
+                podcast_learning_video.ARTICLE_WIDTH,
+                podcast_learning_video.ARTICLE_HEIGHT,
+            ),
+        )
+    )
+
+    for subtitle_id, text in cases:
+        _, cue = _syntax_backed_cue(
+            text,
+            subtitle_id,
+            word_timing=_word_timing_with_gaps(text, {8: 420}),
+        )
+        bundle = podcast_learning_video._build_article_english_page_plan(
+            cue,
+            draw,
+            _return_candidates=True,
+        )
+
+        assert bundle["status"] == "candidate_bundle"
+        assert bundle["candidates"]
+
+
+def test_complete_attached_continuations_remain_reviewable_at_normal_font():
+    cases = (
+        (
+            "S9811",
+            (
+                "Exactly. And that single confusing label is actually currently "
+                "sitting at the center of a massive global trade dispute involving "
+                "billions of dollars."
+            ),
+            "complete_prepositional_continuation",
+        ),
+        (
+            "S9812",
+            (
+                "Because this source material involves some heavily politically "
+                "charged policy actions from the current administration."
+            ),
+            "complete_object_continuation",
+        ),
+        (
+            "S9813",
+            (
+                "Which really brings us to a daunting question about the future of "
+                "global commerce based on all this."
+            ),
+            "complete_prepositional_continuation",
+        ),
+    )
+
+    for subtitle_id, text, expected_evidence in cases:
+        _, cue = _syntax_backed_cue(
+            text,
+            subtitle_id,
+            word_timing=_word_timing_with_gaps(text),
+        )
+
+        plan = _plan(cue)
+
+        assert len(plan["pages"]) == 2
+        assert all(page["english_font_size"] in {56, 54, 52} for page in plan["pages"])
+        boundary = plan["pages"][1]["boundary_before"]
+        assert boundary["classification"] == "review"
+        assert boundary[expected_evidence] is True
+        assert podcast_learning_video._article_secondary_review_boundary_is_complete(
+            plan["pages"][1]
+        )
+
+
+def test_attached_continuation_requires_complete_terminal_object():
+    assert not podcast_learning_video._article_secondary_review_boundary_is_complete(
+        {
+            "en": "about the future of global commerce and",
+            "boundary_before": {
+                "classification": "review",
+                "issue_codes": ["dependency_phrase_entrance_split"],
+                "complete_prepositional_continuation": True,
+            },
+        }
+    )
+
+    _, short_governor = _syntax_backed_cue(
+        (
+            "Right. Which totally shatters the current economic model of how "
+            "these systems are actually supposed to generate revenue."
+        ),
+        "S9814",
+    )
+    decision = podcast_learning_video._article_display_boundary_decision(
+        short_governor,
+        4,
+    )
+    assert decision["complete_object_continuation"] is False
+
+    quantified = (
+        "Teams can integrate an optimized system into every facet of their "
+        "economy without requiring a centralized platform."
+    )
+    _, quantified_cue = _syntax_backed_cue(quantified, "S9815")
+    quantified_words = quantified.split()
+    quantified_split = quantified_words.index("of")
+    quantified_decision = podcast_learning_video._article_display_boundary_decision(
+        quantified_cue,
+        quantified_split,
+    )
+    assert quantified_decision["complete_prepositional_continuation"] is False
+    assert not podcast_learning_video._article_secondary_review_boundary_is_complete(
+        {
+            "en": "some heavily disputed policy actions without a conclusion",
+            "boundary_before": {
+                "classification": "review",
+                "issue_codes": [
+                    "short_verb_complement_split",
+                    "short_verb_object_split",
+                ],
+                "complete_object_continuation": True,
+            },
+        }
+    )
+
+
 def test_line_wrap_downranks_page_syntax_without_blocking_same_screen_lines():
     cue = _cue(
         "Domestic universities now offer stronger programs.",
@@ -3346,6 +3627,49 @@ def test_same_screen_subject_predicate_wrap_keeps_preferred_font():
         "Especially when the domestic alternative",
         "has improved at such a staggering rate.",
     ]
+
+
+def test_same_screen_hard_boundary_does_not_block_a_fitting_page():
+    """A hard page boundary may still be a harmless two-line wrap."""
+    cases = (
+        (
+            "because the bank was just dealing with this massive institutional "
+            "headache at the time.",
+            6,
+            "preposition_object_split",
+        ),
+        (
+            "Yeah, they skip the broader critical thinking skills altogether.",
+            5,
+            "protected_syntax_cut",
+        ),
+    )
+    for text, split, issue_code in cases:
+        cue = _cue(
+            text,
+            "S9602",
+            word_timing=tuple(
+                {
+                    "word_id": index,
+                    "surface": word,
+                    "start": index * 0.3,
+                    "end": index * 0.3 + 0.2,
+                }
+                for index, word in enumerate(text.split())
+            ),
+            display_boundary_evidence={
+                str(split): {
+                    "hard_issues": [issue_code],
+                    "soft_issues": [],
+                    "pause_ms": 0,
+                }
+            },
+        )
+        plan = _plan(cue)
+        assert len(plan["pages"]) == 1
+        assert plan["pages"][0]["english_font_size"] == 56
+        assert len(plan["pages"][0]["en_lines"]) == 2
+        assert " ".join(plan["pages"][0]["en_lines"]) == text
 
 
 def test_same_screen_line_wrap_keeps_atomic_language_units_hard():
@@ -3521,7 +3845,7 @@ def test_same_screen_reflow_does_not_shrink_without_a_better_line_break():
     assert finalized["pages"][0]["en_lines"] == lines
 
 
-def test_same_screen_reflow_cannot_retain_an_invalid_legacy_wrap():
+def test_same_screen_reflow_marks_legacy_syntax_wrap_without_shrinking():
     text = "itself are now being actively weaponized against these returning students."
     cue = _cue(
         text,
@@ -3566,13 +3890,10 @@ def test_same_screen_reflow_cannot_retain_an_invalid_legacy_wrap():
         plan,
     )
 
-    assert finalized["pages"][0]["english_font_size"] == 52
-    assert finalized["font_fallback"] == {
-        "used": True,
-        "from": 56,
-        "to": 52,
-        "reason": "no_safe_higher_font_layout",
-    }
+    assert finalized["pages"][0]["english_font_size"] == 56
+    assert finalized["pages"][0]["en_lines"] == legacy_lines
+    assert finalized["pages"][0]["line_wrap_review"] is True
+    assert finalized["font_fallback"] == {"used": False}
 
 
 def test_same_screen_reflow_keeps_valid_56px_over_a_smaller_one_line_layout():
@@ -4127,6 +4448,7 @@ if __name__ == "__main__":
     test_candidate_workspace_is_read_only_and_bounded()
     test_candidate_workspace_allows_explicit_manual_six_page_search()
     test_display_planning_does_not_mutate_frozen_cue_identity_text_or_timing()
+    test_numeric_magnitude_is_nonoverridable_at_display_page_boundary()
     test_visual_planning_reuses_the_complete_frozen_page_projection()
     test_subject_predicate_boundary_is_not_used_for_efficiency_gap_page_change()
     test_zero_relative_tail_does_not_become_an_isolated_display_page()
@@ -4162,6 +4484,8 @@ if __name__ == "__main__":
     test_forced_page_break_rank_reuses_the_forced_decision_for_risk()
     test_actual_plans_do_not_select_the_tight_complement_boundaries()
     test_display_page_keeps_multiword_work_title_atomic()
+    test_title_detection_does_not_cross_sentences_or_claim_numeric_condition()
+    test_complete_from_gerund_can_relax_verb_preposition_evidence()
     test_numeric_head_guard_does_not_absorb_a_following_preposition()
     test_spaced_thousands_group_is_atomic_at_line_wrap()
     test_amount_frequency_phrase_stays_on_the_same_display_page()
@@ -4190,13 +4514,16 @@ if __name__ == "__main__":
     test_complete_infinitive_page_can_relax_relative_subject_evidence()
     test_nested_continuation_clause_starts_after_punctuation_not_introducer()
     test_three_line_fallback_promotes_complete_two_page_alternative()
+    test_complete_prepositional_and_coordinated_continuations_survive_page_filter()
+    test_complete_attached_continuations_remain_reviewable_at_normal_font()
+    test_attached_continuation_requires_complete_terminal_object()
     test_line_wrap_downranks_page_syntax_without_blocking_same_screen_lines()
     test_same_screen_subject_predicate_wrap_keeps_preferred_font()
     test_same_screen_line_wrap_keeps_atomic_language_units_hard()
     test_preferred_font_wins_when_56px_has_a_valid_two_line_wrap()
     test_short_page_keeps_56px_instead_of_shrinking_to_one_line()
     test_same_screen_reflow_does_not_shrink_without_a_better_line_break()
-    test_same_screen_reflow_cannot_retain_an_invalid_legacy_wrap()
+    test_same_screen_reflow_marks_legacy_syntax_wrap_without_shrinking()
     test_same_screen_reflow_keeps_valid_56px_over_a_smaller_one_line_layout()
     test_same_screen_reflow_cannot_change_frozen_page_contract()
     test_frozen_artifact_same_screen_reflow_changes_only_typography()

@@ -1,5 +1,8 @@
+import argparse
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -9,8 +12,9 @@ if not PYTHON.exists():
     PYTHON = Path(sys.executable)
 
 
-def run_step(name: str, args: list[str], allow_warning_exit: bool = False) -> int:
+def run_step(name: str, args: list[str], allow_warning_exit: bool = False) -> tuple[int, float]:
     print(f"\n== {name} ==")
+    started = time.perf_counter()
     result = subprocess.run(
         [str(PYTHON), *args],
         cwd=str(ROOT),
@@ -18,15 +22,54 @@ def run_step(name: str, args: list[str], allow_warning_exit: bool = False) -> in
         encoding="utf-8",
         errors="replace",
     )
+    elapsed = time.perf_counter() - started
     if result.returncode != 0 and not allow_warning_exit:
         print(f"FAILED: {name} exited with {result.returncode}")
-    return result.returncode
+    print(f"{name}: {('PASS' if result.returncode == 0 else 'WARN' if allow_warning_exit else 'FAIL')} ({elapsed:.2f}s)")
+    return result.returncode, elapsed
 
 
-def main() -> int:
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the subtitle regression suite with reproducible profiles."
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("fast", "pipeline", "full"),
+        default="full",
+        help="fast=stage-local checks, pipeline=core pipeline checks, full=all checks (default)",
+    )
+    parser.add_argument(
+        "--only",
+        help="comma-separated check slugs to run, for example stable-run-state,syntax-check",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop after the first failed check",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list check slugs and exit",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    options = _parse_args(argv)
     failures = []
 
     checks = [
+        (
+            "regression runner contract",
+            ["tests/test_regression_runner.py"],
+            False,
+        ),
         (
             "ASR trust contract",
             ["tests/test_asr_trust_contract.py"],
@@ -158,6 +201,11 @@ def main() -> int:
             False,
         ),
         (
+            "fixed-ID translation quality audit",
+            ["tests/test_translation_quality_audit.py"],
+            False,
+        ),
+        (
             "stable run state",
             ["tests/test_stable_run_state.py"],
             False,
@@ -226,22 +274,89 @@ def main() -> int:
                 "app/core/subtitle_processor/stable_english_boundaries.py",
                 "app/core/subtitle_processor/stable_english_optimizer.py",
                 "app/core/subtitle_processor/subtitle_review_marks.py",
+                "app/core/subtitle_processor/translation_quality_audit.py",
+                "scripts/audit_opencode_translation_quality.py",
+                "tests/test_translation_quality_audit.py",
                 "app/core/subtitle_processor/user_facing_issue_text.py",
                 "app/core/subtitle_processor/stable_run_state.py",
                 "app/view/subtitle_interface.py",
                 "tests/test_stable_run_state.py",
                 "tests/test_stable_english_optimizer.py",
                 "tests/test_user_facing_issue_text.py",
+                "tests/test_regression_runner.py",
                 "tests/audit_stable_outputs.py",
             ],
             False,
         ),
     ]
 
-    for name, args, allow_warning_exit in checks:
-        code = run_step(name, args, allow_warning_exit=allow_warning_exit)
+    available = {_slug(name): name for name, _, _ in checks}
+    if options.list:
+        for slug, name in available.items():
+            print(f"{slug}\t{name}")
+        return 0
+
+    profile_keys = {
+        "fast": {
+            "regression-runner-contract",
+            "stable-run-state",
+            "stable-artifact-helpers",
+            "article-context-state",
+            "task-context-contract",
+            "database-reliability",
+            "golden-subtitle-evaluation",
+            "syntax-check",
+        },
+        "pipeline": {
+            "asr-trust-contract",
+            "stable-subtitle-publication",
+            "article-context-state",
+            "task-context-contract",
+            "final-cue-timeline",
+            "stable-caption-smoke-tests",
+            "stable-boundary-finalization",
+            "stable-english-global-optimizer",
+            "english-boundary-rules",
+            "allocation-only-replay-contract",
+            "allocation-quality-policy",
+            "stable-artifact-helpers",
+            "stable-display-page-translation-contract",
+            "article-display-readability-contract",
+            "manual-final-subtitle-editor",
+            "subtitle-review-marks",
+            "qa-review-queue",
+            "translation-review-suggestions",
+            "stable-run-state",
+            "syntax-check",
+        },
+    }
+    if options.only:
+        requested = {_slug(item) for item in options.only.split(",") if item.strip()}
+        unknown = sorted(requested - set(available))
+        if unknown:
+            print("Unknown checks: " + ", ".join(unknown), file=sys.stderr)
+            print("Use --list to see available check slugs.", file=sys.stderr)
+            return 2
+        selected = requested
+    elif options.profile == "full":
+        selected = set(available)
+    else:
+        selected = profile_keys[options.profile]
+
+    selected_checks = [check for check in checks if _slug(check[0]) in selected]
+    print(
+        f"Regression profile={options.profile} checks={len(selected_checks)} "
+        f"fail_fast={options.fail_fast}"
+    )
+    started_all = time.perf_counter()
+    for name, args, allow_warning_exit in selected_checks:
+        code, _elapsed = run_step(name, args, allow_warning_exit=allow_warning_exit)
         if code != 0 and not allow_warning_exit:
             failures.append(name)
+            if options.fail_fast:
+                break
+
+    print(f"Regression elapsed: {time.perf_counter() - started_all:.2f}s")
 
     if failures:
         print("\nRegression failed:")

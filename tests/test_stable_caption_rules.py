@@ -2,6 +2,7 @@ import sys
 import json
 import subprocess
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 from pathlib import Path
@@ -14,6 +15,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
+from app.core.subtitle_processor.final_cue_timeline import (
+    DISPLAY_LEAD_IN_MS,
+    DISPLAY_TAIL_PADDING_MS,
+)
 from app.core.subtitle_processor.stable_ts_alignment import (
     align_frozen_word_ledger_with_whisperx,
     _fallback_implausible_stable_ts_updates,
@@ -206,6 +211,94 @@ def _split_text(text, max_words=14):
         " ".join(entry["surface"] for entry in editor._active_word_entries[start : end + 1])
         for start, end in ranges
     ]
+
+
+def test_parent_boundary_gate_rejects_dependent_fragment_shapes_before_ids_freeze():
+    cases = [
+        (
+            "And to understand just",
+            "how wild that price tag really is, you really have to look closer.",
+            "trailing_modifier_fragment",
+        ),
+        (
+            "If every piece of that manufacturing puzzle is intrinsically Chinese,",
+            "at what point does the assembled product become Vietnamese?",
+            "open_subordinate_prefix_fragment",
+        ),
+        (
+            "The imports came from a global trading system",
+            "that America helped create in the 1940s.",
+            "relative_clause_entrance_split",
+        ),
+        (
+            "The company said it wasn't,",
+            "you know, a legacy manufacturer with decades of experience.",
+            "trailing_auxiliary_fragment",
+        ),
+    ]
+    for left_text, right_text, expected_issue in cases:
+        editor = _editor(max_words=16)
+        editor._active_source_word_spans = {}
+        editor._active_word_entries = _entries(f"{left_text} {right_text}")
+        left_count = len(_entries(left_text))
+        left = editor._item_from_word_span(0, left_count - 1)
+        right = editor._item_from_word_span(
+            left_count,
+            len(editor._active_word_entries) - 1,
+        )
+
+        evaluation = editor._evaluate_item_pair_for_final_boundary(left, right)
+
+        assert evaluation["legal"] is False
+        assert expected_issue in evaluation["hard_issues"]
+
+
+def test_parent_boundary_gate_keeps_preposition_led_continuation_reviewable():
+    editor = _editor(max_words=16)
+    editor._active_source_word_spans = {}
+    editor._active_word_entries = _entries(
+        "Revenue climbed to nearly 24 million in a difficult consumer market."
+    )
+    left = editor._item_from_word_span(0, 5)
+    right = editor._item_from_word_span(6, len(editor._active_word_entries) - 1)
+
+    evaluation = editor._evaluate_item_pair_for_final_boundary(left, right)
+
+    assert evaluation["legal"] is True
+    assert "leading_prepositional_fragment" in evaluation["soft_issues"]
+
+
+def test_parent_boundary_gate_does_not_let_a_pause_legalize_dangling_syntax():
+    editor = _editor(max_words=16)
+    editor._active_source_word_spans = {}
+    editor._active_word_entries = _entries(
+        "The company said it wasn't a legacy manufacturer."
+    )
+    left = editor._item_from_word_span(0, 4)
+    right = editor._item_from_word_span(5, len(editor._active_word_entries) - 1)
+    editor._active_word_entries[5]["start_time"] = (
+        editor._active_word_entries[4]["end_time"] + 900
+    )
+
+    evaluation = editor._evaluate_item_pair_for_final_boundary(left, right)
+
+    assert evaluation["pause_ms"] == 900
+    assert evaluation["legal"] is False
+    assert "trailing_auxiliary_fragment" in evaluation["hard_issues"]
+
+
+def test_complete_sentence_overflow_does_not_create_dangling_emphasis_boundary():
+    parts = _split_text(
+        "And to understand just how wild that price tag really is, you really "
+        "have to look at how historically rare this behavior is.",
+        max_words=16,
+    )
+
+    assert all(not part.rstrip(" ,").endswith(" just") for part in parts[:-1])
+    assert " ".join(parts) == (
+        "And to understand just how wild that price tag really is, you really "
+        "have to look at how historically rare this behavior is."
+    )
 
 
 def test_final_time_alignment_reapplies_display_padding_to_loaded_short_subtitle():
@@ -561,6 +654,9 @@ def _id_editor():
     editor._frozen_subtitle_ids = []
     editor._llm_cache_used = False
     editor._llm_cache_stats = {}
+    editor._llm_request_ledger = []
+    editor._llm_request_ledger_lock = threading.Lock()
+    editor._display_page_external_request_count = 0
     editor._allocation_runtime_stats = {}
     return editor
 
@@ -633,6 +729,16 @@ def test_screen_editor_routes_full_translation_and_allocation_models_by_role():
     assert metadata["llm_usage_summary"]["by_model"]["deepseek-v4-flash"][
         "external_attempt_count"
     ] == 1
+    assert metadata["translation_request_policy"] == {
+        "configured_budget": 0,
+        "budget_scope": "per_stage",
+        "max_attempts_per_request": 3,
+        "attempts_used": 2,
+        "attempts_by_stage": {"screen_subtitle_edit": 2},
+        "remaining_attempts": None,
+        "remaining_attempts_by_stage": {},
+        "budget_exhausted": False,
+    }
 
 
 def test_screen_editor_disables_sdk_level_retries():
@@ -650,6 +756,28 @@ def test_screen_editor_disables_sdk_level_retries():
         api_key="test-key",
         max_retries=0,
     )
+
+
+def test_translation_request_budget_is_isolated_for_display_page_stage():
+    editor = _id_editor()
+    editor.translation_request_budget = 1
+    editor._translation_request_attempts = 0
+    editor._translation_request_attempts_by_scope = {}
+
+    assert editor._claim_translation_attempt(
+        "screen_subtitle_semantic_full_translation_v7"
+    )
+    assert not editor._claim_translation_attempt(
+        "screen_subtitle_semantic_translation_allocation_v3"
+    )
+    assert editor._claim_translation_attempt(
+        "screen_subtitle_display_page_translation_v2"
+    )
+    assert editor._translation_request_attempts == 2
+    assert editor._translation_request_attempts_by_scope == {
+        "screen_subtitle_edit": 1,
+        "display_page_translation": 1,
+    }
 
 
 def test_semantic_cache_identity_uses_only_the_request_owner_model():
@@ -720,6 +848,13 @@ def test_screen_manifest_records_translation_model_roles_and_retry_owners():
             "display_page_retry_model": "deepseek-v4-pro",
             "model_role_policy_version": "stable-translation-model-roles-v1",
             "prompt_version": "global-subtitle-id-v2",
+            "translation_request_policy": {
+                "configured_budget": 40,
+                "max_attempts_per_request": 3,
+                "attempts_used": 5,
+                "remaining_attempts": 35,
+                "budget_exhausted": False,
+            },
         },
         model="deepseek-v4-flash",
         target_language="简体中文",
@@ -741,6 +876,8 @@ def test_screen_manifest_records_translation_model_roles_and_retry_owners():
     assert runtime["allocation_quality_retry_model"] == "deepseek-v4-pro"
     assert runtime["display_page_retry_model"] == "deepseek-v4-pro"
     assert runtime["model_role_policy_version"] == "stable-translation-model-roles-v1"
+    assert runtime["translation_request_policy"]["configured_budget"] == 40
+    assert runtime["translation_request_policy"]["attempts_used"] == 5
 
 
 def test_stable_screen_pipeline_requests_word_timestamps_without_legacy_split():
@@ -804,6 +941,7 @@ class _QueueCache:
     def __init__(self, results):
         self.results = list(results)
         self.set_calls = []
+        self.set_thread_ids = []
 
     def get_llm_result(self, *args, **kwargs):
         if self.results:
@@ -812,6 +950,7 @@ class _QueueCache:
 
     def set_llm_result(self, *args, **kwargs):
         self.set_calls.append((args, kwargs))
+        self.set_thread_ids.append(threading.get_ident())
 
 
 class _KeyedCache:
@@ -897,7 +1036,19 @@ def test_stable_chinese_cache_rejects_stale_frozen_boundary_context():
 
     assert before_contract["full_english_text_hash"] == after_contract["full_english_text_hash"]
     assert before_contract["frozen_id_word_span_hash"] != after_contract["frozen_id_word_span_hash"]
+    after_payload = [
+        {
+            **payload[0],
+            "subtitle_parts": [
+                {"subtitle_id": "S0001", "english": after[0].original},
+                {"subtitle_id": "S0002", "english": after[1].original},
+            ],
+        }
+    ]
+    # Allocation owns frozen subtitle spans.  A span move must invalidate even
+    # when the aggregate English happens to be unchanged.
     assert old_key != editor._semantic_chinese_cache_key(prompt, payload, cache_task)
+    assert old_key != editor._semantic_chinese_cache_key(prompt, after_payload, cache_task)
     assert editor._load_cached_allocation_batch(
         prompt,
         payload,
@@ -905,7 +1056,149 @@ def test_stable_chinese_cache_rejects_stale_frozen_boundary_context():
         batch_id=1,
         cache_task=cache_task,
     ) is None
-    assert editor.cache_manager.get_calls[-1][0][0] != old_key
+    assert editor.cache_manager.get_calls == []
+
+
+def test_semantic_full_translation_rejects_duplicate_request_group_ids():
+    payload = [
+        {"id": 1, "full_english": "One.", "source_echo_required": True},
+        {"id": 1, "full_english": "One.", "source_echo_required": True},
+    ]
+    errors = ScreenSubtitleEditor._semantic_full_translation_response_errors(
+        {"groups": [{"id": 1, "source_english": "One.", "full_translation": "一。"}]},
+        payload,
+    )
+    assert any(error["code"] == "translation_request_group_id_duplicate" for error in errors)
+
+
+def test_allocation_payload_rejects_duplicate_group_ids():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids([ScreenSubtitleItem([1], "One.", "", 0, 0)])
+    group = _id_group(1, 0, items)
+    payload = [
+        {"id": 1, "subtitle_parts": [{"subtitle_id": "S0001", "english": "One."}]},
+        {"id": 1, "subtitle_parts": [{"subtitle_id": "S0001", "english": "One."}]},
+    ]
+    assert not editor._allocation_payload_matches_expected_groups(payload, {1: group})
+
+
+def test_translation_api_only_retries_only_rate_limit_and_respects_budget():
+    class RateLimited(Exception):
+        status_code = 429
+
+    class Completions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RateLimited("429")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"groups": []}'))]
+            )
+
+    editor = _editor()
+    editor.full_translation_model = "flash"
+    editor.timeout = 1
+    editor.translation_request_max_attempts = 3
+    editor.translation_request_budget = 2
+    editor._translation_request_attempts = 0
+    editor.client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    with patch.object(ScreenSubtitleEditor, "_translation_retry_delay_seconds", return_value=0):
+        data, error, attempts = editor._request_semantic_full_translation_api_only(
+            "prompt", [], cache_task="test-budget"
+        )
+    assert data == {"groups": []}
+    assert error == ""
+    assert len(attempts) == 2
+    assert editor._translation_request_attempts == 2
+
+
+def test_display_page_api_only_returns_attempts_without_worker_state_writes():
+    class RateLimited(Exception):
+        status_code = 429
+
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0001",
+                "english": "Alpha beta gamma delta.",
+                "chinese": "甲乙丙丁。",
+                "word_start": 0,
+                "word_end": 3,
+                "pages": [
+                    {
+                        "display_page_id": "S0001.P01",
+                        "word_start": 0,
+                        "word_end": 1,
+                        "english": "Alpha beta",
+                        "start_ms": 0,
+                        "end_ms": 800,
+                    },
+                    {
+                        "display_page_id": "S0001.P02",
+                        "word_start": 2,
+                        "word_end": 3,
+                        "english": "gamma delta.",
+                        "start_ms": 800,
+                        "end_ms": 1600,
+                    },
+                ],
+            }
+        ],
+        layout_profile={"chinese_font_size": 48, "max_lines": 2},
+    )
+
+    class Completions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RateLimited("429")
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "pages": [
+                                        {
+                                            "display_page_id": "S0001.P01",
+                                            "source_english": "Alpha beta",
+                                            "zh": "甲乙",
+                                        },
+                                        {
+                                            "display_page_id": "S0001.P02",
+                                            "source_english": "gamma delta.",
+                                            "zh": "丙丁。",
+                                        },
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    )
+                ]
+            )
+
+    editor = _id_editor()
+    editor.client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    editor.translation_request_budget = 2
+    editor.translation_request_max_attempts = 3
+    editor._translation_request_attempts = 0
+    with patch.object(ScreenSubtitleEditor, "_translation_retry_delay_seconds", return_value=0):
+        data, error, attempts = editor._request_display_page_translation_api_only(
+            contract
+        )
+
+    assert error == ""
+    assert data["pages"][0]["display_page_id"] == "S0001.P01"
+    assert len(attempts) == 2
+    assert editor._llm_request_ledger == []
+    assert editor._display_page_external_request_count == 0
 
 
 def test_semantic_full_translation_cache_survives_allocation_algorithm_change():
@@ -1060,6 +1353,257 @@ def test_partial_full_translation_cache_preserves_valid_groups_for_resume():
         payload=payload,
     ) == {1: "第一。"}
     assert editor._llm_cache_stats[task] == {"hit": 1, "miss": 0}
+
+
+def test_full_translation_unit_cache_invalidates_only_context_dependents():
+    shared_cache = _KeyedCache({})
+    api_calls = []
+
+    def make_editor(texts):
+        editor = _id_editor()
+        editor.allocation_batch_size = 8
+        editor.cache_manager = shared_cache
+
+        def create(**kwargs):
+            request_payload = json.loads(kwargs["messages"][1]["content"])
+            api_calls.append(tuple(int(entry["id"]) for entry in request_payload))
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "groups": [
+                                        {
+                                            "id": int(entry["id"]),
+                                            "source_english": entry["full_english"],
+                                            "full_translation": f"译文-{entry['id']}",
+                                        }
+                                        for entry in request_payload
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    )
+                ]
+            )
+
+        editor.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        items = editor._assign_global_subtitle_ids(
+            [
+                ScreenSubtitleItem([index], text, "", index * 2, index * 2 + 1)
+                for index, text in enumerate(texts, 1)
+            ]
+        )
+        groups = [
+            _id_group(index, index - 1, [item])
+            for index, item in enumerate(items, 1)
+        ]
+        return editor, groups
+
+    first, first_groups = make_editor(["One.", "Two.", "Three.", "Four."])
+    assert set(first._translate_semantic_group_full_translations(first_groups)) == {1, 2, 3, 4}
+    assert api_calls == [(1, 2, 3, 4)]
+
+    second, second_groups = make_editor(
+        ["One.", "Two.", "Three.", "Four changed."]
+    )
+    assert set(second._translate_semantic_group_full_translations(second_groups)) == {1, 2, 3, 4}
+    # Radius=2 means G1 has no dependency on G4, while G2/G3 read G4 as a
+    # neighbor and G4 itself changed.  This is local invalidation, not an
+    # unsafe whole-episode cache reuse.
+    assert api_calls[-1] == (2, 3, 4)
+
+
+def test_full_translation_concurrency_merges_out_of_order_batches_by_id():
+    editor = _id_editor()
+    editor.allocation_batch_size = 2
+    editor.allocation_max_concurrency = 2
+    editor.cache_manager = _KeyedCache({})
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    groups = [_id_group(index, index - 1, [item]) for index, item in enumerate(items, 1)]
+    completions = []
+
+    def request_api(_prompt, payload, *, cache_task):
+        ids = [int(entry["id"]) for entry in payload]
+        if ids == [1, 2]:
+            time.sleep(0.03)
+        completions.append(ids)
+        return (
+            {
+                "groups": [
+                    {
+                        "id": entry["id"],
+                        "source_english": entry["full_english"],
+                        "full_translation": f"译文-{entry['id']}",
+                    }
+                    for entry in reversed(payload)
+                ]
+            },
+            "",
+            [],
+        )
+
+    with patch.object(editor, "_request_semantic_full_translation_api_only", side_effect=request_api):
+        result = editor._translate_semantic_group_full_translations(groups)
+
+    assert completions[0] == [3, 4]
+    assert sorted(result) == [1, 2, 3, 4], (result, completions)
+    assert result == {index: f"译文-{index}" for index in range(1, 5)}
+
+
+def test_display_page_concurrency_caches_completed_batches_immediately():
+    parents = []
+    for index in range(1, 8):
+        parent_id = f"S{index:04d}"
+        english = f"alpha {index} beta {index}"
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": english,
+                "chinese": f"第{index}条完整中文。",
+                "word_start": index * 4,
+                "word_end": index * 4 + 3,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": index * 4,
+                        "word_end": index * 4 + 1,
+                        "english": f"alpha {index}",
+                        "start_ms": index * 1000,
+                        "end_ms": index * 1000 + 400,
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": index * 4 + 2,
+                        "word_end": index * 4 + 3,
+                        "english": f"beta {index}",
+                        "start_ms": index * 1000 + 400,
+                        "end_ms": index * 1000 + 900,
+                    },
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents, layout_profile={"chinese_font_size": 48, "max_lines": 2}
+    )
+
+    class Cache:
+        def __init__(self):
+            self.values = {}
+            self.write_batches = []
+
+        def get_llm_result(self, key, *_args, **_kwargs):
+            return self.values.get(key)
+
+        def set_llm_result(self, key, value, *_args, **_kwargs):
+            self.values[key] = value
+            self.write_batches.append(
+                [row["display_page_id"] for row in json.loads(value)["pages"]]
+            )
+
+    cache = Cache()
+    editor = _id_editor()
+    editor.full_translation_model = "flash"
+    editor.allocation_review_model = "flash"
+    editor.display_page_translation_model = "flash"
+    editor.target_language = "简体中文"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.allocation_max_concurrency = 2
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.cache_manager = cache
+    progress_events = []
+    editor.progress_callback = progress_events.append
+    calls = []
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        parent_ids = [parent["parent_subtitle_id"] for parent in payload]
+        if len(parent_ids) > 1:
+            time.sleep(0.03)
+        calls.append(parent_ids)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"pages": [
+                {
+                    "display_page_id": page["display_page_id"],
+                    "source_english": page["english"],
+                    "zh": (
+                        f"第{int(parent['parent_subtitle_id'][1:])}条"
+                        if page["display_page_id"].endswith(".P01")
+                        else "完整中文。"
+                    ),
+                }
+                for parent in payload for page in parent["pages"]
+            ]}, ensure_ascii=False)))]
+        )
+
+    editor.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    response, cache_hit = editor._request_display_page_translations(contract)
+
+    assert cache_hit is False
+    assert calls[0] == ["S0007"]
+    assert cache.write_batches == [
+        ["S0007.P01", "S0007.P02"],
+        [
+            f"S{index:04d}.P{page_index:02d}"
+            for index in range(1, 7)
+            for page_index in (1, 2)
+        ],
+    ]
+    assert any(
+        event.get("phase") == "display_page_translation"
+        and event.get("completed") == 1
+        and event.get("total") == 2
+        for event in progress_events
+    )
+    assert progress_events[-1]["completed"] == 2
+    assert [row["display_page_id"] for row in response["pages"]] == [
+        f"S{index:04d}.P{page_index:02d}"
+        for index in range(1, 8)
+        for page_index in (1, 2)
+    ]
+
+
+def test_final_allocation_unit_cache_resumes_without_batch_request():
+    shared_cache = _KeyedCache({})
+
+    def make_editor_and_payload():
+        editor = _id_editor()
+        editor.cache_manager = shared_cache
+        items = editor._assign_global_subtitle_ids(
+            [
+                ScreenSubtitleItem([1], "Alice arrived.", "", 0, 1),
+                ScreenSubtitleItem([2], "Bob left.", "", 2, 3),
+            ]
+        )
+        group = _id_group(1, 0, items)
+        payload = [
+            {
+                "id": 1,
+                "full_english": "Alice arrived. Bob left.",
+                "full_translation": "爱丽丝到了。鲍勃离开了。",
+                "subtitle_parts": [
+                    {"subtitle_id": "S0001", "english": "Alice arrived."},
+                    {"subtitle_id": "S0002", "english": "Bob left."},
+                ],
+            }
+        ]
+        return editor, payload, {1: group}
+
+    first, payload, expected = make_editor_and_payload()
+    allocation = {1: {"S0001": "爱丽丝到了。", "S0002": "鲍勃离开了。"}}
+    first._store_allocation_units(payload, expected, allocation)
+
+    second, resumed_payload, resumed_expected = make_editor_and_payload()
+    assert second._load_cached_allocation_units(
+        resumed_payload,
+        resumed_expected,
+    ) == allocation
 
 
 def test_llm_request_ledger_persists_token_and_reasoning_usage():
@@ -1302,13 +1846,16 @@ class _StaticCache:
         raise AssertionError("cache-backed test must not write")
 
 
-def _assert_stable_split(text, max_words=16):
+def _assert_stable_split(text, max_words=16, *, allow_complete_overflow=False):
     parts = _split_text(text, max_words=max_words)
     assert parts
     rebuilt = [word for part in parts for word in _words(part)]
     assert rebuilt == _words(text)
     for part in parts:
-        assert len(_words(part)) <= max_words, part
+        if len(_words(part)) > max_words:
+            assert allow_complete_overflow, part
+            assert len(parts) == 1, parts
+            assert part.rstrip().endswith((".", "?", "!")), part
         first = _words(part)[0]
         last = _words(part)[-1]
         assert first not in {"of", "for", "with", "by", "to"}, parts
@@ -1317,7 +1864,8 @@ def _assert_stable_split(text, max_words=16):
 
 def test_preposition_phrase_is_not_stranded():
     _assert_stable_split(
-        "If the market starts seeing the Fed as just a piggy bank to seamlessly fund government deficits, they lose credibility."
+        "If the market starts seeing the Fed as just a piggy bank to seamlessly fund government deficits, they lose credibility.",
+        allow_complete_overflow=True,
     )
 
 
@@ -1329,7 +1877,8 @@ def test_number_and_policy_sentence_keeps_readable_boundaries():
 
 def test_long_finance_sentence_keeps_full_coverage():
     _assert_stable_split(
-        "Although the central bank can reduce its footprint, it cannot drain these massive financial reservoirs without triggering a drought."
+        "Although the central bank can reduce its footprint, it cannot drain these massive financial reservoirs without triggering a drought.",
+        allow_complete_overflow=True,
     )
 
 
@@ -1773,6 +2322,23 @@ def test_duplicate_chinese_is_warning_not_blocking():
         issue["code"] == "duplicate_chinese"
         for issue in editor.last_validation_summary["warnings"]
     )
+
+
+def test_repeated_english_with_repeated_chinese_is_not_a_duplicate_warning():
+    editor = _editor()
+    segments = [
+        ASRDataSeg("303 billion.", 0, 1200, "3030亿。"),
+        ASRDataSeg("303 billion.", 1300, 2500, "3030亿。"),
+    ]
+
+    editor._report_subtitle_coverage_gaps(segments, segments)
+
+    duplicate_groups = [
+        issue
+        for issue in editor.last_validation_summary["warnings"]
+        if issue["code"] == "duplicate_chinese"
+    ]
+    assert duplicate_groups == []
 
 
 def test_overlong_english_segment_is_locally_split_without_llm():
@@ -2353,6 +2919,17 @@ def test_asr_suspicious_article_context_misses_are_reported():
     assert "asr_name_suspicious" in codes
 
 
+def test_asr_suspicious_issues_are_bound_to_frozen_subtitle_ids():
+    editor = _editor()
+    segment = ASRDataSeg("That caught me total off guard.", 1000, 3000, "ok")
+    segment.subtitle_id = "S0042"
+
+    issues = editor._asr_suspicious_issues([segment])
+
+    assert issues
+    assert {issue["subtitle_id"] for issue in issues} == {"S0042"}
+
+
 def test_abbreviation_name_boundary_is_syntax_warning():
     editor = _editor()
 
@@ -2722,9 +3299,9 @@ def test_display_timing_preserves_clear_long_pause():
 
     adjusted = ScreenSubtitleEditor._apply_display_timing_padding(segments)
 
-    assert adjusted[0].end_time == 4750
+    assert adjusted[0].end_time == segments[0].end_time + DISPLAY_TAIL_PADDING_MS
     assert adjusted[0].end_time < adjusted[1].start_time - 40
-    assert adjusted[1].start_time == segments[1].start_time - 80
+    assert adjusted[1].start_time == segments[1].start_time - DISPLAY_LEAD_IN_MS
 
 
 def test_standalone_discourse_marker_attaches_to_immediate_next_sentence():
@@ -3057,13 +3634,13 @@ def test_short_though_rebalances_without_leaving_orphan():
         "constant",
         "pressure.",
     ]
-    editor = _marker_editor(words, max_words=14)
+    editor = _marker_editor(words, max_words=16)
     items = [_word_item(editor, 0, 0, 1), _word_item(editor, 1, 14, 2)]
 
     merged = editor._merge_short_display_segments(items)
 
-    assert len(merged) == 2
-    assert all(ScreenSubtitleEditor._word_count(item.original) <= 14 for item in merged)
+    assert len(merged) == 1
+    assert all(ScreenSubtitleEditor._word_count(item.original) <= 16 for item in merged)
     assert all(item.original != "Though," for item in merged)
     assert all(ScreenSubtitleEditor._word_count(item.original) > 1 for item in merged)
     assert ScreenSubtitleEditor._word_tokens(" ".join(item.original for item in merged)) == ScreenSubtitleEditor._word_tokens(
@@ -3298,6 +3875,67 @@ def test_parser_blocks_object_attached_modifier_boundary():
     assert not evaluation["legal"]
 
 
+def test_parser_keeps_clause_scope_adverb_with_following_subordinator():
+    words = (
+        "They are deliberately driving up this box office specifically because "
+        "the plot is incomprehensible and the animation is shockingly terrible."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    specifically_index = words.index("specifically")
+    because_index = words.index("because")
+
+    evaluation = editor._evaluate_stable_cut_boundary(
+        specifically_index,
+        because_index,
+    )
+    ranges = editor._stable_word_ranges_for_span((0, len(words) - 1))
+    rendered = [" ".join(words[start : end + 1]) for start, end in ranges]
+
+    assert "clause_scope_modifier_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+    assert rendered == [
+        "They are deliberately driving up this box office",
+        "specifically because the plot is incomprehensible and the animation is shockingly terrible.",
+    ]
+
+
+def test_parser_clause_scope_modifier_guard_has_general_positive_and_negative_cases():
+    protected_cases = [
+        ("They rejected it just because the timing was wrong.", "just", "because"),
+        ("We changed course only because the evidence shifted.", "only", "because"),
+        (
+            "They continued specifically although the risk remained.",
+            "specifically",
+            "although",
+        ),
+    ]
+    for text, modifier, marker in protected_cases:
+        words = text.split()
+        editor = _marker_editor(words)
+        editor._prepare_syntax_cut_hints()
+
+        evaluation = editor._evaluate_stable_cut_boundary(
+            words.index(modifier),
+            words.index(marker),
+        )
+
+        assert "clause_scope_modifier_split" in evaluation["hard_issues"]
+        assert not evaluation["legal"]
+
+    punctuated_words = (
+        "They discussed it specifically, because the timing mattered."
+    ).split()
+    punctuated_editor = _marker_editor(punctuated_words)
+    punctuated_editor._prepare_syntax_cut_hints()
+    punctuated = punctuated_editor._evaluate_stable_cut_boundary(
+        punctuated_words.index("specifically,"),
+        punctuated_words.index("because"),
+    )
+
+    assert "clause_scope_modifier_split" not in punctuated["hard_issues"]
+
+
 def test_parser_blocks_misattached_zero_relative_clause_boundary():
     editor = _marker_editor(
         (
@@ -3447,6 +4085,21 @@ def test_parser_blocks_dreamcore_cross_cue_dependency_continuations():
 
         assert expected_issue in evaluation["hard_issues"], (text, evaluation)
         assert not evaluation["legal"], text
+
+
+def test_parser_does_not_treat_parallel_common_noun_list_as_name_apposition():
+    text = (
+        "The system monitors the origin of every component, the digital routing "
+        "of every container, and the nationality of the capital."
+    )
+    words = text.split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    left = words.index("component,")
+
+    evaluation = editor._evaluate_stable_cut_boundary(left, left + 1)
+
+    assert "appositive_name_split" not in evaluation["hard_issues"]
 
 
 def test_dreamcore_dependency_continuation_guard_respects_sentence_and_pause():
@@ -3995,8 +4648,9 @@ def test_final_pre_id_rebalances_leading_nonfinite_dependent_prefix():
     ]
     assert [item.word_start for item in repaired] == [0, 11]
     assert [item.word_end for item in repaired] == [10, len(words) - 1]
-    assert editor._pre_id_boundary_repairs[0]["repair_reason"] == (
-        "leading_nonfinite_dependent_prefix_rebalanced"
+    assert any(
+        record["repair_reason"] == "leading_nonfinite_dependent_prefix_rebalanced"
+        for record in editor._pre_id_boundary_repairs
     )
     assert editor._pre_id_boundary_repairs[0]["word_order_preserved"] is True
     assert editor._pre_id_boundary_repairs[0]["word_coverage_preserved"] is True
@@ -4973,6 +5627,19 @@ def test_punctuated_numeric_model_allows_a_determiner_clause_restart():
     assert "numeric_unit_or_noun_split" not in evaluation["hard_issues"]
 
 
+def test_punctuated_year_allows_a_determiner_clause_restart_without_long_pause():
+    editor = _marker_editor(
+        ["at", "the", "end", "of", "2025,", "this", "adjusted", "number"]
+    )
+    editor._active_word_entries[4]["end_time"] = 1000
+    editor._active_word_entries[5]["start_time"] = 1340
+
+    evaluation = editor._evaluate_stable_cut_boundary(4, 5)
+
+    assert evaluation["legal"]
+    assert "numeric_unit_or_noun_split" not in evaluation["hard_issues"]
+
+
 def test_numeric_unit_split_remains_hard_with_ordinary_pause():
     editor = _marker_editor(["80", "000", "hours"])
 
@@ -5557,8 +6224,8 @@ def test_podcast_english_only_mode_hides_only_chinese_subtitle_for_both_template
     )
 
 
-def test_article_cover_ignores_legacy_date_text():
-    article_image = Image.new(
+def test_article_cover_renders_unmasked_date_and_preserves_empty_opt_out():
+    dark_article = Image.new(
         "RGBA",
         (
             podcast_learning_video.acx(854),
@@ -5566,19 +6233,42 @@ def test_article_cover_ignores_legacy_date_text():
         ),
         (18, 54, 86, 255),
     )
-    date_area = podcast_learning_video.article_rect(673, 0, 854, 44)
+    light_article = Image.new("RGBA", dark_article.size, (232, 236, 228, 255))
 
-    with_legacy_date = podcast_learning_video.decorate_article_cover(
-        article_image,
-        "Jul 31st 2026",
+    without_date = podcast_learning_video.decorate_article_cover(dark_article, "")
+    with_dark_cover = podcast_learning_video.decorate_article_cover(
+        dark_article,
+        "Aug 21st 2026",
     )
-    with_different_legacy_date = podcast_learning_video.decorate_article_cover(
-        article_image,
-        "December 1st 2030",
+    with_light_cover = podcast_learning_video.decorate_article_cover(
+        light_article,
+        "2026年8月21日",
     )
 
-    assert with_legacy_date.tobytes() == with_different_legacy_date.tobytes()
-    assert with_legacy_date.crop(date_area).tobytes() == article_image.crop(date_area).tobytes()
+    assert without_date.tobytes() == dark_article.tobytes()
+    dark_diff = ImageChops.difference(
+        dark_article.convert("RGB"),
+        with_dark_cover.convert("RGB"),
+    ).getbbox()
+    light_diff = ImageChops.difference(
+        light_article.convert("RGB"),
+        with_light_cover.convert("RGB"),
+    ).getbbox()
+    assert dark_diff is not None and light_diff is not None
+    assert dark_diff[0] > dark_article.width // 2
+    assert light_diff[0] > light_article.width // 2
+    assert dark_diff[1] > 0 and light_diff[1] > 0
+    assert dark_diff[2] < dark_article.width
+    assert light_diff[2] < light_article.width
+    assert dark_diff[3] <= podcast_learning_video.acy(72)
+    assert light_diff[3] <= podcast_learning_video.acy(72)
+    assert podcast_learning_video.ARTICLE_DATE_SCRIM_ENABLED is False
+    assert with_dark_cover.getpixel((dark_article.width - 1, 0)) == dark_article.getpixel(
+        (dark_article.width - 1, 0)
+    )
+    assert with_light_cover.getpixel((light_article.width - 1, 0)) == light_article.getpixel(
+        (light_article.width - 1, 0)
+    )
 
 
 def test_article_brand_logo_is_optional_and_preserves_aspect_ratio():
@@ -8449,6 +9139,52 @@ def test_id_bound_allocation_accepts_terminal_shi_de_predicate():
     assert "unnatural_chinese_fragment" not in validation["issue_codes"]
 
 
+def test_id_bound_allocation_accepts_conditional_modifier_before_following_question():
+    editor = _id_editor()
+    entry = {
+        "id": 4,
+        "full_translation": "如果制造环节的每一块拼图本质上都是中国的，那最终组装的产品到底从哪一刻起才算越南制造？",
+        "subtitle_parts": [
+            {"subtitle_id": "S0005", "english": "If every piece is intrinsically Chinese,"},
+            {"subtitle_id": "S0006", "english": "at what point does the product become Vietnamese?"},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0005": "如果制造环节的每一块拼图本质上都是中国的，",
+            "S0006": "那最终组装的产品到底从哪一刻起才算越南制造？",
+        },
+    )
+
+    assert validation["valid"]
+    assert "unnatural_chinese_fragment" not in validation["issue_codes"]
+
+
+def test_id_bound_allocation_accepts_terminal_shi_de_creation_predicate():
+    editor = _id_editor()
+    entry = {
+        "id": 23,
+        "full_translation": "这个体系是美国自己于1940年代参与缔造的全球贸易体系。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0030", "english": "It altered a global trading system"},
+            {"subtitle_id": "S0031", "english": "that America helped author."},
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0030": "因为它彻底改变了全球贸易体系",
+            "S0031": "这个体系是美国自己于1940年代参与缔造的。",
+        },
+    )
+
+    assert validation["valid"]
+    assert "unnatural_chinese_fragment" not in validation["issue_codes"]
+
+
 def test_terminal_modifier_fragment_uses_specialized_fixed_id_retry():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
@@ -8596,7 +9332,10 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
         _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
         for index in range(1, 26)
     ]
-    full_translations = {index: f"full-{index}" for index in range(1, 26)}
+    full_translations = {
+        index: f"译文S{index * 2 - 1:04d}译文S{index * 2:04d}"
+        for index in range(1, 26)
+    }
     requested_group_ids = []
 
     def request(
@@ -8613,7 +9352,7 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
                     "part_translations": [
                         {
                             "subtitle_id": part["subtitle_id"],
-                            "zh": f"zh-{part['subtitle_id']}",
+                            "zh": f"译文{part['subtitle_id']}",
                         }
                         for part in entry["subtitle_parts"]
                     ],
@@ -8629,8 +9368,8 @@ def test_allocation_requests_large_payload_in_small_id_bound_chunks():
         list(range(1, 25)),
         [25],
     ]
-    assert allocated[1] == {"S0001": "zh-S0001", "S0002": "zh-S0002"}
-    assert allocated[25] == {"S0049": "zh-S0049", "S0050": "zh-S0050"}
+    assert allocated[1] == {"S0001": "译文S0001", "S0002": "译文S0002"}
+    assert allocated[25] == {"S0049": "译文S0049", "S0050": "译文S0050"}
     assert editor._translation_structure_errors == []
 
 
@@ -9238,13 +9977,70 @@ def test_two_stage_translation_failure_does_not_fallback_to_single_stage():
     assert [item.translated for item in result] == ["old-1", "old-2"]
 
 
+def test_missing_fixed_id_chinese_stops_at_translation_owner_with_provider_error():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(_id_items(2, translated=""))
+    editor._semantic_allocation_request_failures = [
+        {
+            "task": "screen_subtitle_semantic_translation_allocation_v3",
+            "error": "Request timed out.",
+        }
+    ]
+
+    try:
+        editor._validate_final_item_translation_ids(items)
+        assert False, "missing fixed-ID Chinese must stop before authority artifacts"
+    except RuntimeError as exc:
+        message = str(exc)
+        assert message.startswith("semantic_chinese_incomplete:")
+        assert "S0001,S0002" in message
+        assert "Request timed out." in message
+        assert "authoritative_parent_chinese" not in message
+
+    assert editor._translation_structure_errors[-1]["code"] == (
+        "final_translation_id_mismatch"
+    )
+    assert editor._translation_structure_errors[-1]["missing_subtitle_ids"] == [
+        "S0001",
+        "S0002",
+    ]
+
+
+def test_semantic_allocation_request_retains_provider_failure_for_owner_error():
+    editor = _id_editor()
+
+    with patch.object(
+        editor,
+        "_request_semantic_translation_allocation_api_only",
+        return_value=(None, "Error code: 500 - Internal server error"),
+    ):
+        result = editor._request_semantic_translation_allocation(
+            "allocation prompt",
+            [{"id": 1}],
+        )
+
+    assert result is None
+    assert editor._semantic_allocation_request_failures == [
+        {
+            "task": "screen_subtitle_semantic_translation_allocation_v3",
+            "error": "Error code: 500 - Internal server error",
+        }
+    ]
+
+
 def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_errors():
     editor = _id_editor()
     editor.batch_num = 24
     editor.allocation_batch_size = 24
-    items = editor._assign_global_subtitle_ids(_id_items(3))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 4)]
-    full_translations = {index: f"full-{index}" for index in range(1, 4)}
+    items = editor._assign_global_subtitle_ids(_id_items(6))
+    groups = [
+        _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
+        for index in range(1, 4)
+    ]
+    full_translations = {
+        index: f"译文S{index * 2 - 1:04d}译文S{index * 2:04d}"
+        for index in range(1, 4)
+    }
     calls = []
 
     def request(
@@ -9260,7 +10056,8 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
                     {
                         "id": 1,
                         "part_translations": [
-                            {"subtitle_id": "S0001", "zh": "zh-S0001"},
+                            {"subtitle_id": "S0001", "zh": "译文S0001"},
+                            {"subtitle_id": "S0002", "zh": "译文S0002"},
                         ],
                     }
                 ]
@@ -9271,9 +10068,10 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
                     "id": entry["id"],
                     "part_translations": [
                         {
-                            "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
-                            "zh": f"zh-{entry['subtitle_parts'][0]['subtitle_id']}",
+                            "subtitle_id": part["subtitle_id"],
+                            "zh": f"译文{part['subtitle_id']}",
                         }
+                        for part in entry["subtitle_parts"]
                     ],
                 }
                 for entry in payload
@@ -9290,9 +10088,9 @@ def test_allocation_retries_incomplete_chunk_by_single_group_without_lingering_e
         ("screen_subtitle_semantic_translation_allocation_retry_v3", [3]),
     ]
     assert allocated == {
-        1: {"S0001": "zh-S0001"},
-        2: {"S0002": "zh-S0002"},
-        3: {"S0003": "zh-S0003"},
+        1: {"S0001": "译文S0001", "S0002": "译文S0002"},
+        2: {"S0003": "译文S0003", "S0004": "译文S0004"},
+        3: {"S0005": "译文S0005", "S0006": "译文S0006"},
     }
     assert editor._translation_structure_errors == []
 
@@ -9302,12 +10100,23 @@ def test_allocation_concurrency_merges_out_of_order_batches_by_id():
     editor.batch_num = 2
     editor.allocation_batch_size = 2
     editor.allocation_max_concurrency = 2
-    items = editor._assign_global_subtitle_ids(_id_items(4))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
-    full_translations = {index: f"full-{index}" for index in range(1, 5)}
+    items = editor._assign_global_subtitle_ids(_id_items(8))
+    groups = [
+        _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
+        for index in range(1, 5)
+    ]
+    full_translations = {
+        index: "".join(f"译文{item.subtitle_id}" for item in group["items"])
+        for index, group in enumerate(groups, 1)
+    }
     completions = []
 
-    def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+    def request_api(
+        prompt,
+        payload,
+        cache_task="screen_subtitle_semantic_translation_allocation",
+        **_kwargs,
+    ):
         ids = [entry["id"] for entry in payload]
         if ids == [1, 2]:
             time.sleep(0.05)
@@ -9318,27 +10127,26 @@ def test_allocation_concurrency_merges_out_of_order_batches_by_id():
                     {
                         "id": entry["id"],
                         "part_translations": [
-                            {
-                                "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
-                                "zh": f"zh-{entry['subtitle_parts'][0]['subtitle_id']}",
-                            }
+                            {"subtitle_id": part["subtitle_id"], "zh": f"译文{part['subtitle_id']}"}
+                            for part in entry["subtitle_parts"]
                         ],
                     }
                     for entry in reversed(payload)
                 ]
             },
             "",
+            [],
         )
 
-    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api):
+    with patch.object(editor, "_request_semantic_translation_allocation_api_with_attempts", side_effect=request_api):
         allocated = editor._allocate_semantic_group_translations(groups, full_translations)
 
     assert completions[0] == [3, 4]
     assert allocated == {
-        1: {"S0001": "zh-S0001"},
-        2: {"S0002": "zh-S0002"},
-        3: {"S0003": "zh-S0003"},
-        4: {"S0004": "zh-S0004"},
+        1: {"S0001": "译文S0001", "S0002": "译文S0002"},
+        2: {"S0003": "译文S0003", "S0004": "译文S0004"},
+        3: {"S0005": "译文S0005", "S0006": "译文S0006"},
+        4: {"S0007": "译文S0007", "S0008": "译文S0008"},
     }
     assert [entry["batch_id"] for entry in editor._last_llm_raw_returns] == [1, 2]
     assert editor._translation_structure_errors == []
@@ -9349,55 +10157,75 @@ def test_allocation_concurrency_retries_one_failed_batch_without_dropping_comple
     editor.batch_num = 2
     editor.allocation_batch_size = 2
     editor.allocation_max_concurrency = 2
-    items = editor._assign_global_subtitle_ids(_id_items(4))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
-    full_translations = {index: f"full-{index}" for index in range(1, 5)}
+    items = editor._assign_global_subtitle_ids(_id_items(8))
+    groups = [
+        _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
+        for index in range(1, 5)
+    ]
+    full_translations = {
+        index: "".join(f"译文{item.subtitle_id}" for item in group["items"])
+        for index, group in enumerate(groups, 1)
+    }
     retried = []
 
     def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
         ids = [entry["id"] for entry in payload]
         if ids == [1, 2]:
-            return None, "timeout"
+            return None, "timeout", []
         return (
             {
                 "groups": [
                     {
                         "id": entry["id"],
                         "part_translations": [
-                            {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"zh-{entry['id']}"}
+                            {
+                                "subtitle_id": part["subtitle_id"],
+                                "zh": f"译文{part['subtitle_id']}",
+                            }
+                            for part in entry["subtitle_parts"]
                         ],
                     }
                     for entry in payload
                 ]
             },
             "",
+            [],
         )
 
-    def retry_request(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation_retry"):
+    def retry_request(
+        prompt,
+        payload,
+        cache_task="screen_subtitle_semantic_translation_allocation_retry",
+        **_kwargs,
+    ):
         retried.append([entry["id"] for entry in payload])
         return {
             "groups": [
                 {
                     "id": entry["id"],
                     "part_translations": [
-                        {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"retry-{entry['id']}"}
+                        {
+                            "subtitle_id": part["subtitle_id"],
+                            "zh": f"译文{part['subtitle_id']}",
+                        }
+                        for part in entry["subtitle_parts"]
                     ],
                 }
                 for entry in payload
             ]
         }
 
-    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api), patch.object(
+    with patch.object(editor, "_request_semantic_translation_allocation_api_with_attempts", side_effect=request_api), patch.object(
         editor, "_request_semantic_translation_allocation", side_effect=retry_request
     ):
         allocated = editor._allocate_semantic_group_translations(groups, full_translations)
 
     assert retried == [[1], [2]]
     assert allocated == {
-        1: {"S0001": "retry-1"},
-        2: {"S0002": "retry-2"},
-        3: {"S0003": "zh-3"},
-        4: {"S0004": "zh-4"},
+        1: {"S0001": "译文S0001", "S0002": "译文S0002"},
+        2: {"S0003": "译文S0003", "S0004": "译文S0004"},
+        3: {"S0005": "译文S0005", "S0006": "译文S0006"},
+        4: {"S0007": "译文S0007", "S0008": "译文S0008"},
     }
     assert editor._translation_structure_errors == []
 
@@ -9449,7 +10277,7 @@ def test_allocation_concurrency_keeps_hit_only_context_for_cache_api_and_retry()
         ids = tuple(entry["id"] for entry in payload)
         api_prompts.append((ids, prompt))
         if ids == (1,):
-            return None, "timeout"
+            return None, "timeout", []
         return (
             {
                 "groups": [
@@ -9467,6 +10295,7 @@ def test_allocation_concurrency_keeps_hit_only_context_for_cache_api_and_retry()
                 ]
             },
             "",
+            [],
         )
 
     def store_cache(prompt, payload, data, **kwargs):
@@ -9496,7 +10325,7 @@ def test_allocation_concurrency_keeps_hit_only_context_for_cache_api_and_retry()
         side_effect=load_cache,
     ), patch.object(
         editor,
-        "_request_semantic_translation_allocation_api_only",
+        "_request_semantic_translation_allocation_api_with_attempts",
         side_effect=request_api,
     ), patch.object(
         editor,
@@ -9534,13 +10363,21 @@ def test_allocation_concurrency_keeps_hit_only_context_for_cache_api_and_retry()
 def test_allocation_concurrency_records_duplicate_and_unknown_ids_after_retry_failure():
     editor = _id_editor()
     editor.batch_num = 2
-    editor.allocation_batch_size = 2
+    editor.allocation_batch_size = 1
     editor.allocation_max_concurrency = 2
-    items = editor._assign_global_subtitle_ids(_id_items(2))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 3)]
-    full_translations = {1: "full-1", 2: "full-2"}
+    items = editor._assign_global_subtitle_ids(_id_items(4))
+    groups = [
+        _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
+        for index in range(1, 3)
+    ]
+    full_translations = {1: "第一组完整译文", 2: "第二组完整译文"}
 
-    def bad_response(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+    def bad_response(
+        prompt,
+        payload,
+        cache_task="screen_subtitle_semantic_translation_allocation",
+        **_kwargs,
+    ):
         return {
             "groups": [
                 {
@@ -9555,7 +10392,7 @@ def test_allocation_concurrency_records_duplicate_and_unknown_ids_after_retry_fa
             ]
         }
 
-    with patch.object(editor, "_request_semantic_translation_allocation_api_only", return_value=(bad_response("", []), "")), patch.object(
+    with patch.object(editor, "_request_semantic_translation_allocation_api_with_attempts", return_value=(bad_response("", []), "", [])), patch.object(
         editor, "_request_semantic_translation_allocation", side_effect=bad_response
     ):
         allocated = editor._allocate_semantic_group_translations(groups, full_translations)
@@ -9574,42 +10411,76 @@ def test_allocation_concurrency_uses_mixed_cache_hits_without_worker_cache_write
     editor.allocation_max_concurrency = 2
     cached_payload = {
         "groups": [
-            {"id": 1, "part_translations": [{"subtitle_id": "S0001", "zh": "cached-1"}]},
-            {"id": 2, "part_translations": [{"subtitle_id": "S0002", "zh": "cached-2"}]},
+            {
+                "id": 1,
+                "part_translations": [
+                    {"subtitle_id": "S0001", "zh": "cached-1a"},
+                    {"subtitle_id": "S0002", "zh": "cached-1b"},
+                ],
+            },
+            {
+                "id": 2,
+                "part_translations": [
+                    {"subtitle_id": "S0003", "zh": "cached-2a"},
+                    {"subtitle_id": "S0004", "zh": "cached-2b"},
+                ],
+            },
         ]
     }
-    editor.cache_manager = _QueueCache([json.dumps(cached_payload, ensure_ascii=False), None])
-    items = editor._assign_global_subtitle_ids(_id_items(4))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 5)]
+    class BatchOnlyQueueCache(_QueueCache):
+        def get_llm_result(self, *args, **kwargs):
+            if kwargs.get("task") == "screen_subtitle_semantic_translation_allocation_unit_v1":
+                return None
+            return super().get_llm_result(*args, **kwargs)
+
+    editor.cache_manager = BatchOnlyQueueCache(
+        [json.dumps(cached_payload, ensure_ascii=False), None]
+    )
+    items = editor._assign_global_subtitle_ids(_id_items(8))
+    groups = [
+        _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
+        for index in range(1, 5)
+    ]
     full_translations = {index: f"full-{index}" for index in range(1, 5)}
 
-    def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+    def request_api(
+        prompt,
+        payload,
+        cache_task="screen_subtitle_semantic_translation_allocation",
+        **_kwargs,
+    ):
         return (
             {
                 "groups": [
                     {
                         "id": entry["id"],
                         "part_translations": [
-                            {"subtitle_id": entry["subtitle_parts"][0]["subtitle_id"], "zh": f"api-{entry['id']}"}
+                            {
+                                "subtitle_id": part["subtitle_id"],
+                                "zh": f"api-{part['subtitle_id']}",
+                            }
+                            for part in entry["subtitle_parts"]
                         ],
                     }
                     for entry in payload
                 ]
             },
             "",
+            [{"attempt": 1, "elapsed_seconds": 0.0, "response": None, "error": None}],
         )
 
-    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api):
+    with patch.object(editor, "_request_semantic_translation_allocation_api_with_attempts", side_effect=request_api):
         allocated = editor._allocate_semantic_group_translations(groups, full_translations)
 
     assert allocated == {
-        1: {"S0001": "cached-1"},
-        2: {"S0002": "cached-2"},
-        3: {"S0003": "api-3"},
-        4: {"S0004": "api-4"},
+        1: {"S0001": "cached-1a", "S0002": "cached-1b"},
+        2: {"S0003": "cached-2a", "S0004": "cached-2b"},
+        3: {"S0005": "api-S0005", "S0006": "api-S0006"},
+        4: {"S0007": "api-S0007", "S0008": "api-S0008"},
     }
     assert editor._llm_cache_used is True
-    assert len(editor.cache_manager.set_calls) == 1
+    assert len(editor.cache_manager.set_calls) >= 1
+    assert set(editor.cache_manager.set_thread_ids) == {threading.get_ident()}
     assert editor._llm_cache_stats["screen_subtitle_semantic_translation_allocation_v3"] == {"hit": 1, "miss": 1}
     assert editor._allocation_runtime_stats["batch_size"] == 2
     assert editor._allocation_runtime_stats["batch_count"] == 2
@@ -9829,10 +10700,21 @@ def test_allocation_concurrency_preserves_400_plus_subtitle_ids_without_drift():
     editor.allocation_batch_size = 24
     editor.allocation_max_concurrency = 2
     items = editor._assign_global_subtitle_ids(_id_items(432))
-    groups = [_id_group(index, index - 1, [items[index - 1]]) for index in range(1, 433)]
-    full_translations = {index: f"full-{index}" for index in range(1, 433)}
+    groups = [
+        _id_group(index, (index - 1) * 2, items[(index - 1) * 2 : index * 2])
+        for index in range(1, 217)
+    ]
+    full_translations = {
+        index: "".join(f"译文{item.subtitle_id}" for item in group["items"])
+        for index, group in enumerate(groups, 1)
+    }
 
-    def request_api(prompt, payload, cache_task="screen_subtitle_semantic_translation_allocation"):
+    def request_api(
+        prompt,
+        payload,
+        cache_task="screen_subtitle_semantic_translation_allocation",
+        **_kwargs,
+    ):
         return (
             {
                 "groups": [
@@ -9840,23 +10722,25 @@ def test_allocation_concurrency_preserves_400_plus_subtitle_ids_without_drift():
                         "id": entry["id"],
                         "part_translations": [
                             {
-                                "subtitle_id": entry["subtitle_parts"][0]["subtitle_id"],
-                                "zh": f"zh-{entry['subtitle_parts'][0]['subtitle_id']}",
+                                "subtitle_id": part["subtitle_id"],
+                                "zh": f"译文{part['subtitle_id']}",
                             }
+                            for part in entry["subtitle_parts"]
                         ],
                     }
                     for entry in reversed(payload)
                 ]
             },
             "",
+            [],
         )
 
-    with patch.object(editor, "_request_semantic_translation_allocation_api_only", side_effect=request_api):
+    with patch.object(editor, "_request_semantic_translation_allocation_api_with_attempts", side_effect=request_api):
         translations = editor._allocate_semantic_group_translations(groups, full_translations)
     applied = editor._apply_semantic_group_translations(items, groups, translations)
 
     assert [item.subtitle_id for item in applied] == [f"S{index:04d}" for index in range(1, 433)]
-    assert [item.translated for item in applied] == [f"zh-S{index:04d}" for index in range(1, 433)]
+    assert [item.translated for item in applied] == [f"译文S{index:04d}" for index in range(1, 433)]
     assert editor._translation_structure_errors == []
 
 
@@ -10592,6 +11476,36 @@ def test_cross_id_leakage_flags_when_target_id_is_consumed_and_empty():
     assert "cross_id_semantic_leakage" in validation["issue_codes"]
 
 
+def test_cross_id_relation_marker_cannot_move_to_previous_question_id():
+    editor = _id_editor()
+    entry = {
+        "id": 12,
+        "full_translation": "当经济标尺不再像尺子，而像球门柱时，会发生什么。",
+        "subtitle_parts": [
+            {"subtitle_id": "S0015", "english": "And what actually happens"},
+            {
+                "subtitle_id": "S0016",
+                "english": "when an economic yardstick stops acting like a ruler and starts acting like a goalpost.",
+            },
+        ],
+    }
+
+    validation = editor._validate_group_chinese_allocation(
+        entry,
+        {
+            "S0015": "当经济标尺不再像尺子",
+            "S0016": "而像球门柱时，会发生什么。",
+        },
+    )
+
+    assert not validation["valid"]
+    assert "cross_id_semantic_leakage" in validation["issue_codes"]
+    assert any(
+        issue.get("reason") == "subordinate_relation_marker_moved_to_previous_id"
+        for issue in validation["issues"]
+    )
+
+
 def test_allocation_quality_keeps_out_of_order_return_by_subtitle_id():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
@@ -10811,7 +11725,12 @@ def test_empty_middle_translation_keeps_its_own_id_slot():
         ],
     )
     applied = editor._apply_semantic_group_translations(items, [group], {1: translations})
-    editor._validate_final_item_translation_ids(applied)
+    try:
+        editor._validate_final_item_translation_ids(applied)
+        assert False, "empty fixed-ID Chinese must block before authority artifacts"
+    except RuntimeError as exc:
+        assert str(exc).startswith("semantic_chinese_incomplete:")
+        assert "S0002" in str(exc)
 
     assert [item.subtitle_id for item in applied] == ["S0001", "S0002", "S0003"]
     assert applied[1].translated == ""
@@ -10830,8 +11749,6 @@ def test_numeric_only_subtitle_keeps_semantic_group_id_slot():
             ScreenSubtitleItem(
                 original="Imports rose sharply.",
                 translated="",
-                start_ms=0,
-                end_ms=1000,
                 source_ids=[1],
                 word_start=0,
                 word_end=2,
@@ -10839,8 +11756,6 @@ def test_numeric_only_subtitle_keeps_semantic_group_id_slot():
             ScreenSubtitleItem(
                 original="70%.",
                 translated="",
-                start_ms=1000,
-                end_ms=1600,
                 source_ids=[2],
                 word_start=3,
                 word_end=3,
@@ -10848,8 +11763,6 @@ def test_numeric_only_subtitle_keeps_semantic_group_id_slot():
             ScreenSubtitleItem(
                 original="That is a wild jump.",
                 translated="",
-                start_ms=1600,
-                end_ms=2600,
                 source_ids=[3],
                 word_start=4,
                 word_end=8,
@@ -11232,6 +12145,19 @@ def test_screen_editor_normalizes_enum_target_language_for_prompts_and_artifacts
     assert ScreenSubtitleEditor._normalize_target_language("English") == "English"
 
 
+def test_word_ledger_preserves_unicode_and_meaningful_connectors():
+    entries = ScreenSubtitleEditor._word_time_entries(
+        [ASRDataSeg("Nestl\u00e9, R&D and 100th.", 0, 400)]
+    )
+
+    assert [entry["surface"] for entry in entries] == [
+        "Nestl\u00e9,",
+        "R&D",
+        "and",
+        "100th.",
+    ]
+
+
 def test_short_nonindependent_backchannel_attaches_to_previous_display_item():
     previous_words = "This explanation has fourteen ordinary words and ends as a complete thought clearly today".split()
     words = previous_words + ["Yeah.", "The", "next", "sentence", "continues."]
@@ -11359,16 +12285,7 @@ def test_context_rejected_overlong_split_is_structural_warning_not_error():
     items = [_word_item(editor, start, end, 1) for start, end in ranges]
 
     repaired, _ = editor._safe_overlong_item_split(items[1])
-    candidate_gate = editor._can_apply_pre_id_repair_candidate(
-        [items[1]],
-        repaired,
-        previous_item=items[0],
-        next_item=items[2],
-    )
-
-    assert [editor._word_count(item.original) for item in repaired] == [15, 4]
-    assert candidate_gate["accepted"] is False
-    assert "short_open_prefix_fragment" in candidate_gate["reasons"]
+    assert repaired == []
 
     segments = []
     for index, (text, (word_start, word_end)) in enumerate(zip(texts, ranges), start=1):
@@ -11425,7 +12342,7 @@ def test_stable_cut_keeps_an_unsplittable_complete_sentence_renderer_owned():
     assert len(editor._overlong_english_issues([incomplete])) == 1
 
 
-def test_stable_cut_splits_complete_comma_clauses_at_twenty_words():
+def test_stable_cut_prefers_normal_limit_complete_clauses_over_twenty_word_spans():
     text = (
         "And you know the really strange consequence of that massive volume is that "
         "you are constantly swimming in synthetic text, yet the very tricks you "
@@ -11436,35 +12353,15 @@ def test_stable_cut_splits_complete_comma_clauses_at_twenty_words():
 
     ranges = editor._stable_word_ranges_for_span((0, len(words) - 1))
 
-    assert ranges == [(0, 19), (20, len(words) - 1)]
-    assert [end - start + 1 for start, end in ranges] == [20, 18]
-    first = editor._item_from_word_span(*ranges[0])
-    second = editor._item_from_word_span(*ranges[1])
-    assert first is not None and second is not None
-    assert first.original.endswith("text,")
-    assert second.original.startswith("yet the very tricks")
-    assert editor._evaluate_item_pair_for_final_boundary(first, second)["legal"]
-    assert not editor._evaluate_final_display_fragment(second, first, None)[
-        "hard_fragment_issues"
-    ]
-
-    segment = ASRDataSeg(first.original, 0, 7080, "完整中文。")
-    segment.subtitle_id = "S0001"
-    segment.word_start, segment.word_end = ranges[0]
-    editor._safe_overlong_item_split = lambda item: ([], [])
-
-    assert editor._overlong_english_issues([segment]) == []
-    assert editor._structural_english_overflow_issues([segment]) == [
-        {
-            "subtitle_id": "S0001",
-            "start": "00:00:00.000",
-            "end": "00:00:07.080",
-            "word_count": 20,
-            "hard_limit": 16,
-            "text": first.original,
-            "reason": "no_legal_internal_cut_within_normal_limit",
-        }
-    ]
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == len(words) - 1
+    assert all(end - start + 1 <= 16 for start, end in ranges)
+    items = [editor._item_from_word_span(start, end) for start, end in ranges]
+    assert all(item is not None for item in items)
+    assert all(
+        editor._evaluate_item_pair_for_final_boundary(left, right)["legal"]
+        for left, right in zip(items, items[1:])
+    )
 
 
 def test_overlong_repair_keeps_relative_clause_with_its_main_predicate():
@@ -11994,7 +12891,7 @@ def test_v10_adjacent_rebalance_preserves_approved_boundaries():
         ]
 
 
-def test_visual_temporal_budget_splits_punctuated_fronted_introduction():
+def test_visual_temporal_budget_does_not_override_protected_fronted_introduction():
     words = (
         "Reading about these polysyllables and nominalizations, "
         "it immediately brings George Orwell to mind."
@@ -12010,15 +12907,9 @@ def test_visual_temporal_budget_splits_punctuated_fronted_introduction():
 
     repaired = editor._apply_visual_reading_budget([original])
 
-    assert [item.original for item in repaired] == [
-        "Reading about these polysyllables and nominalizations,",
-        "it immediately brings George Orwell to mind.",
-    ]
-    assert [item.word_start for item in repaired] == [0, 6]
-    assert [item.word_end for item in repaired] == [5, 12]
-    assert editor._pre_id_boundary_repairs[0]["visual_temporal_category"] == (
-        "fronted_introduction_boundary"
-    )
+    assert [item.original for item in repaired] == [original.original]
+    assert [item.word_start for item in repaired] == [0]
+    assert [item.word_end for item in repaired] == [12]
     assert [
         (entry["start_time"], entry["end_time"])
         for entry in editor._active_word_entries
@@ -12294,6 +13185,34 @@ def test_invalid_final_timeline_blocks_before_display_page_translation():
     assert "final_timeline_word_coverage_incomplete" in message
 
 
+def test_failed_display_page_translation_skips_network_quality_audit():
+    segment = ASRDataSeg("A fixed English cue.", 0, 2000, "固定中文。")
+    segment.subtitle_id = "S0001"
+    editor = SimpleNamespace(
+        _display_page_translation_artifact={
+            "status": "ERROR",
+            "errors": [{"code": "display_page_translation_request_failed"}],
+        }
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir, patch(
+        "app.thread.subtitle_thread.audit_fixed_id_translation_quality"
+    ) as audit, patch(
+        "app.thread.subtitle_thread.write_subtitle_review_ledger"
+    ):
+        payload = SubtitleThread._run_translation_quality_audit(
+            editor,
+            SimpleNamespace(segments=[segment]),
+            str(Path(temp_dir) / "coverage-report.txt"),
+        )
+
+    audit.assert_not_called()
+    assert payload["status"] == "SKIPPED"
+    assert payload["batch_errors"] == [
+        {"code": "translation_quality_audit_skipped_page_projection_failed"}
+    ]
+
+
 def test_non_structural_validation_errors_do_not_block_render_gate():
     editor = _id_editor()
     editor._translation_structure_errors = []
@@ -12492,6 +13411,17 @@ def test_redistribution_parses_new_id_only_protocol_without_position_shift():
     parsed = editor._parse_chinese_group_allocations(data, segments)
 
     assert parsed == {"S0003": {"S0004": "这是第四条", "S0002": "这是第二条"}}
+
+
+def test_terminal_punctuation_inheritance_does_not_stack_period_after_comma():
+    assert ScreenSubtitleEditor._inherit_terminal_chinese_punctuation(
+        "旧句子。",
+        "承接下一条，",
+    ) == "承接下一条，"
+    assert ScreenSubtitleEditor._inherit_terminal_chinese_punctuation(
+        "旧句子。",
+        "完整新句子",
+    ) == "完整新句子。"
 
 
 def test_compression_keeps_subtitle_ids_and_count():
@@ -13642,11 +14572,17 @@ def test_stable_ts_density_fallback_stops_on_an_unmappable_empty_token():
 if __name__ == "__main__":
     test_formal_boundary_audit_projects_display_pages_and_unresolved_pre_id_evidence()
     test_stable_chinese_cache_rejects_stale_frozen_boundary_context()
+    test_semantic_full_translation_rejects_duplicate_request_group_ids()
+    test_allocation_payload_rejects_duplicate_group_ids()
+    test_translation_api_only_retries_only_rate_limit_and_respects_budget()
+    test_display_page_api_only_returns_attempts_without_worker_state_writes()
     test_semantic_full_translation_cache_survives_allocation_algorithm_change()
     test_semantic_full_translation_reads_verified_legacy_role_cache_once()
     test_semantic_cache_identity_uses_only_the_request_owner_model()
     test_invalid_full_translation_cache_is_replaced_only_by_valid_response()
     test_partial_full_translation_cache_preserves_valid_groups_for_resume()
+    test_full_translation_unit_cache_invalidates_only_context_dependents()
+    test_final_allocation_unit_cache_resumes_without_batch_request()
     test_llm_request_ledger_persists_token_and_reasoning_usage()
     test_invalid_allocation_cache_is_replaced_only_after_id_validation()
     test_final_time_alignment_reapplies_display_padding_to_loaded_short_subtitle()
@@ -13681,6 +14617,7 @@ if __name__ == "__main__":
     test_allocation_isolation_report_passes_when_only_chinese_changes()
     test_allocation_isolation_report_fails_on_english_boundary_change()
     test_duplicate_chinese_is_warning_not_blocking()
+    test_repeated_english_with_repeated_chinese_is_not_a_duplicate_warning()
     test_overlong_english_segment_is_locally_split_without_llm()
     test_audit_parser_does_not_count_chinese_line_with_it_as_english()
     test_888_chinese_speed_compression_rejects_dangling_fragment()
@@ -13709,6 +14646,7 @@ if __name__ == "__main__":
     test_short_regular_sentence_duration_remains_error()
     test_asr_suspicious_phrases_are_reported_without_fixing_text()
     test_asr_suspicious_article_context_misses_are_reported()
+    test_asr_suspicious_issues_are_bound_to_frozen_subtitle_ids()
     test_abbreviation_name_boundary_is_syntax_warning()
     test_terminal_punctuation_wins_over_token_only_determiner_heuristic()
     test_pronoun_restart_is_not_misclassified_as_a_determiner_head_split()
@@ -13763,6 +14701,8 @@ if __name__ == "__main__":
     test_parser_blocks_compact_coordination_boundaries()
     test_parser_blocks_object_content_clause_boundary()
     test_parser_blocks_object_attached_modifier_boundary()
+    test_parser_keeps_clause_scope_adverb_with_following_subordinator()
+    test_parser_clause_scope_modifier_guard_has_general_positive_and_negative_cases()
     test_parser_blocks_misattached_zero_relative_clause_boundary()
     test_parser_blocks_cross_cue_dependency_units_from_oil_run()
     test_parser_blocks_dreamcore_cross_cue_dependency_continuations()
@@ -13858,7 +14798,7 @@ if __name__ == "__main__":
     test_podcast_template_preserves_full_media_duration_when_subtitles_end_early()
     test_podcast_template_uses_frozen_task_configuration()
     test_podcast_english_only_mode_hides_only_chinese_subtitle_for_both_templates()
-    test_article_cover_ignores_legacy_date_text()
+    test_article_cover_renders_fixed_gradient_date_and_preserves_empty_opt_out()
     test_article_brand_logo_is_optional_and_preserves_aspect_ratio()
     test_article_brand_logo_rejects_missing_or_unreadable_files()
     test_article_opening_title_shrinks_to_keep_a_normal_long_title_in_three_lines()
@@ -14000,6 +14940,7 @@ if __name__ == "__main__":
     test_id_bound_candidate_decision_never_accepts_invalid_candidate()
     test_cross_id_leakage_requires_target_id_to_be_degraded()
     test_cross_id_leakage_flags_when_target_id_is_consumed_and_empty()
+    test_cross_id_relation_marker_cannot_move_to_previous_question_id()
     test_allocation_quality_keeps_out_of_order_return_by_subtitle_id()
     test_allocation_concurrency_keeps_hit_only_context_for_cache_api_and_retry()
     test_allocation_quality_failed_group_does_not_shift_following_100_ids()
@@ -14044,6 +14985,7 @@ if __name__ == "__main__":
     test_whisperx_time_only_uses_expanded_frozen_ledger_not_source_segment_count()
     test_whisperx_time_only_uses_explicit_source_audio_from_complete_task()
     test_screen_editor_normalizes_enum_target_language_for_prompts_and_artifacts()
+    test_word_ledger_preserves_unicode_and_meaningful_connectors()
     test_short_nonindependent_backchannel_attaches_to_previous_display_item()
     test_short_backchannel_stays_with_following_coordinated_clause()
     test_pre_id_validation_keeps_terminal_backchannel_out_of_previous_sentence()

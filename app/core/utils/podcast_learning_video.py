@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from openai import OpenAI
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+from PIL import (
+    Image,
+    ImageChops,
+    ImageDraw,
+    ImageEnhance,
+    ImageFilter,
+    ImageFont,
+    ImageOps,
+)
 
 from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
 from app.core.llm_service_config import resolve_llm_service_config
@@ -60,6 +68,11 @@ ARTICLE_DESIGN_WIDTH = 1600
 ARTICLE_DESIGN_HEIGHT = 900
 ARTICLE_WIDTH = 1920
 ARTICLE_HEIGHT = 1080
+PODCAST_OUTPUT_RESOLUTIONS = {
+    "1080p": (1920, 1080),
+    "1440p平台上传": (2560, 1440),
+}
+PODCAST_KEYFRAME_INTERVAL_SECONDS = 2
 ARTICLE_SCALE_X = ARTICLE_WIDTH / ARTICLE_DESIGN_WIDTH
 ARTICLE_SCALE_Y = ARTICLE_HEIGHT / ARTICLE_DESIGN_HEIGHT
 ARTICLE_CARD_CONTAINER = (251, 246, 237, 255)  # #FBF6ED
@@ -82,6 +95,7 @@ FONT_SOURCE_HAN_SERIF_CN_BOLD = TEMPLATE_FONT_DIR / "SourceHanSerifCN-Bold.otf"
 FONT_SOURCE_HAN_SERIF_CN_SEMIBOLD = (
     TEMPLATE_FONT_DIR / "SourceHanSerifCN-SemiBold.otf"
 )
+FONT_ALIMAMA_SHUHEI_BOLD = TEMPLATE_FONT_DIR / "AlimamaShuHeiTi-Bold.ttf"
 FONT_HANCHAN_BOLD = TEMPLATE_FONT_DIR / "ChillYunmoGothicBold.otf"
 FONT_HANCHAN_HEAVY = TEMPLATE_FONT_DIR / "ChillYunmoGothicHeavy.otf"
 FONT_HANCHAN_MEDIUM = TEMPLATE_FONT_DIR / "ChillYunmoGothicMedium.otf"
@@ -104,6 +118,12 @@ BLUE = (0, 234, 255, 255)
 ARTICLE_BLUE = (47, 111, 237, 255)
 ARTICLE_SUBTITLE_ZH_COLOR = (85, 103, 128, 255)
 ARTICLE_VOCAB_MEANING_COLOR = (42, 63, 93, 255)
+ARTICLE_DATE_SCRIM_ENABLED = False
+ARTICLE_DATE_SCRIM_COLOR = (27, 47, 74)  # #1B2F4A
+ARTICLE_DATE_TEXT_COLOR = (251, 246, 237, 255)  # #FBF6ED
+ARTICLE_DATE_SCRIM_MIN_ALPHA = 110
+ARTICLE_DATE_SCRIM_MAX_ALPHA = 180
+ARTICLE_DATE_MIN_CONTRAST = 4.5
 ARTICLE_VOCAB_MEANING_FONT_WEIGHT = 600
 ARTICLE_VOCAB_DETAIL_COLOR = ARTICLE_SUBTITLE_ZH_COLOR
 ARTICLE_VOCAB_DETAIL_FONT_SIZE = 28
@@ -146,7 +166,7 @@ ARTICLE_SUBTITLE_ZH_FONT_SIZE = 50
 # Percentage of the rendered font size applied between adjacent glyphs.
 # This is intentionally scoped to the article template subtitle renderer;
 # ordinary subtitles and vocabulary cards keep their existing spacing.
-ARTICLE_SUBTITLE_ZH_LETTER_SPACING = -0.02
+ARTICLE_SUBTITLE_ZH_LETTER_SPACING = 0.0
 ARTICLE_SUBTITLE_EN_LINE_HEIGHT_MULTIPLIER = 1.22
 # Every newly planned page keeps a 52px floor. The legacy 50px size is accepted
 # only while validating or reopening an already-frozen artifact.
@@ -200,8 +220,12 @@ ARTICLE_SAME_SCREEN_BALANCE_PENALTY = 30_000
 ARTICLE_PAGE_50PX_LAST_RESORT_PENALTY = 1_200
 ARTICLE_PAGE_ATOMIC_BOUNDARY_ISSUES = frozenset(
     {
+        "determiner_numeric_noun_split",
         "modifier_head_split",
         "modifier_noun_head_split",
+        "numeric_magnitude_split",
+        "numeric_range_split",
+        "numeric_unit_or_noun_split",
         "post_noun_participial_modifier_split",
         "subject_predicate_split",
         "subject_finite_verb_split",
@@ -351,6 +375,13 @@ ARTICLE_TITLE_CONNECTOR_WORDS = frozenset(
 ARTICLE_TITLE_NUMERIC_SUFFIXES = frozenset({"s", "st", "nd", "rd", "th"})
 ARTICLE_PAGE_OBJECT_DETERMINERS = frozenset(
     {"a", "an", "the", "this", "that", "these", "those", "my", "your", "our", "their", "its"}
+)
+ARTICLE_PAGE_NOMINAL_OBJECT_START_WORDS = frozenset(
+    ARTICLE_PAGE_OBJECT_DETERMINERS
+    | {"all", "any", "each", "either", "enough", "every", "few", "many", "more", "most", "much", "neither", "no", "several", "some"}
+)
+ARTICLE_PAGE_OF_QUANTIFIER_HEAD_WORDS = frozenset(
+    {"all", "any", "each", "either", "every", "few", "many", "most", "much", "neither", "no", "some"}
 )
 ARTICLE_PAGE_TO_INFINITIVE_HEADS = frozenset(
     {
@@ -788,6 +819,12 @@ def article_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
     if FONT_READEX_REGULAR.exists():
         return font(FONT_READEX_REGULAR, size, weight)
     return font(FONT_GANTARI, size, weight)
+
+
+def article_date_font(size: int) -> ImageFont.FreeTypeFont:
+    if FONT_ALIMAMA_SHUHEI_BOLD.exists():
+        return font(FONT_ALIMAMA_SHUHEI_BOLD, acx(size), 700)
+    return article_en_font(size, 700)
 
 
 def article_subtitle_en_font(size: int, weight: int = 600) -> ImageFont.FreeTypeFont:
@@ -2659,6 +2696,102 @@ def _caption_phrase_start_is_complete(words: list[str], split: int) -> bool:
     return remaining[-1] not in LINE_BREAK_AVOID_AFTER_WORDS
 
 
+def _article_complete_prepositional_continuation_shape(
+    words: list[str],
+    split: int,
+    issue_codes: set[str],
+) -> bool:
+    """Recognize a terminal, visible preposition-object continuation."""
+    if not 0 <= split < len(words):
+        return False
+    following = re.sub(r"[^A-Za-z']", "", words[split]).casefold()
+    remaining = words[split:]
+    object_start = (
+        re.sub(r"[^A-Za-z']", "", remaining[1]).casefold()
+        if len(remaining) > 1
+        else ""
+    )
+    existing_continuation_issues = {
+        "dependency_phrase_entrance_split",
+        "object_attached_modifier_split",
+        "predicate_attached_continuation_split",
+        "unsupported_tight_page_transition",
+    }
+    noun_attached_continuation_issues = {
+        "atomic_of_complement_split",
+        "dependency_phrase_entrance_split",
+        "unsupported_tight_page_transition",
+    }
+    simple_for_continuation_issues = {
+        "dependency_phrase_entrance_split",
+        "unsupported_tight_page_transition",
+    }
+    quantifier_head_of_phrase = bool(
+        following == "of"
+        and split >= 2
+        and re.sub(r"[^A-Za-z']", "", words[split - 2]).casefold()
+        in ARTICLE_PAGE_OF_QUANTIFIER_HEAD_WORDS
+    )
+    issue_shape_is_supported = bool(
+        issue_codes
+        and (
+            (
+                following in {"by", "from", "in", "into"}
+                and issue_codes <= existing_continuation_issues
+            )
+            or (
+                following == "for"
+                and issue_codes <= simple_for_continuation_issues
+            )
+            or (
+                issue_codes <= noun_attached_continuation_issues
+                and object_start in ARTICLE_PAGE_NOMINAL_OBJECT_START_WORDS
+                and not quantifier_head_of_phrase
+            )
+        )
+    )
+    return bool(
+        following in ARTICLE_PAGE_PHRASE_START_WORDS
+        and len(remaining) >= ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+        and _caption_has_terminal_completion(remaining)
+        and issue_shape_is_supported
+    )
+
+
+def _article_complete_object_continuation_shape(
+    words: list[str],
+    split: int,
+    issue_codes: set[str],
+) -> bool:
+    """Recognize a complete determiner-led direct-object continuation."""
+    if not 0 <= split < len(words):
+        return False
+    following = re.sub(r"[^A-Za-z']", "", words[split]).casefold()
+    remaining = words[split:]
+    previous = (
+        re.sub(r"[^A-Za-z']", "", words[split - 1]).casefold()
+        if split > 0
+        else ""
+    )
+    object_issues = {
+        "short_verb_complement_split",
+        "short_verb_object_split",
+        "verb_complement_split",
+    }
+    return bool(
+        (
+            split == 0
+            or split >= ARTICLE_VISUAL_PAGE_MIN_WORDS + 1
+        )
+        and len(remaining) >= ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+        and following in ARTICLE_PAGE_NOMINAL_OBJECT_START_WORDS
+        and "short_verb_object_split" in issue_codes
+        and issue_codes <= object_issues
+        and not previous.endswith(("ed", "ing"))
+        and _caption_has_terminal_completion(remaining)
+    )
+
+
 def _has_discouraged_caption_break(
     text: str,
     lines: list[str],
@@ -3412,7 +3545,16 @@ def _article_fixed_english_lines(
                         and _has_discouraged_caption_break(
                             text,
                             lines,
-                            boundary_penalty=boundary_penalty,
+                            # A line break keeps both lines visible at once;
+                            # frozen page-boundary syntax must only rank the
+                            # candidate, not make an otherwise fitting page
+                            # structurally unrenderable. Cross-page planning
+                            # still applies the same penalty as a hard gate.
+                            boundary_penalty=(
+                                None
+                                if relax_same_screen_syntax
+                                else boundary_penalty
+                            ),
                             intrinsic_penalty=score_intrinsic,
                         )
                     )
@@ -3653,10 +3795,26 @@ def _article_title_entity_spans(words: Sequence[str]) -> tuple[tuple[int, int], 
             )
         )
 
+    def ends_sentence(index: int) -> bool:
+        raw = surface(index)
+        if not re.search(r"[.!?][\"')\]]*$", raw):
+            return False
+        if "?" in raw or "!" in raw:
+            return True
+        abbreviation = raw.rstrip("\"')]")
+        return not bool(
+            re.fullmatch(r"(?:[A-Z]\.){1,4}", abbreviation)
+            or token(index).lower()
+            in {"dr", "jr", "mr", "mrs", "ms", "prof", "sr", "st", "vs"}
+        )
+
     spans: list[tuple[int, int]] = []
     index = 0
     while index < len(words):
         if not is_title_or_numeric(index):
+            index += 1
+            continue
+        if lower(index) in ARTICLE_PAGE_COMPLETE_CONTINUATION_START_WORDS:
             index += 1
             continue
         start = index
@@ -3665,6 +3823,8 @@ def _article_title_entity_spans(words: Sequence[str]) -> tuple[tuple[int, int], 
         has_numeric = bool(re.fullmatch(r"\d+(?:\.\d+)?", token(index)))
         cursor = index + 1
         while cursor < len(words):
+            if ends_sentence(cursor - 1):
+                break
             current = lower(cursor)
             if (
                 current in ARTICLE_TITLE_NUMERIC_SUFFIXES
@@ -3854,6 +4014,18 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         and issue_codes
         and issue_codes <= {"coordinated_constituent_split"}
     )
+    open_parent_coordinated_restart = bool(
+        punctuation_boundary
+        and following in {"and", "but", "nor", "or", "so", "yet"}
+        and split + 1 < len(words)
+        and re.sub(r"[^A-Za-z']", "", words[split + 1]).lower()
+        in ARTICLE_PAGE_COMPLETE_SUBJECT_START_WORDS
+        and min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        and not _caption_has_terminal_completion(words)
+        and bool(re.search(r"[,;:][\"')\]]*$", str(words[-1]).strip()))
+        and issue_codes
+        and issue_codes <= {"coordinated_constituent_split"}
+    )
     punctuated_coordinated_gerund_restart = bool(
         following.endswith("ing")
         and punctuation_boundary
@@ -3862,6 +4034,44 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         and pause_ms is not None
         and int(pause_ms) >= ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS
         and issue_codes == {"coordinated_constituent_split"}
+    )
+    open_parent_coordinated_gerund_restart = bool(
+        following in {"and", "but"}
+        and split + 1 < len(words)
+        and re.sub(r"[^A-Za-z']", "", words[split + 1]).lower().endswith("ing")
+        and len(words) - split >= ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+        and pause_ms is not None
+        and int(pause_ms) >= ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS
+        and bool(re.search(r"[,;:][\"')\]]*$", str(words[-1]).strip()))
+        and issue_codes
+        and issue_codes <= {"coordinated_constituent_split"}
+    )
+    complete_prepositional_continuation = (
+        _article_complete_prepositional_continuation_shape(
+            words,
+            split,
+            issue_codes,
+        )
+        or bool(
+            following in {"by", "from", "into"}
+            and len(words) - split >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+            and split + 1 < len(words)
+            and re.sub(r"[^A-Za-z']", "", words[split + 1])
+            .lower()
+            .endswith("ing")
+            and issue_codes
+            <= {
+                "dependency_phrase_entrance_split",
+                "object_attached_modifier_split",
+                "predicate_attached_continuation_split",
+                "unsupported_tight_page_transition",
+            }
+        )
+    )
+    complete_object_continuation = _article_complete_object_continuation_shape(
+        words,
+        split,
+        issue_codes,
     )
     balanced_predicate_restart = bool(
         min(split, len(words) - split) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
@@ -3918,7 +4128,11 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
     elif (
         complete_clause_restart
         or coordinated_phrase_restart
+        or open_parent_coordinated_restart
         or punctuated_coordinated_gerund_restart
+        or open_parent_coordinated_gerund_restart
+        or complete_prepositional_continuation
+        or complete_object_continuation
         or balanced_predicate_restart
     ):
         classification = "review"
@@ -3929,7 +4143,23 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
             else (
                 "punctuated_coordinated_gerund_restart"
                 if punctuated_coordinated_gerund_restart
-                else "complete_clause_restart"
+                else (
+                    "open_parent_coordinated_restart"
+                    if open_parent_coordinated_restart
+                    else (
+                        "open_parent_coordinated_gerund_restart"
+                        if open_parent_coordinated_gerund_restart
+                        else (
+                            "complete_prepositional_continuation"
+                            if complete_prepositional_continuation
+                            else (
+                                "complete_object_continuation"
+                                if complete_object_continuation
+                                else "complete_clause_restart"
+                            )
+                        )
+                    )
+                )
             )
         )
     elif complete_title_restart:
@@ -4011,6 +4241,14 @@ def _article_display_boundary_decision(cue: Cue, split: int) -> dict:
         "punctuated_coordinated_gerund_restart": (
             punctuated_coordinated_gerund_restart
         ),
+        "open_parent_coordinated_restart": open_parent_coordinated_restart,
+        "open_parent_coordinated_gerund_restart": (
+            open_parent_coordinated_gerund_restart
+        ),
+        "complete_prepositional_continuation": (
+            complete_prepositional_continuation
+        ),
+        "complete_object_continuation": complete_object_continuation,
         "tight_complete_phrase_start": tight_complete_phrase_start,
     }
 
@@ -4062,6 +4300,7 @@ def _article_forced_continuation_decision(
         "short_verb_complement_split",
         "stranded_leading_complement_split",
         "verb_complement_split",
+        "verb_preposition_complement_split",
     }
     following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
     next_word = (
@@ -4075,6 +4314,7 @@ def _article_forced_continuation_decision(
         and next_word not in ARTICLE_PAGE_OBJECT_DETERMINERS
         and next_word not in LINE_BREAK_AVOID_BEFORE_WORDS
     )
+    previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
     forced_subject_predicate = bool(
         following in {"am", "are", "is", "was", "were"}
         and _caption_complete_clausal_subject_before_copula(words, split)
@@ -4156,7 +4396,9 @@ def _article_forced_continuation_decision(
             "forced_display_continuation": True,
             "forced_subject_predicate": forced_subject_predicate,
             "forced_complete_to_phrase": bool(
-                likely_infinitive_start and not forced_subject_predicate
+                likely_infinitive_start
+                and previous not in ARTICLE_PAGE_TO_INFINITIVE_HEADS
+                and not forced_subject_predicate
             ),
             "forced_complete_predicate_phrase": bool(
                 complete_predicate_phrase and not forced_subject_predicate
@@ -4361,6 +4603,10 @@ def _article_page_boundary_risk(decision: Mapping, cost: int | float) -> int:
         # A complete ``to ...`` phrase is still reviewable, but it is a
         # substantially safer page restart only when the left page has not
         # stranded the governing verb from that complement.
+        risk = min(risk, 2)
+    elif decision.get("complete_prepositional_continuation"):
+        risk = min(risk, 2)
+    elif decision.get("complete_object_continuation"):
         risk = min(risk, 2)
     elif decision.get("forced_complete_predicate_phrase"):
         risk = min(risk, 2)
@@ -4567,6 +4813,11 @@ def _article_page_has_tight_nonfinite_complement(
 ) -> bool:
     """Reject only parser-supported, tightly spoken non-finite attachments."""
     if split <= 0 or split >= len(words) or len(word_timing) != len(words):
+        return False
+    if (boundary_decision or {}).get("forced_complete_predicate_phrase"):
+        # The right page owns a complete visible phrase (for example,
+        # ``from eating ...``). It remains reviewable but is not a stranded
+        # non-finite fragment.
         return False
     previous = re.sub(r"[^A-Za-z']", "", words[split - 1]).lower()
     following = re.sub(r"[^A-Za-z']", "", words[split]).lower()
@@ -4898,7 +5149,14 @@ def _article_same_screen_english_lines(
         font_size=int(font_size),
         enforce_word_limit=enforce_word_limit,
         boundary_penalty=lambda split, base=start: (
-            _article_line_boundary_penalty(cue, base + split)
+            # Page-boundary evidence still ranks a line break, but a hard
+            # cross-page prohibition is not a hard same-screen prohibition.
+            # Keep the penalty finite so the pixel-fitting wrap can choose a
+            # natural line rather than forcing a smaller font or overflow.
+            min(
+                _article_line_boundary_penalty(cue, base + split),
+                DISPLAY_PAGE_HIGH_CONFIDENCE_REVIEW_PENALTY,
+            )
         ),
         relax_same_screen_syntax=True,
         intrinsic_penalty=lambda page_words, split, base=start: (
@@ -5657,6 +5915,9 @@ def _build_article_english_page_plan(
                     _article_display_page_pressure(page) for page in pages
                 ),
                 "line_balance_ratios": tuple(line_balance_ratios),
+                "line_wrap_review_count": sum(
+                    bool(page.get("line_wrap_review")) for page in pages
+                ),
             },
             "",
         )
@@ -5888,6 +6149,9 @@ def _build_article_english_page_plan(
                         (page.get("boundary_before") or {}).get(
                             "complete_title_restart"
                         )
+                        or (page.get("boundary_before") or {}).get(
+                            "complete_prepositional_continuation"
+                        )
                     )
                     for page in candidate.get("plan", {}).get("pages", [])[1:]
                 )
@@ -5905,6 +6169,9 @@ def _build_article_english_page_plan(
                     )
                     or (page.get("boundary_before") or {}).get(
                         "complete_title_restart"
+                    )
+                    or (page.get("boundary_before") or {}).get(
+                        "complete_prepositional_continuation"
                     )
                 )
                 for page in candidate.get("plan", {}).get("pages", [])[1:]
@@ -6086,6 +6353,8 @@ def _build_article_english_page_plan(
                 candidate["high_risk_count"],
                 candidate["medium_risk_count"],
                 candidate["low_risk_count"],
+                -int(candidate.get("supported_restart_count") or 0),
+                int(candidate.get("line_wrap_review_count") or 0),
                 candidate["font_reduction"],
                 candidate["quality_cost"],
             ),
@@ -6326,7 +6595,12 @@ def _article_high_pressure_review_candidates(
 def _article_nonoverridable_atomic_page_boundary_issues(
     decision: Mapping[str, object],
 ) -> set[str]:
-    """Return lexical issues that acoustic restart evidence cannot relax."""
+    """Return lexical issues that acoustic restart evidence cannot relax.
+
+    A display transition must never bisect a written numeric phrase such as
+    ``1.4 billion``. Unlike a clause restart, no pause can make either visible
+    half independently meaningful.
+    """
     issue_codes = {
         str(issue or "") for issue in decision.get("issue_codes") or []
     }
@@ -6339,6 +6613,24 @@ def _article_nonoverridable_atomic_page_boundary_issues(
         atomic_issues -= {
             "subject_predicate_split",
             "subject_finite_verb_split",
+        }
+    if decision.get("complete_prepositional_continuation"):
+        atomic_issues -= {
+            "atomic_of_complement_split",
+            "dependency_phrase_entrance_split",
+            "object_attached_modifier_split",
+            "predicate_attached_continuation_split",
+        }
+    if decision.get("complete_object_continuation"):
+        atomic_issues -= {
+            "short_verb_complement_split",
+            "short_verb_object_split",
+            "verb_complement_split",
+        }
+    if decision.get("forced_complete_predicate_phrase"):
+        atomic_issues -= {
+            "predicate_attached_continuation_split",
+            "predicate_complement_chain_split",
         }
     return atomic_issues
 
@@ -6358,11 +6650,29 @@ def _article_secondary_review_boundary_is_complete(
         return False
     first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
     complete_from_gerund = _article_complete_from_gerund_restart(right_page)
+    complete_from_nominal = _article_complete_from_nominal_restart(right_page)
+    complete_to_infinitive = _article_complete_to_infinitive_restart(right_page)
     complete_participial_restart = _article_complete_participial_restart(
         right_page
     )
     complete_temporal_range_restart = _article_complete_temporal_range_restart(
         right_page
+    )
+    complete_prepositional_continuation = bool(
+        decision.get("complete_prepositional_continuation")
+        and _article_complete_prepositional_continuation_shape(
+            words,
+            0,
+            issue_codes,
+        )
+    )
+    complete_object_continuation = bool(
+        decision.get("complete_object_continuation")
+        and _article_complete_object_continuation_shape(
+            words,
+            0,
+            issue_codes,
+        )
     )
     complete_temporal_adjunct = bool(
         first_word in ARTICLE_PAGE_OPTIONAL_TEMPORAL_ADJUNCT_START_WORDS
@@ -6412,8 +6722,11 @@ def _article_secondary_review_boundary_is_complete(
         "verb_preposition_complement_split",
     } and not (
         complete_from_gerund
+        or complete_from_nominal
+        or complete_to_infinitive
         or complete_participial_restart
         or complete_temporal_adjunct
+        or complete_prepositional_continuation
     ):
         return False
     # Strictly allowed boundaries have already passed the page-level syntax
@@ -6427,7 +6740,15 @@ def _article_secondary_review_boundary_is_complete(
         or decision.get("complete_page_clause_start")
         or decision.get("balanced_predicate_restart")
         or decision.get("punctuated_coordinated_gerund_restart")
-        or decision.get("tight_complete_phrase_start")
+        or decision.get("open_parent_coordinated_restart")
+        or decision.get("open_parent_coordinated_gerund_restart")
+        or complete_prepositional_continuation
+        or complete_object_continuation
+        or complete_from_gerund
+        or complete_from_nominal
+        or complete_to_infinitive
+        or decision.get("forced_complete_to_phrase")
+        or decision.get("forced_complete_predicate_phrase")
         or complete_forced_predicate
         or complete_participial_restart
         or complete_temporal_adjunct
@@ -6451,6 +6772,46 @@ def _article_complete_from_gerund_restart(
         decision.get("tight_complete_phrase_start")
         and first_word in {"by", "from", "into"}
         and second_word.endswith("ing")
+    )
+
+
+def _article_complete_from_nominal_restart(
+    right_page: Mapping[str, object],
+) -> bool:
+    """Keep a complete visible ``from/into + noun phrase`` page eligible."""
+    decision = right_page.get("boundary_before") or {}
+    words = str(right_page.get("en") or "").split()
+    if len(words) < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS:
+        return False
+    first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
+    second_word = re.sub(r"[^A-Za-z]+", "", words[1]).casefold()
+    return bool(
+        decision.get("tight_complete_phrase_start")
+        and first_word in {"from", "into"}
+        and not second_word.endswith("ing")
+        and _caption_has_terminal_completion(words)
+    )
+
+
+def _article_complete_to_infinitive_restart(
+    right_page: Mapping[str, object],
+) -> bool:
+    """Allow a full visual ``to + verb`` page, not an attached noun phrase."""
+    decision = right_page.get("boundary_before") or {}
+    issue_codes = set(decision.get("issue_codes") or [])
+    words = str(right_page.get("en") or "").split()
+    if len(words) < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS:
+        return False
+    first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
+    second_word = re.sub(r"[^A-Za-z']+", "", words[1]).casefold()
+    return bool(
+        decision.get("tight_complete_phrase_start")
+        and issue_codes == {"unsupported_tight_page_transition"}
+        and first_word == "to"
+        and second_word
+        and second_word not in ARTICLE_PAGE_OBJECT_DETERMINERS
+        and not second_word.endswith("'s")
+        and _caption_has_terminal_completion(words)
     )
 
 
@@ -6521,6 +6882,7 @@ def _article_secondary_boundary_needs_three_line_escape(
         str(decision.get("classification") or "") == "allow"
         or not decision.get("tight_complete_phrase_start")
         or _article_complete_from_gerund_restart(right_page)
+        or _article_complete_to_infinitive_restart(right_page)
         or decision.get("forced_complete_predicate_phrase")
     ):
         return False
@@ -6676,6 +7038,12 @@ def _article_candidate_readability_metrics(
         "three_line_pages": sum(
             len(list(page.get("en_lines") or [])) > 2 for page in pages
         ),
+        "line_wrap_review_count": int(
+            candidate.get("line_wrap_review_count") or 0
+        ),
+        "supported_restart_count": int(
+            candidate.get("supported_restart_count") or 0
+        ),
         "risk_score": int(candidate.get("risk_score") or 0),
         "review_count": int(candidate.get("review_count") or 0),
         "incomplete_review_count": int(
@@ -6710,7 +7078,9 @@ def _article_added_reviews_are_complete_phrases(
         decision = page.get("boundary_before") or {}
         if str(decision.get("classification") or "") != "review":
             continue
-        if decision.get("relaxed_raw_hard"):
+        if decision.get("relaxed_raw_hard") and not decision.get(
+            "complete_prepositional_continuation"
+        ):
             return False
         issue_codes = {
             str(value) for value in decision.get("issue_codes") or []
@@ -6728,15 +7098,45 @@ def _article_added_reviews_are_complete_phrases(
         if (
             "object_attached_modifier_split" in issue_codes
             and not attached_modifier_is_optional_temporal_adjunct
+            and not decision.get("complete_prepositional_continuation")
         ):
             return False
-        if (
+        if decision.get("complete_prepositional_continuation"):
+            issue_codes -= {
+                "dependency_phrase_entrance_split",
+                "object_attached_modifier_split",
+                "predicate_attached_continuation_split",
+            }
+        complete_prepositional = bool(
+            decision.get("complete_prepositional_continuation")
+        )
+        if complete_prepositional:
+            if issue_codes or not _article_page_can_start_with_complete_phrase(
+                words, split
+            ):
+                return False
+        elif (
             not issue_codes
             or not issue_codes <= reviewable_phrase_issues
             or not _article_page_can_start_with_complete_phrase(words, split)
         ):
             return False
     return True
+
+
+def _article_candidate_relaxes_only_complete_prepositional_continuations(
+    candidate: Mapping[str, object],
+) -> bool:
+    relaxed = [
+        page.get("boundary_before") or {}
+        for page in list((candidate.get("plan") or {}).get("pages") or [])[1:]
+        if (page.get("boundary_before") or {}).get("relaxed_raw_hard")
+    ]
+    return bool(relaxed) and all(
+        decision.get("complete_prepositional_continuation")
+        and not _article_nonoverridable_atomic_page_boundary_issues(decision)
+        for decision in relaxed
+    )
 
 
 def _article_mark_dominant_readability_candidate(
@@ -6759,7 +7159,7 @@ def _select_article_dominant_readability_candidate(
     baseline: Mapping[str, object],
     candidates: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
-    """Promote only a cross-page-count candidate with a non-compensating win.
+    """Promote a validated candidate only when readability objectively improves.
 
     Stable English and timing have already been frozen.  This selector may
     only choose another validated renderer projection: it cannot create a new
@@ -6771,18 +7171,43 @@ def _select_article_dominant_readability_candidate(
     for candidate in candidates:
         metrics = _article_candidate_readability_metrics(candidate)
         pages = list((candidate.get("plan") or {}).get("pages") or [])
+        same_page_line_wrap_relief = bool(
+            int(metrics["page_count"]) == int(baseline_metrics["page_count"])
+            and int(metrics["line_wrap_review_count"]) == 0
+            and int(baseline_metrics["line_wrap_review_count"]) > 0
+            and int(metrics["supported_restart_count"])
+            >= int(baseline_metrics["supported_restart_count"])
+            and int(metrics["min_words"]) >= ARTICLE_VISUAL_PAGE_MIN_WORDS
+        )
+        line_wrap_relief_boundaries_complete = bool(
+            same_page_line_wrap_relief
+            and all(
+                _article_secondary_review_boundary_is_complete(page)
+                for page in pages[1:]
+            )
+        )
         if (
             int(metrics["severe_risk_count"])
-            or int(metrics["relaxed_raw_hard_count"])
+            or (
+                int(metrics["relaxed_raw_hard_count"])
+                and not _article_candidate_relaxes_only_complete_prepositional_continuations(
+                    candidate
+                )
+                and not line_wrap_relief_boundaries_complete
+            )
             or int(metrics["three_line_pages"])
             > int(baseline_metrics["three_line_pages"])
-            or int(metrics["min_words"])
-            < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+            or (
+                int(metrics["min_words"])
+                < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+                and not same_page_line_wrap_relief
+            )
             or not _article_added_reviews_are_complete_phrases(
                 cue,
                 baseline,
                 candidate,
             )
+            and not line_wrap_relief_boundaries_complete
             or any(
                 str(
                     (page.get("boundary_before") or {}).get("classification")
@@ -6809,14 +7234,24 @@ def _select_article_dominant_readability_candidate(
             baseline_metrics["risk_score"]
         )
         if page_delta < 0:
+            removes_short_tail = bool(
+                int(baseline_metrics["min_words"])
+                <= ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+                and int(metrics["page_count"]) == 1
+                and int(metrics["max_words"])
+                <= ARTICLE_VISUAL_PAGE_REVIEW_WORDS
+            )
             if (
                 risk_not_worse
                 and int(metrics["min_font"]) >= ARTICLE_SUBTITLE_EN_FONT_SIZE
                 and int(metrics["max_words"])
                 <= ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
-                and float(metrics["max_pressure"])
-                <= float(baseline_metrics["max_pressure"])
-                + ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA
+                and (
+                    removes_short_tail
+                    or float(metrics["max_pressure"])
+                    <= float(baseline_metrics["max_pressure"])
+                    + ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA
+                )
             ):
                 eligible.append(("fewer_comfortable_pages", candidate, metrics))
             continue
@@ -6837,6 +7272,19 @@ def _select_article_dominant_readability_candidate(
                 < float(baseline_metrics["max_pressure"])
             ):
                 eligible.append(("objective_pressure_relief", candidate, metrics))
+            continue
+        removes_line_wrap_review = same_page_line_wrap_relief
+        if (
+            removes_line_wrap_review
+            and risk_not_worse
+            and int(metrics["min_font"]) >= int(baseline_metrics["min_font"])
+            and int(metrics["max_words"])
+            <= ARTICLE_VISUAL_PAGE_COUNT_TARGET_WORDS
+            and float(metrics["max_pressure"])
+            <= float(baseline_metrics["max_pressure"])
+            + ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA
+        ):
+            eligible.append(("same_page_count_line_wrap_relief", candidate, metrics))
             continue
         dominates = bool(
             risk_not_worse
@@ -6887,12 +7335,16 @@ def _select_article_dominant_readability_candidate(
         )
         return _article_mark_dominant_readability_candidate(selected, reason)
     same_page_count = [
-        item for item in eligible if item[0] == "same_page_count_dominance"
+        item
+        for item in eligible
+        if item[0]
+        in {"same_page_count_line_wrap_relief", "same_page_count_dominance"}
     ]
     if same_page_count:
         reason, selected, _ = min(
             same_page_count,
             key=lambda item: (
+                int(item[2]["line_wrap_review_count"]),
                 int(item[2]["low_font_pages"]),
                 int(item[2]["over_16_pages"]),
                 float(item[2]["max_pressure"]),
@@ -6917,7 +7369,7 @@ def _select_article_page_plan_sequence(
         return []
 
     states: list[
-        tuple[tuple[int, int, int, float], list[Mapping[str, object]]]
+        tuple[tuple[int, int, int, int, float], list[Mapping[str, object]]]
     ] = []
     for candidate in groups[0]:
         states.append(
@@ -6926,6 +7378,7 @@ def _select_article_page_plan_sequence(
                     int(bool(candidate.get("forced_continuation"))),
                     int(bool(candidate.get("review_boundary_candidate"))),
                     int(candidate.get("severe_risk_count") or 0),
+                    int(candidate.get("line_wrap_review_count") or 0),
                     _article_candidate_sequence_cost(candidate),
                 ),
                 [candidate],
@@ -6939,6 +7392,7 @@ def _select_article_page_plan_sequence(
                 int(bool(candidate.get("forced_continuation"))),
                 int(bool(candidate.get("review_boundary_candidate"))),
                 int(candidate.get("severe_risk_count") or 0),
+                int(candidate.get("line_wrap_review_count") or 0),
                 _article_candidate_sequence_cost(candidate),
             )
             current_pressures = tuple(
@@ -6962,7 +7416,8 @@ def _select_article_page_plan_sequence(
                     previous_rank[0] + local_rank[0],
                     previous_rank[1] + local_rank[1],
                     previous_rank[2] + local_rank[2],
-                    previous_rank[3] + local_rank[3] + transition_cost,
+                    previous_rank[3] + local_rank[3],
+                    previous_rank[4] + local_rank[4] + transition_cost,
                 )
                 proposed = (rank, [*previous_path, candidate])
                 if best is None or proposed[0] < best[0]:
@@ -9379,13 +9834,192 @@ def draw_article_logo(
     img.alpha_composite(logo, (x, y))
 
 
+def _article_date_ease(value: float) -> float:
+    value = max(0.0, min(1.0, value))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def _article_date_relative_luminance(rgb: tuple[int, int, int]) -> float:
+    channels = []
+    for value in rgb:
+        channel = value / 255.0
+        channels.append(
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+        )
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _article_date_contrast_ratio(
+    background: tuple[int, int, int],
+    scrim_alpha: int,
+) -> float:
+    blended = tuple(
+        round(
+            (scrim * scrim_alpha + source * (255 - scrim_alpha))
+            / 255
+        )
+        for source, scrim in zip(background, ARTICLE_DATE_SCRIM_COLOR)
+    )
+    text_luminance = _article_date_relative_luminance(
+        ARTICLE_DATE_TEXT_COLOR[:3]
+    )
+    background_luminance = _article_date_relative_luminance(blended)
+    lighter = max(text_luminance, background_luminance)
+    darker = min(text_luminance, background_luminance)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def article_date_scrim_alpha(
+    cover: Image.Image,
+    sample_box: tuple[int, int, int, int] | None = None,
+) -> int:
+    if sample_box is None:
+        sample_width = min(cover.width, acx(360))
+        sample_height = min(cover.height, acy(50))
+        sample_box = (
+            cover.width - sample_width,
+            0,
+            cover.width,
+            sample_height,
+        )
+    x0, y0, x1, y1 = sample_box
+    bounded_box = (
+        max(0, min(cover.width, x0)),
+        max(0, min(cover.height, y0)),
+        max(0, min(cover.width, x1)),
+        max(0, min(cover.height, y1)),
+    )
+    crop = cover.crop(bounded_box).convert("RGBA")
+    if crop.width <= 0 or crop.height <= 0:
+        return ARTICLE_DATE_SCRIM_MAX_ALPHA
+    backdrop = Image.new("RGBA", crop.size, ARTICLE_CARD_CONTAINER)
+    backdrop.alpha_composite(crop)
+    pixels = backdrop.convert("RGB").getdata()
+    for alpha in range(
+        ARTICLE_DATE_SCRIM_MIN_ALPHA,
+        ARTICLE_DATE_SCRIM_MAX_ALPHA + 1,
+    ):
+        if all(
+            _article_date_contrast_ratio(pixel, alpha)
+            >= ARTICLE_DATE_MIN_CONTRAST
+            for pixel in pixels
+        ):
+            return alpha
+    return ARTICLE_DATE_SCRIM_MAX_ALPHA
+
+
+def article_date_gradient_mask(
+    width: int,
+    height: int,
+    max_alpha: int,
+    fade_width: int,
+) -> Image.Image:
+    solid_height = min(height, acy(36))
+    horizontal = Image.new("L", (width, 1), 0)
+    horizontal.putdata(
+        [
+            round(
+                max_alpha
+                * _article_date_ease(x / max(1, fade_width - 1))
+            )
+            for x in range(width)
+        ]
+    )
+    horizontal = horizontal.resize((width, height), Image.Resampling.NEAREST)
+
+    vertical = Image.new("L", (1, height), 0)
+    vertical.putdata(
+        [
+            255
+            if y <= solid_height
+            else round(
+                255
+                * _article_date_ease(
+                    (height - 1 - y)
+                    / max(1, height - 1 - solid_height)
+                )
+            )
+            for y in range(height)
+        ]
+    )
+    vertical = vertical.resize((width, height), Image.Resampling.NEAREST)
+    return ImageChops.multiply(horizontal, vertical)
+
+
 def decorate_article_cover(
     article_image: Image.Image,
-    _date_text: str,
+    date_text: str,
     logo: Image.Image | None = None,
 ) -> Image.Image:
     cover = article_image.convert("RGBA").copy()
     draw_article_logo(cover, logo, (0, 0))
+    date = re.sub(r"\s+", " ", str(date_text or "")).strip()
+    if not date:
+        return cover
+
+    draw = ImageDraw.Draw(cover, "RGBA")
+    date_font = fit_article_font_to_width(
+        draw,
+        date,
+        330,
+        22,
+        12,
+        article_date_font,
+    )
+    max_text_width = acx(330)
+    if text_w(draw, date, date_font) > max_text_width:
+        suffix = "..."
+        while date and text_w(draw, date + suffix, date_font) > max_text_width:
+            date = date[:-1].rstrip()
+        date = (date + suffix) if date else suffix
+
+    right_padding = acx(14)
+    text_xy = (cover.width - right_padding, acy(25))
+    if ARTICLE_DATE_SCRIM_ENABLED:
+        fade_padding = acx(74)
+        text_width = text_w(draw, date, date_font)
+        gradient_width = min(
+            cover.width,
+            text_width + right_padding + fade_padding,
+        )
+        gradient_height = min(cover.height, acy(72))
+        text_box = draw.textbbox(
+            text_xy,
+            date,
+            font=date_font,
+            anchor="rm",
+        )
+        scrim = Image.new(
+            "RGBA",
+            (gradient_width, gradient_height),
+            (*ARTICLE_DATE_SCRIM_COLOR, 0),
+        )
+        scrim.putalpha(article_date_gradient_mask(
+            gradient_width,
+            gradient_height,
+            article_date_scrim_alpha(cover, text_box),
+            fade_padding,
+        ))
+        cover.alpha_composite(scrim, (cover.width - gradient_width, 0))
+
+    shadow = Image.new("RGBA", cover.size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow, "RGBA").text(
+        (text_xy[0], text_xy[1] + acy(1)),
+        date,
+        font=date_font,
+        fill=(0, 0, 0, 150),
+        anchor="rm",
+    )
+    cover.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(acx(2))))
+    ImageDraw.Draw(cover, "RGBA").text(
+        text_xy,
+        date,
+        font=date_font,
+        fill=ARTICLE_DATE_TEXT_COLOR,
+        anchor="rm",
+    )
     return cover
 
 
@@ -10052,11 +10686,92 @@ def draw_highlighted_article_line(
             cursor += text_w(draw, part, fnt)
 
 
+def build_podcast_ffmpeg_command(
+    media_path: str | Path,
+    staged_output: str | Path,
+    *,
+    source_width: int,
+    source_height: int,
+    output_resolution: str,
+) -> list[str]:
+    """Build the deterministic upload-master encoding command."""
+    target_width, target_height = PODCAST_OUTPUT_RESOLUTIONS.get(
+        output_resolution,
+        PODCAST_OUTPUT_RESOLUTIONS["1080p"],
+    )
+    keyframe_interval = FPS * PODCAST_KEYFRAME_INTERVAL_SECONDS
+    command = [
+        str(FFMPEG),
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{source_width}x{source_height}",
+        "-r",
+        str(FPS),
+        "-i",
+        "-",
+        "-i",
+        str(media_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+    ]
+    if (target_width, target_height) != (source_width, source_height):
+        command.extend(
+            [
+                "-vf",
+                f"scale={target_width}:{target_height}:flags=lanczos",
+            ]
+        )
+    command.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "slow",
+            "-crf",
+            "15",
+            "-bf",
+            "2",
+            "-g",
+            str(keyframe_interval),
+            "-keyint_min",
+            str(keyframe_interval),
+            "-sc_threshold",
+            "0",
+            "-flags",
+            "+cgop",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-movflags",
+            "+faststart",
+            "-shortest",
+            str(staged_output),
+        ]
+    )
+    return command
+
+
 def render_podcast_learning_video(
     media_path: str,
     subtitle_path: str,
     output_path: str,
     template_style: str = "暗色播客",
+    output_resolution: str = "1080p",
     show_ai_vocab: bool = False,
     title_text: str = "",
     background_path: str = "",
@@ -10097,48 +10812,27 @@ def render_podcast_learning_video(
     out_width = ARTICLE_WIDTH if is_article_template else WIDTH
     out_height = ARTICLE_HEIGHT if is_article_template else HEIGHT
     base = None if is_article_template else make_base(background_path)
-    article_image = make_article_image(cover_path, (acx(854), acy(480))) if is_article_template else None
-    male, female = (None, None) if is_article_template else make_avatars()
     title_text = (title_text or TITLE_TEXT).strip() or TITLE_TEXT
-    date_text = (date_text or "Jul 23rd 2026").strip() or "Jul 23rd 2026"
+    date_text = re.sub(r"\s+", " ", str(date_text or "")).strip()
+    article_image = make_article_image(cover_path, (acx(854), acy(480))) if is_article_template else None
+    if article_image is not None:
+        article_image = decorate_article_cover(
+            article_image,
+            date_text,
+            article_logo,
+        )
+        date_text = ""
+        article_logo = None
+    male, female = (None, None) if is_article_template else make_avatars()
 
     with staged_media_output(output_path) as staged_output:
-        cmd = [
-            str(FFMPEG),
-            "-y",
-            "-f",
-            "rawvideo",
-            "-vcodec",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{out_width}x{out_height}",
-            "-r",
-            str(FPS),
-            "-i",
-            "-",
-            "-i",
-            str(media_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            "slow",
-            "-crf",
-            "15",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            str(staged_output),
-        ]
+        cmd = build_podcast_ffmpeg_command(
+            media_path,
+            staged_output,
+            source_width=out_width,
+            source_height=out_height,
+            output_resolution=output_resolution,
+        )
         process = None
         last_index = 0
         last_cue_key = object()

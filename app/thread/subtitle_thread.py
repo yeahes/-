@@ -6,9 +6,10 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Mapping
+from typing import Callable, Dict, Mapping
 
 from PyQt5.QtCore import QSettings, QThread, pyqtSignal
+from openai import OpenAI
 
 from app.common.config import cfg
 from app.core.bk_asr.asr_data import ASRData
@@ -60,6 +61,13 @@ from app.core.subtitle_processor.word_timing_trust import (
     find_implausible_word_timing_runs,
 )
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor
+from app.core.subtitle_processor.subtitle_review_marks import (
+    write_subtitle_review_ledger,
+)
+from app.core.subtitle_processor.translation_quality_audit import (
+    audit_fixed_id_translation_quality,
+    build_translation_audit_rows,
+)
 from app.core.subtitle_processor.translate import TranslatorFactory, TranslatorType
 from app.core.utils.logger import setup_logger
 from app.core.utils.test_opanai import test_openai
@@ -89,7 +97,9 @@ class SubtitleThread(QThread):
         "translate_subtitle": (50, 64),
         "screen_subtitle_edit": (28, 92),
         "whisperx_time_only_alignment": (92, 96),
-        "final_subtitle_save": (96, 100),
+        "display_page_translation": (96, 98),
+        "translation_quality_audit": (98, 99),
+        "final_subtitle_save": (99, 100),
     }
 
     def __init__(self, task: SubtitleTask):
@@ -318,6 +328,19 @@ class SubtitleThread(QThread):
         if not isinstance(event, dict):
             return
         phase = str(event.get("phase") or "")
+        if phase == "display_page_translation":
+            completed = event.get("completed")
+            total = event.get("total")
+            self._emit_stage_progress(
+                "display_page_translation",
+                "双语分页语义分配",
+                completed=int(completed) if completed is not None else None,
+                total=int(total) if total is not None else None,
+                cache_hits=int(event.get("cache_hits") or 0),
+                retries=int(event.get("retries") or 0),
+                details={key: value for key, value in event.items() if key != "phase"},
+            )
+            return
         phase_timers = self.__dict__.setdefault("_screen_editor_phase_started_at", {})
         phase_started_at = phase_timers.setdefault(phase, time.perf_counter()) if phase else None
         completed = event.get("completed")
@@ -419,11 +442,12 @@ class SubtitleThread(QThread):
             )
         metadata["stage_timings_seconds"] = dict(self._stage_timings_seconds)
         metadata["stage_timings_total_seconds"] = round(sum(self._stage_timings_seconds.values()), 3)
+        article_run_metadata = self.__dict__.get("_article_run_metadata")
+        if not isinstance(article_run_metadata, dict):
+            article_run_metadata = self._empty_article_run_metadata()
         metadata["run_comparison"] = {
             "schema_version": 1,
-            "article_reference": dict(
-                getattr(self, "_article_run_metadata", self._empty_article_run_metadata())
-            ),
+            "article_reference": dict(article_run_metadata),
             "translation_runtime_config": {
                 "translation_model": str(metadata.get("translation_model", "") or ""),
                 "full_translation_model": str(
@@ -453,6 +477,9 @@ class SubtitleThread(QThread):
                 ),
                 "allocation_max_concurrency": int(
                     getattr(screen_editor, "allocation_max_concurrency", 0) or 0
+                ),
+                "translation_request_policy": dict(
+                    metadata.get("translation_request_policy") or {}
                 ),
                 "chinese_polish_enabled": bool(
                     getattr(screen_editor, "enable_chinese_polish", False)
@@ -791,6 +818,130 @@ class SubtitleThread(QThread):
             )
 
     @staticmethod
+    def _run_translation_quality_audit(
+        screen_editor: ScreenSubtitleEditor,
+        asr_data: ASRData,
+        coverage_report_path: str | None,
+        *,
+        progress_callback: Callable[[Dict], None] | None = None,
+    ) -> dict:
+        """Run the dedicated OpenCode audit after actual pages are frozen."""
+        if not coverage_report_path:
+            return {}
+        artifact_dir = stable_artifact_dir(Path(coverage_report_path))
+        rows = build_translation_audit_rows(
+            asr_data.segments,
+            getattr(screen_editor, "_display_page_translation_artifact", {}) or {},
+        )
+        page_artifact = dict(
+            getattr(screen_editor, "_display_page_translation_artifact", {}) or {}
+        )
+        model = str(cfg.opencode_go_model.value or "deepseek-v4-flash").strip()
+        if str(page_artifact.get("status") or "") != "PASS":
+            payload = {
+                "schema_version": 1,
+                "status": "SKIPPED",
+                "model": model,
+                "source_subtitle_count": len(rows),
+                "audited_subtitle_count": 0,
+                "issue_count": 0,
+                "items": [],
+                "batch_errors": [
+                    {
+                        "code": (
+                            "translation_quality_audit_skipped_"
+                            "page_projection_failed"
+                        )
+                    }
+                ],
+            }
+        else:
+            api_key = str(cfg.opencode_go_api_key.value or "").strip()
+            base_url = str(cfg.opencode_go_api_base.value or "").strip()
+        if str(page_artifact.get("status") or "") == "PASS" and (
+            not api_key or not base_url or not model
+        ):
+            payload = {
+                "schema_version": 1,
+                "status": "UNAVAILABLE",
+                "model": model,
+                "source_subtitle_count": len(rows),
+                "audited_subtitle_count": 0,
+                "issue_count": 0,
+                "items": [],
+                "batch_errors": [
+                    {"code": "opencode_translation_audit_not_configured"}
+                ],
+            }
+        elif str(page_artifact.get("status") or "") == "PASS":
+            client = OpenAI(
+                base_url=base_url,
+                api_key=api_key,
+                max_retries=0,
+                timeout=90,
+            )
+
+            def completion(request: dict) -> dict:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": str(request["system_prompt"]),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "target_ids": [
+                                        str(value)
+                                        for value in request["target_ids"]
+                                    ],
+                                    "subtitles": request["rows"],
+                                    **(
+                                        {
+                                            "candidate_issues": request[
+                                                "candidate_issues"
+                                            ]
+                                        }
+                                        if request.get("candidate_issues")
+                                        else {}
+                                    ),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
+                content = str(response.choices[0].message.content or "").strip()
+                if content.startswith("```"):
+                    content = content.removeprefix("```json").removeprefix("```")
+                    content = content.removesuffix("```").strip()
+                parsed = json.loads(content)
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        "translation quality audit returned non-object JSON"
+                    )
+                return parsed
+
+            payload = audit_fixed_id_translation_quality(
+                rows,
+                completion,
+                model=model,
+                cache_dir=artifact_dir / "translation-quality-audit-cache",
+                progress_callback=progress_callback,
+            )
+        write_json_artifact(
+            artifact_dir / "translation-quality-audit.json",
+            payload,
+        )
+        write_subtitle_review_ledger(artifact_dir)
+        return payload
+
+    @staticmethod
     def _srt_timestamp(ms: int) -> str:
         ms = max(0, int(ms))
         hours = ms // 3_600_000
@@ -850,7 +1001,11 @@ class SubtitleThread(QThread):
         if not artifact_source.is_dir():
             return str(report_target), None, None
         artifact_target = run_dir / artifact_source.name
-        shutil.copytree(artifact_source, artifact_target)
+        shutil.copytree(
+            artifact_source,
+            artifact_target,
+            ignore=shutil.ignore_patterns("translation-quality-audit-cache"),
+        )
         return str(report_target), artifact_source, artifact_target
 
     @staticmethod
@@ -1380,6 +1535,31 @@ class SubtitleThread(QThread):
             item for item in polish_log
             if item.get("decision") in {"rejected", "skipped", "batch_skipped"}
         ]
+        repair_log = list(manifest.get("safe_auto_repair_log") or [])
+        actual_repairs = []
+        seen_repairs = set()
+        for item in repair_log:
+            changed = (
+                str(item.get("before_chinese") or "")
+                != str(item.get("after_chinese") or "")
+                or item.get("before_start_ms") != item.get("after_start_ms")
+                or item.get("before_end_ms") != item.get("after_end_ms")
+            )
+            if not changed:
+                continue
+            key = (
+                str(item.get("subtitle_id") or ""),
+                str(item.get("before_chinese") or ""),
+                str(item.get("after_chinese") or ""),
+                item.get("before_start_ms"),
+                item.get("before_end_ms"),
+                item.get("after_start_ms"),
+                item.get("after_end_ms"),
+            )
+            if key in seen_repairs:
+                continue
+            seen_repairs.add(key)
+            actual_repairs.append(item)
 
         status = str(manifest.get("validation_status") or "unknown")
         blocked = bool(manifest.get("render_blocked"))
@@ -1407,6 +1587,7 @@ class SubtitleThread(QThread):
             f"- ERROR：{len(errors)}",
             f"- WARNING：{len(warnings)}",
             f"- INFO：{len(info)}",
+            f"- 实际修复：{len(actual_repairs)}",
             f"- 润色成功：{len(applied_polish)}",
             f"- 润色跳过/拒绝：{len(rejected_polish)}",
         ]
@@ -1418,6 +1599,23 @@ class SubtitleThread(QThread):
         if warnings:
             lines.extend(["", "主要 WARNING："])
             lines.extend(self._summary_issue_lines(warnings, limit=8))
+
+        if actual_repairs:
+            lines.extend(["", "本次自动修复："])
+            for item in actual_repairs[:12]:
+                subtitle_id = str(item.get("subtitle_id") or "")
+                before_chinese = str(item.get("before_chinese") or "")
+                after_chinese = str(item.get("after_chinese") or "")
+                if before_chinese != after_chinese:
+                    lines.append(
+                        f"- {subtitle_id}：{before_chinese} -> {after_chinese}"
+                    )
+                else:
+                    lines.append(
+                        f"- {subtitle_id}：时间轴 "
+                        f"{item.get('before_start_ms')}-{item.get('before_end_ms')} -> "
+                        f"{item.get('after_start_ms')}-{item.get('after_end_ms')}"
+                    )
 
         if applied_polish:
             lines.extend(["", "本次中文润色："])
@@ -1756,6 +1954,10 @@ class SubtitleThread(QThread):
                             asr_raw,
                             article_context,
                             output_dir=article_output_dir,
+                            article_text=str(
+                                getattr(self.task, "article_reference_text", "")
+                                or ""
+                            ),
                         )
                     asr_data = asr_corrected
                     prior_correction_details = self._resume_stage_details(
@@ -1998,6 +2200,8 @@ class SubtitleThread(QThread):
                     ),
                     allocation_max_concurrency=subtitle_config.screen_subtitle_allocation_max_concurrency,
                     allocation_batch_size=subtitle_config.screen_subtitle_allocation_batch_size,
+                    translation_request_budget=subtitle_config.screen_subtitle_translation_request_budget,
+                    translation_request_max_attempts=subtitle_config.screen_subtitle_translation_request_max_attempts,
                     article_context_prompt=article_translation_prompt,
                     article_context_data=article_context,
                     coverage_report_path=coverage_report_path,
@@ -2151,6 +2355,20 @@ class SubtitleThread(QThread):
                     display_page_errors = list(
                         getattr(exc, "display_page_errors", []) or []
                     )
+                    try:
+                        # Parent Chinese and fixed IDs are already authoritative
+                        # here.  A renderer-page failure must not suppress the
+                        # higher-value English/Chinese review queue.
+                        self._run_translation_quality_audit(
+                            screen_editor,
+                            asr_data,
+                            coverage_report_path,
+                        )
+                    except Exception as audit_exc:
+                        logger.warning(
+                            "Translation quality audit after page failure unavailable: %s",
+                            audit_exc,
+                        )
                     issue = {
                         "code": "display_page_translation_invalid",
                         "message": str(exc),
@@ -2172,6 +2390,44 @@ class SubtitleThread(QThread):
                         manifest_meta=self._screen_manifest_metadata(screen_editor),
                     )
                     raise
+                audit_stage_started = self._begin_stage(
+                    "translation_quality_audit",
+                    "翻译质量审计",
+                )
+
+                def audit_progress(event: Dict) -> None:
+                    completed = event.get("completed")
+                    total = event.get("total")
+                    self._emit_stage_progress(
+                        "translation_quality_audit",
+                        "翻译质量审计",
+                        completed=(
+                            int(completed) if completed is not None else None
+                        ),
+                        total=int(total) if total is not None else None,
+                        cache_hits=int(event.get("cache_hits") or 0),
+                        retries=int(event.get("retries") or 0),
+                        details=dict(event),
+                    )
+
+                translation_audit = self._run_translation_quality_audit(
+                    screen_editor,
+                    asr_data,
+                    coverage_report_path,
+                    progress_callback=audit_progress,
+                )
+                self._complete_stage(
+                    "translation_quality_audit",
+                    "翻译质量审计",
+                    audit_stage_started,
+                )
+                if translation_audit.get("status") != "PASS":
+                    raise RuntimeError(
+                        self.tr(
+                            "中文质量审计未覆盖全部固定字幕，已保留完成批次；"
+                            "请重试以补齐未完成批次。"
+                        )
+                    )
                 final_duration_errors = screen_editor._subtitle_duration_issues(
                     asr_data.segments,
                     "ERROR",

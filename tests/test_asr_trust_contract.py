@@ -767,6 +767,78 @@ class ASRTrustContractTests(unittest.TestCase):
         self.assertEqual(asr.last_compressed_timing_repairs, [])
         self.assertEqual(len(asr.last_unresolved_compressed_timing_candidates), 1)
 
+    @staticmethod
+    def _terminal_compressed_hallucination_fixture():
+        valid_words = "corporations hide the true origins of their products.".split()
+        source = [
+            ASRDataSeg(word, 1000 + index * 240, 1240 + index * 240)
+            for index, word in enumerate(valid_words)
+        ]
+        tail_words = (
+            "there are some other liters to look first and see that inside the "
+            "never of nonsense in a free mole and an octavia character is nothing "
+            "that low here is a simple fact for these imaginary insurance companies"
+        ).split()
+        tail_start_ms = source[-1].end_time
+        source.extend(
+            ASRDataSeg(
+                word,
+                tail_start_ms + index * 4,
+                tail_start_ms + index * 4 + 4,
+            )
+            for index, word in enumerate(tail_words)
+        )
+        local = [
+            ASRDataSeg(segment.text, segment.start_time, segment.end_time)
+            for segment in source[: len(valid_words)]
+        ]
+        return source, local, len(valid_words)
+
+    def test_faster_whisper_removes_impossible_terminal_tail_omitted_by_local_asr(self):
+        source, local, tail_start = self._terminal_compressed_hallucination_fixture()
+        asr = object.__new__(FasterWhisperASR)
+        asr._can_run_local_gap_repair = lambda: True
+        asr._transcribe_local_window = lambda *_args: local
+        asr.last_tail_hallucination_repair = {}
+
+        repaired = asr._repair_suspicious_compressed_timing(source)
+
+        self.assertEqual(
+            [segment.text for segment in repaired],
+            [segment.text for segment in source[:tail_start]],
+        )
+        self.assertEqual(
+            asr.last_tail_hallucination_repair["code"],
+            "locally_unconfirmed_impossible_terminal_tail",
+        )
+        self.assertEqual(
+            asr.last_tail_hallucination_repair["removed_word_count"],
+            len(source) - tail_start,
+        )
+        self.assertEqual(find_implausible_word_timing_runs(repaired), [])
+
+    def test_faster_whisper_keeps_terminal_tail_when_local_asr_hears_more_words(self):
+        source, local, tail_start = self._terminal_compressed_hallucination_fixture()
+        local.append(
+            ASRDataSeg(
+                source[tail_start].text,
+                source[tail_start - 1].end_time,
+                source[tail_start - 1].end_time + 220,
+            )
+        )
+        asr = object.__new__(FasterWhisperASR)
+        asr._can_run_local_gap_repair = lambda: True
+        asr._transcribe_local_window = lambda *_args: local
+        asr.last_tail_hallucination_repair = {}
+
+        repaired = asr._repair_suspicious_compressed_timing(source)
+
+        self.assertEqual(
+            [segment.text for segment in repaired],
+            [segment.text for segment in source],
+        )
+        self.assertFalse(asr.last_tail_hallucination_repair)
+
     def test_faster_whisper_restores_cached_order_only_for_the_same_word_multiset(self):
         source, local, issue_start = self._compressed_timing_fixture()
         source[issue_start + 2], source[issue_start + 3] = (

@@ -581,8 +581,10 @@ class SubtitleConfig:
     screen_subtitle_chinese_polish: bool = False
     screen_subtitle_max_cjk: int = 24
     screen_subtitle_max_english: int = 16
-    screen_subtitle_allocation_max_concurrency: int = 3
+    screen_subtitle_allocation_max_concurrency: int = 2
     screen_subtitle_allocation_batch_size: int = 16
+    screen_subtitle_translation_request_budget: int = 40
+    screen_subtitle_translation_request_max_attempts: int = 3
     custom_prompt_text: Optional[str] = None
 
 
@@ -594,6 +596,7 @@ class SynthesisConfig:
     soft_subtitle: bool = True
     podcast_learning_template: bool = False
     podcast_template_style: str = "暗色播客"
+    podcast_template_resolution: str = "1080p"
     podcast_template_ai_vocab: bool = False
     podcast_template_english_only: bool = False
     podcast_template_title: str = ""

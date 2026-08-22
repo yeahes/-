@@ -120,9 +120,9 @@ class SubtitleSettingDialog(MessageBoxBase):
             cfg.screen_subtitle_allocation_max_concurrency,
             FIF.TILES,
             self.tr("中文分配并发"),
-            self.tr("只并发请求中文逐条分配；不改变字幕切分、提示词、ID 或最终写回。建议 3，最高 10。"),
+            self.tr("全文翻译、中文分配和分页翻译最多同时发起两路请求；不改变字幕、ID 或时间轴。"),
             minimum=1,
-            maximum=10,
+            maximum=2,
             parent=self,
         )
         self.allocation_batch_size_card = SpinBoxSettingCard(
@@ -132,6 +132,24 @@ class SubtitleSettingDialog(MessageBoxBase):
             self.tr("每次请求分配的语义组数量；较小更稳，较大可能单次返回更慢。默认 16。"),
             minimum=6,
             maximum=24,
+            parent=self,
+        )
+        self.translation_request_budget_card = SpinBoxSettingCard(
+            cfg.screen_subtitle_translation_request_budget,
+            FIF.SPEED_HIGH,
+            self.tr("单次任务请求上限"),
+            self.tr("缓存未命中时最多发起的外部请求次数，默认 40；达到上限后停止继续付费请求。"),
+            minimum=8,
+            maximum=200,
+            parent=self,
+        )
+        self.translation_request_attempts_card = SpinBoxSettingCard(
+            cfg.screen_subtitle_translation_request_max_attempts,
+            FIF.SYNC,
+            self.tr("单批最大尝试次数"),
+            self.tr("只对限流、超时、连接失败和服务端错误重试，默认最多 3 次。"),
+            minimum=1,
+            maximum=5,
             parent=self,
         )
 
@@ -147,6 +165,8 @@ class SubtitleSettingDialog(MessageBoxBase):
         performance_layout.setSpacing(10)
         performance_layout.addWidget(self.allocation_concurrency_card)
         performance_layout.addWidget(self.allocation_batch_size_card)
+        performance_layout.addWidget(self.translation_request_budget_card)
+        performance_layout.addWidget(self.translation_request_attempts_card)
 
         self.compatibility_section = QWidget(self)
         compatibility_layout = QVBoxLayout(self.compatibility_section)

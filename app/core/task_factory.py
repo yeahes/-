@@ -210,6 +210,8 @@ class TaskFactory:
             screen_subtitle_max_english=cfg.screen_subtitle_max_english.value,
             screen_subtitle_allocation_max_concurrency=cfg.screen_subtitle_allocation_max_concurrency.value,
             screen_subtitle_allocation_batch_size=cfg.screen_subtitle_allocation_batch_size.value,
+            screen_subtitle_translation_request_budget=cfg.screen_subtitle_translation_request_budget.value,
+            screen_subtitle_translation_request_max_attempts=cfg.screen_subtitle_translation_request_max_attempts.value,
             # 字幕提示
             custom_prompt_text=cfg.custom_prompt_text.value,
         )
@@ -318,6 +320,7 @@ class TaskFactory:
             soft_subtitle=cfg.soft_subtitle.value,
             podcast_learning_template=cfg.podcast_learning_template.value,
             podcast_template_style=cfg.podcast_template_style.value,
+            podcast_template_resolution=cfg.podcast_template_resolution.value,
             podcast_template_ai_vocab=cfg.podcast_template_ai_vocab.value,
             podcast_template_english_only=cfg.podcast_template_english_only.value,
             podcast_template_title=cfg.podcast_template_title.value,

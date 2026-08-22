@@ -687,6 +687,13 @@ class VideoSynthesisThread(QThread):
                     subtitle_file,
                     output_path,
                     template_style=self.task.synthesis_config.podcast_template_style,
+                    output_resolution=str(
+                        getattr(
+                            self.task.synthesis_config,
+                            "podcast_template_resolution",
+                            "1080p",
+                        )
+                    ),
                     show_ai_vocab=self.task.synthesis_config.podcast_template_ai_vocab,
                     english_only=bool(
                         getattr(

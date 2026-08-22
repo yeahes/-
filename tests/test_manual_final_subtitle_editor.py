@@ -53,6 +53,28 @@ out of date.
     )
 
 
+def test_legacy_display_page_plan_is_marked_for_refresh():
+    session = ManualFinalSubtitleSession.__new__(ManualFinalSubtitleSession)
+    session.display_page_edits = []
+    session.display_page_boundary_overrides = {}
+    session._effective_display_page_artifact = lambda: {
+        "status": "ERROR",
+        "planner_version": "article-fixed-font-pages-v28",
+    }
+    assert session.display_page_plan_needs_refresh() is True
+
+
+def test_current_display_page_plan_does_not_require_refresh():
+    session = ManualFinalSubtitleSession.__new__(ManualFinalSubtitleSession)
+    session.display_page_edits = []
+    session.display_page_boundary_overrides = {}
+    session._effective_display_page_artifact = lambda: {
+        "status": "PASS",
+        "planner_version": stable_display_page_contract.DISPLAY_PAGE_PLANNER_VERSION,
+    }
+    assert session.display_page_plan_needs_refresh() is False
+
+
 def _session_fixture(root: Path) -> tuple[ManualFinalSubtitleSession, Path, Path]:
     source_dir = root / "source"
     subtitle_dir = root / "work" / "subtitle"
@@ -2174,6 +2196,48 @@ def test_stale_single_page_uses_current_parent_chinese_without_confirmation():
         assert single_page["translated_subtitle"] == "新版中文二"
         assert single_page["display_page_chinese_stale"] is False
         assert single_page["display_page_chinese_confirmed"] is True
+
+
+def test_complete_manual_pages_replace_legacy_error_artifact_before_review():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        rows = session.to_model_data(prefer_display_pages=True)
+        session.apply_display_page_model_data(rows, allow_incomplete_chinese=True)
+        assert session.display_page_edits
+
+        artifact_path = session.artifact_dir / "display-page-translations.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact.update(
+            {
+                "status": "ERROR",
+                "planner_version": "article-fixed-font-pages-v28",
+                "errors": [
+                    {
+                        "code": "display_page_blueprint_invalid",
+                        "parent_subtitle_id": "S0002",
+                    }
+                ],
+            }
+        )
+        _write_json(artifact_path, artifact)
+        session.cues[1]["chinese_review_required"] = True
+
+        effective = session._effective_display_page_artifact()
+        refreshed_rows = session.to_model_data(prefer_display_pages=True)
+        single_page = next(
+            row
+            for row in refreshed_rows.values()
+            if row.get("manual_cue_id") == "S0002"
+        )
+
+        assert effective["recovery_source"] == "complete_manual_page_edits"
+        assert "display_page_blueprint_invalid" not in single_page[
+            "display_page_issue_codes"
+        ]
+        assert single_page["display_page_review_required"] is False
+        assert single_page["display_page_chinese_confirmed"] is True
+        assert single_page["chinese_review_required"] is False
 
 
 def test_stale_page_chinese_remains_visible_but_cannot_publish_until_confirmed():
@@ -5198,6 +5262,10 @@ def test_partial_page_artifact_keeps_valid_pages_and_failed_parent_review_row():
             "parent_chinese_fallback"
         )
         assert failed_pages[1]["display_page_chinese_draft_kind"] == ""
+        assert [row["display_page_chinese_pending"] for row in failed_pages] == [
+            False,
+            True,
+        ]
         assert all(
             "page_translation_chinese_token_split"
             in row["display_page_issue_codes"]

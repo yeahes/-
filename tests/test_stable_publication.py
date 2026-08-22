@@ -745,6 +745,180 @@ class StablePublicationTests(unittest.TestCase):
                 self.assertNotIn("final_timeline_invalid", warning_text)
                 self.assertIn("S0003.P02", warning_text)
 
+    def test_manual_blocker_summary_prefers_actionable_page_and_focuses_it(self):
+        interface = SubtitleInterface()
+        interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+        interface.manual_final_session = SimpleNamespace(
+            history=[],
+            has_display_page_model=lambda: True,
+            to_model_data=lambda *, prefer_display_pages=False: {
+                "1": {
+                    "start_time": 0,
+                    "end_time": 1000,
+                    "original_subtitle": "First page",
+                    "translated_subtitle": "第一页",
+                    "display_page_view": bool(prefer_display_pages),
+                    "display_page_id": "S0003.P01" if prefer_display_pages else "",
+                    "manual_cue_id": "S0003",
+                    "parent_cue_index": 0,
+                    "word_start": 0,
+                    "word_end": 1,
+                },
+                "2": {
+                    "start_time": 1000,
+                    "end_time": 2000,
+                    "original_subtitle": "Second page",
+                    "translated_subtitle": "",
+                    "display_page_view": bool(prefer_display_pages),
+                    "display_page_id": "S0003.P02" if prefer_display_pages else "",
+                    "manual_cue_id": "S0003",
+                    "parent_cue_index": 0,
+                    "word_start": 2,
+                    "word_end": 3,
+                },
+            },
+        )
+        interface._manual_page_view = False
+        interface._manual_parent_boundaries_dirty = False
+        interface._load_manual_final_review_marks = lambda _session: None
+        interface._refresh_manual_boundary_inspector = lambda *args: None
+        self.addCleanup(
+            lambda: (interface.close(), self._qt_app.processEvents())
+        )
+
+        summary = SubtitleInterface._manual_publication_issue_summary(
+            "manual_page_translation_required",
+            {
+                "unconfirmed_chinese_count": 1,
+                "unconfirmed_chinese_pages": ["S0003.P02"],
+                "boundary_review_count": 1,
+                "boundary_review_pages": ["S0004.P01"],
+                "hard_page_count": 0,
+                "hard_pages": [],
+            },
+        )
+        focused = interface._focus_manual_problem_position(summary["first_position"])
+
+        self.assertEqual(summary["positions"], ["S0003.P02", "S0004.P01"])
+        self.assertIn("S0003.P02", summary["message"])
+        self.assertTrue(focused)
+        self.assertTrue(interface._manual_page_view)
+        self.assertEqual(interface.subtitle_table.currentIndex().row(), 1)
+
+    def test_failed_manual_save_keeps_edits_and_focuses_actionable_page(self):
+        interface = SubtitleInterface()
+        interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+        interface.manual_final_session = SimpleNamespace(
+            history=[],
+            has_display_page_model=lambda: True,
+            display_page_review_summary=lambda: {
+                "unconfirmed_chinese_count": 1,
+                "unconfirmed_chinese_pages": ["S0003.P02"],
+            },
+        )
+        interface._manual_save_request_id = 7
+        interface._manual_save_in_progress = True
+        interface._manual_active_save_context = None
+        interface._manual_refresh_requested = False
+        interface._manual_pending_page_split = None
+        focused = []
+        interface._focus_manual_problem_position = lambda value: (
+            focused.append(value) or True
+        )
+        self.addCleanup(
+            lambda: (interface.close(), self._qt_app.processEvents())
+        )
+
+        with patch("app.view.subtitle_interface.InfoBar.warning") as warning:
+            interface._apply_manual_final_save_result(
+                7,
+                {},
+                "manual_page_translation_required",
+            )
+
+        self.assertEqual(focused, ["S0003.P02"])
+        self.assertIn("S0003.P02", interface.status_label.text())
+        self.assertIn("当前编辑仍保留", warning.call_args.args[0])
+        self.assertIn("已定位到第一处问题", warning.call_args.args[1])
+
+    def test_manual_save_preflight_error_uses_same_actionable_location(self):
+        interface = SubtitleInterface()
+        interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+        interface.manual_final_session = SimpleNamespace(
+            display_page_review_summary=lambda: {
+                "hard_page_count": 1,
+                "hard_pages": ["S0012.P01"],
+            },
+        )
+        interface._sync_manual_final_text_edits = MagicMock(
+            side_effect=ManualFinalSubtitleEditError(
+                "render_structural_overflow"
+            )
+        )
+        focused = []
+        interface._focus_manual_problem_position = lambda value: (
+            focused.append(value) or True
+        )
+        self.addCleanup(
+            lambda: (interface.close(), self._qt_app.processEvents())
+        )
+
+        with patch("app.view.subtitle_interface.InfoBar.warning") as warning:
+            request_id = interface.save_manual_final_output()
+
+        self.assertIsNone(request_id)
+        self.assertEqual(focused, ["S0012.P01"])
+        self.assertIn("S0012.P01", interface.status_label.text())
+        self.assertIn("已定位到第一处问题", warning.call_args.args[1])
+
+    def test_blocked_synthesis_entry_focuses_manifest_problem_position(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "stable-final-manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "render_blocked": True,
+                        "render_block_reason": "manual_page_translation_invalid",
+                        "display_page_review_summary": {
+                            "unconfirmed_chinese_count": 1,
+                            "unconfirmed_chinese_pages": ["S0008.P02"],
+                        },
+                        "manual_final_override": {
+                            "schema_version": 2,
+                            "render_block_reason": "manual_page_translation_invalid",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            interface = SubtitleInterface()
+            interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+            interface.manual_final_session = SimpleNamespace(
+                manifest_path=manifest_path,
+                state_fingerprint=lambda: "saved-state",
+            )
+            interface._manual_parent_boundaries_dirty = False
+            interface._manual_package_manifest_path = str(manifest_path)
+            interface._set_manual_clean_checkpoint()
+            focused = []
+            interface._focus_manual_problem_position = lambda value: (
+                focused.append(value) or True
+            )
+            self.addCleanup(
+                lambda: (interface.close(), self._qt_app.processEvents())
+            )
+
+            with patch(
+                "app.view.subtitle_interface.resolve_synthesis_package_inputs",
+                side_effect=RuntimeError("manual_page_translation_invalid"),
+            ), patch("app.view.subtitle_interface.InfoBar.warning") as warning:
+                interface.open_manual_final_in_synthesis()
+
+            self.assertEqual(focused, ["S0008.P02"])
+            self.assertIn("S0008.P02", warning.call_args.args[1])
+            self.assertIn("已定位到第一处问题", warning.call_args.args[1])
+
     def test_manual_translation_review_action_tracks_queue_artifact(self):
         class Session:
             history = []
@@ -1080,6 +1254,79 @@ class StablePublicationTests(unittest.TestCase):
             self.assertEqual(interface._manual_package_manifest_path, "")
             self.assertFalse(interface.manual_final_synthesis_action.isEnabled())
             self.assertFalse(interface.manual_draft_synthesis_action.isEnabled())
+
+    def test_open_manual_final_synthesis_recovers_clean_session_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "stable-final-manifest.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            interface = SubtitleInterface()
+            interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+            interface.manual_final_session = SimpleNamespace(
+                manifest_path=manifest_path,
+                source_media_path=None,
+                state_fingerprint=lambda: "saved-state",
+            )
+            interface.task = None
+            interface._manual_parent_boundaries_dirty = False
+            interface._manual_package_manifest_path = ""
+            interface._set_manual_clean_checkpoint()
+            emitted = []
+            interface.manual_final_ready.connect(
+                lambda media, manifest: emitted.append((media, manifest))
+            )
+            self.addCleanup(
+                lambda: (interface.close(), self._qt_app.processEvents())
+            )
+
+            with patch(
+                "app.view.subtitle_interface.resolve_synthesis_package_inputs",
+                return_value=("audio.m4a", str(manifest_path)),
+            ) as resolver:
+                interface.open_manual_final_in_synthesis()
+
+            self.assertEqual(
+                interface._manual_package_manifest_path,
+                str(manifest_path),
+            )
+            self.assertEqual(emitted, [("audio.m4a", str(manifest_path))])
+            resolver.assert_called_once_with(manifest_path)
+
+    def test_open_manual_final_synthesis_does_not_reuse_manifest_with_unsaved_edits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "stable-final-manifest.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            fingerprint = {"value": "saved-state"}
+            interface = SubtitleInterface()
+            interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+            interface.manual_final_session = SimpleNamespace(
+                manifest_path=manifest_path,
+                source_media_path=None,
+                state_fingerprint=lambda: fingerprint["value"],
+            )
+            interface.task = None
+            interface._manual_parent_boundaries_dirty = False
+            interface._manual_package_manifest_path = str(manifest_path)
+            interface._set_manual_clean_checkpoint()
+            fingerprint["value"] = "edited-state"
+            emitted = []
+            interface.manual_final_ready.connect(
+                lambda media, manifest: emitted.append((media, manifest))
+            )
+            def close_interface():
+                fingerprint["value"] = "saved-state"
+                interface._set_manual_clean_checkpoint()
+                interface.close()
+                self._qt_app.processEvents()
+
+            self.addCleanup(close_interface)
+
+            with patch(
+                "app.view.subtitle_interface.resolve_synthesis_package_inputs"
+            ) as resolver, patch("app.view.subtitle_interface.InfoBar.warning"):
+                interface.open_manual_final_in_synthesis()
+
+            self.assertEqual(emitted, [])
+            resolver.assert_not_called()
 
     def test_async_review_marks_do_not_restore_invalidated_edited_ids(self):
         class Toggle:
@@ -1552,6 +1799,12 @@ class StablePublicationTests(unittest.TestCase):
             report.write_text("PASS", encoding="utf-8")
             artifact_dir = root / "source-artifacts"
             artifact_dir.mkdir()
+            audit_cache_dir = artifact_dir / "translation-quality-audit-cache"
+            audit_cache_dir.mkdir()
+            (audit_cache_dir / ("a" * 64 + ".json")).write_text(
+                '{"cache": true}',
+                encoding="utf-8",
+            )
             words = ["The", "first", "line.", "Second", "line."]
             (artifact_dir / "word-ledger.json").write_text(
                 json.dumps(
@@ -1683,6 +1936,10 @@ class StablePublicationTests(unittest.TestCase):
             self.assertEqual(checkpoint["subtitle_count"], 2)
             self.assertEqual(checkpoint["attempt_id"], failure["attempt_id"])
             self.assertTrue(Path(checkpoint["paths"]["original_top_srt"]).is_file())
+            checkpoint_artifact_dir = checkpoint_path.parent / artifact_dir.name
+            self.assertFalse(
+                (checkpoint_artifact_dir / "translation-quality-audit-cache").exists()
+            )
             self.assertFalse((root / "stable-final-manifest.json").exists())
             session = ManualFinalSubtitleSession.load_from_failure_record(failure_path)
             self.assertEqual(len(session.cues), 2)
@@ -4087,7 +4344,7 @@ class StablePublicationTests(unittest.TestCase):
         self.assertIn("整条字幕调整为 6 屏", action_texts)
         self.assertIn("仅将当前屏拆为 2 屏", action_texts)
         self.assertIn("与下一屏合并", action_texts)
-        self.assertIn("试听从当前页删除的切点", action_texts)
+        self.assertNotIn("试听从当前页删除的切点", action_texts)
         self.assertIn("从当前页删除到结尾", action_texts)
         self.assertIn("确认当前中文", action_texts)
         self.assertIn("确认当前分页边界", action_texts)

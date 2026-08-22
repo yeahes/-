@@ -597,6 +597,116 @@ class FasterWhisperASR(BaseASR):
         _, _, repaired, report = sorted(candidates, key=lambda item: item[:2])[0]
         return repaired, report
 
+    @classmethod
+    def _terminal_impossible_tail_start_index(
+        cls,
+        segments: list[ASRDataSeg],
+    ) -> Optional[int]:
+        """Find a sentence-delimited terminal burst that cannot be spoken."""
+
+        if len(segments) < cls.TAIL_HALLUCINATION_MIN_WORDS + 2:
+            return None
+        tail_end_ms = int(segments[-1].end_time)
+        earliest_candidate = None
+        for start_index in range(len(segments) - 1, 0, -1):
+            duration_ms = tail_end_ms - int(segments[start_index].start_time)
+            if duration_ms > cls.TAIL_HALLUCINATION_MAX_DURATION_MS:
+                break
+            if not re.search(
+                r"[.!?][\"')\]]*$",
+                segments[start_index - 1].text.strip(),
+            ):
+                continue
+            candidate = segments[start_index:]
+            word_count = len(candidate)
+            if word_count < cls.TAIL_HALLUCINATION_MIN_WORDS or duration_ms <= 0:
+                continue
+            words_per_second = word_count * 1000.0 / duration_ms
+            if words_per_second < cls.TAIL_HALLUCINATION_MIN_WPS:
+                continue
+            if not find_implausible_word_timing_runs(candidate):
+                continue
+            earliest_candidate = start_index
+        return earliest_candidate
+
+    @classmethod
+    def _local_retranscription_terminal_anchor_count(
+        cls,
+        segments: list[ASRDataSeg],
+        *,
+        tail_start: int,
+        local_segments: list[ASRDataSeg],
+    ) -> int:
+        """Return an exact unique left-anchor size only when local ASR ends there."""
+
+        if tail_start < 2 or not local_segments:
+            return 0
+        source_words = cls._normalized_words(segments)
+        local_words = cls._normalized_words(local_segments)
+        if any(not word for word in local_words):
+            return 0
+        max_anchor = min(4, tail_start)
+        for anchor_count in range(max_anchor, 1, -1):
+            anchor = source_words[tail_start - anchor_count : tail_start]
+            if any(not word for word in anchor):
+                continue
+            if len(cls._subsequence_starts(source_words[:tail_start], anchor)) != 1:
+                continue
+            local_matches = cls._subsequence_starts(local_words, anchor)
+            if len(local_matches) != 1:
+                continue
+            local_anchor_end = local_matches[0] + anchor_count
+            if any(local_words[local_anchor_end:]):
+                continue
+            source_anchor_end_ms = int(segments[tail_start - 1].end_time)
+            local_anchor_end_ms = int(local_segments[local_anchor_end - 1].end_time)
+            if abs(local_anchor_end_ms - source_anchor_end_ms) > 1500:
+                continue
+            return anchor_count
+        return 0
+
+    def _remove_locally_unconfirmed_impossible_terminal_tail(
+        self,
+        segments: list[ASRDataSeg],
+    ) -> list[ASRDataSeg]:
+        tail_start = self._terminal_impossible_tail_start_index(segments)
+        if tail_start is None:
+            return segments
+
+        context_start = max(0, tail_start - self.INTERNAL_GAP_CONTEXT_WORDS)
+        window_start_ms = max(
+            0,
+            int(segments[context_start].start_time)
+            - self.INTERNAL_GAP_WINDOW_PADDING_MS,
+        )
+        window_end_ms = (
+            int(segments[-1].end_time) + self.INTERNAL_GAP_WINDOW_PADDING_MS
+        )
+        local_segments = self._transcribe_local_window(window_start_ms, window_end_ms)
+        anchor_count = self._local_retranscription_terminal_anchor_count(
+            segments,
+            tail_start=tail_start,
+            local_segments=local_segments,
+        )
+        if not anchor_count:
+            return segments
+
+        candidate = segments[tail_start:]
+        self.last_tail_hallucination_repair = {
+            "code": "locally_unconfirmed_impossible_terminal_tail",
+            "start_ms": int(candidate[0].start_time),
+            "end_ms": int(candidate[-1].end_time),
+            "removed_word_count": len(candidate),
+            "removed_text": " ".join(segment.text.strip() for segment in candidate),
+            "left_anchor_count": anchor_count,
+            "verification": "context_free_local_asr_ended_at_unique_left_anchor",
+        }
+        logger.warning(
+            "Removed locally unconfirmed impossible Faster Whisper terminal tail: %s",
+            self.last_tail_hallucination_repair,
+        )
+        return segments[:tail_start]
+
     def _repair_suspicious_compressed_timing(
         self,
         segments: list[ASRDataSeg],
@@ -606,7 +716,9 @@ class FasterWhisperASR(BaseASR):
         if not segments or not self._can_run_local_gap_repair():
             return segments
 
-        repaired = list(segments)
+        repaired = self._remove_locally_unconfirmed_impossible_terminal_tail(
+            list(segments)
+        )
         attempted = set()
         attempts = 0
         while attempts < self.INTERNAL_GAP_MAX_REPAIRS:

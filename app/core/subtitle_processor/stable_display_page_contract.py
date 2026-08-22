@@ -16,10 +16,44 @@ from app.core.subtitle_processor.chinese_token_boundaries import (
 
 
 DISPLAY_PAGE_SCHEMA_VERSION = 2
-DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v27"
-DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v5"
+DISPLAY_PAGE_PLANNER_VERSION = "article-fixed-font-pages-v29"
+DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION = "display-page-translation-v8"
 DISPLAY_PAGE_TRANSLATION_SOURCE_ECHO_VERSION = "display-page-translation-source-echo-v1"
-DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v6"
+DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION = "fixed-parent-page-allocation-v8"
+
+
+_NEUTRAL_PAGE_PROJECTION_BINDING_TOKENS = frozenset(
+    {
+        "以及",
+        "这些",
+        "那些",
+        "其中",
+        "来自",
+        "出自",
+        "介于",
+    }
+)
+_PAGE_PROJECTION_RELATION_FAMILIES = (
+    frozenset(
+        {
+            "从而",
+            "因为",
+            "原因",
+            "由于",
+            "因此",
+            "所以",
+            "导致",
+            "得益于",
+            "源于",
+        }
+    ),
+    frozenset({"谈的是", "也就是", "即", "意味着", "换言之", "就是"}),
+)
+_CONTEXTUAL_PAGE_PROJECTION_BINDING_TOKENS = {
+    token: family
+    for family in _PAGE_PROJECTION_RELATION_FAMILIES
+    for token in family
+}
 
 
 class DisplayPageContractError(ValueError):
@@ -537,10 +571,64 @@ def _repeated_parent_phrase(source: str, aggregate: str) -> str:
     return ""
 
 
+def _novel_parent_content_tokens(
+    source: str,
+    aggregate: str,
+    projected_parts: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Return fact-bearing page tokens absent from authoritative parent Chinese."""
+    source_tokens = _translation_content_tokens(source)
+    if projected_parts:
+        tokenized_parts = [
+            _translation_content_tokens(part) for part in projected_parts
+        ]
+        aggregate_tokens = (
+            tuple(token for part in tokenized_parts for token in (part or ()))
+            if all(part is not None for part in tokenized_parts)
+            else None
+        )
+    else:
+        aggregate_tokens = _translation_content_tokens(aggregate)
+    if source_tokens is None or aggregate_tokens is None:
+        return ()
+
+    source_token_set = set(source_tokens)
+    source_content = _translation_content(source)
+    novel: list[str] = []
+    seen: set[str] = set()
+    for token in aggregate_tokens:
+        if (
+            token in source_token_set
+            or token in _NEUTRAL_PAGE_PROJECTION_BINDING_TOKENS
+            or token in seen
+        ):
+            continue
+        required_source_markers = _CONTEXTUAL_PAGE_PROJECTION_BINDING_TOKENS.get(
+            token
+        )
+        if required_source_markers and any(
+            marker in source_content for marker in required_source_markers
+        ):
+            continue
+        chinese_count = len(re.findall(r"[\u4e00-\u9fff]", token))
+        if chinese_count:
+            # A reordered source phrase can occasionally be segmented at a
+            # different boundary. Exact source containment is still source-
+            # owned wording, while a new multi-character token is not.
+            if token in source_content or chinese_count < 2:
+                continue
+        elif not re.fullmatch(r"[a-z0-9%$¥￥]{2,}", token):
+            continue
+        seen.add(token)
+        novel.append(token)
+    return tuple(novel)
+
+
 def _parent_projection_quality_errors(
     parent_subtitle_id: str,
     source: str,
     aggregate: str,
+    projected_parts: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     repeated_phrase = _repeated_parent_phrase(source, aggregate)
@@ -550,6 +638,20 @@ def _parent_projection_quality_errors(
                 "code": "page_translation_parent_meaning_repeated",
                 "parent_subtitle_id": parent_subtitle_id,
                 "repeated_phrase": repeated_phrase,
+            }
+        )
+
+    added_tokens = _novel_parent_content_tokens(
+        source,
+        aggregate,
+        projected_parts,
+    )
+    if added_tokens:
+        errors.append(
+            {
+                "code": "page_translation_parent_meaning_added",
+                "parent_subtitle_id": parent_subtitle_id,
+                "added_tokens": list(added_tokens),
             }
         )
 
@@ -576,6 +678,26 @@ def _parent_projection_quality_errors(
             }
         )
     return errors
+
+
+def _source_owned_token_crosses_boundary(
+    source: str,
+    aggregate: str,
+    boundary_offset: int,
+) -> bool:
+    """Only the frozen parent may prove that a page edge bisects a Chinese word."""
+    source_tokens = _translation_content_tokens(source)
+    aggregate_tokens = chinese_tokens(aggregate)
+    if source_tokens is None or aggregate_tokens is None:
+        return False
+    source_token_set = set(source_tokens)
+    offset = 0
+    for token in aggregate_tokens:
+        next_offset = offset + len(token)
+        if offset < boundary_offset < next_offset:
+            return _translation_content(token) in source_token_set
+        offset = next_offset
+    return False
 
 
 def _page_projection_quality_errors(
@@ -786,6 +908,7 @@ def validate_page_translation_response(
                 str(parent.get("parent_subtitle_id") or ""),
                 source_chinese,
                 aggregate_chinese,
+                [page["zh"] for page in pages],
             )
         )
         token_boundaries = chinese_token_boundaries(aggregate_chinese)
@@ -800,7 +923,14 @@ def validate_page_translation_response(
             offset = 0
             for page in pages[:-1]:
                 offset += len(page["zh"])
-                if offset not in token_boundaries:
+                if (
+                    offset not in token_boundaries
+                    and _source_owned_token_crosses_boundary(
+                        source_chinese,
+                        aggregate_chinese,
+                        offset,
+                    )
+                ):
                     errors.append(
                         {
                             "code": "page_translation_chinese_token_split",

@@ -8,7 +8,7 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 from app.core.entities import (
     BatchTaskType,
@@ -602,6 +602,7 @@ def test_multiline_podcast_title_is_preserved_by_ui_and_task_snapshot():
     task_cfg.podcast_template_style.value = "文章单词"
     task_cfg.podcast_template_ai_vocab.value = True
     task_cfg.podcast_template_english_only.value = False
+    task_cfg.podcast_template_resolution.value = "1440p平台上传"
     task_cfg.podcast_template_title.value = title
     task_cfg.need_video.value = True
     task_cfg.soft_subtitle.value = True
@@ -612,6 +613,62 @@ def test_multiline_podcast_title_is_preserved_by_ui_and_task_snapshot():
         )
 
     assert task.synthesis_config.podcast_template_title == title
+    assert task.synthesis_config.podcast_template_resolution == "1440p平台上传"
+
+
+def test_podcast_upload_resolution_persists_and_builds_platform_master():
+    interface = SimpleNamespace()
+    view_cfg = MagicMock()
+
+    with patch("app.view.video_synthesis_interface.cfg", view_cfg):
+        VideoSynthesisInterface.save_podcast_resolution(interface, True)
+
+    view_cfg.set.assert_called_once_with(
+        view_cfg.podcast_template_resolution,
+        "1440p平台上传",
+    )
+
+    view_cfg.reset_mock()
+    with patch("app.view.video_synthesis_interface.cfg", view_cfg):
+        VideoSynthesisInterface.save_podcast_resolution(interface, False)
+
+    view_cfg.set.assert_called_once_with(
+        view_cfg.podcast_template_resolution,
+        "1080p",
+    )
+
+    standard = podcast_learning_video.build_podcast_ffmpeg_command(
+        "source.m4a",
+        "standard.mp4",
+        source_width=1920,
+        source_height=1080,
+        output_resolution="1080p",
+    )
+    upload = podcast_learning_video.build_podcast_ffmpeg_command(
+        "source.m4a",
+        "upload.mp4",
+        source_width=1920,
+        source_height=1080,
+        output_resolution="1440p平台上传",
+    )
+
+    assert "-vf" not in standard
+    assert upload[upload.index("-vf") + 1] == "scale=2560:1440:flags=lanczos"
+    output_options_start = upload.index("-c:v")
+    for option, value in (
+        ("-profile:v", "high"),
+        ("-pix_fmt", "yuv420p"),
+        ("-preset", "slow"),
+        ("-crf", "15"),
+        ("-bf", "2"),
+        ("-g", "50"),
+        ("-keyint_min", "50"),
+        ("-sc_threshold", "0"),
+        ("-ar", "48000"),
+    ):
+        assert upload[upload.index(option, output_options_start) + 1] == value
+
+    assert SynthesisConfig().podcast_template_resolution == "1080p"
 
 
 def test_article_logo_path_is_empty_by_default_and_persisted_by_ui():
@@ -629,6 +686,114 @@ def test_article_logo_path_is_empty_by_default_and_persisted_by_ui():
         view_cfg.podcast_template_logo,
         "C:/brand/logos/channel.png",
     )
+
+
+def test_article_date_is_optional_and_persisted_by_ui():
+    assert SynthesisConfig().podcast_template_date == ""
+
+    date_input = MagicMock()
+    date_input.text.return_value = "  Aug 21st 2026  "
+    interface = SimpleNamespace(podcast_date_input=date_input)
+    view_cfg = MagicMock()
+
+    with patch("app.view.video_synthesis_interface.cfg", view_cfg):
+        VideoSynthesisInterface.save_podcast_date(interface)
+
+    view_cfg.set.assert_called_once_with(
+        view_cfg.podcast_template_date,
+        "Aug 21st 2026",
+    )
+
+
+def test_article_date_has_no_scrim_and_empty_value_is_a_noop():
+    cover_size = (
+        podcast_learning_video.acx(854),
+        podcast_learning_video.acy(480),
+    )
+    source = Image.new("RGBA", cover_size, (232, 226, 214, 255))
+
+    empty = podcast_learning_video.decorate_article_cover(source, "")
+    dated = podcast_learning_video.decorate_article_cover(
+        source,
+        "Aug 21st 2026",
+    )
+
+    assert ImageChops.difference(source, empty).getbbox() is None
+    changed = ImageChops.difference(source.convert("RGB"), dated.convert("RGB"))
+    assert changed.getbbox() is not None
+    _, top, right, bottom = changed.getbbox()
+    assert top > 0
+    assert right < source.width
+    assert bottom <= podcast_learning_video.acy(72)
+    assert podcast_learning_video.ARTICLE_DATE_SCRIM_ENABLED is False
+    assert podcast_learning_video.ARTICLE_DATE_SCRIM_COLOR == (27, 47, 74)
+    assert podcast_learning_video.ARTICLE_DATE_TEXT_COLOR == (251, 246, 237, 255)
+    assert podcast_learning_video.FONT_ALIMAMA_SHUHEI_BOLD.is_file()
+    assert podcast_learning_video.article_date_font(22).getname() == (
+        "Alimama ShuHeiTi",
+        "Bold",
+    )
+
+
+def test_article_date_contrast_covers_solid_and_high_detail_backgrounds():
+    cover_size = (
+        podcast_learning_video.acx(854),
+        podcast_learning_video.acy(480),
+    )
+    sample_box = (
+        cover_size[0] - podcast_learning_video.acx(260),
+        0,
+        cover_size[0],
+        podcast_learning_video.acy(50),
+    )
+    solid_colors = (
+        (0, 0, 0),
+        (255, 255, 255),
+        (255, 226, 0),
+        (0, 150, 255),
+        (230, 40, 150),
+        podcast_learning_video.ARTICLE_DATE_SCRIM_COLOR,
+    )
+    for color in solid_colors:
+        cover = Image.new("RGBA", cover_size, (*color, 255))
+        alpha = podcast_learning_video.article_date_scrim_alpha(
+            cover,
+            sample_box,
+        )
+        assert (
+            podcast_learning_video._article_date_contrast_ratio(color, alpha)
+            >= podcast_learning_video.ARTICLE_DATE_MIN_CONTRAST
+        )
+
+    checkerboard = Image.new("RGBA", cover_size, (0, 0, 0, 255))
+    checker_draw = podcast_learning_video.ImageDraw.Draw(checkerboard)
+    tile = podcast_learning_video.acx(12)
+    for y in range(0, sample_box[3], tile):
+        for x in range(sample_box[0], sample_box[2], tile):
+            if ((x - sample_box[0]) // tile + y // tile) % 2:
+                checker_draw.rectangle(
+                    (x, y, x + tile - 1, y + tile - 1),
+                    fill=(255, 255, 255, 255),
+                )
+    alpha = podcast_learning_video.article_date_scrim_alpha(
+        checkerboard,
+        sample_box,
+    )
+    white_alpha = podcast_learning_video.article_date_scrim_alpha(
+        Image.new("RGBA", cover_size, (255, 255, 255, 255)),
+        sample_box,
+    )
+    assert alpha == white_alpha
+    assert alpha <= podcast_learning_video.ARTICLE_DATE_SCRIM_MAX_ALPHA
+    mask = podcast_learning_video.article_date_gradient_mask(
+        podcast_learning_video.acx(300),
+        podcast_learning_video.acy(72),
+        alpha,
+        podcast_learning_video.acx(74),
+    )
+    assert mask.getpixel((0, 0)) == 0
+    assert mask.getpixel((podcast_learning_video.acx(74), 0)) == alpha
+    assert mask.getpixel((mask.width - 1, 0)) == alpha
 
 
 def test_article_logo_picker_starts_in_dedicated_logo_directory():
@@ -1374,7 +1539,11 @@ if __name__ == "__main__":
     test_english_only_podcast_tasks_use_isolated_output_names_for_both_templates()
     test_english_only_action_persists_and_enables_podcast_template()
     test_multiline_podcast_title_is_preserved_by_ui_and_task_snapshot()
+    test_podcast_upload_resolution_persists_and_builds_platform_master()
     test_article_logo_path_is_empty_by_default_and_persisted_by_ui()
+    test_article_date_is_optional_and_persisted_by_ui()
+    test_article_date_has_no_scrim_and_empty_value_is_a_noop()
+    test_article_date_contrast_covers_solid_and_high_detail_backgrounds()
     test_article_logo_picker_starts_in_dedicated_logo_directory()
     test_manual_draft_gate_only_allows_page_quality_blockers()
     test_manual_draft_gate_rejects_unknown_blockers_and_tampered_srt()

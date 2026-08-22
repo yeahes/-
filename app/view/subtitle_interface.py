@@ -23,7 +23,7 @@ from PyQt5.QtCore import (
     QAbstractTableModel,
     pyqtSignal,
 )
-from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeySequence
+from PyQt5.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QKeySequence
 from PyQt5.QtWidgets import (
     QAbstractItemDelegate,
     QAbstractItemView,
@@ -273,10 +273,19 @@ class SubtitleTableModel(QAbstractTableModel):
         marks = self._marks_for_segment(segment)
         if role == Qt.BackgroundRole:
             if segment.get("media_muted"):
-                return QColor(126, 58, 58, 88)
+                return QBrush(QColor(126, 58, 58, 88))
             if segment.get("display_suppressed"):
-                return QColor(112, 112, 112, 72)
+                return QBrush(QColor(112, 112, 112, 72))
             return self._review_background(marks, col)
+        if role == Qt.ForegroundRole:
+            if (
+                col == 3
+                and segment.get("display_page_chinese_pending")
+                and not str(segment.get("translated_subtitle") or "").strip()
+            ):
+                return QBrush(
+                    QColor("#A8A8A8" if isDarkTheme() else "#767676")
+                )
         if role == Qt.ToolTipRole:
             if segment.get("media_muted"):
                 return self.tr(
@@ -302,6 +311,12 @@ class SubtitleTableModel(QAbstractTableModel):
             elif col == 2:
                 return segment["original_subtitle"]
             elif col == 3:
+                if (
+                    role == Qt.DisplayRole
+                    and segment.get("display_page_chinese_pending")
+                    and not str(segment.get("translated_subtitle") or "").strip()
+                ):
+                    return self.tr("待分配")
                 return segment["translated_subtitle"]
         elif role == Qt.TextAlignmentRole:
             if col in [0, 1]:
@@ -569,7 +584,13 @@ class SubtitleTableModel(QAbstractTableModel):
         seen = set()
         for subtitle_id in subtitle_ids:
             for mark in self._review_marks_by_subtitle_id.get(str(subtitle_id or ""), []):
-                key = (mark.subtitle_id, mark.severity, mark.target, mark.code, mark.reason)
+                key = mark.task_id or (
+                    mark.subtitle_id,
+                    mark.severity,
+                    mark.target,
+                    mark.code,
+                    mark.reason,
+                )
                 if key not in seen:
                     seen.add(key)
                     marks.append(mark)
@@ -607,6 +628,20 @@ class SubtitleTableModel(QAbstractTableModel):
                             else "这里显示的是父字幕更新前的分页中文旧稿；请逐页编辑或确认，"
                             "未确认时不会用于正式成片。"
                         )
+                    ),
+                )
+            )
+        elif segment.get("display_page_chinese_pending"):
+            marks.append(
+                SubtitleReviewMark(
+                    subtitle_id=str(segment.get("manual_cue_id") or "人工终稿"),
+                    severity="BLOCKER",
+                    category="chinese_allocation",
+                    target="chinese",
+                    code="display_page_chinese_pending",
+                    reason=(
+                        "这一屏的中文尚未分配。完整父字幕中文没有丢失；"
+                        "请按本屏英文填写，空白状态不会写入正式成片。"
                     ),
                 )
             )
@@ -661,45 +696,26 @@ class SubtitleTableModel(QAbstractTableModel):
     def _review_marks_for_column(
         marks: list[SubtitleReviewMark], column: int
     ) -> list[SubtitleReviewMark]:
-        target = "english" if column == 2 else "chinese" if column == 3 else ""
-        return [
-            mark
-            for mark in marks
-            if mark.target == "both" or (target and mark.target == target)
-        ]
+        # Both text columns form one fixed-width review band. The tooltip keeps
+        # the exact English/Chinese ownership so category does not alter width.
+        return list(marks) if column in (2, 3) else []
 
     def _review_background(self, marks: list[SubtitleReviewMark], column: int):
         relevant = self._review_marks_for_column(marks, column)
         if isDarkTheme():
             colors = {
-                "blocker": "#282225",
-                "english_cut": "#24364A",
-                "timeline_alignment": "#302C3A",
-                "chinese_allocation": "#29251E",
-                "visual_page": "#29322E",
-                "manual_chinese_review": "#27241F",
+                "blocker": "#3D2424",
+                "review": "#3A3420",
             }
         else:
             colors = {
-                "blocker": "#FFF9F8",
-                "english_cut": "#EAF4FF",
-                "timeline_alignment": "#F4F1FB",
-                "chinese_allocation": "#FFFCF7",
-                "visual_page": "#ECF8F1",
-                "manual_chinese_review": "#FFFBF4",
+                "blocker": "#FFE2E2",
+                "review": "#FFF4CC",
             }
         if any(mark.severity == "BLOCKER" for mark in relevant):
-            return QColor(colors["blocker"])
-        if any(mark.category == "english_cut" for mark in relevant):
-            return QColor(colors["english_cut"])
-        if any(mark.category == "timeline_alignment" for mark in relevant):
-            return QColor(colors["timeline_alignment"])
-        if any(mark.category == "chinese_allocation" for mark in relevant):
-            return QColor(colors["chinese_allocation"])
-        if any(mark.category == "visual_page" for mark in relevant):
-            return QColor(colors["visual_page"])
-        if any(mark.category == "manual_chinese_review" for mark in relevant):
-            return QColor(colors["manual_chinese_review"])
+            return QBrush(QColor(colors["blocker"]))
+        if relevant:
+            return QBrush(QColor(colors["review"]))
         return None
 
     def _review_tooltip(self, marks: list[SubtitleReviewMark], column: int):
@@ -712,14 +728,23 @@ class SubtitleTableModel(QAbstractTableModel):
             "english_cut": "英文切分复查",
             "timeline_alignment": "时间轴复查",
             "chinese_allocation": "中文分配复查",
+            "asr_correction": "英文转录复查",
+            "chinese_length": "中文长度复查",
+            "chinese_fluency": "中文通顺复查",
+            "chinese_coherence": "相邻中文复查",
             "visual_page": "视觉分页复查",
             "manual_chinese_review": "人工调整后中文待检查",
         }
         lines = []
         for mark in relevant:
             label = labels.get(mark.category, "字幕复查")
+            target = {
+                "english": "英文",
+                "chinese": "中文",
+                "both": "双语",
+            }.get(mark.target, "字幕")
             reason = user_facing_issue_reason(mark.reason, code=mark.code)
-            lines.append(f"[{label}] {mark.subtitle_id}: {reason}")
+            lines.append(f"[{target} / {label}] {mark.subtitle_id}: {reason}")
         return "\n".join(lines)
 
 
@@ -1065,8 +1090,8 @@ class SubtitleInterface(QWidget):
 
         self.review_color_legend = CaptionLabel(
             self.tr(
-                "浅蓝：英文切分复查  淡黄：中文对应复查  "
-                "紫色：时间轴复查  绿色：视觉分页复查  淡红：结构阻断"
+                "黄色：需要人工复核  红色：阻止正式合成；"
+                "整条双语区域固定标识，具体问题与位置请悬停查看"
             ),
             self,
         )
@@ -2913,14 +2938,15 @@ class SubtitleInterface(QWidget):
         marks = getattr(self.model, "_review_marks_by_subtitle_id", {}) or {}
         self._review_mark_rows = self._rows_with_review_marks(marks)
         unique_marks = {
-            (
-                mark.subtitle_id,
-                mark.severity,
-                mark.category,
-                mark.target,
-                mark.code,
-                mark.reason,
-            )
+            mark.task_id
+            or (
+                    mark.subtitle_id,
+                    mark.severity,
+                    mark.category,
+                    mark.target,
+                    mark.code,
+                    mark.reason,
+                )
             for row in range(self.model.rowCount())
             for mark in self.model._marks_for_segment(
                 self.model._data.get(str(row + 1), {})
@@ -3043,9 +3069,21 @@ class SubtitleInterface(QWidget):
         )
         if callable(clear_boundary_widgets):
             clear_boundary_widgets()
+        stale_page_plan = bool(
+            callable(
+                getattr(
+                    self.manual_final_session,
+                    "display_page_plan_needs_refresh",
+                    None,
+                )
+            )
+            and self.manual_final_session.display_page_plan_needs_refresh()
+        )
         boundaries_dirty = bool(
             getattr(self, "_manual_parent_boundaries_dirty", False)
+            or stale_page_plan
         )
+        self._manual_parent_boundaries_dirty = boundaries_dirty
         data = self.manual_final_session.to_model_data(
             prefer_display_pages=(
                 self._manual_page_view and not boundaries_dirty
@@ -3151,6 +3189,20 @@ class SubtitleInterface(QWidget):
             return
 
         blocked = bool(manifest.get("render_blocked"))
+        review_summary = dict(
+            manifest.get("display_page_review_summary")
+            or override.get("display_page_review_summary")
+            or {}
+        )
+        render_block_reason = str(
+            override.get("render_block_reason")
+            or manifest.get("render_block_reason")
+            or "unknown"
+        )
+        issue_summary = SubtitleInterface._manual_publication_issue_summary(
+            render_block_reason,
+            review_summary,
+        )
         try:
             resolve_synthesis_package_inputs(
                 session.manifest_path,
@@ -3164,7 +3216,7 @@ class SubtitleInterface(QWidget):
         self.manual_final_synthesis_action.setVisible(True)
         SubtitleInterface._set_optional_action_tooltip(
             self.manual_final_synthesis_action,
-            "" if not blocked else self.tr("正式终稿仍有未通过的分页检查"),
+            "" if not blocked else issue_summary["message"],
         )
         self.manual_draft_synthesis_action.setEnabled(blocked)
         self.manual_draft_synthesis_action.setVisible(True)
@@ -3178,6 +3230,90 @@ class SubtitleInterface(QWidget):
         setter = getattr(action, "setToolTip", None)
         if callable(setter):
             setter(str(text))
+
+    @staticmethod
+    def _manual_publication_issue_summary(
+        reason: str,
+        review_summary: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Build one actionable save/synthesis explanation from page evidence."""
+        review = dict(review_summary or {})
+        normalized_reason = str(reason or "unknown").strip() or "unknown"
+        if normalized_reason in {
+            "manual_page_translation_required",
+            "manual_page_translation_invalid",
+        }:
+            position_fields = (
+                "unconfirmed_chinese_pages",
+                "hard_pages",
+                "boundary_review_pages",
+            )
+        elif normalized_reason in {
+            "render_structural_overflow",
+            "final_cue_timeline_invalid",
+            "final_timeline_invalid",
+        }:
+            position_fields = (
+                "hard_pages",
+                "unconfirmed_chinese_pages",
+                "boundary_review_pages",
+            )
+        else:
+            position_fields = (
+                "hard_pages",
+                "unconfirmed_chinese_pages",
+                "boundary_review_pages",
+            )
+        positions: list[str] = []
+        for value in re.findall(r"S\d{4}(?:\.P\d{2})?", normalized_reason):
+            if value not in positions:
+                positions.append(value)
+        for field in position_fields:
+            for raw_value in review.get(field) or []:
+                value = str(raw_value or "").strip()
+                if re.fullmatch(r"S\d{4}(?:\.P\d{2})?", value) and value not in positions:
+                    positions.append(value)
+        message = user_facing_issue_reason(
+            normalized_reason,
+            code=normalized_reason.split(":", 1)[0].strip(),
+            positions=positions[:12],
+        )
+        if positions and positions[0] not in message:
+            message = message.rstrip("。") + "。位置：" + "、".join(positions[:12])
+        if len(positions) > 12:
+            message += f"（另有{len(positions) - 12}处）"
+        return {
+            "message": message,
+            "positions": positions,
+            "first_position": positions[0] if positions else "",
+        }
+
+    def _focus_manual_problem_position(self, position: str) -> bool:
+        """Switch to the relevant view and select an exact page or parent cue."""
+        match = re.fullmatch(r"(S\d{4})(?:\.P\d{2})?", str(position or "").strip())
+        if match is None or self.manual_final_session is None:
+            return False
+        parent_id = match.group(1)
+        page_id = str(position) if ".P" in str(position) else ""
+        has_page_model = callable(
+            getattr(self.manual_final_session, "has_display_page_model", None)
+        ) and bool(self.manual_final_session.has_display_page_model())
+        if (
+            page_id
+            and has_page_model
+            and not bool(getattr(self, "_manual_parent_boundaries_dirty", False))
+        ):
+            current_rows = list(getattr(self.model, "_data", {}).values())
+            if not any(row.get("display_page_view") for row in current_rows):
+                self._manual_page_view = True
+                self._apply_manual_final_session()
+        row = self._manual_row_for_identity(parent_id=parent_id, page_id=page_id)
+        if row is None and page_id:
+            row = self._manual_row_for_identity(parent_id=parent_id)
+        if row is None:
+            return False
+        self._select_manual_boundary_row(row)
+        return True
 
     def _on_manual_table_data_changed(self, top_left, bottom_right, roles=None) -> None:
         if not self.manual_final_session:
@@ -3412,7 +3548,39 @@ class SubtitleInterface(QWidget):
         except ManualFinalSubtitleEditError as exc:
             self._manual_refresh_requested = False
             self._manual_active_save_context = None
-            InfoBar.warning(self.tr("保存失败"), str(exc), duration=5000, parent=self)
+            review_summary_method = getattr(
+                self.manual_final_session,
+                "display_page_review_summary",
+                None,
+            )
+            review_summary = (
+                dict(review_summary_method() or {})
+                if callable(review_summary_method)
+                else {}
+            )
+            issue_summary = SubtitleInterface._manual_publication_issue_summary(
+                str(exc),
+                review_summary,
+            )
+            focus_problem = getattr(self, "_focus_manual_problem_position", None)
+            focused = bool(
+                callable(focus_problem)
+                and focus_problem(issue_summary["first_position"])
+            )
+            self.status_label.setText(
+                self.tr("人工终稿未保存：") + issue_summary["message"]
+            )
+            InfoBar.warning(
+                self.tr("人工终稿未保存，当前编辑仍保留"),
+                issue_summary["message"]
+                + (
+                    self.tr("。已定位到第一处问题，请修改后再次保存。")
+                    if focused
+                    else self.tr("。请按提示修改后再次保存。")
+                ),
+                duration=7000,
+                parent=self,
+            )
         except Exception as exc:
             self._manual_refresh_requested = False
             self._manual_active_save_context = None
@@ -3569,13 +3737,37 @@ class SubtitleInterface(QWidget):
         if error:
             if pending_for_request:
                 self._manual_pending_page_split = None
-            self.status_label.setText(self.tr("人工终稿保存失败"))
+            current_review_summary = {}
+            review_summary_method = getattr(
+                self.manual_final_session,
+                "display_page_review_summary",
+                None,
+            )
+            if callable(review_summary_method):
+                current_review_summary = dict(review_summary_method() or {})
+            issue_summary = SubtitleInterface._manual_publication_issue_summary(
+                error,
+                current_review_summary,
+            )
+            focus_problem = getattr(self, "_focus_manual_problem_position", None)
+            focused = bool(
+                callable(focus_problem)
+                and focus_problem(issue_summary["first_position"])
+            )
+            self.status_label.setText(
+                self.tr("人工终稿未保存：") + issue_summary["message"]
+            )
             # Keep the in-memory draft, view mode and selection intact.  A
             # failed background publication must never make the user restart.
             InfoBar.warning(
-                self.tr("保存失败"),
-                error,
-                duration=5000,
+                self.tr("人工终稿未保存，当前编辑仍保留"),
+                issue_summary["message"]
+                + (
+                    self.tr("。已定位到第一处问题，请修改后再次保存。")
+                    if focused
+                    else self.tr("。请按提示修改后再次保存。")
+                ),
+                duration=7000,
                 parent=self,
             )
             return
@@ -3661,42 +3853,30 @@ class SubtitleInterface(QWidget):
         self.manual_draft_synthesis_action.setEnabled(can_synthesize_draft)
         self.manual_draft_synthesis_action.setVisible(True)
         review_summary = dict(paths.get("display_page_review_summary") or {})
-        chinese_count = int(
-            review_summary.get("unconfirmed_chinese_count") or 0
+        render_block_reason = str(paths.get("render_block_reason") or "unknown")
+        issue_summary = self._manual_publication_issue_summary(
+            render_block_reason,
+            review_summary,
         )
-        boundary_count = int(
-            review_summary.get("boundary_review_count") or 0
-        )
-        hard_count = int(review_summary.get("hard_page_count") or 0)
-        review_text = self.tr(
-            f"{chinese_count}条分页中文未确认，"
-            f"{boundary_count}个分页边界待复核"
-        )
-        chinese_positions = [
-            str(value)
-            for value in review_summary.get("unconfirmed_chinese_pages") or []
-        ]
-        boundary_positions = [
-            str(value)
-            for value in review_summary.get("boundary_review_pages") or []
-        ]
-        soft_position_text = self.tr("；中文位置：") + "、".join(
-            chinese_positions[:8]
-        )
-        if len(chinese_positions) > 8:
-            soft_position_text += self.tr("等")
-        soft_position_text += self.tr("；边界位置：") + "、".join(
-            boundary_positions[:8]
-        )
-        if len(boundary_positions) > 8:
-            soft_position_text += self.tr("等")
         SubtitleInterface._set_optional_action_tooltip(
             self.manual_final_synthesis_action,
-            "" if can_synthesize else review_text,
+            "" if can_synthesize else issue_summary["message"],
         )
         SubtitleInterface._set_optional_action_tooltip(
             self.manual_draft_synthesis_action,
-            "" if can_synthesize_draft else self.tr("当前检查点不能安全合成草稿"),
+            ""
+            if can_synthesize_draft
+            else (
+                issue_summary["message"]
+                if not can_synthesize
+                else self.tr("当前终稿已通过，可直接正式合成")
+            ),
+        )
+        focused = bool(
+            not can_synthesize
+            and self._focus_manual_problem_position(
+                issue_summary["first_position"]
+            )
         )
         if can_synthesize:
             self.status_label.setText(
@@ -3714,53 +3894,132 @@ class SubtitleInterface(QWidget):
             )
         elif can_synthesize_draft:
             self.status_label.setText(
-                review_text + self.tr("；可合成草稿")
+                self.tr("编辑进度已保存；")
+                + issue_summary["message"]
+                + self.tr("；可合成草稿")
             )
             InfoBar.warning(
                 self.tr("人工终稿尚未通过正式合成检查"),
-                review_text
-                + soft_position_text
-                + self.tr(
-                    "。无需重跑音频；在实际分页中右键可确认当前项或全部非阻断提醒，"
-                    "也可先合成草稿。"
+                issue_summary["message"]
+                + self.tr("。编辑进度已经保存，无需重跑音频；")
+                + (
+                    self.tr("已定位到第一处问题。也可以先合成草稿。")
+                    if focused
+                    else self.tr("也可以先合成草稿。")
                 ),
-                duration=6000,
+                duration=7000,
                 parent=self,
             )
         else:
-            render_block_reason = str(
-                paths.get("render_block_reason") or "unknown"
-            )
-            render_block_text = user_facing_issue_reason(
-                render_block_reason,
-                code=render_block_reason,
-            )
             self.status_label.setText(
-                self.tr(
-                    f"编辑进度已保存；{hard_count}个结构问题仍阻止合成："
-                )
-                + render_block_text
+                self.tr("编辑进度已保存，但暂时不能合成：")
+                + issue_summary["message"]
             )
             InfoBar.warning(
-                self.tr("人工终稿仍有结构错误"),
-                self.tr("阻止原因：")
-                + render_block_text
-                + self.tr("；位置：")
-                + "、".join(
-                    str(value)
-                    for value in review_summary.get("hard_pages") or []
-                )[:300],
-                duration=6000,
+                self.tr("人工终稿已保存，但暂时不能合成"),
+                issue_summary["message"]
+                + (
+                    self.tr("。已定位到第一处问题，请修改后再次保存。")
+                    if focused
+                    else self.tr("。请按提示修改后再次保存。")
+                ),
+                duration=7000,
                 parent=self,
             )
 
     def open_manual_final_in_synthesis(self) -> None:
-        manifest_path = self._manual_package_manifest_path
-        if not manifest_path or not Path(manifest_path).is_file():
+        manifest_candidates: list[Path] = []
+        session = self.manual_final_session
+        session_is_clean = bool(
+            session is None
+            or (
+                not bool(getattr(self, "_manual_parent_boundaries_dirty", False))
+                and not self._reconcile_manual_dirty_state()
+            )
+        )
+        if not session_is_clean:
             InfoBar.warning(
-                self.tr("人工终稿包不可用"),
-                self.tr("请先保存通过检查的人工终稿。"),
-                duration=4000,
+                self.tr("当前编辑尚未保存"),
+                self.tr(
+                    "请先保存人工终稿。保存完成后，程序会列出并定位所有阻止合成的问题。"
+                ),
+                duration=5000,
+                parent=self,
+            )
+            return
+        if session_is_clean:
+            configured_manifest = str(
+                self._manual_package_manifest_path or ""
+            ).strip()
+            if configured_manifest:
+                manifest_candidates.append(Path(configured_manifest))
+        if session is not None and session_is_clean:
+            session_manifest = getattr(session, "manifest_path", None)
+            if session_manifest is not None:
+                candidate = Path(session_manifest)
+                if candidate not in manifest_candidates:
+                    manifest_candidates.append(candidate)
+
+        manifest_path = ""
+        package_media_path = ""
+        validation_error = ""
+        validation_issue_summary: dict[str, Any] | None = None
+        for candidate in manifest_candidates:
+            if not candidate.is_file():
+                continue
+            candidate_reason = ""
+            candidate_review_summary = {}
+            try:
+                candidate_manifest = json.loads(
+                    candidate.read_text(encoding="utf-8-sig")
+                )
+                candidate_override = dict(
+                    candidate_manifest.get("manual_final_override") or {}
+                )
+                candidate_reason = str(
+                    candidate_override.get("render_block_reason")
+                    or candidate_manifest.get("render_block_reason")
+                    or ""
+                )
+                candidate_review_summary = dict(
+                    candidate_manifest.get("display_page_review_summary")
+                    or candidate_override.get("display_page_review_summary")
+                    or {}
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                candidate_manifest = {}
+            try:
+                package_media_path, resolved_manifest = (
+                    resolve_synthesis_package_inputs(candidate)
+                )
+            except RuntimeError as exc:
+                validation_error = str(exc)
+                validation_issue_summary = self._manual_publication_issue_summary(
+                    candidate_reason or validation_error,
+                    candidate_review_summary,
+                )
+                continue
+            manifest_path = str(resolved_manifest)
+            self._manual_package_manifest_path = manifest_path
+            break
+        if not manifest_path:
+            if validation_issue_summary is None:
+                validation_issue_summary = self._manual_publication_issue_summary(
+                    validation_error or "unknown",
+                    {},
+                )
+            focused = self._focus_manual_problem_position(
+                validation_issue_summary["first_position"]
+            )
+            InfoBar.warning(
+                self.tr("暂时不能前往视频合成"),
+                validation_issue_summary["message"]
+                + (
+                    self.tr("。已定位到第一处问题，请修改后重新保存。")
+                    if focused
+                    else self.tr("。请保存通过检查的人工终稿。")
+                ),
+                duration=7000,
                 parent=self,
             )
             return
@@ -3775,14 +4034,14 @@ class SubtitleInterface(QWidget):
                     break
         if (
             not source_media_path
-            and self.manual_final_session is not None
-            and getattr(self.manual_final_session, "source_media_path", None)
+            and session is not None
+            and getattr(session, "source_media_path", None)
             is not None
-            and self.manual_final_session.source_media_path.is_file()
+            and session.source_media_path.is_file()
         ):
-            source_media_path = str(
-                self.manual_final_session.source_media_path.resolve()
-            )
+            source_media_path = str(session.source_media_path.resolve())
+        if not source_media_path and package_media_path:
+            source_media_path = str(package_media_path)
         self.manual_final_ready.emit(source_media_path, manifest_path)
 
     def open_manual_draft_in_synthesis(self) -> None:
@@ -4229,20 +4488,6 @@ class SubtitleInterface(QWidget):
             tail_target_available = bool(
                 selected_page_id or not selected.get("display_page_view")
             )
-            menu.addSeparator()
-            preview_trim_action = Action(
-                FIF.PLAY,
-                self.tr(
-                    "试听从当前页删除的切点"
-                    if selected_page_id
-                    else "试听尾部删除切点"
-                ),
-            )
-            preview_trim_action.setEnabled(row > 0 and tail_target_available)
-            preview_trim_action.triggered.connect(
-                lambda: self._preview_manual_tail_trim(row)
-            )
-            menu.addAction(preview_trim_action)
             trim_tail_action = Action(
                 FIF.DELETE,
                 self.tr(

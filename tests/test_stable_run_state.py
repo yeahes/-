@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -44,8 +45,10 @@ class _Config:
     screen_subtitle_chinese_polish = False
     screen_subtitle_max_cjk = 24
     screen_subtitle_max_english = 16
-    screen_subtitle_allocation_max_concurrency = 3
+    screen_subtitle_allocation_max_concurrency = 2
     screen_subtitle_allocation_batch_size = 16
+    screen_subtitle_translation_request_budget = 40
+    screen_subtitle_translation_request_max_attempts = 3
     custom_prompt_text = ""
 
 
@@ -228,6 +231,39 @@ def test_progress_text_is_human_readable_and_signal_payload_remains_two_values()
     assert "缓存命中 1" in thread.progress.events[-1][1]
     assert "已用时 00:10" in thread.progress.events[-1][1]
     assert "预计剩余 00:30" in thread.progress.events[-1][1]
+
+
+def test_display_page_progress_uses_its_own_stage_and_batch_count():
+    class _Progress:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, *args):
+            self.events.append(args)
+
+    thread = SubtitleThread.__new__(SubtitleThread)
+    thread.progress = _Progress()
+    thread.tr = lambda value: value
+    thread._run_state_store = None
+    thread._last_progress_value = 96
+    thread._active_stage = "display_page_translation"
+    thread._active_stage_started_at = time.perf_counter()
+    thread._screen_editor_phase_started_at = {}
+
+    thread._handle_screen_editor_progress(
+        {
+            "phase": "display_page_translation",
+            "completed": 1,
+            "total": 2,
+            "cache_hits": 0,
+            "retries": 1,
+            "active_batches": 1,
+        }
+    )
+
+    assert thread.progress.events[-1][0] == 97
+    assert "双语分页语义分配" in thread.progress.events[-1][1]
+    assert "第 1/2 批" in thread.progress.events[-1][1]
 
 
 def test_resume_recomputes_only_stale_article_asr_correction_policy():

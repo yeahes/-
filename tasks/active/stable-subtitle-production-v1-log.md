@@ -1,5 +1,101 @@
 # Progress Log
 
+## 2026-08-21 - Podcast Upload Master GOP Correction
+
+- Confirmed the two 13:21 employment outputs were 2560x1440 upload masters at
+  7.17-7.53 Mbps and 684.55-718.78 MB; the saved resolution option was 1440p.
+- Corrected the fixed GOP from 13 frames (0.52 seconds) to 50 frames (2 seconds)
+  at 25 fps. CRF 15 and the existing quality settings remain unchanged.
+- Command regression coverage locks both `-g` and `-keyint_min` to 50 and keeps
+  scene-cut insertion disabled for deterministic cadence.
+- Two representative 20-second re-encodes measured 4.47/4.58 MiB at 1080p and
+  5.85/5.99 MiB at 1440p. For the same 13:21 bilingual video, those samples
+  extrapolate to about 181 MiB and 237 MiB. Samples are stored under
+  `output/encoding-size-check-20260821/`.
+
+## 2026-08-21 - Article Cover Date Control
+
+- Restored the article-template `模板日期` input over the existing
+  `podcast_template_date` task field. It is visible only for the article-word
+  template, persists on edit and task creation, and accepts an empty value to
+  suppress the overlay.
+- Replaced the removed fixed date block with a borderless top-right gradient
+  scrim. It uses `#1B2F4A`, automatically strengthens until the actual glyph
+  footprint reaches at least 4.5:1 contrast, and fades only outside the text
+  footprint toward the left and bottom. `#FBF6ED` date text uses the bundled
+  `resource/podcast_template/fonts/AlimamaShuHeiTi-Bold.ttf`. The cover mask
+  owns the outside corner, and no independent pill radius remains.
+- Static logo/date decoration is composed once before the frame loop. The
+  formal renderer generated the current real-cover preview under
+  `output/article-date-gradient-preview-20260821/`.
+- Focused render and synthesis safety tests pass. Real and light-cover visual
+  checks are stored under `output/article-date-reenabled-20260821/`.
+
+## 2026-08-21 - Employment Audio No-GUI Production Audit
+
+### Final rerun after generic review filtering
+
+- Latest checkpoint: `20260821T135047.821840-f6e7faac`.
+- Fixed-ID result remains 260 subtitles, 2,575/2,575 aligned words, zero final
+  timeline errors, and 260/260 quality-audited IDs.
+- Generic review ownership filters removed confirmed article-entity collisions,
+  optional discourse-marker omissions, and stale orphan-predicate flags between
+  two complete sentences. The queue is now 17 tasks across 18 IDs: 93.08%
+  automatic completion by fixed-ID coverage.
+- Remaining blocker: S0029, S0061, S0223, and S0247 need safe visual pagination;
+  S0057 needs two page-translation rows. Full offline regression passes 30/30.
+
+- Replayed `无论怎么衡量，就业市场都很疲软` directly through the subtitle
+  thread using its Desktop article text. The previous authority-write failure
+  was not reproduced after the allocation retry cache completed a valid fixed-ID
+  result; no empty parent Chinese record remains.
+- Production evidence: 260 fixed subtitles, 2,575/2,575 aligned words,
+  final timeline PASS with zero errors, 260/260 parent Chinese records, and
+  260/260 OpenCode Flash audit coverage.
+- The page stage intentionally remains render-blocked for four cues with no
+  safe normal-font partition and two missing S0016 page rows. The editor queue
+  has 23 tasks affecting 26 IDs, giving 90.0% automatic completion by fixed-ID
+  coverage. The queue groups the page failures into one blocker and leaves the
+  remaining 22 tasks as review work.
+- Root-cause fixes: comma-terminated numeric clause restarts are no longer
+  misclassified as numeric unit splits; a valid scoped page retry no longer
+  inherits the first attempt's resolved errors; authority failures identify
+  the exact invalid field and fixed ID.
+- The latest editable checkpoint is under
+  `work-dir/无论怎么衡量，就业市场都很疲软/subtitle/stable-checkpoints/`.
+  It must be loaded after restarting the executable before manual-final save
+  and synthesis are considered verified.
+
+## 2026-08-20 - Terminal ASR Compression Boundary
+
+- Root cause: a completed Faster-Whisper run produced a non-repeated,
+  non-silent 25-word hallucination inside the final 462ms. Existing tail
+  cleanup only covered short repeated silent tails, while double-anchored
+  compressed-timing repair cannot have a right anchor at end of media.
+- Fix owner: Faster-Whisper native ASR validation, before the authoritative
+  word ledger is published. A terminal burst is removed only with impossible
+  timing plus a unique exact left anchor whose context-free local
+  retranscription emits no later word.
+- Regression protects both outcomes: verified omission removes the tail;
+  locally audible following text is preserved and remains fail-closed.
+- Production cache replay keeps 2,443 authoritative words through the real
+  final question, removes 25 unconfirmed terminal records, and reports zero
+  implausible timing runs. ASR trust tests pass 40/40; full offline regression
+  passes 29/29 in 893.21 seconds.
+
+## 2026-08-20 - Podcast Template Upload Resolution
+
+- Added one `1440p平台上传` switch to the synthesis page for both podcast
+  templates. Off persists `1080p`; on persists `1440p平台上传`, and each synthesis
+  task snapshots the selected mode.
+- The standard path remains 1920x1080. Upload mode applies Lanczos scaling to
+  2560x1440 and keeps 25fps, H.264 High Profile, yuv420p, libx264 slow/CRF 15,
+  two B-frames, closed GOPs, AAC 48kHz, and fast-start metadata.
+- The smoke output at
+  `output/platform-upload-audit/article-template-1440p-smoke-20260820.mp4`
+  was decoded and verified as 2560x1440, 25fps, H.264 High, yuv420p, and AAC
+  48kHz. The complete 29-check regression passes in 958.44 seconds.
+
 ## 2026-08-19 Title-Atomic Display Pages And Page-Projection Gates
 
 - Added general surface rules for multi-word work titles, named entities,
@@ -27,16 +123,15 @@
 
 ## 2026-08-19 Article Chinese Subtitle Typography
 
-- Article-template Chinese subtitles are now rendered at 50px with -2%
-  relative letter spacing. The article-only measurement, wrapping, and
-  per-glyph drawing paths share the same spacing metric, so the wider font
-  cannot silently disagree with the rendered line.
+- Article-template Chinese subtitles are rendered at 50px with zero extra
+  letter spacing. The article-only measurement, wrapping, and per-glyph
+  drawing paths share the same spacing metric, so layout cannot silently
+  disagree with the rendered line.
 - Ordinary subtitles, concept-card detail text, frozen IDs, timing, and page
   Chinese contracts are unchanged. Visual verification:
-  `output/article-subtitle-zh-spacing-audit/article-subtitle-zh-50px-minus2-20260819.png`.
-- Direct typography and page-mapping checks pass. The full regression command
-  still reports stale Roboto Slab/layout expectations in unrelated long-caption
-  tests.
+  `output/article-subtitle-zh-spacing-audit/article-subtitle-zh-50px-zero-spacing-20260820.png`.
+- Direct typography and page-mapping checks pass. The complete regression
+  passes all 29 checks.
 
 ## 2026-08-19 Article Vocabulary And Opening Title Fonts
 
@@ -2932,3 +3027,229 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
   page artifact loader. The final cue, final page, and media cut are equal.
 - `tests/test_final_cue_timeline.py`, the complete manual-final editor suite,
   `scripts/run_regression.py`, and `git diff --check` pass offline.
+
+## 2026-08-20 Three-Stage Reliability And Golden V2
+
+- Stage 1 added per-unit translation/allocation checkpoints, minimal cache
+  invalidation, duplicate-cache migration, and resumable run state. A changed
+  semantic group no longer invalidates every verified group.
+- Stage 2 made application code the single retry owner, bounded external
+  concurrency at two, recorded request attempts/usage, and enforced request
+  budgets and explicit failure instead of unbounded paid retries.
+- Stage 3 added schema-v2 Golden evaluation with four weighted components,
+  90% overall and 85% per-component thresholds, plus timeline, ID, word-ledger,
+  parent-Chinese, and display-page hard contracts. Modern and legacy artifact
+  evidence are distinguished explicitly.
+- Curated Dreamcore and animation references are loaded by offline regression.
+  Dreamcore passes at 95.36%. The old animation output remains at 90.84% with
+  only the English component below threshold because of
+  `specifically | because`.
+- A parser-owned clause-scope rule fixes that boundary generically. Full-ledger
+  replay covers all 1,836 animation words and yields
+  `... box office | specifically because ...` without changing text, order,
+  timing, Chinese, or any production artifact.
+- No paid API was called during stage 3. Focused Golden/parser tests, the
+  20-check pipeline regression, and the final 29-check full regression pass.
+  The full run completed in 867.38 seconds.
+
+## 2026-08-20 Page Restart And Manual Publication Diagnostics
+
+- Reproduced three renderer-only failures from the saved White House artifact.
+  `S0125` lost a valid coordinated restart because its frozen parent ended at
+  a comma; `S0189` treated a common list noun as a name apposition; `S0193`
+  promoted an attached `to` phrase over a balanced predicate restart.
+- Replaced the generic tight-phrase promotion with named safe categories and
+  restricted name-apposition syntax protection to proper nouns. Real replay
+  now selects 8+11, 14+7+10 and 8+13 word pages respectively, without changing
+  the frozen cue text, ID, ledger span or timing.
+- Added one blocker-summary and focus path for preflight save errors,
+  background save results, synthesis entry and synthesis-action tooltips.
+  Exact `Sxxxx.Pxx` evidence is shown and the first page is selected when the
+  session or manifest can identify it; failed saves explicitly retain the
+  current in-memory edits.
+- Stable-caption smoke tests, 90 editor/publication tests, the complete article
+  readability contract, focused UI entry tests and real cue replay pass. The
+  final project regression passes all 29 checks in 883.19 seconds. Verification
+  made no paid API request and changed no production artifact.
+
+## 2026-08-21 High-Value Manual Review Queue
+
+- Added a frozen, ID-addressable editor review ledger. Cross-ID evidence is one
+  human task, and category-specific cell colors/tooltips distinguish English,
+  Chinese, timing, and page work without changing subtitle content.
+- Added post-page OpenCode Flash audits for accuracy/ASR, Chinese fluency/page
+  load, and adjacent mapping/continuity. Forty-target batches are cached
+  independently; complete target-ID coverage is required in all three passes
+  and an incomplete audit blocks completion.
+- Model results remain read-only. Actual page load is verified locally, valid
+  short responses and omitted conversational fillers are excluded, and noisy
+  local semantic heuristics become fallback evidence after a full model audit.
+- Fixed article-review ownership so valid demonyms and canonical names already
+  present in a cue do not become manual ASR tasks.
+- White House is the current three-stage baseline; Dreamcore is a legacy missed-
+  class sample. Live audits were read-only and did not rewrite either artifact.
+- A complete two-pass rerun still missed the known `S0075` cross-row defect, so
+  continuity/mapping now has a dedicated third pass and a new prompt/cache
+  version instead of relying on one overloaded fluency pass.
+- The first three-pass replay recovered `S0075` but incorrectly reported
+  omitted `Absolutely`/`Exactly` responses. Semantic and ASR findings now carry
+  an exact source quote so local validation can reject ungrounded evidence and
+  optional discourse-marker omissions.
+- Cross-row coherence now requires exactly two adjacent fixed IDs. The
+  validator accepts an adjacent batch-context ID only when the issue also owns
+  a target ID, preventing both single-row mislocation and batch-edge blind
+  spots.
+- The v4 White House replay covered 217/217 IDs with no batch error and bound
+  `S0074`/`S0075` as one task. A final local evidence check removes semantic
+  findings whose reason cites only optional discourse markers, even if the
+  model quoted a longer surrounding sentence.
+- The final read-only queue contains 31 deduplicated human tasks across 36 of
+  217 White House subtitle IDs. The complete 30-check offline regression passes
+  in 929.70 seconds. A new GUI click-to-editor-to-save-to-synthesis run remains
+  required before treating the 95% automation target as production-verified.
+
+## 2026-08-21 Chocolate Full-Pipeline Repair
+
+- Root-cause audit of `中国会有爱上巧克力的一天吗？` found a 96% page-stage
+  failure, five rejected parent page plans, five missing Chinese page rows, and
+  article-assisted ASR misses/false expansions caused by inconsistent token
+  ownership and incomplete response acceptance.
+- Article correction v6 shares Unicode-aware lexical rules, ignores terminal
+  punctuation for similarity, preserves legitimate short entities and
+  hyphenation variants, and limits whitespace-only connector repair to exact
+  surfaces such as `R &D -> R&D`.
+- Real ASR replay applies 14 high-confidence corrections with the expected
+  `Nestlé` 1, `R&D` 4, `Choc Revive` 6, and `Saturnbird` 3 occurrences. The
+  frozen-ID editor queue reduces to two actionable English checks:
+  `S0069 stringing -> springing` and `S0078 Shi Liang -> Xie Liang`.
+- The renderer candidate selector now carries a proven complete prepositional
+  continuation through final readability selection. The real 229-parent
+  checkpoint produces 258 pages and clears all five former plan failures at
+  56px without changing parent English, IDs, word ranges, or timing.
+- Fresh empty/partial page-translation JSON is no longer accepted as a valid
+  batch. The same batch retries until every requested page ID is present or the
+  bounded request fails explicitly; completed sibling batches remain reusable.
+- White House replay retains the intended `Hinrich Foundation` corrections and
+  blocks the previously observed `Navarro`, `Trump administration`,
+  `G K. Chesterton`, and `Southeast Asian` expansions. A new GUI production run
+  is still required to verify click-to-editor-to-save-to-synthesis behavior.
+- Final focused article correction verification passes 57/57. The complete
+  offline regression passes 30/30 in 875.03 seconds, and `git diff --check`
+  passes with line-ending warnings only.
+
+## 2026-08-21 Empty Chinese Projection And Generic Retry
+
+- Root cause: a frozen fragment page was required to read as an independent
+  Chinese sentence while page text was forbidden from exceeding authoritative
+  parent Chinese. The model repeatedly invented a nominalizer to satisfy both.
+- The prompt now permits natural cross-page Chinese continuation when the fixed
+  English page is itself a fragment or review boundary. Validator evidence is
+  converted into exact retry constraints for any added token, repeated phrase,
+  or missing page ID; no sample-specific allowlist entry was introduced.
+- A live isolated S0133 request failed the first strict semantic check and
+  passed its second request. Existing S0227/S0229 page plans also pass, with
+  `1.4 billion` remaining indivisible.
+- Editor projection of the old chocolate checkpoint exposes all four missing
+  page translations as red `待分配` placeholders. Stored/edit values remain
+  empty and the only background colors are yellow and red.
+- Page translation, article readability, review-mark, and manual-final suites
+  pass. Full regression is delegated to the user after final diff review.
+
+## 2026-08-21 Employment Manual-Final Reload And Synthesis
+
+- Recovered the complete real manual draft after a stale `ERROR` page artifact
+  had taken precedence over user edits. Reload retains 101 operations, 263 page
+  edits, and 22 boundary overrides; no audio or subtitle-ID special case was
+  added.
+- Formal save published generation `20260821T193503294564-21eb6181` with no
+  pending Chinese, boundary review, hard page error, or render block. The
+  synthesis resolver selected that generation's SRT and derived M4A.
+- Restarted the working-copy GUI and imported the manual-final SRT. The editor
+  continued the saved package rather than restarting from the original-top
+  checkpoint, then entered formal synthesis successfully.
+- Vocabulary generation completed all 9 batches and scheduled 13 cards. The
+  final 801.09s, 1920x1080 MP4 is 536,961,887 bytes; a decoded frame at 17s
+  confirms the first card is present in the actual video.
+- Production code contains no White House, Chocolate, Employment, or real
+  subtitle-ID condition. Known false structural blockers are repaired through
+  shared page ownership, same-screen layout, and publication-gate invariants;
+  genuinely unrenderable future pages remain explicit manual review work.
+
+## 2026-08-22 Generic Boundary And Review-Queue Closure
+
+- Audited every frozen parent and display page in the latest Chocolate, White
+  House, and Employment artifacts without calling an API or rewriting output.
+- Added a pre-ID cross-cue completeness gate for unfinished subordinate clauses,
+  dangling emphasis/auxiliary/complement words, relative-clause entrances, and
+  similar deterministic fragments. Long pauses no longer legalize incomplete
+  syntax; uncertain prepositional/coordinated continuations stay review-only.
+- Removed the second high-confidence allowlist that discarded valid formal
+  parent/page `review` evidence. The two-complete-sentence false-positive guard
+  remains, and lower-risk page evidence receives the generic
+  `visual_page_boundary_review` code.
+- Split page-failure ownership at both production recording and editor loading:
+  renderer blueprint failures target English layout, while missing page IDs and
+  other page-translation failures target Chinese allocation.
+- Read-only full-boundary repair preserved 100% ordered ledger coverage. It left
+  14/240 Chocolate, 7/232 White House, and 8/274 Employment boundaries as
+  explicit manual review rather than silently accepting them.
+- Verified 72 boundary/fragment tests, 22 review-mark tests, and all 69 page-
+  translation contract tests. `py_compile` passes; `git diff --check` has only
+  existing line-ending warnings. The user will run the fresh GUI workflow and
+  complete project regression locally.
+
+## 2026-08-22 Page-Stage Liveness And Bounded Failure Recovery
+
+- Reproduced the `日本X世代的困境：被反复诅咒的一代人` run at the page stage:
+  11 batches / 115 pages, concurrency two, exhausted 40-attempt shared budget,
+  and a stale 96% GUI. After page failure it could start about 21 serial quality-
+  audit requests with a 180-second timeout.
+- Replaced eager submission with a bounded `FIRST_COMPLETED` scheduler. At most
+  two batches are active; every valid completion is cached and reported before
+  another batch is admitted. A terminal failure stops later admission while the
+  frozen contract remains the only final merge order.
+- Split request accounting into `screen_subtitle_edit` and
+  `display_page_translation` scopes. Manifest metadata records per-stage use.
+  Page-stage failure now writes quality audit status `SKIPPED` and preserves the
+  editable checkpoint without starting audit requests.
+- GUI/run-state progress now owns page translation 96-98%, audit 98-99%, and
+  final save 99-100%. Page events include completion, total, cache hits, retries,
+  active/failed batches, and elapsed seconds.
+- Focused syntax and changed-layer suites pass. Full regression finished in
+  788.30 seconds with 29/30 checks passing. Page translation (361.86s), article
+  readability (357.90s), manual-final, review marks, quality audit, run state,
+  and syntax all pass. The only failure is the unrelated legacy strict-16-word
+  assertion `test_preposition_phrase_is_not_stranded`; the production policy
+  now keeps that complete unsafe-to-split clause for renderer wrapping.
+- The Chocolate manual-final package was successfully published at 04:44:55
+  with `render_blocked=false` and zero pending Chinese, boundary-review, or hard
+  page counts. The old GUI was then closed cleanly; generated/manual artifacts
+  were not touched by implementation or tests.
+
+## 2026-08-22 Semantic Allocation Failure Boundary
+
+- Reproduced the Japanese-generation failure twice. Its only uncached multi-cue
+  allocation request exhausted three attempts (`500`, timeout, `500`); the GUI
+  process remained responsive and the apparent `0/1` stall was external request
+  latency rather than a local deadlock.
+- Root cause after the request failure was local: fixed-ID completeness only
+  recorded an error and allowed the incomplete Chinese set to reach authority
+  artifact construction. That downstream contract then obscured the provider
+  failure with `authoritative_parent_chinese_record_invalid`.
+- The translation owner now stops immediately with
+  `semantic_chinese_incomplete`, exact missing IDs, retained-cache guidance,
+  and the last provider error. Non-missing ID corruption stops under the
+  separate `semantic_chinese_id_contract_invalid` code.
+- Three focused regressions pass for owner-stage blocking, provider-error
+  retention, and empty-middle-ID handling. Raw pytest over the stable-caption
+  file passes 511 tests; its 14 failures are pre-existing assertions outside
+  this change, including the known strict-16-word expectation and stale test
+  constructors/encoding cases.
+# 2026-08-22 - Equal-Risk Page Boundary Ordering
+
+- Reproduced a deterministic page-selection regression where equal structural
+  risk allowed visual balance to choose `set | a strict` over the pause-backed
+  `objections | would` restart.
+- The final candidate ordering now uses verified strong-pause restart count as
+  a tie-breaker before line-wrap, font, and visual-quality costs. Candidate
+  generation and every frozen parent/timing/translation contract are unchanged.

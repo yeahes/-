@@ -29,6 +29,14 @@ Important rules:
   remove, or rewrite words. Millisecond zero-width repair preserves emitted
   word order. Unanchored, text-changing, or still-compressed results remain
   blocked, while a successful repair replaces the stale raw ASR cache value.
+- A physically impossible terminal word burst has one narrower recovery path.
+  It must begin after a sentence boundary, remain inside the existing
+  compressed-timing limits, and a context-free local retranscription must end
+  at a unique exact left text anchor without emitting any candidate-tail word.
+  Only then is the unconfirmed terminal burst quarantined as an ASR
+  hallucination. If local ASR hears any following word, or the anchor is
+  absent or ambiguous, the transcript remains unchanged and the timing gate
+  still blocks publication.
 - Article-assisted ASR correction runs before stable English boundaries freeze.
   Fresh, cached, and UI-supplied article analysis must all be enriched with
   source evidence in memory before either ASR correction or the translation
@@ -123,6 +131,11 @@ Rules:
 - Missing Chinese is a validation issue.
 - LLM allocation responses must include `subtitle_id` for each returned Chinese line.
 - Returned, missing, duplicate, and unknown subtitle IDs are recorded as structure errors.
+- After allocation, every frozen subtitle ID must own non-empty Chinese before
+  the authority/artifact stage begins. A provider failure therefore stops as
+  `semantic_chinese_incomplete`, reports the exact missing IDs and provider
+  reason, and leaves completed unit caches reusable; it cannot continue and be
+  misreported as an authoritative-parent artifact failure.
 - Chinese cache identity includes the model that owns the current request, not
   unrelated model roles. A Flash allocation-model change therefore does not
   invalidate verified Pro full translations.
@@ -225,6 +238,8 @@ Outputs:
 - `final-cue-timeline.json`
 - `display-page-translations.json`
 - `english-boundary-audit.json`
+- `translation-quality-audit.json`
+- `editor-review-ledger.json`
 - `llm-request-ledger.json`
 - `run-state.json`
 
@@ -243,6 +258,20 @@ Run-state rules:
   only for batches that are still missing. A valid legacy whole-contract cache
   remains reusable; all batch rows are merged and validated once against the
   original complete display-page contract before publication.
+- Page batches use a bounded completion-order scheduler with at most two active
+  external requests. Every completed batch is validated and cached immediately,
+  and batch completion, cache hits, retries, active requests, failures, and
+  elapsed time are emitted to the run-state/GUI progress channel. Final merge
+  order still follows the frozen contract rather than completion order.
+- When a page batch exhausts its bounded attempts, no later batch is admitted.
+  An already active request is allowed to settle because an in-flight HTTP call
+  cannot be safely revoked, but every not-yet-started batch remains cancelled.
+  The page artifact records the explicit failure and any independently valid
+  completed parents for checkpoint recovery.
+- The configured request budget is enforced independently for
+  `screen_subtitle_edit` and `display_page_translation`. Translation/allocation
+  attempts therefore cannot consume the later page-stage allowance. The
+  manifest records attempts used and remaining allowance by stage.
 - `llm-request-ledger.json` is atomically updated after each cache lookup or
   external request. It records task, model, attempt, latency, provider token
   usage, prompt-cache tokens, and reasoning tokens when returned by the API;
@@ -251,6 +280,26 @@ Run-state rules:
   original complete fixed-ID allocation remains authoritative, while the
   failed candidate and unresolved quality issue remain review evidence. This
   does not relax initial allocation or final fixed-ID validation.
+- After actual display pages freeze, OpenCode Flash runs three independent,
+  read-only audits: accuracy/ASR, Chinese fluency/page load, and adjacent
+  mapping/continuity. Each cached request owns at most 40 target IDs plus one
+  adjacent context row on each side. Every target ID must be acknowledged in
+  all three passes; otherwise the stable run remains incomplete and retry
+  reuses completed batches.
+- If display-page translation has already failed, the quality audit is marked
+  `SKIPPED` and makes no external request. The pipeline publishes the recoverable
+  checkpoint and page-stage evidence first instead of spending more time and
+  request allowance on an output that cannot yet be finalized.
+- Model findings cannot mutate English, Chinese, IDs, word ownership, timing,
+  or page geometry. Semantic, mapping, number, negation, and ASR findings must
+  quote an exact English source span; the local validator rejects ungrounded
+  evidence and optional discourse-marker omissions. Cross-row coherence
+  evidence must bind exactly two adjacent fixed IDs, including a batch-edge
+  context ID when needed. A model length finding enters the editor only when
+  local actual-page character count or reading speed also exceeds its limit.
+- `editor-review-ledger.json` is generated after all evidence owners finish.
+  It groups multiple evidence records that require the same human action and
+  is the editor's primary frozen review queue.
 
 Validation checks:
 
@@ -299,11 +348,12 @@ Rule:
   ledger, final cue timeline, fixed-ID Chinese mapping, page contract, and
   existing audit artifacts. Existing artifacts are the checkpoint; reopening
   them does not rerun ASR, translation, or English segmentation.
-- Review highlighting is intentionally narrow: unresolved hard/high-confidence
-  English boundaries, cue-edge alignment fallback, high-confidence Chinese
-  semantic loss, unresolved fixed-ID allocation, and high-risk visual page
-  boundaries. Routine reading-speed warnings and low-confidence parser guesses
-  are not editor marks.
+- Review highlighting is intentionally narrow: structural blockers, genuine
+  parent/page boundary risks, abnormal cue-edge alignment fallback, locally
+  verified actual-page Chinese load, high-confidence ASR findings, and
+  model-confirmed Chinese meaning/fluency/coherence problems. Routine fallback
+  provenance, normal conversational fragments, duplicate evidence, and
+  low-confidence parser guesses are not separate editor tasks.
 - High-signal Chinese review items may start an optional background model
   request. The response is suggestion-only and bound to fixed IDs, exact
   English source echo, current-Chinese hash, and protected fact/term anchors.
@@ -623,7 +673,7 @@ Rule:
   or timing.
   Article-template Chinese uses a fixed 48px font, at most two lines, and the
   existing 1455-design-pixel safe width.
-  The page contract version is `article-fixed-font-pages-v27`, so page-layout
+  The page contract version is `article-fixed-font-pages-v28`, so page-layout
   and page-translation caches from earlier planner versions cannot be reused;
   unchanged ASR, full-translation, and fixed-ID allocation caches remain
   independently reusable under their own fingerprints.

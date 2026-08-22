@@ -13,6 +13,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from app.config import CACHE_PATH
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.storage.cache_manager import CacheManager
+from app.core.subtitle_processor.text_metrics import surface_word_tokens
 from app.core.utils import json_repair
 from app.core.utils.logger import setup_logger
 
@@ -20,7 +21,7 @@ logger = setup_logger("article_context")
 
 ARTICLE_CONTEXT_SCHEMA_VERSION = 2
 ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION = "article-context-analysis-v2"
-ARTICLE_ASR_CORRECTION_POLICY_VERSION = "article-asr-correction-v5"
+ARTICLE_ASR_CORRECTION_POLICY_VERSION = "article-asr-correction-v6"
 ARTICLE_TRANSLATION_CONTEXT_PROMPT_VERSION = "article-translation-context-v2-hit-only"
 ARTICLE_RAW_RESPONSE_KEY = "_raw_response"
 ARTICLE_ANALYSIS_META_KEY = "_analysis_meta"
@@ -572,6 +573,7 @@ def apply_article_asr_corrections(
     context: Dict[str, Any],
     *,
     output_dir: str | Path,
+    article_text: str = "",
     high_confidence: float = 0.82,
     review_confidence: float = 0.72,
 ) -> ASRData:
@@ -614,6 +616,15 @@ def apply_article_asr_corrections(
                 logs.append(item)
                 candidates.append(item)
 
+    supplemental_reviews = _article_reference_review_candidates(
+        asr_data.segments,
+        glossary,
+        article_text=article_text,
+        existing_candidates=candidates,
+    )
+    candidates.extend(supplemental_reviews)
+    logs.extend(supplemental_reviews)
+
     candidates_path = output_root / "correction_candidates.json"
     entity_candidates_path = output_root / "entity_candidates.json"
     log_path = output_root / "correction_log.json"
@@ -638,6 +649,188 @@ def apply_article_asr_corrections(
     return ASRData(corrected_segments)
 
 
+def _article_reference_review_candidates(
+    segments: Sequence[ASRDataSeg],
+    glossary: Sequence[Mapping[str, Any]],
+    *,
+    article_text: str,
+    existing_candidates: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Add high-precision review evidence that must never rewrite English."""
+    supplemental_reasons = {
+        "article_person_surname_variant",
+        "article_phrase_near_match",
+    }
+    existing = {
+        (
+            int(item.get("start_time") or 0),
+            int(item.get("end_time") or 0),
+            _entity_phrase_key(str(item.get("candidate_text") or "")),
+        )
+        for item in existing_candidates
+        if bool(item.get("applied"))
+        or str(item.get("reason") or "") in supplemental_reasons
+    }
+    reviews: List[Dict[str, Any]] = []
+
+    for term in glossary:
+        if str(term.get("category") or "").casefold() != "person":
+            continue
+        canonical = str(term.get("canonical_name") or "").strip()
+        canonical_tokens = _word_tokens(canonical)
+        if len(canonical_tokens) < 2:
+            continue
+        width = len(canonical_tokens)
+        for start in range(0, len(segments) - width + 1):
+            window = list(segments[start : start + width])
+            original_tokens = [
+                token
+                for segment in window
+                for token in _word_tokens(str(segment.text or ""))
+            ]
+            if len(original_tokens) != width:
+                continue
+            normalized_original = _normalized_entity_tokens(original_tokens)
+            normalized_canonical = _normalized_entity_tokens(canonical_tokens)
+            if (
+                normalized_original == normalized_canonical
+                or normalized_original[-1] != normalized_canonical[-1]
+                or not original_tokens[0][:1].isupper()
+                or _entity_token_similarity(
+                    normalized_original[0], normalized_canonical[0]
+                )
+                < 0.3
+            ):
+                continue
+            original = _join_asr_words([segment.text for segment in window])
+            key = (
+                int(window[0].start_time),
+                int(window[-1].end_time),
+                _entity_phrase_key(canonical),
+            )
+            if key in existing:
+                continue
+            reviews.append(
+                _supplemental_article_review(
+                    candidate_id=f"article-person-surname-{start}",
+                    original=original,
+                    suggested=canonical,
+                    start_ms=int(window[0].start_time),
+                    end_ms=int(window[-1].end_time),
+                    category="person",
+                    source_key="people",
+                    reason="article_person_surname_variant",
+                    evidence=dict(term.get("evidence") or {}),
+                )
+            )
+            existing.add(key)
+
+    article_tokens = surface_word_tokens(article_text)
+    article_pairs: Dict[str, List[str]] = {}
+    for left, right in zip(article_tokens, article_tokens[1:]):
+        right_key = _normalize_entity_gate_token(right)
+        if len(right_key) >= 2:
+            article_pairs.setdefault(right_key, []).append(left)
+    for index, (current, following) in enumerate(zip(segments, segments[1:])):
+        current_tokens = _word_tokens(str(current.text or ""))
+        following_tokens = _word_tokens(str(following.text or ""))
+        if len(current_tokens) != 1 or len(following_tokens) != 1:
+            continue
+        original = _normalize_entity_gate_token(current_tokens[0])
+        right_key = _normalize_entity_gate_token(following_tokens[0])
+        if len(original) < 6 or not right_key:
+            continue
+        candidates_for_anchor = {
+            token
+            for token in article_pairs.get(right_key, [])
+            if _edit_distance(
+                original,
+                _normalize_entity_gate_token(token),
+                max_distance=1,
+            )
+            == 1
+        }
+        if len(candidates_for_anchor) != 1:
+            continue
+        suggested = next(iter(candidates_for_anchor))
+        suggested_normalized = _normalize_entity_gate_token(suggested)
+        if (
+            suggested_normalized == original
+            or _entity_phrase_key(suggested) == _entity_phrase_key(current.text)
+            or _is_regional_spelling_variant(original, suggested_normalized)
+        ):
+            continue
+        key = (
+            int(current.start_time),
+            int(current.end_time),
+            _entity_phrase_key(suggested),
+        )
+        if key in existing:
+            continue
+        reviews.append(
+            _supplemental_article_review(
+                candidate_id=f"article-phrase-near-match-{index}",
+                original=str(current.text or "").strip(),
+                suggested=suggested,
+                start_ms=int(current.start_time),
+                end_ms=int(current.end_time),
+                category="article phrase",
+                source_key="article_reference",
+                reason="article_phrase_near_match",
+                evidence={
+                    "article_phrase": f"{suggested} {following_tokens[0]}"
+                },
+            )
+        )
+        existing.add(key)
+    return reviews
+
+
+def _is_regional_spelling_variant(left: str, right: str) -> bool:
+    variants = {str(left or "").casefold(), str(right or "").casefold()}
+    if len(variants) != 2:
+        return False
+    shorter, longer = sorted(variants, key=len)
+    return bool(
+        len(longer) == len(shorter) + 1
+        and "u" in longer
+        and longer.replace("u", "", 1) == shorter
+        and longer.endswith(("our", "ours", "oured", "ouring"))
+    )
+
+
+def _supplemental_article_review(
+    *,
+    candidate_id: str,
+    original: str,
+    suggested: str,
+    start_ms: int,
+    end_ms: int,
+    category: str,
+    source_key: str,
+    reason: str,
+    evidence: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "candidate_id": candidate_id,
+        "original_text": original,
+        "candidate_text": suggested,
+        "corrected_text": suggested,
+        "original_token_count": len(_word_tokens(original)),
+        "candidate_token_count": len(_word_tokens(suggested)),
+        "final_confidence": 0.81,
+        "start_time": start_ms,
+        "end_time": end_ms,
+        "source_key": source_key,
+        "category": category,
+        "evidence": dict(evidence),
+        "entity_gate_passed": True,
+        "applied": False,
+        "result": "review_only",
+        "reason": reason,
+    }
+
+
 def build_article_asr_review_artifact(
     correction_logs: Sequence[Mapping[str, Any]],
     final_segments: Sequence[ASRDataSeg],
@@ -646,6 +839,9 @@ def build_article_asr_review_artifact(
     source_file_hash: str,
 ) -> Dict[str, Any]:
     """Map only high-signal uncertain article corrections to frozen cue IDs."""
+    known_article_entity_surfaces = _article_entity_surfaces_from_candidates(
+        correction_logs
+    )
     grouped: Dict[tuple[int, int, str], List[Mapping[str, Any]]] = {}
     for item in correction_logs:
         if not isinstance(item, Mapping):
@@ -655,12 +851,17 @@ def build_article_asr_review_artifact(
             rejection_reason == "ordinary_text_not_article_proper_noun_scope"
             and item.get("entity_gate_passed") is True
         )
+        supplemental_reference_review = rejection_reason in {
+            "article_person_surname_variant",
+            "article_phrase_near_match",
+        }
         if (
             bool(item.get("applied"))
             or str(item.get("result") or "") != "review_only"
             or (
                 rejection_reason != "below_high_confidence_threshold"
                 and not reviewable_scope_rejection
+                and not supplemental_reference_review
             )
             or item.get("entity_gate_passed") is not True
         ):
@@ -708,6 +909,23 @@ def build_article_asr_review_artifact(
     ):
         start_ms = int(candidate.get("start_time") or 0)
         end_ms = int(candidate.get("end_time") or 0)
+        review_rejection = _article_review_candidate_rejection_reason(
+            candidate,
+            final_segments,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            known_article_entity_surfaces=known_article_entity_surfaces,
+        )
+        if review_rejection:
+            dropped.append(
+                {
+                    "candidate_id": str(candidate.get("candidate_id") or ""),
+                    "reason": review_rejection,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                }
+            )
+            continue
         subtitle_ids: List[str] = []
         for segment in final_segments:
             subtitle_id = str(getattr(segment, "subtitle_id", "") or "")
@@ -765,6 +983,97 @@ def build_article_asr_review_artifact(
     }
 
 
+def _article_review_candidate_rejection_reason(
+    candidate: Mapping[str, Any],
+    final_segments: Sequence[ASRDataSeg],
+    *,
+    start_ms: int,
+    end_ms: int,
+    known_article_entity_surfaces: set[str] | None = None,
+) -> str:
+    """Reject review suggestions that cannot improve the frozen cue text."""
+    original = str(candidate.get("original_text") or "").strip()
+    suggested = str(
+        candidate.get("candidate_text")
+        or candidate.get("corrected_text")
+        or ""
+    ).strip()
+    if not original or not suggested:
+        return "empty_review_surface"
+    original_key = _entity_phrase_key(original)
+    suggested_key = _entity_phrase_key(suggested)
+    if (
+        original_key
+        and original_key != suggested_key
+        and original_key in (known_article_entity_surfaces or set())
+    ):
+        return "original_is_confirmed_article_entity"
+    if _is_place_demonym_candidate(
+        _word_tokens(original),
+        _word_tokens(suggested),
+        dict(candidate),
+    ):
+        return "place_demonym_not_reviewable"
+
+    if not suggested_key:
+        return "empty_review_surface"
+    overlapping_text = " ".join(
+        str(segment.text or "")
+        for segment in final_segments
+        if min(int(segment.end_time), end_ms)
+        - max(int(segment.start_time), start_ms)
+        > 0
+    )
+    if suggested_key in _entity_phrase_key(overlapping_text):
+        return "canonical_entity_already_present_in_frozen_cue"
+    if _surface_is_inside_capitalized_frozen_phrase(original, overlapping_text):
+        return "original_is_part_of_frozen_proper_name"
+    return ""
+
+
+def _article_entity_surfaces_from_candidates(
+    correction_logs: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    """Collect article-confirmed canonical and alias surfaces from evidence."""
+    surfaces: set[str] = set()
+    for candidate in correction_logs:
+        if not isinstance(candidate, Mapping):
+            continue
+        glossary = candidate.get("source_glossary") or {}
+        if not isinstance(glossary, Mapping):
+            continue
+        values = [glossary.get("canonical_name")]
+        values.extend(glossary.get("aliases") or [])
+        for value in values:
+            key = _entity_phrase_key(str(value or ""))
+            if key:
+                surfaces.add(key)
+    return surfaces
+
+
+def _surface_is_inside_capitalized_frozen_phrase(
+    original: str,
+    frozen_text: str,
+) -> bool:
+    """Protect an existing title-cased multiword name such as Bretton Woods."""
+    original_words = re.findall(r"[A-Za-z][A-Za-z'’-]*", original or "")
+    frozen_words = re.findall(r"[A-Za-z][A-Za-z'’-]*", frozen_text or "")
+    if len(original_words) != 1 or len(frozen_words) < 2:
+        return False
+    original_key = _entity_phrase_key(original_words[0])
+    for index, word in enumerate(frozen_words):
+        if _entity_phrase_key(word) != original_key:
+            continue
+        left_title = index > 0 and frozen_words[index - 1][:1].isupper()
+        right_title = (
+            index + 1 < len(frozen_words)
+            and frozen_words[index + 1][:1].isupper()
+        )
+        if word[:1].isupper() and (left_title or right_title):
+            return True
+    return False
+
+
 def _correct_word_timestamp_segments(
     segments: Sequence[ASRDataSeg],
     glossary: Sequence[Dict[str, Any]],
@@ -815,6 +1124,39 @@ def _correct_word_timestamp_segments(
                 candidate["start_word_index"] = index
                 candidate["end_word_index"] = index + window_size
                 candidate["original_words"] = [str(seg.text or "") for seg in window]
+                candidate["exact_multi_segment_canonical_merge"] = bool(
+                    window_size > 1
+                    and re.search(r"[,.;:!?]+$", original_text.strip())
+                    and _normalized_entity_tokens(_word_tokens(original_text))
+                    == _normalized_entity_tokens(
+                        _word_tokens(str(candidate.get("candidate_text") or ""))
+                    )
+                )
+                canonical_tokens = _normalized_entity_tokens(
+                    _word_tokens(str(candidate.get("candidate_text") or ""))
+                )
+                original_tokens = _normalized_entity_tokens(
+                    _word_tokens(original_text)
+                )
+                missing_prefix_count = len(canonical_tokens) - len(original_tokens)
+                adjacent_prefix_window = (
+                    segments[index - missing_prefix_count : index + window_size]
+                    if missing_prefix_count > 0 and index >= missing_prefix_count
+                    else []
+                )
+                candidate["adjacent_canonical_prefix_merge"] = bool(
+                    adjacent_prefix_window
+                    and not _window_crosses_sentence_boundary(adjacent_prefix_window)
+                    and _normalized_entity_tokens(
+                        _word_tokens(
+                            _join_asr_words(
+                                segment.text
+                                for segment in adjacent_prefix_window
+                            )
+                        )
+                    )
+                    == canonical_tokens
+                )
                 candidate["canonical_name"] = term["source"].get("canonical_name", term["canonical"])
                 candidate["category"] = term["source"].get("category", "")
                 candidate["source_key"] = term["source"].get("source_key", "")
@@ -903,7 +1245,11 @@ def _correct_word_timestamp_segments(
         if candidate.get("candidate_id") in selected_ids:
             candidate["applied"] = True
             candidate["result"] = "replaced"
-            candidate["reason"] = "high_confidence_article_glossary_match"
+            candidate["reason"] = (
+                "exact_multi_segment_canonical_merge"
+                if candidate.get("exact_multi_segment_canonical_merge")
+                else "high_confidence_article_glossary_match"
+            )
             logs.append(candidate)
         elif candidate.get("candidate_id") in overlap_rejected_ids:
             candidate["applied"] = False
@@ -2164,6 +2510,8 @@ def _find_alias_discriminator_conflict(
 
 
 def _is_self_replacement_candidate(candidate: Dict[str, Any]) -> bool:
+    if candidate.get("exact_multi_segment_canonical_merge"):
+        return False
     original = str(candidate.get("original_text", "") or "")
     corrected = str(candidate.get("corrected_text", "") or "")
     return _surface_text_key(original) == _surface_text_key(corrected)
@@ -2174,7 +2522,13 @@ def _surface_text_key(text: str) -> str:
 
 
 def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -> bool:
+    if candidate.get("exact_multi_segment_canonical_merge"):
+        return True
     if _is_self_replacement_candidate(candidate):
+        return False
+    if _is_connector_only_surface_correction(candidate):
+        return True
+    if _candidate_replaces_an_existing_entity_surface(candidate):
         return False
     near_threshold_person_edge = _near_threshold_person_edge_candidate(
         candidate, high_confidence
@@ -2207,6 +2561,8 @@ def _should_apply_candidate(candidate: Dict[str, Any], high_confidence: float) -
 def _not_applied_reason(candidate: Dict[str, Any], high_confidence: float) -> str:
     if _is_self_replacement_candidate(candidate):
         return "self_replacement_skipped"
+    if _candidate_replaces_an_existing_entity_surface(candidate):
+        return "existing_entity_surface_cannot_be_replaced_or_expanded"
     if (
         candidate["final_confidence"] < high_confidence
         and not _near_threshold_person_edge_candidate(candidate, high_confidence)
@@ -2241,6 +2597,9 @@ def _article_scope_rejection_reason(candidate: Dict[str, Any]) -> str:
 
     if _is_place_demonym_candidate(original_tokens, corrected_tokens, candidate):
         return "place_demonym_not_entity"
+
+    if _is_hyphenation_only_spelling_variant(original, corrected):
+        return "hyphenation_variant_not_asr_error"
 
     if "exact_alias_match" in (candidate.get("matched_conditions") or []):
         return "" if _exact_alias_can_auto_apply(candidate) else "alias_would_degrade_canonical_match"
@@ -2286,15 +2645,20 @@ def _is_place_demonym_candidate(
     demonym is ordinary sentence text. Similarity alone must not turn
     ``Americans`` into ``America``.
     """
-    if len(original_tokens) != 1 or len(corrected_tokens) != 1:
-        return False
     source = candidate.get("source_glossary") or {}
     source_key = str(source.get("source_key", candidate.get("source_key", "")) or "").casefold()
     category = str(source.get("category", candidate.get("category", "")) or "").casefold()
     if source_key != "places" and category not in {"place", "places", "location", "country", "city"}:
         return False
-    original = _normalize_entity_gate_token(original_tokens[0])
-    corrected = _normalize_entity_gate_token(corrected_tokens[0])
+    if len(original_tokens) != len(corrected_tokens) or not original_tokens:
+        return False
+    if len(original_tokens) > 1 and any(
+        _entity_phrase_key(original) != _entity_phrase_key(corrected)
+        for original, corrected in zip(original_tokens[:-1], corrected_tokens[:-1])
+    ):
+        return False
+    original = _normalize_entity_gate_token(original_tokens[-1])
+    corrected = _normalize_entity_gate_token(corrected_tokens[-1])
     if original == corrected or min(len(original), len(corrected)) < 4:
         return False
     prefix_length = len(os.path.commonprefix((original, corrected)))
@@ -2586,6 +2950,84 @@ def _exact_alias_can_auto_apply(candidate: Dict[str, Any]) -> bool:
     return _entity_phrase_key(original) == _entity_phrase_key(corrected)
 
 
+def _is_connector_only_surface_correction(candidate: Mapping[str, Any]) -> bool:
+    original = str(candidate.get("original_text") or "")
+    corrected = str(candidate.get("candidate_text") or "")
+    original_without_spacing = re.sub(
+        r"\s+",
+        "",
+        re.sub(r"[,.;:!?]+$", "", original.strip()),
+    ).casefold()
+    corrected_without_spacing = re.sub(
+        r"\s+",
+        "",
+        re.sub(r"[,.;:!?]+$", "", corrected.strip()),
+    ).casefold()
+    return bool(
+        _entity_phrase_key(original)
+        and _entity_phrase_key(original) == _entity_phrase_key(corrected)
+        and _surface_text_key(original) != _surface_text_key(corrected)
+        and original_without_spacing == corrected_without_spacing
+        and any(connector in original + corrected for connector in "&-'\u2019")
+    )
+
+
+def _is_hyphenation_only_spelling_variant(original: str, corrected: str) -> bool:
+    def compact_surface(value: str) -> str:
+        without_terminal_punctuation = re.sub(
+            r"[,.;:!?]+$", "", str(value or "").strip()
+        )
+        return re.sub(r"\s+", "", without_terminal_punctuation).casefold()
+
+    original_surface = compact_surface(original)
+    corrected_surface = compact_surface(corrected)
+    return bool(
+        original_surface
+        and corrected_surface
+        and original_surface != corrected_surface
+        and original_surface.replace("-", "")
+        == corrected_surface.replace("-", "")
+    )
+
+
+def _candidate_replaces_an_existing_entity_surface(
+    candidate: Mapping[str, Any],
+) -> bool:
+    """Keep a valid surname/acronym/short name from becoming a full name.
+
+    A fused misspelling such as ``Chakravive -> Choc Revive`` is still
+    eligible because its token is not already a complete canonical component.
+    """
+    if candidate.get("adjacent_canonical_prefix_merge"):
+        return False
+    original_tokens = _normalized_entity_tokens(
+        _word_tokens(str(candidate.get("original_text") or ""))
+    )
+    canonical_tokens = _normalized_entity_tokens(
+        _word_tokens(str(candidate.get("candidate_text") or ""))
+    )
+    if not original_tokens or len(canonical_tokens) < len(original_tokens):
+        return False
+    if len(canonical_tokens) == len(original_tokens):
+        shared = sum(
+            left == right
+            for left, right in zip(original_tokens, canonical_tokens)
+        )
+        return bool(
+            len(original_tokens) >= 3
+            and shared >= 2
+            and any(
+                left != right and _entity_token_similarity(left, right) < 0.6
+                for left, right in zip(original_tokens, canonical_tokens)
+            )
+        )
+    width = len(original_tokens)
+    return any(
+        canonical_tokens[start : start + width] == original_tokens
+        for start in range(0, len(canonical_tokens) - width + 1)
+    )
+
+
 def _entity_phrase_gate(original_text: str, canonical: str) -> Dict[str, Any]:
     original_tokens = _word_tokens(original_text)
     canonical_tokens = _word_tokens(canonical)
@@ -2670,13 +3112,13 @@ def _entity_gate_result(passed: bool, reason: str) -> Dict[str, Any]:
 
 
 def _normalize_entity_gate_token(token: str) -> str:
-    core = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", token or "")
+    core = re.sub(r"^[\W_]+|[\W_]+$", "", token or "", flags=re.UNICODE)
     core = re.sub(r"(?:'|\u2019)s$", "", core, flags=re.IGNORECASE)
     return core.casefold()
 
 
 def _token_looks_entity_like(token: str) -> bool:
-    core = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", token or "")
+    core = re.sub(r"^[\W_]+|[\W_]+$", "", token or "", flags=re.UNICODE)
     core = re.sub(r"(?:'|\u2019)s$", "", core, flags=re.IGNORECASE)
     if not core:
         return False
@@ -2862,16 +3304,21 @@ def _join_asr_words(words: Sequence[str]) -> str:
 
 
 def _word_tokens(text: str) -> List[str]:
-    return re.findall(r"[A-Za-z0-9][A-Za-z0-9'&.-]*", text or "")
+    return re.findall(
+        r"[^\W_](?:[^\W_]|[\u0300-\u036f]|['&.\-])*",
+        text or "",
+        flags=re.UNICODE,
+    )
 
 
 def _compact_text(text: str) -> str:
-    return "".join(token.casefold() for token in _word_tokens(text))
+    return "".join(token.casefold() for token in surface_word_tokens(text))
 
 
 def _entity_phrase_key(text: str) -> str:
     """Compare entity phrases without treating terminal punctuation as content."""
-    return "".join(_normalized_entity_tokens(_word_tokens(text)))
+    joined = "".join(_normalized_entity_tokens(_word_tokens(text)))
+    return re.sub(r"[\W_]+", "", joined, flags=re.UNICODE)
 
 
 def _phonetic_key(text: str) -> str:
