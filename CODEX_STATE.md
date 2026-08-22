@@ -1,37 +1,36 @@
 # Project State
 Status: complete
-Last verified: 2026-08-22 22:33:04 Asia/Shanghai
+Last verified: 2026-08-23 01:52:08 Asia/Shanghai
 Branch: main
-Verified HEAD: 8bd57b0 (base; modified working tree verified)
-Working tree: verified checkpoint ready to commit; untracked output preserved
+Verified HEAD: 6104934 (documentation-only working tree changes)
+Working tree: untracked audit documentation; unrelated output preserved
 
 ## Current Goal
-Bound complete-Chinese-translation failure latency during persistent provider errors while preserving resumable work.
+Standardize a read-only, actual-display-page audit for every new automatic subtitle result.
 
 ## Confirmed Facts
-- Initial full translation uses batches of at most 8 and at most 2 in-flight requests.
-- Two consecutive retryable provider failures stop new admission; in-flight valid results still cache.
-- One isolated failure may recover; budget exhaustion or non-retryable failure stops immediately.
-- One HTTP attempt creates one ledger record; completed unit caches survive retry.
-- English, IDs, timing, prompts, allocation, and display-page rules are unchanged.
+- The newest White House raw checkpoint has 221 parents, 271 actual pages, 42 multipage parents, 5 missing page-Chinese IDs, and 5 formal error parents.
+- Its semantic review queue is stale: all 25 saved context rows mismatch the current English spans.
+- Chocolate v27/v29 share word-ledger hash `85ba0f98...9199a`; v27 is PASS and v29 is ERROR with different parent/page plans.
+- Local skill `audit-caption-results` collects immutable-run identity, parent/neighbour context, actual pages, page Chinese, marks, and same-ledger A/B evidence without writes.
 
 ## Approved Decisions
-- Reuse the bounded page-stage scheduler pattern; do not change subtitle-content contracts.
-- Commit each tested logical change before a real GUI/audio comparison; do not commit exploratory edits or generated output.
+- A routine new-run audit checks one raw automatic result; regression claims require the same word ledger.
+- Skill qualification uses the current result, one same-ledger A/B, and later one historical good-result guard instead of re-auditing every recent case.
 
 ## Relevant Paths
-- Handoff: `docs/handoffs/2026-08-22-full-translation-provider-circuit-breaker.md`
-- Source: `app/core/subtitle_processor/screen_editor.py`
-- Tests: `tests/test_stable_caption_rules.py`
+- Audit: `docs/audits/2026-08-23/recent-actual-page-quality-audit.md`
+- Skill: `C:\Users\19379\.codex\skills\audit-caption-results\SKILL.md`
+- Collector: `C:\Users\19379\.codex\skills\audit-caption-results\scripts\collect_caption_evidence.py`
 
 ## Last Verification
-- Focused 5/5; stable-caption pytest 530/530; full regression checks 30/30 after harness-name repair; diff check passes; working-copy GUI PID 9252 started.
+- Skill validator passes; collector reproduces White House counts/identity failure and Chocolate same-ledger A/B; UTF-8 output passes.
 
 ## Next Action
-Retry White House in the running working-copy GUI to verify live provider behavior and cache resume.
+Invoke `$audit-caption-results` on the next unseen automatic run and complete one full page-level audit.
 
 ## Do Not Regress
-- Do not modify frozen English/ID/word/timing/page contracts or production work-dir artifacts.
+- Keep audits read-only and separate raw automatic checkpoints from manual finals.
 
 ## Unknowns
-- Current OpenCode Go provider health and fresh GUI end-to-end result.
+- No manually labelled corpus yet proves review precision/recall across unseen audio.
