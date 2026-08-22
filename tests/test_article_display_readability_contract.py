@@ -1597,6 +1597,26 @@ def test_extended_numeric_range_does_not_create_a_five_word_tail_page():
     assert all(len(page["en_lines"]) <= 2 for page in plan["pages"])
 
 
+def test_participial_restart_accepts_compatible_dependency_evidence_only():
+    page = {
+        "en": (
+            "showing worldwide AI chip shipments growing from 15 million units"
+        ),
+        "boundary_before": {
+            "classification": "review",
+            "issue_codes": [
+                "dependency_phrase_entrance_split",
+                "post_noun_participial_modifier_split",
+            ],
+        },
+    }
+
+    assert podcast_learning_video._article_complete_participial_restart(page)
+
+    page["boundary_before"]["issue_codes"].append("numeric_unit_or_noun_split")
+    assert not podcast_learning_video._article_complete_participial_restart(page)
+
+
 def test_complete_five_word_terminal_phrase_is_a_reviewable_page_fallback():
     text = (
         "Wow. Okay, so a hyper-localized, vertically integrated supply chain "

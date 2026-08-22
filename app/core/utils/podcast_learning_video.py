@@ -6852,13 +6852,17 @@ def _article_complete_participial_restart(
         str(issue or "") for issue in decision.get("issue_codes") or []
     }
     words = str(right_page.get("en") or "").split()
+    compatible_participial_issues = (
+        {"post_noun_participial_modifier_split"},
+        {
+            "dependency_phrase_entrance_split",
+            "post_noun_participial_modifier_split",
+        },
+        {"unsupported_tight_page_transition"},
+    )
     if (
         len(words) < ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
-        or issue_codes
-        not in (
-            {"post_noun_participial_modifier_split"},
-            {"unsupported_tight_page_transition"},
-        )
+        or issue_codes not in compatible_participial_issues
     ):
         return False
     first_word = re.sub(r"[^A-Za-z]+", "", words[0]).casefold()
