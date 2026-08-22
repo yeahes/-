@@ -1,20 +1,19 @@
 # Project State
 Status: active
-Last verified: 2026-08-23 02:44:20 Asia/Shanghai
+Last verified: 2026-08-23 03:40:10 Asia/Shanghai
 Branch: main
-Verified HEAD: e3852e4 (base; five-word page delta verified in working tree)
-Working tree: pagination source/tests/docs modified; unrelated output preserved
+Verified HEAD: 3e2f2b7 (base; English boundary delta verified in working tree)
+Working tree: English boundary source/tests/docs modified; unrelated output preserved
 
 ## Current Goal
 Repair the verified causes of reduced automatic subtitle quality in independently tested commits.
 
 ## Confirmed Facts
 - The newest White House raw checkpoint has 221 parents, 271 actual pages, 42 multipage parents, 5 missing page-Chinese IDs, and 5 formal error parents.
-- Its semantic review queue is stale: all 25 saved context rows mismatch the current English spans.
-- Chocolate v27/v29 share word-ledger hash `85ba0f98...9199a`; v27 is PASS and v29 is ERROR with different parent/page plans.
 - Local skill `audit-caption-results` collects immutable-run identity, parent/neighbour context, actual pages, page Chinese, marks, and same-ledger A/B evidence without writes.
-- Review queues now require current word-ledger and frozen ID/English/span identity; real White House replay has zero stale semantic-queue marks.
 - Chocolate real-timing replay restores its complete 11+5 page plan; passing White House replay changes 0/217 frozen page/font signatures.
+- New White House replay removes 6/6 confirmed English defects with 2,586/2,586 ordered words preserved.
+- The stable-caption rule suite passes 538/538; the newly exposed 24-word cue retains its historical 56px three-page plan.
 
 ## Approved Decisions
 - A routine new-run audit checks one raw automatic result; regression claims require the same word ledger.
@@ -29,10 +28,10 @@ Repair the verified causes of reduced automatic subtitle quality in independentl
 - Page planner: `app/core/utils/podcast_learning_video.py`
 
 ## Last Verification
-- Article readability 104/104; White House frozen-plan guard 217/217 unchanged.
+- Stable-caption rules 538/538; White House 2,586/2,586 words and historical three-page guard pass.
 
 ## Next Action
-Repair the pre-ID English boundary completeness gaps against current-run evidence.
+Commit the verified English boundary fix, then repair page-Chinese completeness and continuity.
 
 ## Do Not Regress
 - Do not mutate production artifacts or relax word coverage, timing, font, or semantic page ownership.

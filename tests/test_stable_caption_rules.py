@@ -5008,6 +5008,102 @@ def test_parser_dependency_phrase_entrances_are_hard_boundaries():
         assert not evaluation["legal"], words
 
 
+def test_spacy_alignment_keeps_ledger_words_after_a_split_contraction():
+    words = (
+        "You cannot untangle a hopelessly complex global supply chain without "
+        "someone paying the bill."
+    ).split()
+    editor = _marker_editor(words)
+    nlp = editor._load_syntax_nlp()
+    assert nlp is not None
+    doc = nlp(editor._normalize_text(" ".join(words)))
+
+    mapping = editor._align_doc_tokens_to_word_entries(doc, 0, len(words) - 1)
+    token_words = {
+        token.text: mapping.get(token.i)
+        for token in doc
+        if not token.is_punct
+    }
+
+    assert token_words["can"] == words.index("cannot")
+    assert token_words["not"] == words.index("cannot")
+    assert token_words["supply"] == words.index("supply")
+    assert token_words["chain"] == words.index("chain")
+
+
+def test_parser_blocks_attached_clause_entrances_from_white_house_run():
+    cases = [
+        (
+            "It's a completely normal scenario for anyone just walking down a store aisle today.",
+            "anyone",
+            "just",
+        ),
+        (
+            "Free trade agreements include massive highly technical chapters called rules of origin.",
+            "chapters",
+            "called",
+        ),
+        (
+            "The reason that extreme localized dragnet hasn't come to pass is a massive roadblock.",
+            "come",
+            "to",
+        ),
+    ]
+    for text, left_surface, right_surface in cases:
+        words = text.split()
+        editor = _marker_editor(words, max_words=16)
+        editor._prepare_syntax_cut_hints()
+        left = next(
+            index
+            for index, (current, following) in enumerate(zip(words, words[1:]))
+            if current == left_surface and following == right_surface
+        )
+
+        evaluation = editor._evaluate_stable_cut_boundary(left, left + 1)
+
+        assert "dependency_phrase_entrance_split" in evaluation["hard_issues"], (
+            text,
+            evaluation,
+        )
+        assert not evaluation["legal"], text
+
+
+def test_attached_clause_entrance_guard_allows_independent_sentence_starts():
+    cases = [
+        ("We stopped. To reduce costs, we automated.", "stopped.", "To"),
+        ("The report ended. Called sources responded later.", "ended.", "Called"),
+    ]
+    for text, left_surface, right_surface in cases:
+        words = text.split()
+        editor = _marker_editor(words, max_words=16)
+        editor._prepare_syntax_cut_hints()
+        left = next(
+            index
+            for index, (current, following) in enumerate(zip(words, words[1:]))
+            if current == left_surface and following == right_surface
+        )
+
+        evaluation = editor._evaluate_stable_cut_boundary(left, left + 1)
+
+        assert "dependency_phrase_entrance_split" not in evaluation["hard_issues"]
+        assert evaluation["legal"], (text, evaluation)
+
+
+def test_attached_clause_entrance_guard_allows_a_complete_purpose_restart():
+    words = (
+        "Our mission is to analyze the logic presented in this text to try and "
+        "understand how global trade is shifting."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    left = words.index("text")
+
+    evaluation = editor._evaluate_stable_cut_boundary(left, left + 1)
+
+    assert "dependency_phrase_entrance_split" not in evaluation["hard_issues"]
+    assert evaluation["legal"], evaluation
+
+
 def test_dependency_phrase_entrance_guard_allows_independent_sentence_starts():
     cases = [
         (["We", "invested.", "To", "reduce", "costs,", "we", "automated."], 1),
@@ -5092,6 +5188,33 @@ def test_parser_clause_chains_block_migrated_dependency_boundaries():
 
         assert issue in evaluation["hard_issues"], (words, evaluation)
         assert not evaluation["legal"], words
+
+
+def test_separable_particle_and_following_preposition_stay_in_one_predicate_chain():
+    words = "The source puts Navarro's numbers up against an analysis from 2023.".split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    particle = words.index("up")
+
+    evaluation = editor._evaluate_stable_cut_boundary(particle, particle + 1)
+
+    assert "verb_particle_preposition_chain_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_predicate_adverb_and_following_preposition_stay_in_one_chain():
+    words = (
+        "You cannot dismantle global supply chains without passing that cost "
+        "directly to the public."
+    ).split()
+    editor = _marker_editor(words, max_words=16)
+    editor._prepare_syntax_cut_hints()
+    adverb = words.index("directly")
+
+    evaluation = editor._evaluate_stable_cut_boundary(adverb, adverb + 1)
+
+    assert "verb_adverb_preposition_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
 
 
 def test_pre_id_candidate_cannot_remove_existing_strong_sentence_anchor():
@@ -5739,6 +5862,31 @@ def test_orphaned_predicate_parse_is_cached_for_the_same_frozen_span():
     assert first == ["right_orphaned_finite_predicate"]
     assert second == first
     assert parse_calls == ["spend less today."]
+
+
+def test_orphaned_predicate_detects_a_leading_passive_before_a_complete_clause():
+    text = "was financed by a Chinese bank, so now the entire cake is illegal."
+    words = text.split()
+    editor = _marker_editor(words, max_words=16)
+    item = _word_item(editor, 0, len(words) - 1, 1)
+
+    assert editor._orphaned_finite_predicate_issues(item) == [
+        "right_orphaned_finite_predicate"
+    ]
+
+
+def test_orphaned_predicate_keeps_questions_conditionals_and_nonfinite_intros():
+    cases = [
+        "Was the policy successful?",
+        "Had investors expected this, markets would have reacted.",
+        "Walking home, she called.",
+    ]
+    for text in cases:
+        words = text.split()
+        editor = _marker_editor(words, max_words=16)
+        item = _word_item(editor, 0, len(words) - 1, 1)
+
+        assert editor._orphaned_finite_predicate_issues(item) == [], text
 
 
 def test_final_gate_soft_flags_heuristic_short_verb_object_split():

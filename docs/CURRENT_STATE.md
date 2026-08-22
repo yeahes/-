@@ -2,6 +2,37 @@
 
 Last updated: 2026-08-23
 
+## 2026-08-23 Frozen English Dependency Boundary Completeness
+
+- A complete replay of the newest White House word ledger exposed six formal
+  cue boundaries that remained legal despite splitting an attached clause,
+  separable predicate chain, leading passive predicate, or compound noun.
+  The common tokenizer defect was positional: spaCy may split one immutable
+  ledger word such as `cannot` into multiple tokens, while the old substring
+  cursor consumed the ledger word once and then skipped the rest of the
+  sentence.
+- spaCy tokens now map to immutable ledger words by overlapping character
+  intervals in the exact non-destructive parse text. Multiple parser tokens
+  may map to the same ledger word; English surface text, word IDs, order, and
+  timing remain unchanged.
+- The pre-ID grammar owner now protects unpunctuated attached `acl`/`relcl`
+  entrances, directly attached `to` infinitival predicate continuations,
+  separable particle-plus-preposition predicates, and adjacent predicate
+  adverb-plus-preposition chains. Independent sentence starts, punctuated
+  adjuncts, and complete purpose restarts remain legal.
+- A leading finite passive predicate without its own subject is rejected even
+  when a later coordinated/main predicate has a subject. Passive questions,
+  inverted conditionals, and leading non-finite adjuncts remain legal.
+- The attached-clause evidence reuses the existing
+  `dependency_phrase_entrance_split` cross-stage classification: it is HARD for
+  formal cue freezing but may remain an explicit renderer REVIEW boundary when
+  a complete normal-font display page requires it.
+- Current-code replay removes all 6/6 confirmed White House defects while
+  preserving 2,586/2,586 ordered ledger words. The one newly exposed 24-word
+  cue retains its historical 56px three-page plan; the three pre-existing
+  structural page failures remain unchanged. Boundary-focused tests pass
+  105/105 and the complete stable-caption rule suite passes 538/538.
+
 ## 2026-08-23 Reviewable Five-Word Terminal Display Page
 
 - The same-ledger Chocolate replay exposed a renderer ownership error: the

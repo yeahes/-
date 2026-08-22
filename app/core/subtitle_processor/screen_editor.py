@@ -5484,11 +5484,48 @@ class ScreenSubtitleEditor:
             and re.search(r"[.!?][\"')\]]*\s*$", text)
             and not has_subject
         )
+        subject_deps = {"nsubj", "nsubjpass", "csubj", "expl"}
+        first_content_index = next(
+            (
+                getattr(token, "i", index)
+                for index, token in enumerate(doc)
+                if not getattr(token, "is_punct", False)
+            ),
+            None,
+        )
+        leading_subjectless_passive = any(
+            getattr(predicate, "pos_", "") == "VERB"
+            and getattr(predicate, "tag_", "") == "VBN"
+            and min(
+                (
+                    item.i
+                    for item in predicate.subtree
+                    if not getattr(item, "is_punct", False)
+                ),
+                default=predicate.i,
+            )
+            == first_content_index
+            and any(
+                getattr(child, "dep_", "") == "auxpass"
+                and getattr(child, "tag_", "") in {"MD", "VBD", "VBP", "VBZ"}
+                for child in predicate.children
+            )
+            and not any(
+                getattr(child, "dep_", "") in subject_deps
+                for child in predicate.children
+            )
+            for predicate in doc
+        )
         issues = (
             ("right_orphaned_finite_predicate",)
-            if (root_is_finite or root_has_finite_auxiliary)
-            and not has_subject
-            and not imperative
+            if (
+                (
+                    (root_is_finite or root_has_finite_auxiliary)
+                    and not has_subject
+                    and not imperative
+                )
+                or leading_subjectless_passive
+            )
             else ()
         )
         if len(cache) >= LOCAL_SYNTAX_RESULT_CACHE_MAX:
@@ -10153,6 +10190,46 @@ class ScreenSubtitleEditor:
                     range(verb_index, particle_index + 1),
                     "separable_verb_particle_chain_split",
                 )
+                following_prepositions = [
+                    child
+                    for child in verb.children
+                    if (
+                        getattr(child, "dep_", "") == "prep"
+                        and child.i in doc_to_word
+                        and doc_to_word[child.i] == particle_index + 1
+                        and any(
+                            getattr(complement, "dep_", "") in {"pobj", "pcomp"}
+                            for complement in child.children
+                        )
+                    )
+                ]
+                if following_prepositions:
+                    preposition_index = particle_index + 1
+                    particle_pause = self._word_pause_ms(
+                        particle_index,
+                        preposition_index,
+                    )
+                    if (
+                        not self._is_unambiguous_sentence_terminal(
+                            str(
+                                self._active_word_entries[particle_index].get(
+                                    "surface"
+                                )
+                                or ""
+                            ),
+                            str(
+                                self._active_word_entries[preposition_index].get(
+                                    "surface"
+                                )
+                                or ""
+                            ),
+                        )
+                        and (particle_pause is None or particle_pause < 450)
+                    ):
+                        self._record_syntax_hard_issue_for_indices(
+                            range(verb_index, preposition_index + 1),
+                            "verb_particle_preposition_chain_split",
+                        )
                 continue
             if re.search(r"[.!?]\s*$", str(particle.text or "")):
                 continue
@@ -10427,6 +10504,46 @@ class ScreenSubtitleEditor:
         for token in doc:
             if getattr(token, "dep_", "") != "prep" or token.i not in doc_to_word:
                 continue
+            prep_index = doc_to_word[token.i]
+            governing_verb = token.head
+            adjacent_adverbs = [
+                child
+                for child in governing_verb.children
+                if (
+                    getattr(child, "dep_", "") == "advmod"
+                    and getattr(child, "pos_", "") == "ADV"
+                    and child.i in doc_to_word
+                    and doc_to_word[child.i] == prep_index - 1
+                )
+            ]
+            if (
+                getattr(governing_verb, "pos_", "") in {"VERB", "AUX"}
+                and any(
+                    getattr(child, "dep_", "") in {"pobj", "pcomp"}
+                    for child in token.children
+                )
+                and adjacent_adverbs
+            ):
+                adverb_index = prep_index - 1
+                pause_ms = self._word_pause_ms(adverb_index, prep_index)
+                adverb_surface = str(
+                    self._active_word_entries[adverb_index].get("surface") or ""
+                )
+                if (
+                    not re.search(r"[,;:][\"')\]]*\s*$", adverb_surface)
+                    and not self._is_unambiguous_sentence_terminal(
+                        adverb_surface,
+                        str(
+                            self._active_word_entries[prep_index].get("surface")
+                            or ""
+                        ),
+                    )
+                    and (pause_ms is None or pause_ms < 450)
+                ):
+                    self._record_syntax_hard_issue_for_indices(
+                        [adverb_index, prep_index],
+                        "verb_adverb_preposition_split",
+                    )
             adverb = token.head
             verb = adverb.head
             if (
@@ -11461,6 +11578,53 @@ class ScreenSubtitleEditor:
                 and current.head == governing
             )
 
+        for predicate in doc:
+            dependency = getattr(predicate, "dep_", "")
+            if dependency not in {"acl", "relcl", "advcl"}:
+                continue
+            head_word = doc_to_word.get(predicate.head.i)
+            clause_words = sorted(
+                {
+                    doc_to_word[item.i]
+                    for item in predicate.subtree
+                    if item.i in doc_to_word
+                }
+            )
+            if not clause_words or head_word is None:
+                continue
+            entrance = clause_words[0]
+            left = entrance - 1
+            if head_word >= entrance or left not in tokens_by_word:
+                continue
+            if dependency == "advcl":
+                if head_word != left or not any(
+                    self._clean_boundary_token(getattr(item, "text", "")) == "to"
+                    and getattr(item, "dep_", "") in {"aux", "mark"}
+                    for item in predicate.subtree
+                ):
+                    continue
+            left_surface = str(
+                self._active_word_entries[left].get("surface") or ""
+            )
+            right_surface = str(
+                self._active_word_entries[entrance].get("surface") or ""
+            )
+            if (
+                re.search(r"[,;:][\"')\]]*\s*$", left_surface)
+                or self._is_unambiguous_sentence_terminal(
+                    left_surface,
+                    right_surface,
+                )
+            ):
+                continue
+            pause_ms = self._word_pause_ms(left, entrance)
+            if pause_ms is not None and pause_ms >= 450:
+                continue
+            self._record_syntax_hard_issue_for_indices(
+                [left, entrance],
+                "dependency_phrase_entrance_split",
+            )
+
         for token in doc:
             if token.i not in doc_to_word:
                 continue
@@ -11794,43 +11958,46 @@ class ScreenSubtitleEditor:
     def _align_doc_tokens_to_word_entries(
         self, doc, span_start: int, span_end: int
     ) -> Dict[int, int]:
+        doc_text = str(getattr(doc, "text", "") or "")
+        if not doc_text:
+            return {}
+
+        ledger_ranges: List[tuple[int, int, int]] = []
+        search_start = 0
+        for word_index in range(span_start, span_end + 1):
+            entry = self._active_word_entries[word_index]
+            surface = str(entry.get("surface") or entry.get("token") or "")
+            surface = re.sub(r"\s+", " ", surface).strip()
+            if not surface:
+                continue
+            range_start = doc_text.find(surface, search_start)
+            if range_start < 0:
+                logger.debug(
+                    "spaCy token alignment skipped: ledger surface %r missing at word %s",
+                    surface,
+                    word_index,
+                )
+                return {}
+            range_end = range_start + len(surface)
+            ledger_ranges.append((range_start, range_end, word_index))
+            search_start = range_end
+
         mapping: Dict[int, int] = {}
-        cursor = span_start
-        last_entry_token = ""
         for token in doc:
             if getattr(token, "is_punct", False):
                 continue
-            normalized = self._clean_boundary_token(token.text)
-            if not normalized:
+            token_start = int(getattr(token, "idx", -1))
+            token_text = str(getattr(token, "text", "") or "")
+            token_end = token_start + len(token_text)
+            if token_start < 0 or token_end <= token_start:
                 continue
-            # The word ledger keeps ASR tokens intact (for example
-            # ``six-fold``), while spaCy may split the same surface into
-            # ``six``, ``-`` and ``fold``. Once a sub-token has consumed the
-            # ledger word, ignore later sub-tokens from that same compound so
-            # they cannot advance the cursor and misalign the rest of the
-            # sentence.
-            if (
-                last_entry_token
-                and normalized != last_entry_token
-                and normalized in last_entry_token
-                and bool(re.search(r"[-/'’]", last_entry_token))
-            ):
-                continue
-            while cursor <= span_end:
-                entry_token = self._clean_boundary_token(
-                    self._active_word_entries[cursor].get("token") or ""
-                )
-                if entry_token == normalized:
-                    mapping[token.i] = cursor
-                    last_entry_token = entry_token
-                    cursor += 1
-                    break
-                if normalized in entry_token or entry_token in normalized:
-                    mapping[token.i] = cursor
-                    last_entry_token = entry_token
-                    cursor += 1
-                    break
-                cursor += 1
+            overlaps = [
+                (min(token_end, range_end) - max(token_start, range_start), word_index)
+                for range_start, range_end, word_index in ledger_ranges
+                if token_start < range_end and token_end > range_start
+            ]
+            if overlaps:
+                mapping[token.i] = max(overlaps)[1]
         return mapping
 
     @staticmethod
