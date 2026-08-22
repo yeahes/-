@@ -20,13 +20,17 @@ from app.core.subtitle_processor.user_facing_issue_text import (
     issue_codes_text,
     user_facing_issue_reason,
 )
+from app.core.subtitle_processor.review_evidence_identity import (
+    build_review_source_identity,
+    load_bound_semantic_review_queue,
+)
 from app.core.subtitle_processor.stable_artifacts import write_json_artifact
 
 
 _SUBTITLE_ID_RE = re.compile(r"S\d{4}")
 _TERMINAL_SENTENCE_RE = re.compile(r"[.!?][\"'”’\)\]]*$")
 _REVIEW_LEDGER_NAME = "editor-review-ledger.json"
-_REVIEW_LEDGER_SCHEMA_VERSION = 1
+_REVIEW_LEDGER_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -95,14 +99,18 @@ def write_subtitle_review_ledger(artifact_dir: str | Path) -> Dict[str, Any]:
         )
     )
     word_ledger = _read_json(directory / "word-ledger.json", {})
-    source_word_ledger_hash = (
-        str(word_ledger.get("hash") or "")
-        if isinstance(word_ledger, Mapping)
-        else ""
+    subtitle_spans = _as_list(
+        _read_json(directory / "subtitle-spans.json", [])
+    )
+    source_identity = build_review_source_identity(
+        word_ledger if isinstance(word_ledger, Mapping) else {},
+        [span for span in subtitle_spans if isinstance(span, Mapping)],
     )
     payload: Dict[str, Any] = {
         "schema_version": _REVIEW_LEDGER_SCHEMA_VERSION,
-        "source_word_ledger_hash": source_word_ledger_hash,
+        "source_word_ledger_hash": source_identity["word_ledger_hash"],
+        "source_frozen_span_hash": source_identity["frozen_span_hash"],
+        "source_subtitle_count": source_identity["subtitle_count"],
         "summary": {
             "task_count": len(items),
             "blocker_count": sum(item["severity"] == "BLOCKER" for item in items),
@@ -235,13 +243,21 @@ def _review_marks_from_ledger(
     if int(payload.get("schema_version") or 0) != _REVIEW_LEDGER_SCHEMA_VERSION:
         return None
     current_ledger = _read_json(directory / "word-ledger.json", {})
-    current_hash = (
-        str(current_ledger.get("hash") or "")
-        if isinstance(current_ledger, Mapping)
-        else ""
+    current_spans = _as_list(
+        _read_json(directory / "subtitle-spans.json", [])
     )
-    expected_hash = str(payload.get("source_word_ledger_hash") or "")
-    if expected_hash and current_hash and expected_hash != current_hash:
+    current_identity = build_review_source_identity(
+        current_ledger if isinstance(current_ledger, Mapping) else {},
+        [span for span in current_spans if isinstance(span, Mapping)],
+    )
+    if (
+        str(payload.get("source_word_ledger_hash") or "")
+        != current_identity["word_ledger_hash"]
+        or str(payload.get("source_frozen_span_hash") or "")
+        != current_identity["frozen_span_hash"]
+        or payload.get("source_subtitle_count")
+        != current_identity["subtitle_count"]
+    ):
         return None
 
     marks: List[SubtitleReviewMark] = []
@@ -915,7 +931,7 @@ def _deterministic_text_review_marks(directory: Path) -> List[SubtitleReviewMark
 
 def _semantic_review_queue_marks(directory: Path) -> List[SubtitleReviewMark]:
     """Expose the persisted semantic queue as read-only editor marks."""
-    payload = _read_json(directory / "semantic-review-queue.json", {})
+    payload = load_bound_semantic_review_queue(directory)
     items = payload.get("items") if isinstance(payload, Mapping) else None
     if not isinstance(items, list):
         return []

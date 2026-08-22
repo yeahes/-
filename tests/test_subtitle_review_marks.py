@@ -17,6 +17,9 @@ from app.core.subtitle_processor.subtitle_review_marks import (
     review_marks_to_payload,
     write_subtitle_review_ledger,
 )
+from app.core.subtitle_processor.review_evidence_identity import (
+    build_review_source_identity,
+)
 from app.view.subtitle_interface import SubtitleTableModel
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QBrush
@@ -320,15 +323,40 @@ def test_english_boundary_marks_drop_complete_sentence_false_positive():
 def test_semantic_review_queue_is_loaded_as_id_bound_read_only_marks():
     with tempfile.TemporaryDirectory() as temp_dir:
         artifact_dir = Path(temp_dir)
+        word_ledger = {"hash": "current-ledger", "words": []}
+        subtitle_spans = [
+            {
+                "subtitle_id": "S0002",
+                "original": "The current English sentence.",
+                "word_start": 4,
+                "word_end": 7,
+            }
+        ]
+        _write_json(artifact_dir / "word-ledger.json", word_ledger)
+        _write_json(artifact_dir / "subtitle-spans.json", subtitle_spans)
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
         _write_json(
             artifact_dir / "semantic-review-queue.json",
             {
+                "schema_version": 2,
+                "source_run": build_review_source_identity(
+                    word_ledger,
+                    subtitle_spans,
+                ),
                 "items": [
                     {
                         "code": "translation_fluency_review",
                         "title": "中文翻译腔复核",
                         "reason": "语义表达不自然",
                         "subtitle_ids": ["S0002"],
+                        "context": [
+                            {
+                                "subtitle_id": "S0002",
+                                "english": "The current English sentence.",
+                                "word_start": 4,
+                                "word_end": 7,
+                            }
+                        ],
                     },
                     {"code": "bad", "subtitle_ids": ["not-an-id"]},
                 ]
@@ -346,6 +374,92 @@ def test_semantic_review_queue_is_loaded_as_id_bound_read_only_marks():
         assert "not-an-id" not in marks
 
 
+def test_semantic_review_queue_rejects_same_id_from_different_frozen_run():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        current_ledger = {"hash": "current-ledger", "words": []}
+        current_spans = [
+            {
+                "subtitle_id": "S0002",
+                "original": "The current English sentence.",
+                "word_start": 4,
+                "word_end": 7,
+            }
+        ]
+        stale_spans = [
+            {
+                "subtitle_id": "S0002",
+                "original": "A stale English sentence.",
+                "word_start": 10,
+                "word_end": 14,
+            }
+        ]
+        _write_json(artifact_dir / "word-ledger.json", current_ledger)
+        _write_json(artifact_dir / "subtitle-spans.json", current_spans)
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
+        _write_json(
+            artifact_dir / "semantic-review-queue.json",
+            {
+                "schema_version": 2,
+                "source_run": build_review_source_identity(
+                    {"hash": "stale-ledger", "words": []},
+                    stale_spans,
+                ),
+                "items": [
+                    {
+                        "code": "translation_fluency_review",
+                        "subtitle_ids": ["S0002"],
+                        "context": [
+                            {
+                                "subtitle_id": "S0002",
+                                "english": "A stale English sentence.",
+                                "word_start": 10,
+                                "word_end": 14,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+        assert load_subtitle_review_marks(artifact_dir) == {}
+
+
+def test_semantic_review_queue_rejects_unbound_legacy_payload():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        _write_json(
+            artifact_dir / "word-ledger.json",
+            {"hash": "current-ledger", "words": []},
+        )
+        _write_json(
+            artifact_dir / "subtitle-spans.json",
+            [
+                {
+                    "subtitle_id": "S0002",
+                    "original": "The current English sentence.",
+                    "word_start": 4,
+                    "word_end": 7,
+                }
+            ],
+        )
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
+        _write_json(
+            artifact_dir / "semantic-review-queue.json",
+            {
+                "schema_version": 1,
+                "items": [
+                    {
+                        "code": "translation_fluency_review",
+                        "subtitle_ids": ["S0002"],
+                    }
+                ],
+            },
+        )
+
+        assert load_subtitle_review_marks(artifact_dir) == {}
+
+
 def test_article_asr_review_marks_require_matching_frozen_ledger_hash():
     with tempfile.TemporaryDirectory() as temp_dir:
         artifact_dir = Path(temp_dir)
@@ -353,6 +467,7 @@ def test_article_asr_review_marks_require_matching_frozen_ledger_hash():
             artifact_dir / "word-ledger.json",
             {"hash": "current-ledger", "words": []},
         )
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
         _write_json(
             artifact_dir / "article-asr-correction-review.json",
             {
@@ -870,7 +985,9 @@ def test_review_ledger_freezes_high_value_tasks_and_merges_shared_subtitle_ids()
 
         ledger = write_subtitle_review_ledger(artifact_dir)
 
+        assert ledger["schema_version"] == 2
         assert ledger["source_word_ledger_hash"] == "frozen-word-ledger"
+        assert ledger["source_frozen_span_hash"]
         assert ledger["summary"] == {
             "task_count": 4,
             "blocker_count": 0,

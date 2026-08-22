@@ -9,6 +9,10 @@ from app.core.subtitle_processor.translation_review_suggestions import (
     currency_unit_review_suggestions,
     validate_translation_review_suggestions,
 )
+from app.core.subtitle_processor.review_evidence_identity import (
+    SEMANTIC_REVIEW_QUEUE_SCHEMA_VERSION,
+    build_review_source_identity,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -171,6 +175,8 @@ class QASummaryBuilder:
                 "end_ms": item.get("end_ms"),
                 "english": _normal_text(item, "original", "text", "english"),
                 "chinese": _normal_text(item, "translated", "translated_text", "zh"),
+                "word_start": item.get("word_start"),
+                "word_end": item.get("word_end"),
             }
         for index, item in enumerate(self.translations, 1):
             subtitle_id = str(item.get("subtitle_id") or f"S{index:04d}")
@@ -257,6 +263,8 @@ class QASummaryBuilder:
                     "english": record.get("english", ""),
                     "chinese": record.get("chinese", ""),
                     "word_count": _word_count(record.get("english", "")),
+                    "word_start": record.get("word_start"),
+                    "word_end": record.get("word_end"),
                 }
             )
         return context
@@ -860,6 +868,7 @@ def write_qa_review_artifacts(
             "code_commit": summary["summary"].get("code_commit"),
             "translation_model": summary["summary"].get("translation_model"),
             "subtitle_count": summary["summary"].get("subtitle_count"),
+            **build_review_source_identity(builder.word_ledger, builder.spans),
         },
         "queue": queue_meta,
         "items": _review_queue_items(summary, review_limit=review_limit)[0],
@@ -870,7 +879,12 @@ def write_qa_review_artifacts(
     semantic_srt, semantic_meta = _semantic_review_queue_srt(semantic_items)
     _write_json(
         semantic_json_path,
-        {"schema_version": 1, "source_run": queue_payload["source_run"], "queue": semantic_meta, "items": semantic_items},
+        {
+            "schema_version": SEMANTIC_REVIEW_QUEUE_SCHEMA_VERSION,
+            "source_run": queue_payload["source_run"],
+            "queue": semantic_meta,
+            "items": semantic_items,
+        },
     )
     semantic_srt_path.write_text(semantic_srt, encoding="utf-8-sig")
 

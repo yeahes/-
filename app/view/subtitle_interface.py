@@ -82,6 +82,9 @@ from app.core.subtitle_processor.subtitle_review_marks import (
     review_marks_from_payload,
     syntax_review_parser_available,
 )
+from app.core.subtitle_processor.review_evidence_identity import (
+    load_bound_semantic_review_queue,
+)
 from app.core.subtitle_processor.stable_artifacts import write_json_artifact
 from app.core.subtitle_processor.translation_review_suggestions import (
     apply_translation_review_suggestion,
@@ -3133,9 +3136,12 @@ class SubtitleInterface(QWidget):
                 if artifact_dir
                 else None
             )
-            queue_available = bool(
-                semantic_queue_path and semantic_queue_path.is_file()
+            queue_payload = (
+                load_bound_semantic_review_queue(artifact_dir)
+                if semantic_queue_path and semantic_queue_path.is_file()
+                else None
             )
+            queue_available = isinstance(queue_payload, dict)
             self.manual_translation_review_action.setEnabled(queue_available)
             self.manual_translation_review_action.setVisible(queue_available)
         self.manual_final_undo_action.setEnabled(
@@ -4935,12 +4941,13 @@ class SubtitleInterface(QWidget):
         session = self.manual_final_session
         if session is None:
             return
-        queue_path = session.artifact_dir / "semantic-review-queue.json"
-        try:
-            payload = json.loads(queue_path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError) as exc:
+        payload = load_bound_semantic_review_queue(session.artifact_dir)
+        if payload is None:
             InfoBar.warning(
-                self.tr("无法读取中文复查队列"), str(exc), duration=5000, parent=self
+                self.tr("无法读取中文复查队列"),
+                self.tr("复查队列与当前字幕版本不匹配，请重新生成。"),
+                duration=5000,
+                parent=self,
             )
             return
         items = payload.get("items") if isinstance(payload, dict) else None

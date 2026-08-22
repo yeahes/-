@@ -340,6 +340,10 @@ def test_semantic_queue_suggests_currency_unit_only_with_article_evidence():
             Path(result["semantic_review_queue_json"]).read_text(encoding="utf-8")
         )
 
+        assert payload["schema_version"] == 2
+        assert payload["source_run"]["word_ledger_hash"]
+        assert payload["source_run"]["frozen_span_hash"]
+        assert payload["source_run"]["subtitle_count"] == 1
         assert result["semantic_review_item_count"] == 1
         item = payload["items"][0]
         assert item["code"] == "currency_unit_conflict_review"
@@ -352,6 +356,8 @@ def test_semantic_queue_suggests_currency_unit_only_with_article_evidence():
             ),
             "suggested_chinese": "这些女性偷偷付费咨询，每次75美元。",
         }
+        assert item["context"][0]["word_start"] is None
+        assert item["context"][0]["word_end"] is None
 
 
 def test_semantic_queue_does_not_guess_bare_number_currency_without_evidence():

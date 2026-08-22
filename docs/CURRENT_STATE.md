@@ -4109,3 +4109,22 @@ Result:
   those names, the failed check passes, giving 30/30 verified checks in total.
   English text, frozen subtitle IDs, word spans, timing, translation prompts,
   allocation rules, and display pagination are unchanged.
+
+## 2026-08-23 Review Evidence Identity Isolation
+
+- Root cause: a copied semantic review queue could be loaded by matching
+  `Sxxxx` alone. The newest White House checkpoint therefore inherited review
+  context from a different 217-parent run even though its current run has 221
+  parents and different English for every referenced context row.
+- Semantic review queues now use schema v2 and bind the authoritative word
+  ledger, the complete frozen `subtitle_id + English + word span` snapshot,
+  and subtitle count. Every referenced context row must also match its current
+  English and word range before the queue can reach editor marks or the manual
+  translation-review dialog.
+- Editor review ledgers now use the same frozen-span identity. Legacy unbound
+  ledgers are recomputed from current evidence; unbound legacy semantic queues
+  are rejected instead of being trusted by numeric ID coincidence.
+- Focused review-mark tests pass 24/24, QA queue tests pass 6/6, and the editor
+  visibility regression passes. Read-only replay of the real White House
+  checkpoint produces zero semantic-queue marks while preserving all current
+  non-semantic evidence. No production subtitle artifact was rewritten.

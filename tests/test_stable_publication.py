@@ -30,6 +30,9 @@ from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleSession,
 )
 from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
+from app.core.subtitle_processor.review_evidence_identity import (
+    build_review_source_identity,
+)
 from app.core.subtitle_processor.subtitle_review_marks import SubtitleReviewMark
 from app.core.subtitle_processor.translation_review_suggestions import (
     current_chinese_hash,
@@ -965,14 +968,49 @@ class StablePublicationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact_dir = Path(temp_dir)
+            word_ledger = {"hash": "queue-ledger", "words": []}
+            subtitle_spans = [
+                {
+                    "subtitle_id": "S0001",
+                    "original": "English",
+                    "word_start": 0,
+                    "word_end": 0,
+                }
+            ]
+            (artifact_dir / "word-ledger.json").write_text(
+                json.dumps(word_ledger),
+                encoding="utf-8",
+            )
+            (artifact_dir / "subtitle-spans.json").write_text(
+                json.dumps(subtitle_spans),
+                encoding="utf-8",
+            )
             (artifact_dir / "semantic-review-queue.json").write_text(
-                json.dumps({"schema_version": 1, "items": []}),
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "source_run": build_review_source_identity(
+                            word_ledger,
+                            subtitle_spans,
+                        ),
+                        "items": [],
+                    }
+                ),
                 encoding="utf-8",
             )
             interface.manual_final_session = Session(artifact_dir)
             interface._apply_manual_final_session()
             self.assertTrue(interface.manual_translation_review_action.isVisible())
             self.assertTrue(interface.manual_translation_review_action.isEnabled())
+
+            subtitle_spans[0]["original"] = "Different English"
+            (artifact_dir / "subtitle-spans.json").write_text(
+                json.dumps(subtitle_spans),
+                encoding="utf-8",
+            )
+            interface._apply_manual_final_session()
+            self.assertFalse(interface.manual_translation_review_action.isVisible())
+            self.assertFalse(interface.manual_translation_review_action.isEnabled())
 
     def test_fixed_id_translation_suggestion_rejects_an_active_new_chinese_edit(self):
         captured = {}
