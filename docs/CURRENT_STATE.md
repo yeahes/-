@@ -2,6 +2,30 @@
 
 Last updated: 2026-08-23
 
+## 2026-08-23 Offline Pre-ID Joint Page Feasibility
+
+- Added a production-independent, offline experiment that moves the two cuts
+  in each requested three-parent window by at most eight words, then requires
+  the current pre-ID grammar/fragment contract and real 56/54/52px page planner
+  to accept all three parents. It never mutates production artifacts and does
+  not evaluate invalidated Chinese ownership.
+- Across 14 requested White House targets, 2,686 boundary combinations produced
+  one feasible changed-boundary alternative and zero net improvements. The one
+  `S0183` alternative shortened the target only by worsening its left neighbor.
+  `S0123`, `S0132`, and `S0192` remained unsolved.
+- The passing historical White House artifact replays through the production
+  whole-episode page selector at 217/217 with zero page-range or font-signature
+  changes. A regression test prevents the experiment from substituting a
+  misleading per-cue page replay for that full-sequence guard.
+- Do not implement the tested same-count joint precheck in stable mode. The ten
+  renderable targets still belong to inside-parent page selection. Any future
+  attempt to solve the three structural failures by changing parent count must
+  remain offline until speaker ownership and translation/page-Chinese A/B
+  evidence exist.
+- Verification passed: focused experiment tests 9/9 and the full regression
+  suite 30/30 in 904.05 seconds. The GUI-held log file produced harmless
+  `WinError 32` rotation warnings but no test failure.
+
 ## 2026-08-23 Content-Bound Translation Cache And Snapshot Isolation
 
 - Complete semantic-group translations now use a v2 content identity that
