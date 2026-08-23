@@ -148,7 +148,6 @@ def audit(
     cues = _load_cues(artifact_dir)
     requested_ids = {str(value) for value in subtitle_ids if str(value)}
     if requested_ids:
-        cues = [cue for cue in cues if cue.subtitle_id in requested_ids]
         missing_ids = requested_ids - {cue.subtitle_id for cue in cues}
         if missing_ids:
             raise ValueError(
@@ -168,26 +167,31 @@ def audit(
         )
         for cue in cues
     ]
-    failures = [
-        dict(bundle)
-        for bundle in bundles
-        if bundle.get("status") != "candidate_bundle"
+    bundle_entries = [
+        (cue, bundle)
+        for cue, bundle in zip(cues, bundles)
+        if bundle.get("status") == "candidate_bundle"
     ]
-    if failures:
-        return {
-            "schema_version": 1,
-            "status": "failed",
-            "artifact_dir": str(artifact_dir.resolve()),
-            "failures": failures,
+    failures = [
+        {
+            "subtitle_id": cue.subtitle_id,
+            **dict(bundle),
         }
+        for cue, bundle in zip(cues, bundles)
+        if bundle.get("status") != "candidate_bundle"
+        and (not requested_ids or cue.subtitle_id in requested_ids)
+    ]
 
     production_selected = podcast_learning_video._select_article_page_plan_sequence(
-        [bundle["candidates"] for bundle in bundles]
+        [bundle["candidates"] for _cue, bundle in bundle_entries]
     )
     shadow_selected = podcast_learning_video._select_article_page_plan_sequence(
-        [bundle["shadow_candidates"] for bundle in bundles]
+        [bundle["shadow_candidates"] for _cue, bundle in bundle_entries]
     )
-    if len(production_selected) != len(cues) or len(shadow_selected) != len(cues):
+    if (
+        len(production_selected) != len(bundle_entries)
+        or len(shadow_selected) != len(bundle_entries)
+    ):
         raise ValueError("candidate sequence selection did not cover every cue")
 
     conservative_selected = [
@@ -196,22 +200,27 @@ def audit(
             production_candidate,
             bundle["shadow_candidates"],
         )
-        for cue, bundle, production_candidate in zip(
-            cues,
-            bundles,
+        for (cue, bundle), production_candidate in zip(
+            bundle_entries,
             production_selected,
         )
     ]
     records = []
-    for cue, bundle, production_candidate, shadow_candidate in zip(
-        cues,
-        bundles,
+    for (
+        (cue, bundle),
+        production_candidate,
+        shadow_candidate,
+        conservative_candidate,
+    ) in zip(
+        bundle_entries,
         production_selected,
         shadow_selected,
+        conservative_selected,
     ):
+        if requested_ids and cue.subtitle_id not in requested_ids:
+            continue
         production_plan = _final_plan(cue, draw, bundle, production_candidate)
         shadow_plan = _final_plan(cue, draw, bundle, shadow_candidate)
-        conservative_candidate = conservative_selected[len(records)]
         conservative_plan = _final_plan(
             cue,
             draw,
@@ -286,9 +295,12 @@ def audit(
         records.append(record)
     report = {
         "schema_version": 1,
-        "status": "ok",
+        "status": "partial" if failures else "ok",
         "artifact_dir": str(artifact_dir.resolve()),
-        "cue_count": len(cues),
+        "source_cue_count": len(cues),
+        "cue_count": len(records),
+        "failure_count": len(failures),
+        "failures": failures,
         "changed_cue_count": sum(bool(record["changed"]) for record in records),
         "production": _aggregate(records, "production"),
         "shadow": _aggregate(records, "shadow"),
