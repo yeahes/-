@@ -1654,7 +1654,12 @@ def test_invalid_page_translation_cache_is_replaced_only_after_validation():
 
     assert result == valid_fresh
     assert cache_hit is False
-    assert editor.cache_manager.writes == [valid_fresh]
+    assert editor.cache_manager.writes[0] == valid_fresh
+    assert editor.cache_manager.writes[1]["schema_version"] == 1
+    assert [
+        page["source_english"]
+        for page in editor.cache_manager.writes[1]["pages"]
+    ] == [page["english"] for page in case["pages"]]
     assert editor._display_page_external_request_count == 1
 
 
@@ -1991,7 +1996,8 @@ def test_page_translation_batches_preserve_completed_cache_after_later_timeout()
         ["S0107"],
         ["S0107"],
     ]
-    assert len(cache.writes) == 1
+    # One completed batch and its six independently reusable parent units survive.
+    assert len(cache.writes) == 7
 
     fail_last_batch = False
     response, cache_hit = editor._request_display_page_translations(contract)
@@ -2004,6 +2010,7 @@ def test_page_translation_batches_preserve_completed_cache_after_later_timeout()
         response,
         require_source_echo=True,
     )["status"] == "PASS"
+
 
     request_count = len(request_scopes)
     response, cache_hit = editor._request_display_page_translations(contract)
@@ -2032,6 +2039,115 @@ def test_page_translation_batches_preserve_completed_cache_after_later_timeout()
         response,
         require_source_echo=True,
     )["status"] == "PASS"
+
+
+def test_page_translation_unit_cache_rebinds_shifted_ids_with_same_semantics():
+    case = copy.deepcopy(next(iter(_cases().values())))
+
+    class Cache:
+        def __init__(self):
+            self.values = {}
+
+        def get_llm_result(self, cache_key, *args, **kwargs):
+            return self.values.get(cache_key)
+
+        def set_llm_result(self, cache_key, value, *args, **kwargs):
+            self.values[cache_key] = value
+
+    cache = Cache()
+    api_calls = []
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        api_calls.append([entry["parent_subtitle_id"] for entry in payload])
+        rows = []
+        for parent in payload:
+            for page, fixture_page in zip(parent["pages"], case["pages"]):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": fixture_page["chinese"],
+                    }
+                )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = cache
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    original_contract = _contract(case)
+    original_response, original_hit = editor._request_display_page_translations(
+        original_contract
+    )
+    assert original_hit is False
+    assert validate_page_translation_response(
+        original_contract,
+        original_response,
+        require_source_echo=True,
+    )["status"] == "PASS"
+    assert len(api_calls) == 1
+
+    shifted = copy.deepcopy(case)
+    shifted["subtitle_id"] = "S0999"
+    shift = 1000
+    shifted["word_start"] += shift
+    shifted["word_end"] += shift
+    for page in shifted["pages"]:
+        page["word_start"] += shift
+        page["word_end"] += shift
+    shifted_contract = _contract(shifted)
+
+    shifted_response, shifted_hit = editor._request_display_page_translations(
+        shifted_contract
+    )
+
+    assert shifted_hit is True
+    assert len(api_calls) == 1
+    shifted_artifact = validate_page_translation_response(
+        shifted_contract,
+        shifted_response,
+        require_source_echo=True,
+    )
+    assert shifted_artifact["status"] == "PASS"
+    assert [
+        page["display_page_id"]
+        for parent in shifted_artifact["parents"]
+        for page in parent["pages"]
+    ] == [
+        display_page_id("S0999", index)
+        for index in range(1, len(case["pages"]) + 1)
+    ]
+
+    changed_chinese = copy.deepcopy(shifted)
+    changed_chinese["parent_chinese"] += "变化"
+    assert editor._display_page_translation_unit_cache_key(
+        shifted_contract
+    ) != editor._display_page_translation_unit_cache_key(
+        _contract(changed_chinese)
+    )
 
 
 def test_page_translation_terminal_failure_does_not_start_later_batches():
@@ -2143,7 +2259,9 @@ def test_page_translation_terminal_failure_does_not_start_later_batches():
         [f"S{index:04d}" for index in range(1, 7)],
         [f"S{index:04d}" for index in range(7, 13)],
     ]
-    assert len(editor.cache_manager.writes) == 1
+    # The one successful in-flight batch seeds six parent units in addition to
+    # retaining the original complete batch response.
+    assert len(editor.cache_manager.writes) == 7
     assert editor.cache_manager.writes[0]["pages"][0]["display_page_id"] == (
         "S0007.P01"
     )
@@ -4747,6 +4865,7 @@ if __name__ == "__main__":
     test_page_translation_requests_use_flash_then_pro_for_quality_retry()
     test_residual_page_retry_shrinks_scope_until_all_parents_are_valid()
     test_page_translation_batches_preserve_completed_cache_after_later_timeout()
+    test_page_translation_unit_cache_rebinds_shifted_ids_with_same_semantics()
     test_page_translation_batches_retry_empty_batch_and_keep_other_valid_batch()
     test_page_translation_rejects_page_level_chinese_speed_overflow()
     test_page_translation_rejects_repeated_parent_meaning()

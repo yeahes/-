@@ -129,8 +129,11 @@ LEGACY_FULL_TRANSLATION_CACHE_ALLOCATION_CONTRACTS = (
     },
 )
 SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v7"
-SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK = (
+LEGACY_SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK = (
     "screen_subtitle_semantic_full_translation_unit_v1"
+)
+SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK = (
+    "screen_subtitle_semantic_full_translation_unit_v2"
 )
 SEMANTIC_FULL_TRANSLATION_INITIAL_BATCH_LIMIT = 8
 SEMANTIC_FULL_TRANSLATION_CIRCUIT_BREAKER_FAILURES = 2
@@ -151,6 +154,9 @@ SEMANTIC_CHINESE_POLISH_PROMPT_VERSION = "semantic-chinese-polish-v3"
 SEMANTIC_CHINESE_POLISH_CACHE_TASK = "screen_subtitle_semantic_chinese_polish_v3"
 DISPLAY_PAGE_TRANSLATION_CACHE_TASK = "screen_subtitle_display_page_translation_v2"
 DISPLAY_PAGE_TRANSLATION_RETRY_CACHE_TASK = "screen_subtitle_display_page_translation_retry_v2"
+DISPLAY_PAGE_TRANSLATION_UNIT_CACHE_TASK = (
+    "screen_subtitle_display_page_translation_unit_v1"
+)
 DISPLAY_PAGE_TRANSLATION_BATCH_PARENT_LIMIT = 6
 DISPLAY_PAGE_TRANSLATION_BATCH_PAGE_LIMIT = 12
 MODEL_ROLE_POLICY_VERSION = "stable-translation-model-roles-v1"
@@ -2282,6 +2288,212 @@ class ScreenSubtitleEditor:
             for parent_ids in parent_batches
         ]
 
+    def _display_page_translation_unit_cache_key(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        request_model: Optional[str] = None,
+    ) -> str:
+        """Return the semantic cache identity for one page-translated parent."""
+        payload = page_translation_request_payload(contract)
+        if len(payload) != 1:
+            raise ValueError("display page unit cache requires exactly one parent")
+        dependency = dict(payload[0])
+        dependency.pop("id", None)
+        dependency.pop("parent_subtitle_id", None)
+        dependency["pages"] = [
+            {
+                key: value
+                for key, value in dict(page).items()
+                if key != "display_page_id"
+            }
+            for page in dependency.get("pages") or []
+        ]
+        model = str(request_model or self._display_page_translation_model_name())
+        prompt = self._display_page_translation_request_prompt(contract)
+        return self._cache_key(
+            prompt,
+            [
+                {
+                    "cache_task": DISPLAY_PAGE_TRANSLATION_UNIT_CACHE_TASK,
+                    "prompt_version": DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION,
+                    "algorithm_version": DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION,
+                    "model": model,
+                    "target_language": str(self.target_language),
+                    "dependency": dependency,
+                }
+            ],
+        )
+
+    @staticmethod
+    def _ordered_display_page_translation_rows(
+        contract: Mapping[str, Any],
+        rows: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, str]]:
+        by_id = {
+            str(row.get("display_page_id") or ""): row
+            for row in rows
+            if isinstance(row, Mapping)
+        }
+        ordered: List[Dict[str, str]] = []
+        for parent in contract.get("parents") or []:
+            for page in parent.get("pages") or []:
+                page_id = str(page.get("display_page_id") or "")
+                row = by_id.get(page_id)
+                if row is None:
+                    continue
+                ordered.append(
+                    {
+                        "display_page_id": page_id,
+                        "source_english": str(row.get("source_english") or ""),
+                        "zh": str(row.get("zh") or ""),
+                    }
+                )
+        return ordered
+
+    def _load_display_page_translation_units(
+        self,
+        contract: Mapping[str, Any],
+    ) -> tuple[List[Dict[str, str]], List[str]]:
+        request_model = self._display_page_translation_model_name()
+        rows: List[Dict[str, str]] = []
+        parent_ids: List[str] = []
+        for parent in contract.get("parents") or []:
+            parent_id = str(parent.get("parent_subtitle_id") or "")
+            single_contract = self._display_page_contract_for_parent_ids(
+                contract,
+                [parent_id],
+            )
+            cache_key = self._display_page_translation_unit_cache_key(
+                single_contract,
+                request_model=request_model,
+            )
+            started = time.perf_counter()
+            cached = self.cache_manager.get_llm_result(
+                cache_key,
+                request_model,
+                temperature=0.2,
+                task=DISPLAY_PAGE_TRANSLATION_UNIT_CACHE_TASK,
+            )
+            try:
+                data = json.loads(cached) if cached else None
+            except (TypeError, ValueError):
+                data = None
+            if not isinstance(data, Mapping) or int(data.get("schema_version") or 0) != 1:
+                continue
+            cached_pages = data.get("pages")
+            current_pages = list(parent.get("pages") or [])
+            if not isinstance(cached_pages, list) or len(cached_pages) != len(current_pages):
+                continue
+            candidate_rows = [
+                {
+                    "display_page_id": str(current_page.get("display_page_id") or ""),
+                    "source_english": str(cached_page.get("source_english") or ""),
+                    "zh": str(cached_page.get("zh") or ""),
+                }
+                for current_page, cached_page in zip(current_pages, cached_pages)
+                if isinstance(cached_page, Mapping)
+            ]
+            prior_reviews = list(
+                getattr(self, "_display_page_translation_reviews", []) or []
+            )
+            try:
+                cacheable = self._display_page_translation_response_is_cacheable(
+                    single_contract,
+                    {"pages": candidate_rows},
+                )
+            finally:
+                self._display_page_translation_reviews = prior_reviews
+            if not cacheable:
+                continue
+            rows.extend(candidate_rows)
+            parent_ids.append(parent_id)
+            self._llm_cache_used = True
+            self._record_llm_cache_stat(DISPLAY_PAGE_TRANSLATION_UNIT_CACHE_TASK, True)
+            self._record_llm_request(
+                task=DISPLAY_PAGE_TRANSLATION_UNIT_CACHE_TASK,
+                model=request_model,
+                cache_hit=True,
+                elapsed_seconds=time.perf_counter() - started,
+                payload_count=len(candidate_rows),
+            )
+        return rows, parent_ids
+
+    def _store_display_page_translation_units(
+        self,
+        contract: Mapping[str, Any],
+        response: object,
+    ) -> None:
+        request_model = self._display_page_translation_model_name()
+        artifact = validate_page_translation_response(
+            contract,
+            response,
+            require_source_echo=True,
+        )
+        if artifact.get("status") != "PASS":
+            return
+        artifact_by_parent = {
+            str(parent.get("parent_subtitle_id") or ""): parent
+            for parent in artifact.get("parents") or []
+        }
+        for parent in contract.get("parents") or []:
+            parent_id = str(parent.get("parent_subtitle_id") or "")
+            artifact_parent = artifact_by_parent.get(parent_id)
+            if artifact_parent is None:
+                continue
+            single_contract = self._display_page_contract_for_parent_ids(
+                contract,
+                [parent_id],
+            )
+            single_rows = [
+                {
+                    "display_page_id": str(page.get("display_page_id") or ""),
+                    "source_english": str(page.get("english") or ""),
+                    "zh": str(page.get("zh") or ""),
+                }
+                for page in artifact_parent.get("pages") or []
+            ]
+            prior_reviews = list(
+                getattr(self, "_display_page_translation_reviews", []) or []
+            )
+            try:
+                cacheable = self._display_page_translation_response_is_cacheable(
+                    single_contract,
+                    {"pages": single_rows},
+                )
+            finally:
+                self._display_page_translation_reviews = prior_reviews
+            if not cacheable:
+                continue
+            cache_key = self._display_page_translation_unit_cache_key(
+                single_contract,
+                request_model=request_model,
+            )
+            data = {
+                "schema_version": 1,
+                "pages": [
+                    {
+                        "source_english": row["source_english"],
+                        "zh": row["zh"],
+                    }
+                    for row in single_rows
+                ],
+            }
+            try:
+                self.cache_manager.set_llm_result(
+                    cache_key,
+                    json.dumps(data, ensure_ascii=False),
+                    request_model,
+                    temperature=0.2,
+                    task=DISPLAY_PAGE_TRANSLATION_UNIT_CACHE_TASK,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Display-page translation unit cache write failed: parent=%s error=%s",
+                    parent_id,
+                    exc,
+                )
+
     def _request_display_page_translations(
         self,
         contract: Mapping[str, Any],
@@ -2315,8 +2527,70 @@ class ScreenSubtitleEditor:
                 ),
             )
 
+        exact_cached, exact_cache_hit = self._request_display_page_translation_batch(
+            contract,
+            retry_errors=retry_errors,
+            cache_only=True,
+        )
+        if exact_cache_hit:
+            if not retry_errors:
+                self._store_display_page_translation_units(contract, exact_cached)
+            emit_progress(
+                completed=total_batches,
+                cache_hits=total_batches,
+                retries=0,
+            )
+            return exact_cached, True
+
+        unit_rows: List[Dict[str, str]] = []
+        unit_parent_ids: List[str] = []
+        if not retry_errors:
+            unit_rows, unit_parent_ids = self._load_display_page_translation_units(
+                contract
+            )
+        all_parent_ids = [
+            str(parent.get("parent_subtitle_id") or "")
+            for parent in contract.get("parents") or []
+        ]
+        unit_parent_id_set = set(unit_parent_ids)
+        pending_parent_ids = [
+            parent_id
+            for parent_id in all_parent_ids
+            if parent_id not in unit_parent_id_set
+        ]
+        if not pending_parent_ids:
+            response = {
+                "pages": self._ordered_display_page_translation_rows(
+                    contract,
+                    unit_rows,
+                )
+            }
+            emit_progress(
+                completed=total_batches,
+                cache_hits=len(unit_parent_ids),
+                retries=0,
+            )
+            return response, True
+
+        pending_contract = (
+            contract
+            if len(pending_parent_ids) == len(all_parent_ids)
+            else self._display_page_contract_for_parent_ids(
+                contract,
+                pending_parent_ids,
+            )
+        )
+        batch_contracts = self._display_page_translation_batch_contracts(
+            pending_contract
+        )
+        total_batches = len(batch_contracts)
+
         if total_batches == 1:
-            emit_progress(completed=0, cache_hits=0, retries=0)
+            emit_progress(
+                completed=0,
+                cache_hits=len(unit_parent_ids),
+                retries=0,
+            )
             try:
                 response, cache_hit = self._request_display_page_translation_batch(
                     batch_contracts[0],
@@ -2325,43 +2599,42 @@ class ScreenSubtitleEditor:
             except Exception:
                 emit_progress(
                     completed=0,
-                    cache_hits=0,
+                    cache_hits=len(unit_parent_ids),
                     retries=0,
                     failed_batches=1,
                 )
                 raise
+            if not retry_errors:
+                self._store_display_page_translation_units(
+                    batch_contracts[0],
+                    response,
+                )
+            merged_rows = [*unit_rows, *page_translation_response_rows(response)]
+            merged_response = {
+                "pages": self._ordered_display_page_translation_rows(
+                    contract,
+                    merged_rows,
+                )
+            }
             emit_progress(
                 completed=1,
-                cache_hits=1 if cache_hit else 0,
+                cache_hits=len(unit_parent_ids) + (1 if cache_hit else 0),
                 retries=0,
             )
-            return response, cache_hit
-
-        legacy_cached, legacy_cache_hit = self._request_display_page_translation_batch(
-            contract,
-            retry_errors=retry_errors,
-            cache_only=True,
-        )
-        if legacy_cache_hit:
-            emit_progress(
-                completed=total_batches,
-                cache_hits=total_batches,
-                retries=0,
-            )
-            return legacy_cached, True
+            return merged_response, cache_hit
 
         logger.info(
             "Display-page translation batches: total=%s parents=%s pages=%s",
             total_batches,
-            len(contract.get("parents") or []),
+            len(pending_contract.get("parents") or []),
             sum(
                 len(parent.get("pages") or [])
-                for parent in contract.get("parents") or []
+                for parent in pending_contract.get("parents") or []
             ),
         )
-        rows: List[Dict[str, Any]] = []
+        rows: List[Dict[str, Any]] = [dict(row) for row in unit_rows]
         all_cache_hit = True
-        completed_parent_ids: List[str] = []
+        completed_parent_ids: List[str] = list(unit_parent_ids)
         # Resolve cache reads on the owner thread. Network work is admitted in
         # a bounded window so a terminal failure cannot start every remaining
         # request. Each completed valid batch is cached before another batch
@@ -2394,11 +2667,12 @@ class ScreenSubtitleEditor:
             else:
                 pending_batches.append((batch_index, batch_contract, batch_retry_errors))
         cache_hits = len(batch_results)
+        reported_cache_hits = cache_hits + len(unit_parent_ids)
         retries = 0
         failed_batches = 0
         emit_progress(
             completed=cache_hits,
-            cache_hits=cache_hits,
+            cache_hits=reported_cache_hits,
             retries=retries,
         )
 
@@ -2457,6 +2731,11 @@ class ScreenSubtitleEditor:
                     response,
                     retry_errors=batch_retry_errors,
                 )
+                if not batch_retry_errors:
+                    self._store_display_page_translation_units(
+                        batch_contract,
+                        response,
+                    )
 
         if pending_batches:
             workers = min(
@@ -2501,7 +2780,7 @@ class ScreenSubtitleEditor:
                     if not done:
                         emit_progress(
                             completed=cache_hits + settled_network_batches,
-                            cache_hits=cache_hits,
+                            cache_hits=reported_cache_hits,
                             retries=retries,
                             active_batches=len(futures),
                             failed_batches=failed_batches,
@@ -2559,7 +2838,7 @@ class ScreenSubtitleEditor:
                         )
                         emit_progress(
                             completed=cache_hits + settled_network_batches,
-                            cache_hits=cache_hits,
+                            cache_hits=reported_cache_hits,
                             retries=retries,
                             active_batches=len(futures),
                             failed_batches=failed_batches,
@@ -2599,6 +2878,16 @@ class ScreenSubtitleEditor:
                 batch_contract,
                 batch_artifact,
             )
+            if (
+                cache_hit
+                and not batch_retry_errors
+                and batch_artifact.get("status") == "PASS"
+                and not batch_quality_errors
+            ):
+                self._store_display_page_translation_units(
+                    batch_contract,
+                    response,
+                )
             batch_reviews.extend(
                 dict(review)
                 for review in getattr(
@@ -2669,11 +2958,18 @@ class ScreenSubtitleEditor:
                 f"batch {failed_batch_index}/{total_batches} "
                 f"parents={','.join(failed_batch_parent_ids)}: {request_error}"
             )
-            wrapped.partial_response = {"pages": [dict(row) for row in rows]}
+            wrapped.partial_response = {
+                "pages": self._ordered_display_page_translation_rows(
+                    contract,
+                    rows,
+                )
+            }
             wrapped.completed_parent_ids = list(completed_parent_ids)
             wrapped.failed_parent_ids = failed_parent_ids
             raise wrapped from request_error
-        return {"pages": rows}, all_cache_hit
+        return {
+            "pages": self._ordered_display_page_translation_rows(contract, rows)
+        }, all_cache_hit
 
     @staticmethod
     def _display_page_errors_for_parent_ids(
@@ -18022,8 +18318,14 @@ class ScreenSubtitleEditor:
                 if payload
                 else "",
             )
-            # Article context remains part of the translation policy and thus
-            # remains in the unit identity.
+            cache_payload = [
+                self._semantic_full_translation_unit_cache_dependency(
+                    payload[0] if payload else {}
+                )
+            ]
+            # Article context remains in cache_prompt. Numeric group/subtitle
+            # IDs do not affect the group translation and would invalidate all
+            # later units after one upstream boundary insertion.
         return self._cache_key(
             cache_prompt,
             [
@@ -18033,6 +18335,50 @@ class ScreenSubtitleEditor:
                 }
             ],
         )
+
+    @staticmethod
+    def _semantic_full_translation_unit_cache_dependency(
+        payload_entry: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Return the semantic inputs owned by one full-translation result."""
+
+        def context_rows(value: object) -> List[Dict[str, str]]:
+            rows: List[Dict[str, str]] = []
+            for entry in value if isinstance(value, list) else []:
+                if not isinstance(entry, Mapping):
+                    continue
+                rows.append(
+                    {
+                        "full_english": str(entry.get("full_english") or ""),
+                        "current_translation": str(
+                            entry.get("current_translation") or ""
+                        ),
+                    }
+                )
+            return rows
+
+        context = payload_entry.get("translation_context")
+        context = context if isinstance(context, Mapping) else {}
+        budget = payload_entry.get("translation_budget")
+        return {
+            "full_english": str(payload_entry.get("full_english") or ""),
+            "current_translation": str(
+                payload_entry.get("current_translation") or ""
+            ),
+            "translation_context_version": str(
+                payload_entry.get("translation_context_version") or ""
+            ),
+            "source_echo_version": str(
+                payload_entry.get("source_echo_version") or ""
+            ),
+            "translation_budget": dict(budget)
+            if isinstance(budget, Mapping)
+            else {},
+            "translation_context": {
+                "previous": context_rows(context.get("previous")),
+                "next": context_rows(context.get("next")),
+            },
+        }
 
     def _legacy_semantic_full_translation_cache_keys(
         self,
@@ -18978,27 +19324,57 @@ class ScreenSubtitleEditor:
             temperature=0.2,
             task=SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK,
         )
-        if not cached:
-            return None
-        try:
-            data = json.loads(cached)
-        except (TypeError, ValueError):
-            return None
-        if not self._semantic_full_translation_response_is_cacheable(
-            data,
-            [dict(payload_entry)],
-        ):
-            return None
-        translated = self._semantic_full_translations_from_response(
-            data,
-            payload=[dict(payload_entry)],
-        ).get(group_id)
+        translated = ""
+        if cached:
+            try:
+                data = json.loads(cached)
+            except (TypeError, ValueError):
+                data = None
+            if isinstance(data, Mapping) and int(data.get("schema_version") or 0) == 2:
+                expected_source = str(payload_entry.get("full_english") or "")
+                source_echo = str(data.get("source_english") or "")
+                if (
+                    source_echo
+                    and self._word_tokens(source_echo)
+                    == self._word_tokens(expected_source)
+                ):
+                    translated = str(data.get("full_translation") or "").strip()
+        cache_task = SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK
+        if not translated:
+            legacy_key = self._semantic_chinese_cache_key(
+                prompt,
+                [dict(payload_entry)],
+                LEGACY_SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK,
+                request_model=request_model,
+            )
+            legacy_cached = self.cache_manager.get_llm_result(
+                legacy_key,
+                request_model,
+                temperature=0.2,
+                task=LEGACY_SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK,
+            )
+            try:
+                legacy_data = json.loads(legacy_cached) if legacy_cached else None
+            except (TypeError, ValueError):
+                legacy_data = None
+            if self._semantic_full_translation_response_is_cacheable(
+                legacy_data,
+                [dict(payload_entry)],
+            ):
+                translated = str(
+                    self._semantic_full_translations_from_response(
+                        legacy_data,
+                        payload=[dict(payload_entry)],
+                    ).get(group_id)
+                    or ""
+                ).strip()
+                cache_task = LEGACY_SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK
         if not translated:
             return None
         self._llm_cache_used = True
-        self._record_llm_cache_stat(SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK, True)
+        self._record_llm_cache_stat(cache_task, True)
         self._record_llm_request(
-            task=SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK,
+            task=cache_task,
             model=request_model,
             cache_hit=True,
             elapsed_seconds=time.perf_counter() - started,
@@ -19027,13 +19403,9 @@ class ScreenSubtitleEditor:
                 request_model=request_model,
             )
             data = {
-                "groups": [
-                    {
-                        "id": int(group_id),
-                        "source_english": str(payload_entry.get("full_english") or ""),
-                        "full_translation": str(translated).strip(),
-                    }
-                ]
+                "schema_version": 2,
+                "source_english": str(payload_entry.get("full_english") or ""),
+                "full_translation": str(translated).strip(),
             }
             try:
                 self.cache_manager.set_llm_result(

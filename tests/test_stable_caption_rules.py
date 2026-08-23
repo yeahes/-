@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor, ScreenSubtitleItem
+from app.core.subtitle_processor.screen_editor import (
+    SEMANTIC_FULL_TRANSLATION_PROMPT,
+    ScreenSubtitleEditor,
+    ScreenSubtitleItem,
+)
 from app.core.subtitle_processor.final_cue_timeline import (
     DISPLAY_LEAD_IN_MS,
     DISPLAY_TAIL_PADDING_MS,
@@ -1447,6 +1451,136 @@ def test_full_translation_unit_cache_invalidates_only_context_dependents():
     # neighbor and G4 itself changed.  This is local invalidation, not an
     # unsafe whole-episode cache reuse.
     assert api_calls[-1] == (2, 3, 4)
+
+
+def test_full_translation_unit_cache_survives_numeric_group_id_shift():
+    shared_cache = _KeyedCache({})
+    api_calls = []
+
+    def make_editor(texts):
+        editor = _id_editor()
+        editor.allocation_batch_size = 8
+        editor.cache_manager = shared_cache
+
+        def create(**kwargs):
+            request_payload = json.loads(kwargs["messages"][1]["content"])
+            api_calls.append(tuple(int(entry["id"]) for entry in request_payload))
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "groups": [
+                                        {
+                                            "id": int(entry["id"]),
+                                            "source_english": entry["full_english"],
+                                            "full_translation": f"译文-{entry['full_english']}",
+                                        }
+                                        for entry in request_payload
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
+                    )
+                ]
+            )
+
+        editor.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        items = editor._assign_global_subtitle_ids(
+            [
+                ScreenSubtitleItem([index], text, "", index * 2, index * 2 + 1)
+                for index, text in enumerate(texts, 1)
+            ]
+        )
+        groups = [
+            _id_group(index, index - 1, [item])
+            for index, item in enumerate(items, 1)
+        ]
+        return editor, groups
+
+    first, first_groups = make_editor(["One.", "Two.", "Three.", "Four."])
+    assert set(first._translate_semantic_group_full_translations(first_groups)) == {
+        1,
+        2,
+        3,
+        4,
+    }
+
+    second, second_groups = make_editor(
+        ["Inserted.", "One.", "Two.", "Three.", "Four."]
+    )
+    result = second._translate_semantic_group_full_translations(second_groups)
+
+    # Only the inserted unit and its two context dependants are requested.
+    # Unchanged semantic groups reuse their translations despite new group IDs.
+    assert api_calls == [(1, 2, 3, 4), (1, 2, 3)]
+    assert result[4] == "译文-Three."
+    assert result[5] == "译文-Four."
+
+
+def test_full_translation_unit_cache_reads_v1_and_migrates_to_v2():
+    editor = _id_editor()
+    item = editor._assign_global_subtitle_ids(
+        [ScreenSubtitleItem([1], "One complete thought.", "", 0, 2)]
+    )[0]
+    groups = [_id_group(1, 0, [item])]
+    payload_entry = editor._semantic_full_translation_payload_entry(groups, 0)
+    prompt = editor._compose_prompt(
+        SEMANTIC_FULL_TRANSLATION_PROMPT,
+        source_text=payload_entry["full_english"],
+    )
+    legacy_task = "screen_subtitle_semantic_full_translation_unit_v1"
+    legacy_key = editor._semantic_chinese_cache_key(
+        prompt,
+        [payload_entry],
+        legacy_task,
+        request_model=editor._full_translation_model_name(),
+    )
+    cache = _KeyedCache(
+        {
+            legacy_key: json.dumps(
+                {
+                    "groups": [
+                        {
+                            "id": 1,
+                            "source_english": "One complete thought.",
+                            "full_translation": "一个完整的想法。",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        }
+    )
+    editor.cache_manager = cache
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("legacy cache hit must not call the API")
+                )
+            )
+        )
+    )
+
+    result = editor._translate_semantic_group_full_translations(groups)
+
+    assert result == {1: "一个完整的想法。"}
+    v2_key = editor._semantic_chinese_cache_key(
+        prompt,
+        [payload_entry],
+        "screen_subtitle_semantic_full_translation_unit_v2",
+        request_model=editor._full_translation_model_name(),
+    )
+    assert json.loads(cache.entries[v2_key]) == {
+        "schema_version": 2,
+        "source_english": "One complete thought.",
+        "full_translation": "一个完整的想法。",
+    }
 
 
 def test_full_translation_concurrency_merges_out_of_order_batches_by_id():
