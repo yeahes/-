@@ -994,8 +994,14 @@ class SubtitleInterface(QWidget):
         self.import_subtitle_action = Action(
             FIF.FOLDER_ADD, self.tr("导入字幕"), triggered=self.on_file_select
         )
+        self.restore_recent_subtitle_action = Action(
+            FIF.SYNC,
+            self.tr("恢复最近字幕"),
+            triggered=self.restore_recent_subtitle_result,
+        )
         self.more_menu.addAction(self.subtitle_settings_action)
         self.more_menu.addAction(self.open_folder_action)
+        self.more_menu.addAction(self.restore_recent_subtitle_action)
         self.more_menu.addAction(self.import_subtitle_action)
         self.more_button = TransparentDropDownPushButton(self.tr("更多"), self, FIF.MORE)
         self.more_button.setMenu(self.more_menu)
@@ -2483,7 +2489,147 @@ class SubtitleInterface(QWidget):
         return confirmed
 
     def can_close_with_manual_edits(self) -> bool:
-        return self._confirm_discard_manual_edits(self.tr("关闭程序"))
+        commit_editor = getattr(self, "_commit_active_manual_table_editor", None)
+        if callable(commit_editor):
+            commit_editor()
+        session = self.manual_final_session
+        if session is None:
+            return True
+        clean_fingerprint = str(
+            getattr(self, "_manual_clean_state_fingerprint", "") or ""
+        )
+        if clean_fingerprint:
+            has_unsaved_changes = self._reconcile_manual_dirty_state()
+        else:
+            has_unsaved_changes = bool(
+                getattr(self, "_manual_has_unsaved_changes", False)
+                or getattr(self, "_manual_model_has_pending_edits", False)
+            )
+        if not has_unsaved_changes:
+            return True
+        try:
+            if self._manual_model_has_pending_edits:
+                self._sync_manual_final_text_edits(
+                    allow_incomplete_page_chinese=True
+                )
+            snapshot = session.snapshot_for_save()
+            with _MANUAL_RECOVERY_DRAFT_LOCK:
+                snapshot.save_recovery_draft()
+            return True
+        except Exception as exc:
+            LOG.exception("Unable to persist manual recovery draft before exit")
+            dialog = MessageBox(
+                self.tr("恢复草稿保存失败"),
+                self.tr("退出会丢失尚未保存的修改：") + str(exc),
+                self,
+            )
+            dialog.yesButton.setText(self.tr("仍然退出"))
+            dialog.cancelButton.setText(self.tr("继续编辑"))
+            return bool(dialog.exec())
+
+    def restore_recent_subtitle_result(self) -> bool:
+        """Open a prior stable/manual package without rerunning any stage."""
+        if bool(getattr(self, "_manual_save_in_progress", False)):
+            InfoBar.warning(
+                self.tr("正在保存人工终稿"),
+                self.tr("保存完成前不能切换字幕结果。"),
+                duration=3000,
+                parent=self,
+            )
+            return False
+        records = ManualFinalSubtitleSession.discover_recent_editable_manifests(
+            cfg.work_dir.value,
+            limit=20,
+        )
+        if not records:
+            InfoBar.warning(
+                self.tr("没有可恢复字幕"),
+                self.tr("工作目录中没有找到可编辑的稳定字幕或检查点。"),
+                duration=5000,
+                parent=self,
+            )
+            return False
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.tr("恢复最近字幕"))
+        dialog.resize(760, 520)
+        layout = QVBoxLayout(dialog)
+        label = BodyLabel(
+            self.tr("选择已生成结果继续查看或编辑；不会重新识别、翻译或分页。"),
+            dialog,
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        listing = QListWidget(dialog)
+        listing.setAlternatingRowColors(True)
+        for record in records:
+            created_at = str(record.get("created_at") or "").replace("T", " ")
+            count = int(record.get("subtitle_count") or 0)
+            details = " · ".join(
+                value
+                for value in (
+                    created_at,
+                    str(record.get("state") or ""),
+                    f"{count} 条" if count else "",
+                )
+                if value
+            )
+            item = QListWidgetItem(
+                f"{record.get('title') or self.tr('未命名字幕')}\n{details}",
+                listing,
+            )
+            item.setData(Qt.UserRole, str(record["manifest_path"]))
+            item.setToolTip(str(record["manifest_path"]))
+        listing.setCurrentRow(0)
+        layout.addWidget(listing, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Open | QDialogButtonBox.Cancel,
+            dialog,
+        )
+        buttons.button(QDialogButtonBox.Open).setText(self.tr("打开继续编辑"))
+        buttons.button(QDialogButtonBox.Cancel).setText(self.tr("取消"))
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        listing.itemDoubleClicked.connect(lambda _item: dialog.accept())
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted or listing.currentItem() is None:
+            return False
+        if not self._confirm_discard_manual_edits(self.tr("恢复其他字幕结果")):
+            return False
+
+        manifest_path = Path(str(listing.currentItem().data(Qt.UserRole)))
+        try:
+            session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.error(
+                self.tr("恢复失败"),
+                str(exc),
+                duration=7000,
+                parent=self,
+            )
+            return False
+
+        SubtitleInterface._reset_manual_editor_state(self)
+        self.manual_final_session = session
+        self.subtitle_path = str(session.subtitle_path)
+        self._set_manual_clean_checkpoint()
+        draft_restored = False
+        try:
+            draft_restored = bool(session.restore_recovery_draft())
+        except ManualFinalSubtitleEditError as exc:
+            LOG.warning("Ignoring invalid manual recovery draft: %s", exc)
+        self._load_manual_final_review_marks(session)
+        self._apply_manual_final_session()
+        if draft_restored:
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self.status_label.setText(
+                self.tr("已恢复未保存草稿；可继续编辑，不会重新调用 API")
+            )
+        else:
+            self._restore_saved_manual_package_actions()
+            self.status_label.setText(
+                self.tr("已恢复稳定字幕；可继续查看和编辑，不会重新调用 API")
+            )
+        return True
 
     def on_save_format_clicked(self, format: str):
         """处理保存格式的选择"""

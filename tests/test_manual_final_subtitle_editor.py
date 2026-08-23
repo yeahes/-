@@ -2913,6 +2913,42 @@ def test_recovery_draft_round_trip_is_atomic_and_manifest_bound():
         assert changed_base.restore_recovery_draft() is False
 
 
+def test_recent_editable_manifest_discovery_finds_checkpoint_and_draft():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, _, manifest_path = _session_fixture(root)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "attempt_id": "attempt-1",
+                "stable_run_id": "run-1",
+                "created_at": "2026-08-23T12:00:00",
+                "editable_checkpoint": True,
+                "render_blocked": True,
+                "subtitle_count": 2,
+            }
+        )
+        _write_json(manifest_path, manifest)
+        session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        session.move_suffix_to_next(0, 1)
+        draft_path = session.save_recovery_draft()
+
+        broken = root / "work" / "broken" / "stable-final-manifest.json"
+        broken.parent.mkdir(parents=True)
+        _write_json(broken, {"paths": {"original_top_srt": "missing.srt"}})
+
+        records = ManualFinalSubtitleSession.discover_recent_editable_manifests(
+            root / "work"
+        )
+
+        assert len(records) == 1
+        assert Path(records[0]["manifest_path"]) == manifest_path.resolve()
+        assert records[0]["state"] == "未保存草稿"
+        assert records[0]["has_recovery_draft"] is True
+        assert records[0]["subtitle_count"] == 2
+        assert draft_path.is_file()
+
+
 def test_merge_only_combines_adjacent_continuous_word_ranges():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))

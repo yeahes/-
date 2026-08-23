@@ -86,6 +86,38 @@ class StablePublicationTests(unittest.TestCase):
         )
         self.assertEqual(model.headerData(2, Qt.Vertical, Qt.DisplayRole), "3")
 
+    def test_close_persists_recovery_draft_without_discarding_it(self):
+        snapshot = MagicMock()
+        session = MagicMock()
+        session.snapshot_for_save.return_value = snapshot
+        interface = SimpleNamespace(
+            manual_final_session=session,
+            _manual_clean_state_fingerprint="base-state",
+            _manual_model_has_pending_edits=False,
+            _commit_active_manual_table_editor=MagicMock(),
+            _reconcile_manual_dirty_state=lambda: True,
+            tr=lambda value: value,
+        )
+
+        self.assertTrue(SubtitleInterface.can_close_with_manual_edits(interface))
+
+        session.snapshot_for_save.assert_called_once_with()
+        snapshot.save_recovery_draft.assert_called_once_with()
+
+    def test_close_does_not_infer_dirty_state_without_clean_checkpoint(self):
+        session = MagicMock()
+        interface = SimpleNamespace(
+            manual_final_session=session,
+            _manual_clean_state_fingerprint="",
+            _manual_has_unsaved_changes=False,
+            _manual_model_has_pending_edits=False,
+            _commit_active_manual_table_editor=MagicMock(),
+        )
+
+        self.assertTrue(SubtitleInterface.can_close_with_manual_edits(interface))
+
+        session.snapshot_for_save.assert_not_called()
+
     def _manual_boundary_interaction_fixture(self):
         app = self._qt_app
 
@@ -3296,11 +3328,13 @@ class StablePublicationTests(unittest.TestCase):
             [
                 interface.subtitle_settings_action,
                 interface.open_folder_action,
+                interface.restore_recent_subtitle_action,
                 interface.import_subtitle_action,
             ],
         )
         self.assertTrue(interface.subtitle_settings_action.isVisible())
         self.assertTrue(interface.open_folder_action.isVisible())
+        self.assertTrue(interface.restore_recent_subtitle_action.isVisible())
         self.assertTrue(interface.import_subtitle_action.isVisible())
         self.assertEqual(interface.more_button.text(), "文件")
         self.assertEqual(interface.open_folder_action.text(), "打开终稿文件夹")
@@ -3311,6 +3345,7 @@ class StablePublicationTests(unittest.TestCase):
             [
                 interface.subtitle_settings_action,
                 interface.open_folder_action,
+                interface.restore_recent_subtitle_action,
                 interface.import_subtitle_action,
             ],
         )
@@ -3349,6 +3384,7 @@ class StablePublicationTests(unittest.TestCase):
                 interface.prompt_button,
                 interface.subtitle_settings_action,
                 interface.open_folder_action,
+                interface.restore_recent_subtitle_action,
                 interface.import_subtitle_action,
             ],
         )
@@ -3363,6 +3399,7 @@ class StablePublicationTests(unittest.TestCase):
                 interface.prompt_button,
                 interface.subtitle_settings_action,
                 interface.open_folder_action,
+                interface.restore_recent_subtitle_action,
                 interface.import_subtitle_action,
             ],
         )

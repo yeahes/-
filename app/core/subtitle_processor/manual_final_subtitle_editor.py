@@ -639,6 +639,145 @@ class ManualFinalSubtitleSession:
         return cls._find_manifest_for_subtitle(Path(subtitle_path).resolve(), work_dir)
 
     @classmethod
+    def discover_recent_editable_manifests(
+        cls,
+        work_dir: str | Path,
+        *,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """List recent loadable stable/manual packages without running the pipeline."""
+        root = Path(work_dir).resolve()
+        if not root.is_dir() or limit < 1:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        seen_manifests: set[str] = set()
+        for manifest_path in root.rglob("stable-final-manifest.json"):
+            try:
+                resolved_manifest = manifest_path.resolve()
+                manifest_key = os.path.normcase(str(resolved_manifest))
+                if manifest_key in seen_manifests:
+                    continue
+                seen_manifests.add(manifest_key)
+                manifest = cls._read_json(resolved_manifest)
+                override = manifest.get("manual_final_override") or {}
+                paths = manifest.get("paths") or {}
+                source_paths = manifest.get("source_subtitle_paths") or {}
+                subtitle_text = str(
+                    override.get("subtitle_path")
+                    or source_paths.get("bilingual_original_top_srt")
+                    or paths.get("original_top_srt")
+                    or ""
+                ).strip()
+                subtitle_hash = str(
+                    override.get("subtitle_sha256")
+                    or (manifest.get("source_subtitle_paths_sha256") or {}).get(
+                        "bilingual_original_top_srt"
+                    )
+                    or (manifest.get("paths_sha256") or {}).get("original_top_srt")
+                    or ""
+                ).strip()
+                subtitle_path = cls._resolve_owned_package_file(
+                    resolved_manifest,
+                    subtitle_text,
+                    subtitle_hash,
+                )
+                if subtitle_path is None:
+                    continue
+
+                source_media_text = str(
+                    override.get("source_media_path")
+                    or manifest.get("source_media_path")
+                    or ""
+                ).strip()
+                source_subtitle_text = str(manifest.get("source_subtitle") or "").strip()
+                if source_media_text:
+                    title = Path(source_media_text).stem
+                elif source_subtitle_text:
+                    title = Path(source_subtitle_text).stem
+                    title = re.sub(r"^【[^】]+】", "", title)
+                    title = re.sub(r"-FasterWhisper.*$", "", title)
+                else:
+                    try:
+                        title = resolved_manifest.relative_to(root).parts[0]
+                    except (ValueError, IndexError):
+                        title = resolved_manifest.parent.name
+
+                manifest_mtime = resolved_manifest.stat().st_mtime
+                draft_path = (
+                    resolved_manifest.parent
+                    / ".manual-editor-drafts"
+                    / f"{file_sha256(resolved_manifest)[:24]}.json"
+                )
+                draft_mtime = draft_path.stat().st_mtime if draft_path.is_file() else 0.0
+                is_manual = bool(
+                    isinstance(override, Mapping)
+                    and int(override.get("schema_version") or 0) >= 1
+                )
+                if draft_mtime:
+                    state = "未保存草稿"
+                elif is_manual:
+                    state = "人工终稿"
+                elif bool(manifest.get("render_blocked") or manifest.get("editable_checkpoint")):
+                    state = "待复核检查点"
+                else:
+                    state = "稳定字幕"
+                candidates.append(
+                    {
+                        "title": title or "未命名字幕",
+                        "state": state,
+                        "subtitle_count": int(manifest.get("subtitle_count") or 0),
+                        "created_at": str(manifest.get("created_at") or ""),
+                        "updated_timestamp": max(manifest_mtime, draft_mtime),
+                        "manifest_path": str(resolved_manifest),
+                        "subtitle_path": str(subtitle_path),
+                        "has_recovery_draft": bool(draft_mtime),
+                        "attempt_id": str(manifest.get("attempt_id") or ""),
+                        "stable_run_id": str(manifest.get("stable_run_id") or ""),
+                        "is_manual_package": is_manual,
+                    }
+                )
+            except (ManualFinalSubtitleEditError, OSError, TypeError, ValueError):
+                continue
+
+        def path_rank(item: Mapping[str, Any]) -> int:
+            path = str(item.get("manifest_path") or "")
+            if item.get("is_manual_package"):
+                return 4
+            if "stable-checkpoints" in path:
+                return 3
+            if "stable-runs" in path:
+                return 2
+            return 1
+
+        # Live aliases and immutable run directories can point at the same run.
+        # Keep the most authoritative copy while retaining distinct reruns.
+        deduplicated: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for item in candidates:
+            attempt_id = str(item.get("attempt_id") or "")
+            stable_run_id = str(item.get("stable_run_id") or "")
+            if attempt_id or stable_run_id:
+                identity = (attempt_id, stable_run_id, "")
+            else:
+                identity = ("", "", os.path.normcase(str(item["manifest_path"])))
+            current = deduplicated.get(identity)
+            if current is None or (
+                bool(item.get("has_recovery_draft")),
+                path_rank(item),
+                float(item.get("updated_timestamp") or 0.0),
+            ) > (
+                bool(current.get("has_recovery_draft")),
+                path_rank(current),
+                float(current.get("updated_timestamp") or 0.0),
+            ):
+                deduplicated[identity] = item
+        return sorted(
+            deduplicated.values(),
+            key=lambda item: float(item.get("updated_timestamp") or 0.0),
+            reverse=True,
+        )[:limit]
+
+    @classmethod
     def load_from_failure_record(
         cls,
         failure_path: str | Path,
