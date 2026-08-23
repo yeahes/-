@@ -44,6 +44,11 @@ from app.core.subtitle_processor.stable_artifacts import (
     resolve_manifest_owned_path,
     validate_manifest_artifact,
 )
+from app.core.subtitle_processor.derived_media_timeline import (
+    DerivedMediaTimelineError,
+    map_source_time_ms,
+    normalize_deleted_intervals,
+)
 from app.core.utils.json_repair import loads as repair_json_loads
 from app.core.utils.video_utils import (
     MediaSynthesisCancelled,
@@ -1095,8 +1100,24 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
                 return False
             boundary_evidence = raw_boundaries
         records = list(timeline.get("records") or [])
+        presentation = dict(timeline.get("presentation_timeline") or {})
+        presentation_records = list(presentation.get("records") or [])
+        presentation_by_id = {
+            str(record.get("subtitle_id") or ""): dict(record)
+            for record in presentation_records
+            if isinstance(record, Mapping)
+        }
+        deleted_intervals = normalize_deleted_intervals(
+            presentation.get("deleted_intervals") or []
+        )
         words = list(ledger.get("words") or [])
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        DerivedMediaTimelineError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         logger.warning("Article renderer could not load frozen word timing: %s", exc)
         return False
 
@@ -1106,6 +1127,16 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
         if isinstance(record, Mapping) and not record.get("display_suppressed")
     ]
     if len(visible_records) != len(cues) or not words:
+        return False
+    if presentation and (
+        str((presentation.get("validation") or {}).get("status") or "") != "PASS"
+        or set(presentation_by_id)
+        != {
+            str(record.get("subtitle_id") or "")
+            for record in records
+            if isinstance(record, Mapping)
+        }
+    ):
         return False
     overrides_by_start: dict[int, dict] = {}
     previous_override_end = -1
@@ -1140,8 +1171,17 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
             subtitle_id = str(record["subtitle_id"])
             word_start = int(record["word_start"])
             word_end = int(record["word_end"])
-            record_start = int(record["start_ms"]) / 1000.0
-            record_end = int(record["end_ms"]) / 1000.0
+            presentation_record = presentation_by_id.get(subtitle_id)
+            timeline_deleted = bool(
+                presentation_record
+                and presentation_record.get("timeline_deleted")
+            )
+            if presentation_record and not timeline_deleted:
+                record_start = int(presentation_record["output_start_ms"]) / 1000.0
+                record_end = int(presentation_record["output_end_ms"]) / 1000.0
+            else:
+                record_start = int(record["start_ms"]) / 1000.0
+                record_end = int(record["end_ms"]) / 1000.0
         except (KeyError, TypeError, ValueError):
             return False
         if (
@@ -1165,15 +1205,38 @@ def attach_article_word_timing(cues: list[Cue], subtitle_path: str | Path) -> bo
             start=word_start,
         ):
             try:
+                source_start_ms = int(word["start_ms"])
+                source_end_ms = int(word["end_ms"])
                 timed_words.append(
                     {
                         "word_id": word_id,
                         "surface": str(word["surface"]),
-                        "start": int(word["start_ms"]) / 1000.0,
-                        "end": int(word["end_ms"]) / 1000.0,
+                        "start": (
+                            source_start_ms
+                            if timeline_deleted or not presentation
+                            else map_source_time_ms(
+                                source_start_ms,
+                                deleted_intervals,
+                            )
+                        )
+                        / 1000.0,
+                        "end": (
+                            source_end_ms
+                            if timeline_deleted or not presentation
+                            else map_source_time_ms(
+                                source_end_ms,
+                                deleted_intervals,
+                            )
+                        )
+                        / 1000.0,
                     }
                 )
-            except (KeyError, TypeError, ValueError):
+            except (
+                DerivedMediaTimelineError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
                 return False
         display_spans: list[dict] = []
         cursor = word_start

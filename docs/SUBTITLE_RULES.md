@@ -293,6 +293,16 @@ Manual editor operations:
   hash, cut decision hash, removed IDs, derived-media path, and derived-media
   hash; synthesis must use the recorded derivative and reject a stale or
   tampered file.
+- Complete-parent timeline deletion is separate from hiding or muting. Every
+  page row belonging to a selected parent must be selected together; page-only
+  deletion, mixed states, and deleting every parent are rejected. The editor
+  stores `timeline_deleted` while leaving source audio, frozen IDs, English,
+  the authoritative word ledger, and source word times unchanged. Save emits
+  schema-v3 media derivation with canonical intervals and retained slices,
+  creates a new derivative from the original source, and projects later cue,
+  page, and word-card times onto the compacted presentation clock. Derived
+  audio and timeline hashes are manifest-bound; stale or unbound time shifts
+  block synthesis. Restoring a parent removes the deletion projection.
 
 Manual draft synthesis:
 

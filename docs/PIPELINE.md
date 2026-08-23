@@ -463,6 +463,18 @@ Rule:
   and derived-media SHA-256. Subtitle IDs and retained word/cue times do not
   shift. Page-only mute remains unsupported; legacy one-operation packages
   remain readable and are upgraded on the next save.
+- A complete-parent timeline deletion is separate from hiding or muting. The
+  editor requires every display-page row for a selected parent, rejects
+  page-only deletion, mixed delete states, and deleting every parent, and
+  records `timeline_deleted` without changing source authority. On save,
+  schema-v3 `media_derivation` stores canonical deleted intervals and retained
+  source slices. FFmpeg concatenates those slices from the original source;
+  subsequent cue, page, and word-card times are mapped to the compacted clock
+  by subtracting deleted duration before each source timestamp. Deleted cues
+  remain provenance records but are omitted from rendered SRT/ASS. The
+  manifest binds the derived audio and presentation timeline by hash, and
+  synthesis fails closed on stale, tampered, incomplete, or all-deleted
+  contracts. Restoring the parents returns the normal source timeline.
 - Manual-final imports have explicit checkpoint semantics. Importing
   `*-人工终稿字幕.srt` continues the latest hash-bound manual package. Importing
   `*-原文在上双语字幕.srt` starts again from the immutable stable parent

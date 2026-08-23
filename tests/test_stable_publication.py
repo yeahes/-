@@ -5937,6 +5937,47 @@ class StablePublicationTests(unittest.TestCase):
         self.assertFalse(interface.manual_final_synthesis_action.enabled)
         self.assertFalse(interface.manual_draft_synthesis_action.enabled)
 
+    def test_internal_model_publication_does_not_reenter_user_edit_handler(self):
+        model = SubtitleTableModel(
+            {
+                "1": {
+                    "manual_cue_id": "S0001",
+                    "original_subtitle": "旧英文",
+                    "translated_subtitle": "旧中文",
+                }
+            }
+        )
+        calls = []
+
+        class Toggle:
+            def setEnabled(self, _value):
+                pass
+
+        interface = SimpleNamespace(
+            model=model,
+            manual_final_session=SimpleNamespace(),
+            _manual_applying_session=True,
+            _invalidate_manual_review_marks_for_parent_ids=lambda ids: calls.append(
+                ("invalidate", ids)
+            ),
+            _mark_manual_final_dirty=lambda **kwargs: calls.append(
+                ("dirty", kwargs)
+            ),
+            _refresh_manual_review_rows=lambda: calls.append("review"),
+            _schedule_manual_boundary_inspector_refresh=lambda: calls.append(
+                "boundary"
+            ),
+            manual_final_undo_action=Toggle(),
+        )
+
+        model.dataChanged.connect(
+            lambda top_left, bottom_right, roles: SubtitleInterface._on_manual_table_data_changed(
+                interface, top_left, bottom_right, roles
+            )
+        )
+        self.assertTrue(model.setData(model.index(0, 2), "发布后的英文", Qt.EditRole))
+        self.assertEqual(calls, [])
+
     def test_discard_confirmation_commits_active_delegate_before_unsaved_check(self):
         class Toggle:
             def __init__(self):
@@ -6241,6 +6282,39 @@ class StablePublicationTests(unittest.TestCase):
         self.assertEqual(interface.subtitle_path, "old.srt")
         self.assertEqual(interface.model._data, original_model)
         self.assertIn("invalid subtitle", status_messages[-1])
+
+    def test_timeline_delete_selection_requires_every_page_of_each_parent(self):
+        interface = SimpleNamespace(
+            model=SimpleNamespace(
+                _data={
+                    "1": {"manual_cue_id": "S0001", "display_page_id": "S0001.P01"},
+                    "2": {"manual_cue_id": "S0001", "display_page_id": "S0001.P02"},
+                    "3": {"manual_cue_id": "S0002", "display_page_id": "S0002.P01"},
+                }
+            )
+        )
+
+        self.assertEqual(
+            SubtitleInterface._complete_selected_manual_parent_ids(
+                interface,
+                [0],
+            ),
+            (),
+        )
+        self.assertEqual(
+            SubtitleInterface._complete_selected_manual_parent_ids(
+                interface,
+                [0, 1],
+            ),
+            ("S0001",),
+        )
+        self.assertEqual(
+            SubtitleInterface._complete_selected_manual_parent_ids(
+                interface,
+                [0, 1, 2],
+            ),
+            ("S0001", "S0002"),
+        )
 
 
 if __name__ == "__main__":

@@ -57,6 +57,15 @@ from app.core.subtitle_processor.final_cue_timeline import (
     DISPLAY_TAIL_PADDING_MS,
     derive_final_cue_timeline,
 )
+from app.core.subtitle_processor.derived_media_timeline import (
+    DerivedMediaTimelineError,
+    build_kept_segments,
+    build_presentation_timeline,
+    deleted_intervals_from_cues,
+    map_source_time_ms,
+    normalize_deleted_intervals,
+    project_retained_interval,
+)
 from app.core.utils.video_utils import staged_media_output
 
 
@@ -202,13 +211,14 @@ def _materialize_media_derivation_audio(
     *,
     cut_ms: int | None,
     mute_intervals: Sequence[Mapping[str, Any]],
+    deleted_intervals: Sequence[Mapping[str, Any]] = (),
 ) -> None:
-    """Materialize one original-media derivation with optional mute and tail cut."""
+    """Materialize mute, tail cut, and timeline compaction from source media."""
     if not source_path.is_file():
         raise ManualFinalSubtitleEditError("媒体派生缺少有效的原始音频。")
     if cut_ms is not None and int(cut_ms) <= 0:
         raise ManualFinalSubtitleEditError("媒体派生切点无效。")
-    if cut_ms is None and not mute_intervals:
+    if cut_ms is None and not mute_intervals and not deleted_intervals:
         raise ManualFinalSubtitleEditError("媒体派生没有裁剪或静音操作。")
     ffmpeg = BIN_PATH / "ffmpeg.exe"
     if not ffmpeg.is_file():
@@ -226,19 +236,76 @@ def _materialize_media_derivation_audio(
             f"between(t,{start_ms / 1000.0:.3f},{end_ms / 1000.0:.3f})"
         )
         latest_end_ms = max(latest_end_ms, end_ms)
-    if expressions:
-        filters.append(f"volume=0:enable='{'+'.join(expressions)}'")
-    if cut_ms is not None:
-        filters.extend(
-            [
-                f"atrim=start=0:end={int(cut_ms) / 1000.0:.3f}",
-                "asetpts=PTS-STARTPTS",
-            ]
+    try:
+        canonical_deleted = normalize_deleted_intervals(
+            deleted_intervals,
+            source_end_ms=cut_ms,
         )
+        kept_segments = build_kept_segments(
+            canonical_deleted,
+            source_end_ms=cut_ms,
+        ) if canonical_deleted else []
+    except DerivedMediaTimelineError as exc:
+        raise ManualFinalSubtitleEditError(str(exc)) from exc
+    latest_end_ms = max(
+        latest_end_ms,
+        max((int(item["end_ms"]) for item in canonical_deleted), default=0),
+    )
+
+    use_complex_filter = bool(canonical_deleted)
+    output_map = "0:a:0"
+    if use_complex_filter:
+        complex_filters: List[str] = []
+        base_label = "0:a"
+        if expressions:
+            complex_filters.append(
+                f"[0:a]volume=0:enable='{'+'.join(expressions)}'[muted]"
+            )
+            base_label = "muted"
+        segment_labels: List[str] = []
+        if len(kept_segments) > 1:
+            split_labels = "".join(
+                f"[keep_source_{index}]" for index in range(len(kept_segments))
+            )
+            complex_filters.append(
+                f"[{base_label}]asplit={len(kept_segments)}{split_labels}"
+            )
+        for index, segment in enumerate(kept_segments):
+            source_label = (
+                f"keep_source_{index}" if len(kept_segments) > 1 else base_label
+            )
+            start_seconds = int(segment["source_start_ms"]) / 1000.0
+            end_ms = segment.get("source_end_ms")
+            trim = f"atrim=start={start_seconds:.3f}"
+            if end_ms is not None:
+                trim += f":end={int(end_ms) / 1000.0:.3f}"
+            output_label = f"keep_{index}"
+            complex_filters.append(
+                f"[{source_label}]{trim},asetpts=PTS-STARTPTS[{output_label}]"
+            )
+            segment_labels.append(f"[{output_label}]")
+        if len(segment_labels) == 1:
+            complex_filters.append(f"{segment_labels[0]}anull[outa]")
+        else:
+            complex_filters.append(
+                "".join(segment_labels)
+                + f"concat=n={len(segment_labels)}:v=0:a=1[outa]"
+            )
+        filters = complex_filters
+        output_map = "[outa]"
+    else:
+        if expressions:
+            filters.append(f"volume=0:enable='{'+'.join(expressions)}'")
+        if cut_ms is not None:
+            filters.extend(
+                [
+                    f"atrim=start=0:end={int(cut_ms) / 1000.0:.3f}",
+                    "asetpts=PTS-STARTPTS",
+                ]
+            )
     try:
         with staged_media_output(output_path) as staged_path:
-            result = subprocess.run(
-                [
+            native_args = [
                     str(ffmpeg),
                     "-nostdin",
                     "-hide_banner",
@@ -246,11 +313,16 @@ def _materialize_media_derivation_audio(
                     "error",
                     "-i",
                     str(source_path),
-                    "-map",
-                    "0:a:0",
                     "-vn",
-                    "-af",
-                    ",".join(filters),
+                ]
+            if use_complex_filter:
+                native_args.extend(["-filter_complex", ";".join(filters)])
+            else:
+                native_args.extend(["-af", ",".join(filters)])
+            native_args.extend(
+                [
+                    "-map",
+                    output_map,
                     "-c:a",
                     "aac",
                     "-b:a",
@@ -259,7 +331,10 @@ def _materialize_media_derivation_audio(
                     "+faststart",
                     "-y",
                     str(staged_path),
-                ],
+                ]
+            )
+            result = subprocess.run(
+                native_args,
                 capture_output=True,
                 text=True,
                 timeout=max(60, int(latest_end_ms / 1000) + 30),
@@ -1504,6 +1579,10 @@ class ManualFinalSubtitleSession:
     ) -> None:
         data = ASRData.from_subtitle_file(str(subtitle_path))
         visible_cues = [cue for cue in cues if not cue.get("display_suppressed")]
+        try:
+            deleted_intervals = deleted_intervals_from_cues(cues)
+        except DerivedMediaTimelineError as exc:
+            raise ManualFinalSubtitleEditError(str(exc)) from exc
         if len(data.segments) != len(visible_cues):
             raise ManualFinalSubtitleEditError(
                 "authoritative_parent_chinese_conflict: 父字幕与人工编辑记录条数不一致。"
@@ -1512,13 +1591,21 @@ class ManualFinalSubtitleSession:
             zip(data.segments, visible_cues),
             1,
         ):
+            try:
+                projected = project_retained_interval(
+                    int(cue.get("start_time") or 0),
+                    int(cue.get("end_time") or 0),
+                    deleted_intervals,
+                )
+            except DerivedMediaTimelineError as exc:
+                raise ManualFinalSubtitleEditError(str(exc)) from exc
             if (
                 cls._normalised_tokens(segment.text)
                 != cls._normalised_tokens(str(cue.get("original_subtitle") or ""))
                 or cls._normalised_chinese(segment.translated_text)
                 != cls._normalised_chinese(cue.get("translated_subtitle"))
-                or int(segment.start_time) != int(cue.get("start_time") or 0)
-                or int(segment.end_time) != int(cue.get("end_time") or 0)
+                or int(segment.start_time) != int(projected["start_ms"])
+                or int(segment.end_time) != int(projected["end_ms"])
             ):
                 raise ManualFinalSubtitleEditError(
                     "authoritative_parent_chinese_conflict: "
@@ -1841,7 +1928,8 @@ class ManualFinalSubtitleSession:
             manifest=manifest,
             manifest_path=manifest_path,
             require_materialized=any(
-                bool(cue.get("media_muted")) for cue in session.cues
+                bool(cue.get("media_muted") or cue.get("timeline_deleted"))
+                for cue in session.cues
             ),
         )
         session._validate_display_page_boundary_overrides()
@@ -2613,6 +2701,19 @@ class ManualFinalSubtitleSession:
             if cue.get("media_muted")
         ]
 
+    def _timeline_deleted_intervals(self) -> List[Dict[str, Any]]:
+        try:
+            return deleted_intervals_from_cues(
+                self.cues,
+                source_end_ms=(
+                    int(self.tail_trim["cut_ms"])
+                    if self.tail_trim and self.tail_trim.get("cut_ms") is not None
+                    else None
+                ),
+            )
+        except DerivedMediaTimelineError as exc:
+            raise ManualFinalSubtitleEditError(str(exc)) from exc
+
     def _media_mute_decision_payload(
         self,
         source_media_sha256: str,
@@ -2640,9 +2741,14 @@ class ManualFinalSubtitleSession:
         *,
         cut_ms: int | None,
         mute_intervals: Sequence[Mapping[str, Any]],
+        deleted_intervals: Sequence[Mapping[str, Any]] = (),
     ) -> Dict[str, Any]:
-        return {
-            "schema_version": 2,
+        canonical_deleted = normalize_deleted_intervals(
+            deleted_intervals,
+            source_end_ms=cut_ms,
+        )
+        payload = {
+            "schema_version": 3 if canonical_deleted else 2,
             "source_media_sha256": str(source_media_sha256 or ""),
             "source_word_ledger_hash": self._semantic_word_ledger_hash(
                 self.word_ledger
@@ -2657,6 +2763,17 @@ class ManualFinalSubtitleSession:
                 for item in mute_intervals
             ],
         }
+        if canonical_deleted:
+            payload.update(
+                {
+                    "deleted_intervals": canonical_deleted,
+                    "kept_segments": build_kept_segments(
+                        canonical_deleted,
+                        source_end_ms=cut_ms,
+                    ),
+                }
+            )
+        return payload
 
     @staticmethod
     def _validate_ordered_mute_intervals(
@@ -2687,6 +2804,7 @@ class ManualFinalSubtitleSession:
         require_materialized: bool = False,
     ) -> None:
         intervals = self._media_mute_intervals()
+        deleted_intervals = self._timeline_deleted_intervals()
         if self.media_derivation:
             source_hash = str(
                 self.media_derivation.get("source_media_sha256") or ""
@@ -2707,10 +2825,17 @@ class ManualFinalSubtitleSession:
                 source_hash,
                 cut_ms=cut_ms,
                 mute_intervals=intervals,
+                deleted_intervals=deleted_intervals,
             )
             if (
                 not source_hash
+                or int(self.media_derivation.get("schema_version") or 0)
+                != int(expected_decision["schema_version"])
                 or list(self.media_derivation.get("mute_intervals") or []) != intervals
+                or list(self.media_derivation.get("deleted_intervals") or [])
+                != list(expected_decision.get("deleted_intervals") or [])
+                or list(self.media_derivation.get("kept_segments") or [])
+                != list(expected_decision.get("kept_segments") or [])
                 or str(self.media_derivation.get("source_word_ledger_hash") or "")
                 != str(expected_decision["source_word_ledger_hash"])
                 or str(self.media_derivation.get("decision_hash") or "")
@@ -2751,6 +2876,12 @@ class ManualFinalSubtitleSession:
                 )
                 if derived_path is None or not derived_hash:
                     raise ManualFinalSubtitleEditError("派生音频路径或哈希无效。")
+            return
+        if deleted_intervals:
+            if require_materialized:
+                raise ManualFinalSubtitleEditError(
+                    "删除音频的终稿缺少 v3 媒体派生合同。"
+                )
             return
         if not intervals:
             if self.media_mute:
@@ -3557,6 +3688,10 @@ class ManualFinalSubtitleSession:
         )
         if cue is None:
             raise ManualFinalSubtitleEditError("找不到要隐藏的固定字幕 ID。")
+        if cue.get("timeline_deleted"):
+            raise ManualFinalSubtitleEditError(
+                "该条已从成片时间轴删除；请先恢复该条字幕和音频。"
+            )
         target = bool(suppressed)
         if not target and cue.get("media_muted"):
             raise ManualFinalSubtitleEditError(
@@ -3605,6 +3740,10 @@ class ManualFinalSubtitleSession:
         )
         if cue is None:
             raise ManualFinalSubtitleEditError("找不到要隐藏并静音的固定字幕 ID。")
+        if cue.get("timeline_deleted"):
+            raise ManualFinalSubtitleEditError(
+                "该条已从成片时间轴删除；请先恢复该条字幕和音频。"
+            )
         target = bool(enabled)
         current = bool(cue.get("media_muted")) and bool(
             cue.get("display_suppressed")
@@ -3655,6 +3794,86 @@ class ManualFinalSubtitleSession:
             "changed": True,
             "subtitle_id": parent_id,
             "hidden_and_muted": target,
+        }
+
+    def set_cues_timeline_deleted(
+        self,
+        parent_subtitle_ids: Sequence[str],
+        enabled: bool,
+    ) -> Dict[str, Any]:
+        """Delete complete parent cue media while preserving source authority."""
+        requested_ids = list(
+            dict.fromkeys(
+                str(value or "").strip() for value in parent_subtitle_ids
+            )
+        )
+        if not requested_ids or any(not value for value in requested_ids):
+            raise ManualFinalSubtitleEditError("没有选择可删除的完整父字幕。")
+        cue_by_id = {
+            str(cue.get("cue_id") or ""): cue for cue in self.cues
+        }
+        if any(parent_id not in cue_by_id for parent_id in requested_ids):
+            raise ManualFinalSubtitleEditError("删除范围引用了未知的固定字幕 ID。")
+        target = bool(enabled)
+        selected = [cue_by_id[parent_id] for parent_id in requested_ids]
+        current_states = {bool(cue.get("timeline_deleted")) for cue in selected}
+        if len(current_states) != 1:
+            raise ManualFinalSubtitleEditError(
+                "所选字幕混合了已删除和未删除状态，请分开操作。"
+            )
+        if current_states == {target}:
+            return {
+                "changed": False,
+                "subtitle_ids": requested_ids,
+                "timeline_deleted": target,
+            }
+        if target:
+            if any(
+                cue.get("display_suppressed") or cue.get("media_muted")
+                for cue in selected
+            ):
+                raise ManualFinalSubtitleEditError(
+                    "所选字幕包含已隐藏或静音项；请先恢复后再删除音频。"
+                )
+            already_deleted = sum(
+                bool(cue.get("timeline_deleted")) for cue in self.cues
+            )
+            if already_deleted + len(selected) >= len(self.cues):
+                raise ManualFinalSubtitleEditError("不能删除全部字幕和音频。")
+
+        before_cues = copy.deepcopy(self.cues)
+        original_media = self._tail_trim_source_media_path()
+        self._record_history(
+            "set_timeline_deleted",
+            before_cues,
+            affected_parent_ids=requested_ids,
+            timeline_deleted=target,
+            before_media_mute=copy.deepcopy(self.media_mute),
+            before_media_derivation=copy.deepcopy(self.media_derivation),
+            before_source_media_path=(
+                str(self.source_media_path.resolve())
+                if self.source_media_path is not None
+                else ""
+            ),
+        )
+        for cue in selected:
+            cue["timeline_deleted"] = target
+            cue["display_suppressed"] = target
+            cue["media_muted"] = False
+            self._display_page_preview_cache.pop(
+                str(cue.get("cue_id") or ""),
+                None,
+            )
+        if original_media is not None:
+            self.source_media_path = original_media.resolve()
+        self.media_mute = {}
+        self.media_derivation = {}
+        self._validate_cues()
+        self._timeline_deleted_intervals()
+        return {
+            "changed": True,
+            "subtitle_ids": requested_ids,
+            "timeline_deleted": target,
         }
 
     @staticmethod
@@ -4275,7 +4494,10 @@ class ManualFinalSubtitleSession:
             "set_display_suppressed",
         }:
             self.cues = before
-        elif entry["operation"] == "set_hidden_and_media_muted":
+        elif entry["operation"] in {
+            "set_hidden_and_media_muted",
+            "set_timeline_deleted",
+        }:
             self.cues = before
             self.media_mute = copy.deepcopy(
                 dict(entry.get("before_media_mute") or {})
@@ -4378,6 +4600,7 @@ class ManualFinalSubtitleSession:
                 "chinese_review_required": bool(cue.get("chinese_review_required")),
                 "display_suppressed": bool(cue.get("display_suppressed")),
                 "media_muted": bool(cue.get("media_muted")),
+                "timeline_deleted": bool(cue.get("timeline_deleted")),
             }
             for index, cue in enumerate(self.cues, 1)
         }
@@ -4423,6 +4646,7 @@ class ManualFinalSubtitleSession:
                     "chinese_review_required": False,
                     "display_suppressed": True,
                     "media_muted": bool(cue.get("media_muted")),
+                    "timeline_deleted": bool(cue.get("timeline_deleted")),
                 }
                 continue
             pages = list(previews.get(parent_id) or [])
@@ -4454,6 +4678,7 @@ class ManualFinalSubtitleSession:
                     "chinese_review_required": True,
                     "display_suppressed": False,
                     "media_muted": False,
+                    "timeline_deleted": False,
                 }
                 continue
             for page in pages:
@@ -4555,6 +4780,7 @@ class ManualFinalSubtitleSession:
                     "chinese_review_required": not chinese_confirmed,
                     "display_suppressed": False,
                     "media_muted": False,
+                    "timeline_deleted": False,
                 }
         self._display_page_model_cache_key = cache_key
         self._display_page_model_cache = copy.deepcopy(rows)
@@ -7427,6 +7653,7 @@ class ManualFinalSubtitleSession:
         muted_intervals = self._media_mute_intervals()
         cut_ms = int(self.tail_trim["cut_ms"]) if self.tail_trim else None
         self._validate_ordered_mute_intervals(muted_intervals, cut_ms=cut_ms)
+        deleted_intervals = self._timeline_deleted_intervals()
         media_candidate = source_media_path or self.source_media_path
         media_path = Path(media_candidate).resolve() if media_candidate else None
         if media_path is not None and not media_path.is_file():
@@ -7477,7 +7704,7 @@ class ManualFinalSubtitleSession:
         published_tail_trim: Dict[str, Any] = {}
         published_media_mute: Dict[str, Any] = {}
         published_media_derivation: Dict[str, Any] = {}
-        if cut_ms is not None or muted_intervals:
+        if cut_ms is not None or muted_intervals or deleted_intervals:
             derivation_source = self._tail_trim_source_media_path()
             if derivation_source is None:
                 derivation_source = self._media_mute_source_media_path() or media_path
@@ -7494,6 +7721,7 @@ class ManualFinalSubtitleSession:
                 source_hash,
                 cut_ms=cut_ms,
                 mute_intervals=muted_intervals,
+                deleted_intervals=deleted_intervals,
             )
             decision_hash = stable_payload_hash(decision_payload)
             derivation_audio_path = generation_dir / f"{derivation_source.stem}-人工终稿派生.m4a"
@@ -7524,6 +7752,15 @@ class ManualFinalSubtitleSession:
                     reuse_derivation = False
             if reuse_derivation:
                 shutil.copyfile(previous_audio, derivation_audio_path)
+            elif deleted_intervals:
+                report(10, "正在生成压缩时间轴的非破坏式派生音频")
+                _materialize_media_derivation_audio(
+                    derivation_source,
+                    derivation_audio_path,
+                    cut_ms=cut_ms,
+                    mute_intervals=muted_intervals,
+                    deleted_intervals=deleted_intervals,
+                )
             elif cut_ms is not None and not muted_intervals:
                 report(10, "正在生成非破坏式尾部裁剪音频")
                 _materialize_tail_trim_audio(
@@ -7541,6 +7778,7 @@ class ManualFinalSubtitleSession:
                     derivation_audio_path,
                     cut_ms=cut_ms,
                     mute_intervals=muted_intervals,
+                    deleted_intervals=(),
                 )
             published_media_derivation = {
                 **decision_payload,
@@ -7718,6 +7956,11 @@ class ManualFinalSubtitleSession:
                 for cue in self.cues
                 if cue.get("media_muted")
             ],
+            "timeline_deleted_subtitle_ids": [
+                str(cue.get("cue_id") or "")
+                for cue in self.cues
+                if cue.get("timeline_deleted")
+            ],
             "source_media_path": manifest_media_path,
             "tail_trim": published_tail_trim,
             "media_mute": published_media_mute,
@@ -7855,6 +8098,11 @@ class ManualFinalSubtitleSession:
                 str(cue.get("cue_id") or "")
                 for cue in self.cues
                 if cue.get("media_muted")
+            ],
+            "timeline_deleted_subtitle_ids": [
+                str(cue.get("cue_id") or "")
+                for cue in self.cues
+                if cue.get("timeline_deleted")
             ],
         }
         manual_manifest["source_subtitle_paths_sha256"] = {
@@ -8072,6 +8320,9 @@ class ManualFinalSubtitleSession:
                                     page.get("display_page_id") or ""
                                 ),
                                 "parent_subtitle_id": subtitle_id,
+                                "source_parent_chinese": str(
+                                    display_parent.get("source_parent_chinese") or ""
+                                ),
                                 "word_start": int(page["word_start"]),
                                 "word_end": int(page["word_end"]),
                                 "english": str(page.get("english") or ""),
@@ -8093,6 +8344,70 @@ class ManualFinalSubtitleSession:
                 }
             )
         return sorted(units, key=lambda item: int(item["word_start"]))
+
+    def _source_page_translation_error_scope(
+        self,
+    ) -> tuple[set[str], set[str], bool]:
+        """Return source page errors without widening them to unrelated pages."""
+        try:
+            artifact = self._read_json(
+                self.artifact_dir / "display-page-translations.json"
+            )
+        except ManualFinalSubtitleEditError:
+            return set(), set(), False
+        if str(artifact.get("status") or "") == "PASS":
+            return set(), set(), False
+        errors = artifact.get("errors")
+        if not isinstance(errors, list) or not errors:
+            return set(), set(), False
+
+        parent_ids: set[str] = set()
+        page_ids: set[str] = set()
+        unscoped_error = False
+        id_pattern = re.compile(r"^S\d{4}(?:\.P\d+)?$")
+
+        def visit(value: Any) -> bool:
+            found = False
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    key_name = str(key or "")
+                    if key_name in {
+                        "parent_subtitle_id",
+                        "display_page_id",
+                        "expected_subtitle_id",
+                    }:
+                        candidates = [nested]
+                    elif key_name == "actual_subtitle_ids":
+                        candidates = nested if isinstance(nested, list) else [nested]
+                    elif key_name == "actual_chinese":
+                        candidates = (
+                            list(nested.keys())
+                            if isinstance(nested, Mapping)
+                            else []
+                        )
+                    else:
+                        candidates = []
+                    for candidate in candidates:
+                        token = str(candidate or "").strip()
+                        if not id_pattern.fullmatch(token):
+                            continue
+                        found = True
+                        if ".P" in token:
+                            page_ids.add(token)
+                            parent_ids.add(token.split(".P", 1)[0])
+                        else:
+                            parent_ids.add(token)
+                    if key_name in {"issues", "errors"}:
+                        found = visit(nested) or found
+            elif isinstance(value, list):
+                for item in value:
+                    found = visit(item) or found
+            return found
+
+        for error in errors:
+            if not visit(error):
+                unscoped_error = True
+        return parent_ids, page_ids, unscoped_error
 
     def _source_semantic_page_translations(
         self,
@@ -8144,39 +8459,118 @@ class ManualFinalSubtitleSession:
             return {"pages": []}
         units = self._source_page_units()
         by_start = {int(unit["word_start"]): unit for unit in units}
+        by_page_id = {
+            str(unit.get("display_page_id") or ""): unit
+            for unit in units
+            if str(unit.get("display_page_id") or "")
+        }
+        has_id_bound_units = bool(by_page_id)
+        (
+            source_error_parent_ids,
+            source_error_page_ids,
+            source_error_unscoped,
+        ) = self._source_page_translation_error_scope()
+        if source_error_unscoped:
+            return None
         response_pages: List[Dict[str, str]] = []
         for parent in parents:
+            parent_id = str(parent.get("parent_subtitle_id") or "")
             aggregate = ""
+            source_parent_chinese = ""
+            used_source_ids: set[str] = set()
             for page in parent.get("pages") or []:
                 page_start = int(page["word_start"])
                 page_end = int(page["word_end"])
-                cursor = page_start
-                english_parts: List[str] = []
-                chinese_parts: List[str] = []
-                while cursor <= page_end:
-                    unit = by_start.get(cursor)
-                    if unit is None or int(unit["word_end"]) > page_end:
+                page_id = str(page.get("display_page_id") or "")
+                if (
+                    parent_id in source_error_parent_ids
+                    or page_id in source_error_page_ids
+                ):
+                    # Preserve the source validator's scoped semantic error;
+                    # sibling page cache hits remain usable.
+                    continue
+                unit = by_page_id.get(page_id) if page_id else None
+                if unit is not None:
+                    # New artifacts are keyed by deterministic page identity.
+                    # Page Chinese may reorder a parent phrase for readability,
+                    # so the parent string is not reconstructed by concatenation.
+                    if (
+                        page_id in used_source_ids
+                        or str(unit.get("parent_subtitle_id") or "")
+                        != str(parent.get("parent_subtitle_id") or "")
+                        or int(unit.get("word_start", -1)) != page_start
+                        or int(unit.get("word_end", -1)) != page_end
+                        or " ".join(str(unit.get("english") or "").split())
+                        != " ".join(str(page.get("english") or "").split())
+                    ):
                         return None
-                    english_parts.append(str(unit.get("english") or ""))
-                    chinese_parts.append(str(unit.get("chinese") or ""))
-                    cursor = int(unit["word_end"]) + 1
-                if cursor - 1 != page_end:
-                    return None
-                expected_english = " ".join(str(page.get("english") or "").split())
-                source_english = " ".join(" ".join(english_parts).split())
-                chinese = re.sub(r"\s+", "", "".join(chinese_parts))
-                if source_english != expected_english or not chinese:
-                    return None
+                    used_source_ids.add(page_id)
+                    source_parent_chinese = str(
+                        unit.get("source_parent_chinese") or source_parent_chinese
+                    )
+                else:
+                    if page_id and has_id_bound_units:
+                        # A page absent from the source artifact is a local
+                        # cache miss.  Keep every verified page from the same
+                        # run and let the formal contract report this exact
+                        # missing ID; returning None here would turn one
+                        # missing page into a full-episode draft.
+                        continue
+                    # Legacy artifacts did not persist page IDs. Preserve the
+                    # strict contiguous-range and aggregate check for them.
+                    cursor = page_start
+                    english_parts: List[str] = []
+                    chinese_parts: List[str] = []
+                    while cursor <= page_end:
+                        unit = by_start.get(cursor)
+                        if unit is None or int(unit["word_end"]) > page_end:
+                            return None
+                        english_parts.append(str(unit.get("english") or ""))
+                        chinese_parts.append(str(unit.get("chinese") or ""))
+                        cursor = int(unit["word_end"]) + 1
+                    if cursor - 1 != page_end:
+                        return None
+                    source_english = " ".join(" ".join(english_parts).split())
+                    if source_english != " ".join(str(page.get("english") or "").split()):
+                        return None
+                    chinese = re.sub(r"\s+", "", "".join(chinese_parts))
+                    if chinese:
+                        aggregate += chinese
+                        response_pages.append(
+                            {
+                                "display_page_id": page_id,
+                                "zh": chinese,
+                            }
+                        )
+                    continue
+                chinese = re.sub(r"\s+", "", str(unit.get("chinese") or ""))
+                if not chinese:
+                    # Preserve the other page cache hits.  The validator will
+                    # identify this exact page as missing/blank.
+                    continue
                 aggregate += chinese
                 response_pages.append(
                     {
-                        "display_page_id": str(page.get("display_page_id") or ""),
+                        "display_page_id": page_id,
                         "zh": chinese,
                     }
                 )
-            if aggregate != re.sub(r"\s+", "", str(parent.get("chinese") or "")):
+            current_parent_chinese = re.sub(
+                r"\s+", "", str(parent.get("chinese") or "")
+            )
+            if parent_id in source_error_parent_ids:
+                # The source artifact already identified this parent's page
+                # projection as semantically invalid. Do not turn the skipped
+                # failed pages into a cache-identity mismatch; the formal
+                # validator will keep the parent blocked with its original
+                # diagnostic scope.
+                continue
+            if source_parent_chinese:
+                if re.sub(r"\s+", "", source_parent_chinese) != current_parent_chinese:
+                    return None
+            elif aggregate != current_parent_chinese:
                 return None
-        return {"pages": response_pages}
+        return {"pages": response_pages} if response_pages else None
 
     def _display_page_edit_translation_response(
         self,
@@ -8347,8 +8741,11 @@ class ManualFinalSubtitleSession:
             raise ManualFinalSubtitleEditError(
                 "manual_page_translation_required: 已冻结的人工分页计划状态无效。"
             )
-        if artifact_status != "PASS" and not strict_checkpoint:
-            return None
+        # An ERROR artifact may still contain a valid frozen geometry plan.
+        # Its error can be semantic page Chinese (for example a number mapped
+        # to the wrong page), not a failure to calculate page ranges.  Saving
+        # an unrelated edit must keep those IDs and word spans frozen so one
+        # bad parent cannot trigger a whole-episode re-pagination.
         raw_plans = list(artifact.get("render_plans") or [])
         if not raw_plans:
             if not strict_checkpoint:
@@ -8578,7 +8975,10 @@ class ManualFinalSubtitleSession:
                 "manual_page_translation_required: "
                 "权威分页没有完整覆盖当前父字幕和人工页面编辑。"
             )
-        if set(self.display_page_boundary_overrides) - seen_parents:
+        active_boundary_override_ids = (
+            set(self.display_page_boundary_overrides) - suppressed_parent_ids
+        )
+        if active_boundary_override_ids - seen_parents:
             raise ManualFinalSubtitleEditError(
                 "manual_page_translation_required: 人工分页计划引用了未知父字幕。"
             )
@@ -8634,6 +9034,15 @@ class ManualFinalSubtitleSession:
             cue["start_time"] = int(record["start_ms"])
             cue["end_time"] = int(record["end_ms"])
         self._validate_cues()
+        deleted_intervals = self._timeline_deleted_intervals()
+        if deleted_intervals:
+            try:
+                timeline["presentation_timeline"] = build_presentation_timeline(
+                    timeline.get("records") or [],
+                    deleted_intervals,
+                )
+            except DerivedMediaTimelineError as exc:
+                raise ManualFinalSubtitleEditError(str(exc)) from exc
         return timeline
 
     def _write_manual_render_contract(
@@ -8664,6 +9073,13 @@ class ManualFinalSubtitleSession:
             for record in timeline.get("records") or []
             if isinstance(record, Mapping)
         }
+        presentation = dict(timeline.get("presentation_timeline") or {})
+        presentation_records_by_id = {
+            str(record.get("subtitle_id") or ""): dict(record)
+            for record in presentation.get("records") or []
+            if isinstance(record, Mapping)
+        }
+        deleted_intervals = list(presentation.get("deleted_intervals") or [])
         boundary_payload = self._validated_display_boundary_evidence()
         boundary_items = dict(boundary_payload.get("boundaries") or {})
         records = []
@@ -8674,6 +9090,7 @@ class ManualFinalSubtitleSession:
             word_end = int(cue["word_end"])
             display_suppressed = bool(cue.get("display_suppressed"))
             media_muted = bool(cue.get("media_muted"))
+            timeline_deleted = bool(cue.get("timeline_deleted"))
             timeline_record = timeline_records_by_id.get(subtitle_id)
             if timeline_record is None:
                 raise ManualFinalSubtitleEditError(
@@ -8689,15 +9106,27 @@ class ManualFinalSubtitleSession:
                     "translated": str(cue.get("translated_subtitle") or ""),
                     "display_suppressed": display_suppressed,
                     "media_muted": media_muted,
+                    "timeline_deleted": timeline_deleted,
                 }
             )
             if display_suppressed:
                 continue
+            presentation_record = presentation_records_by_id.get(subtitle_id)
+            cue_start_ms = (
+                int(presentation_record["output_start_ms"])
+                if presentation_record
+                else int(cue["start_time"])
+            )
+            cue_end_ms = (
+                int(presentation_record["output_end_ms"])
+                if presentation_record
+                else int(cue["end_time"])
+            )
             render_cues.append(
                 Cue(
                     index=index,
-                    start=int(cue["start_time"]) / 1000.0,
-                    end=int(cue["end_time"]) / 1000.0,
+                    start=cue_start_ms / 1000.0,
+                    end=cue_end_ms / 1000.0,
                     en=str(cue["original_subtitle"]),
                     zh=str(cue.get("translated_subtitle") or ""),
                     speaker="male" if index % 2 else "female",
@@ -8711,8 +9140,16 @@ class ManualFinalSubtitleSession:
                                     self.word_ledger[word_id].get("token", ""),
                                 )
                             ),
-                            "start": self._word_start_time(word_id) / 1000.0,
-                            "end": self._word_end_time(word_id) / 1000.0,
+                            "start": map_source_time_ms(
+                                self._word_start_time(word_id),
+                                deleted_intervals,
+                            )
+                            / 1000.0,
+                            "end": map_source_time_ms(
+                                self._word_end_time(word_id),
+                                deleted_intervals,
+                            )
+                            / 1000.0,
                         }
                         for word_id in range(word_start, word_end + 1)
                     ),
@@ -8728,9 +9165,20 @@ class ManualFinalSubtitleSession:
         render_block_reason = ""
         blueprint: Dict[str, Any] = {}
         try:
-            blueprint = self._blueprint_from_frozen_display_page_edits() or (
-                build_article_display_page_blueprint(render_cues)
+            frozen_blueprint = self._blueprint_from_frozen_display_page_edits()
+            blueprint = frozen_blueprint or build_article_display_page_blueprint(
+                render_cues
             )
+            if frozen_blueprint and deleted_intervals:
+                for plan in blueprint.get("render_plans") or []:
+                    for page in plan.get("pages") or []:
+                        projected = project_retained_interval(
+                            int(page["start_ms"]),
+                            int(page["end_ms"]),
+                            deleted_intervals,
+                        )
+                        page["start_ms"] = projected["start_ms"]
+                        page["end_ms"] = projected["end_ms"]
             multipage_parents = list(blueprint.get("parents") or [])
             page_response = self._display_page_edit_translation_response(
                 multipage_parents,
@@ -8848,6 +9296,7 @@ class ManualFinalSubtitleSession:
                         record.get("display_suppressed")
                     ),
                     "media_muted": bool(record.get("media_muted")),
+                    "timeline_deleted": bool(record.get("timeline_deleted")),
                 }
                 for record in records
             ],
@@ -8871,6 +9320,7 @@ class ManualFinalSubtitleSession:
                         record.get("display_suppressed")
                     ),
                     "media_muted": bool(record.get("media_muted")),
+                    "timeline_deleted": bool(record.get("timeline_deleted")),
                 }
                 for record in records
             ],
@@ -9028,14 +9478,21 @@ class ManualFinalSubtitleSession:
 
     def _write_bilingual_srt(self, path: Path) -> None:
         lines = []
+        deleted_intervals = self._timeline_deleted_intervals()
         visible_cues = [
             cue for cue in self.cues if not cue.get("display_suppressed")
         ]
         for index, cue in enumerate(visible_cues, 1):
+            projected = project_retained_interval(
+                int(cue["start_time"]),
+                int(cue["end_time"]),
+                deleted_intervals,
+            )
             lines.extend(
                 [
                     str(index),
-                    f"{self._srt_timestamp(cue['start_time'])} --> {self._srt_timestamp(cue['end_time'])}",
+                    f"{self._srt_timestamp(projected['start_ms'])} --> "
+                    f"{self._srt_timestamp(projected['end_ms'])}",
                     str(cue["original_subtitle"]),
                 ]
             )

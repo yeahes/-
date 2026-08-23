@@ -275,6 +275,8 @@ class SubtitleTableModel(QAbstractTableModel):
 
         marks = self._marks_for_segment(segment)
         if role == Qt.BackgroundRole:
+            if segment.get("timeline_deleted"):
+                return QBrush(QColor(150, 45, 45, 112))
             if segment.get("media_muted"):
                 return QBrush(QColor(126, 58, 58, 88))
             if segment.get("display_suppressed"):
@@ -290,6 +292,11 @@ class SubtitleTableModel(QAbstractTableModel):
                     QColor("#A8A8A8" if isDarkTheme() else "#767676")
                 )
         if role == Qt.ToolTipRole:
+            if segment.get("timeline_deleted"):
+                return self.tr(
+                    "该条字幕及对应音频会从成片中删除；后续成片时间会前移。"
+                    "原始音频、固定字幕 ID 和词时间账本保持不变。"
+                )
             if segment.get("media_muted"):
                 return self.tr(
                     "该条字幕已隐藏；保存人工终稿后，对应音频区间也会静音。"
@@ -786,6 +793,8 @@ class SubtitleInterface(QWidget):
         self._manual_boundary_edit_active = False
         self._manual_boundary_row_armed = False
         self._manual_boundary_move_direction = ""
+        self._manual_boundary_refresh_timer = None
+        self._manual_applying_session = False
         self._manual_save_request_id = 0
         self._manual_save_in_progress = False
         self._manual_refresh_requested = False
@@ -1841,6 +1850,19 @@ class SubtitleInterface(QWidget):
         finally:
             self._manual_boundary_refreshing = False
 
+    def _schedule_manual_boundary_inspector_refresh(self) -> None:
+        """Coalesce expensive index-widget rebuilds after text edits."""
+        if QApplication.instance() is None:
+            self._refresh_manual_boundary_inspector()
+            return
+        timer = getattr(self, "_manual_boundary_refresh_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._refresh_manual_boundary_inspector)
+            self._manual_boundary_refresh_timer = timer
+        timer.start(100)
+
     def _select_manual_boundary_row(self, left_index: int) -> None:
         if (
             not self.model.rowCount()
@@ -2806,6 +2828,7 @@ class SubtitleInterface(QWidget):
         self._manual_long_caption_parent_id = ""
         self._manual_long_caption_queue_row = 0
         self._manual_page_view = True
+        self._manual_applying_session = False
         self._manual_model_has_pending_edits = False
         self._manual_has_unsaved_changes = False
         self._manual_clean_state_fingerprint = ""
@@ -3256,7 +3279,17 @@ class SubtitleInterface(QWidget):
                 self._manual_page_view and not boundaries_dirty
             )
         )
-        self.model.update_incremental(data)
+        # update_incremental emits dataChanged(EditRole).  That signal also
+        # represents a real user edit, so the normal handler would otherwise
+        # invalidate the save package, rescan all review rows, and schedule a
+        # recovery snapshot while we are merely publishing an already-owned
+        # session state to the table.  Keep the model refresh visible while
+        # separating it from user-originated edits.
+        self._manual_applying_session = True
+        try:
+            self.model.update_incremental(data)
+        finally:
+            self._manual_applying_session = False
         self._manual_model_has_pending_edits = False
         refresh_review_rows = getattr(self, "_refresh_manual_review_rows", None)
         if callable(refresh_review_rows):
@@ -3486,6 +3519,8 @@ class SubtitleInterface(QWidget):
         return True
 
     def _on_manual_table_data_changed(self, top_left, bottom_right, roles=None) -> None:
+        if bool(getattr(self, "_manual_applying_session", False)):
+            return
         if not self.manual_final_session:
             return
         if bottom_right.column() < 2 or top_left.column() > 3:
@@ -3515,7 +3550,15 @@ class SubtitleInterface(QWidget):
         refresh_review_rows = getattr(self, "_refresh_manual_review_rows", None)
         if callable(refresh_review_rows):
             refresh_review_rows()
-        self._refresh_manual_boundary_inspector()
+        schedule_refresh = getattr(
+            self,
+            "_schedule_manual_boundary_inspector_refresh",
+            None,
+        )
+        if callable(schedule_refresh):
+            schedule_refresh()
+        else:
+            self._refresh_manual_boundary_inspector()
 
     def undo_manual_final_edit(self, parent_subtitle_id: str = "") -> None:
         if not self.manual_final_session:
@@ -4314,6 +4357,9 @@ class SubtitleInterface(QWidget):
 
         self.video_player = MyVideoWidget()
         self.video_player.resize(800, 600)
+        preview_update_timer = QTimer(self)
+        preview_update_timer.setSingleShot(True)
+        preview_update_timer.setInterval(120)
 
         def signal_update():
             if not self.model._data:
@@ -4333,12 +4379,18 @@ class SubtitleInterface(QWidget):
             )
             signalBus.add_subtitle(temp_srt_path)
 
+        def schedule_signal_update(*_args):
+            # VLC subtitle reload is synchronous. Coalesce rapid table edits so
+            # typing or moving a boundary cannot block the editor repeatedly.
+            preview_update_timer.start()
+
         # 如果有字幕文件,则添加字幕
         signal_update()
 
-        signalBus.subtitle_layout_changed.connect(signal_update)
-        self.model.dataChanged.connect(signal_update)
-        self.model.layoutChanged.connect(signal_update)
+        preview_update_timer.timeout.connect(signal_update)
+        signalBus.subtitle_layout_changed.connect(schedule_signal_update)
+        self.model.dataChanged.connect(schedule_signal_update)
+        self.model.layoutChanged.connect(schedule_signal_update)
 
         # 如果有关联的视频文件,则自动加载
         if self.task and hasattr(self.task, "file_path") and self.task.file_path:
@@ -4362,6 +4414,30 @@ class SubtitleInterface(QWidget):
             else item["end_time"]
         )
         signalBus.play_video_segment(start_time, end_time)
+
+    def _complete_selected_manual_parent_ids(
+        self,
+        rows: list[int],
+    ) -> tuple[str, ...]:
+        """Resolve selection only when every selected parent is fully covered."""
+        selected_rows = set(int(row) for row in rows)
+        ordered_parent_ids = list(
+            dict.fromkeys(
+                str((self.model._data.get(str(row + 1)) or {}).get("manual_cue_id") or "")
+                for row in rows
+            )
+        )
+        if not ordered_parent_ids or any(not value for value in ordered_parent_ids):
+            return ()
+        for parent_id in ordered_parent_ids:
+            parent_rows = {
+                index
+                for index, item in enumerate(self.model._data.values())
+                if str(item.get("manual_cue_id") or "") == parent_id
+            }
+            if not parent_rows or not parent_rows.issubset(selected_rows):
+                return ()
+        return tuple(ordered_parent_ids)
 
     def show_context_menu(self, pos):
         """显示右键菜单"""
@@ -4392,6 +4468,16 @@ class SubtitleInterface(QWidget):
         selected_data = [
             self.model._data.get(str(row + 1)) or {} for row in rows
         ]
+        complete_parent_resolver = getattr(
+            self,
+            "_complete_selected_manual_parent_ids",
+            None,
+        )
+        complete_parent_ids = (
+            complete_parent_resolver(rows)
+            if self.manual_final_session and callable(complete_parent_resolver)
+            else ()
+        )
         copy_english_action = Action(FIF.COPY, self.tr("复制英文"))
         copy_handler = getattr(self, "copy_selected_english", None)
         if callable(copy_handler):
@@ -4459,7 +4545,43 @@ class SubtitleInterface(QWidget):
                         True,
                     )
                 )
+                )
+
+        if complete_parent_ids:
+            complete_parent_rows = [
+                row
+                for row in selected_data
+                if str(row.get("manual_cue_id") or "") in complete_parent_ids
+            ]
+            deleted_states = {
+                bool(row.get("timeline_deleted")) for row in complete_parent_rows
+            }
+            mixed_delete_state = len(deleted_states) != 1
+            restore_deleted = deleted_states == {True}
+            delete_media_action = Action(
+                FIF.DELETE,
+                self.tr(
+                    "恢复所选字幕和音频"
+                    if restore_deleted
+                    else "删除所选字幕及对应音频"
+                ),
             )
+            can_apply = not mixed_delete_state and (
+                restore_deleted
+                or not any(
+                    row.get("display_suppressed") or row.get("media_muted")
+                    for row in complete_parent_rows
+                )
+            )
+            delete_media_action.setEnabled(can_apply)
+            delete_media_action.triggered.connect(
+                lambda _checked=False,
+                ids=complete_parent_ids,
+                enabled=not restore_deleted: (
+                    self._confirm_set_manual_cues_timeline_deleted(ids, enabled)
+                )
+            )
+            menu.addAction(delete_media_action)
 
         if self.manual_final_session and len(rows) == 1:
             selected_row = rows[0]
@@ -4625,7 +4747,8 @@ class SubtitleInterface(QWidget):
                 menu.addAction(edit_english_action)
                 suppressed = bool(selected.get("display_suppressed"))
                 media_muted = bool(selected.get("media_muted"))
-                if not media_muted:
+                timeline_deleted = bool(selected.get("timeline_deleted"))
+                if not media_muted and not timeline_deleted:
                     suppress_action = Action(
                         FIF.VIEW if suppressed else FIF.DELETE,
                         self.tr(
@@ -4640,24 +4763,25 @@ class SubtitleInterface(QWidget):
                         )
                     )
                     menu.addAction(suppress_action)
-                mute_action = Action(
-                    FIF.VOLUME,
-                    self.tr(
-                        "恢复字幕和声音"
-                        if media_muted
-                        else "隐藏整条字幕并静音这段"
-                    ),
-                )
-                mute_action.triggered.connect(
-                    lambda _checked=False, pid=parent_id, enabled=not media_muted: (
-                        self._set_manual_cue_hidden_and_media_muted(pid, enabled)
+                if not timeline_deleted:
+                    mute_action = Action(
+                        FIF.VOLUME,
+                        self.tr(
+                            "恢复字幕和声音"
+                            if media_muted
+                            else "隐藏整条字幕并静音这段"
+                        ),
                     )
-                )
-                menu.addAction(mute_action)
+                    mute_action.triggered.connect(
+                        lambda _checked=False, pid=parent_id, enabled=not media_muted: (
+                            self._set_manual_cue_hidden_and_media_muted(pid, enabled)
+                        )
+                    )
+                    menu.addAction(mute_action)
             selected_page_id = str(selected.get("display_page_id") or "")
             tail_target_available = bool(
                 selected_page_id or not selected.get("display_page_view")
-            )
+            ) and not bool(selected.get("timeline_deleted"))
             trim_tail_action = Action(
                 FIF.DELETE,
                 self.tr(
@@ -5827,6 +5951,68 @@ class SubtitleInterface(QWidget):
                 self.tr("无法修改字幕和声音状态"),
                 str(exc),
                 duration=5000,
+                parent=self,
+            )
+
+    def _confirm_set_manual_cues_timeline_deleted(
+        self,
+        parent_subtitle_ids: tuple[str, ...],
+        enabled: bool,
+    ) -> None:
+        if not self.manual_final_session or not parent_subtitle_ids:
+            return
+        if enabled:
+            dialog = MessageBox(
+                self.tr("删除所选字幕及对应音频？"),
+                self.tr(
+                    f"保存人工终稿时会删除所选 {len(parent_subtitle_ids)} 条字幕的"
+                    "原始音频区间，并让后续字幕、分页和单词卡时间统一前移。"
+                    "原始音频、固定字幕 ID 和词时间账本不会被修改；本次操作可整体撤销。"
+                ),
+                self,
+            )
+            dialog.yesButton.setText(self.tr("确认删除并压缩时间轴"))
+            dialog.cancelButton.setText(self.tr("取消"))
+            if not dialog.exec():
+                return
+        self._set_manual_cues_timeline_deleted(parent_subtitle_ids, enabled)
+
+    def _set_manual_cues_timeline_deleted(
+        self,
+        parent_subtitle_ids: tuple[str, ...],
+        enabled: bool,
+    ) -> None:
+        if not self.manual_final_session:
+            return
+        try:
+            self._sync_manual_final_text_edits(
+                allow_incomplete_page_chinese=True
+            )
+            result = self.manual_final_session.set_cues_timeline_deleted(
+                parent_subtitle_ids,
+                enabled,
+            )
+            if not result.get("changed"):
+                return
+            affected_ids = list(result.get("subtitle_ids") or [])
+            self._invalidate_manual_review_marks_for_parent_ids(affected_ids)
+            self._manual_page_view = True
+            self._manual_parent_boundaries_dirty = False
+            self._mark_manual_final_dirty(invalidate_pages=False)
+            self._apply_manual_final_session()
+            self.status_label.setText(
+                self.tr(
+                    f"已标记删除 {len(affected_ids)} 条字幕及对应音频；"
+                    "保存终稿后后续时间轴会统一前移"
+                    if enabled
+                    else f"已恢复 {len(affected_ids)} 条字幕和对应音频"
+                )
+            )
+        except ManualFinalSubtitleEditError as exc:
+            InfoBar.warning(
+                self.tr("无法删除所选字幕和音频"),
+                str(exc),
+                duration=6000,
                 parent=self,
             )
 

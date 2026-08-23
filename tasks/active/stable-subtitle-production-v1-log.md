@@ -1,5 +1,67 @@
 # Progress Log
 
+## 2026-08-24 - Manual editor interaction latency
+
+- Traced the shared slow path for text edits, page splits, adjacent merges,
+  boundary moves, and page confirmations to synchronous Qt model publication.
+  `update_incremental()` emitted an edit-role signal while applying the
+  authoritative session, so the editor treated its own refresh as a new user
+  edit and repeated review invalidation, dirty-state work, and recovery-draft
+  scheduling.
+- Added an internal-publication guard around the model update. User-originated
+  `dataChanged(EditRole)` behavior is unchanged; internal refreshes no longer
+  re-enter it. Existing boundary-inspector and preview debounce timers remain
+  UI-only coalescing layers.
+- Focused verification passes: `tests/test_stable_publication.py` 96 tests
+  and `tests/test_manual_final_subtitle_editor.py` 130 tests. No API,
+  subtitle, audio, cache, checkpoint, or synthesis artifact was changed.
+- Remaining check: restart the working-copy GUI and measure the four reported
+  operations interactively.
+
+## 2026-08-24 - Article vocabulary card left alignment
+
+- The detailed article vocabulary card now uses a `64` design-pixel left safe
+  edge and a `40` design-pixel right inset. Its available width is derived from
+  the card rectangle, reducing unnecessary font shrinking while preserving the
+  existing two-line overflow guards.
+- No subtitle, vocabulary-plan, timing, SRT/ASS, or synthesis behavior changed.
+- Added a focused regression for shared left origins and left anchors.
+- Vocabulary expressions now capitalize their first Latin letter for display;
+  the `1.14x` Latin size multiplier applies only to all-English explanations.
+  Embedded Latin text in a Chinese explanation keeps the normal mixed-script
+  size, and the Chinese font and wrapping policy stay unchanged.
+
+## 2026-08-24 Complete-parent timeline deletion
+
+- Added a reversible, parent-scoped editor operation that marks one or more
+  complete parent cues for deletion from the derived presentation timeline.
+  Multipage parents require all page rows; page-only deletion, mixed states,
+  and deleting every parent are blocked.
+- Manual-final save emits schema-v3 source-bound media derivation. Retained
+  source slices are concatenated from the original audio, and later cue/page/
+  word-card times use the compacted presentation clock. Source audio, frozen
+  IDs, English, the authoritative word ledger, and source word timestamps are
+  unchanged.
+- Focused regression passes 262 tests. The full 30-check run passes 29 checks;
+  the unrelated existing `S9522` article readability assertion remains
+  failing (`into` expected, `in` selected). No pagination strategy change was
+  included in this feature.
+
+## 2026-08-24 Manual-final frozen page checkpoint reuse
+
+- Saving an unrelated manual edit no longer discards an `ERROR` display-page
+  artifact when its render plans are structurally valid. The original page
+  IDs and word ranges remain authoritative; genuine semantic page errors stay
+  blocking.
+- ID-bound page translation cache hits are retained independently. Missing or
+  blank sibling pages are left for exact contract validation instead of
+  converting the complete result into a broad pending queue.
+- Source-scoped semantic errors remain blocking only for their recorded parent
+  or page IDs. The real Japanese X-generation replay now reports only
+  `S0136.P01/P02` after deleting `S0001-S0006`.
+- Manual-editor tests pass `128/128`; full regression remains `29/30` with the
+  pre-existing `S9522` article readability failure.
+
 ## 2026-08-23 - Fixed-Parent Production Selection And Recovery List
 
 - Promoted the fixed-parent material-readability experiment into production as

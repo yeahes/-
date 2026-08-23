@@ -1,6 +1,81 @@
 # Current State
 
-Last updated: 2026-08-23
+Last updated: 2026-08-24
+
+## 2026-08-24 Manual editor interaction latency
+
+- The common lag path was the table publication signal: internal session
+  refreshes emitted `dataChanged(EditRole)` and were re-entering the user-edit
+  handler. That handler invalidated the save package, rescanned review rows,
+  and scheduled recovery work during split, merge, boundary, and confirmation
+  operations.
+- Internal model publication is now marked and ignored by the user-edit
+  handler. The visible model update, authoritative session writeback, IDs,
+  timing, and save contracts are unchanged.
+- Text edits coalesce boundary-inspector rebuilds for 100ms; video preview
+  subtitle reloads coalesce for 120ms. These are UI-only changes and do not
+  alter generated subtitle artifacts.
+- Verification: `tests/test_stable_publication.py` 96 passed and
+  `tests/test_manual_final_subtitle_editor.py` 130 passed. GUI interaction
+  timing after restarting the working-copy editor remains to be checked.
+
+## 2026-08-24 Vocabulary card left alignment
+
+- The article vocabulary card uses a `64px` left safe edge and a `40px` right
+  inset on the card's design grid. The phrase, Chinese gloss, and mixed-
+  language concept note share that origin, leaving more usable width while
+  staying inside the rounded container.
+- This is a renderer-only geometry change. Vocabulary data, card scheduling,
+  subtitle text, timing, SRT/ASS, and the synthesis entry point are unchanged.
+- Focused coverage verifies the three content origins and their left anchors.
+- The displayed expression capitalizes its first Latin letter without
+  rewriting the remaining casing. The `1.14x` Latin size multiplier applies
+  only when the entire concept note is English; Latin fragments inside a
+  Chinese note keep the normal mixed-script size.
+
+## 2026-08-24 Complete-parent timeline deletion
+
+- Added a non-destructive editor operation for selecting one or more complete
+  parent subtitles and deleting their corresponding audio intervals. A
+  multipage parent can be changed only when every page row for that parent is
+  selected; page-only deletion and deleting the whole episode are blocked.
+- Source audio, frozen subtitle IDs, English text, the authoritative word
+  ledger, and source word timestamps remain unchanged. Undo and redo restore
+  the complete selection atomically, including prior media contracts.
+- Manual-final save emits schema-v3 `media_derivation` with canonical deleted
+  intervals and retained source slices. A new derived audio is built from the
+  original source in one FFmpeg graph. Retained cue and word-card times are
+  projected onto the compacted clock; deleted parents remain provenance
+  records but are not rendered.
+- Synthesis resolves only the manifest-bound derived audio and compacted
+  subtitle timeline. Hash, ID, interval, retained-slice, and all-deleted
+  mismatches fail closed. Existing schema-v2 mute/tail packages remain
+  supported.
+- Focused deletion/timeline, manual-editor, publication, and synthesis safety
+  tests pass (`262 passed`). The captured full regression completed 29/30
+  checks: the only failure is the pre-existing `S9522` article readability
+  assertion that expects a page to start at `into`; current production
+  pagination starts the next page at `in`. This failure is outside the
+  deletion/timeline diff and remains explicitly unmodified. GUI mouse
+  acceptance has not been performed.
+
+## 2026-08-24 Preserve frozen pages during manual-final save
+
+- An `ERROR` display-page artifact with valid `render_plans` is now treated as
+  a usable frozen geometry checkpoint. Manual deletion or another unrelated
+  edit keeps its page IDs, word spans, and page count instead of rebuilding a
+  new whole-episode pagination.
+- ID-bound page translation reuse now returns verified sibling pages when one
+  page is absent or blank. The formal page contract reports the exact missing
+  page ID; one cache miss no longer expands into every page being marked
+  pending. Legacy artifacts without page IDs retain their strict contiguous
+  span and aggregate checks.
+- Source-scoped semantic errors are inherited during reuse: the failed parent
+  or page remains blocked, while unrelated page translations are retained.
+  The real Japanese X-generation deletion replay keeps 235 frozen plans and
+  296 pages, reuses 108 valid pages, and reports only `S0136.P01/P02` missing.
+- Manual-editor tests pass (`128 passed`). The full regression remains `29/30`
+  because of the pre-existing `S9522` readability assertion described above.
 
 ## 2026-08-23 Fixed-Parent Production Selection And Recovery List
 

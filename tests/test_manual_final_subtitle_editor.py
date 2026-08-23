@@ -17,6 +17,7 @@ from app.core.output_paths import (
 from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleEditError,
     ManualFinalSubtitleSession,
+    _materialize_media_derivation_audio,
     _materialize_media_mute_audio,
 )
 from app.core.subtitle_processor import stable_display_page_contract
@@ -3357,6 +3358,172 @@ def test_hide_and_mute_cue_is_parent_scoped_and_can_precede_tail_trim():
         assert session.cues[0]["media_muted"] is True
 
 
+def test_timeline_delete_is_reversible_and_preserves_source_ledger():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"original-audio-placeholder")
+        session.source_media_path = source_media.resolve()
+        before_ledger = copy.deepcopy(session.word_ledger)
+        before_cues = copy.deepcopy(session.cues)
+
+        result = session.set_cues_timeline_deleted(["S0001"], True)
+
+        assert result == {
+            "changed": True,
+            "subtitle_ids": ["S0001"],
+            "timeline_deleted": True,
+        }
+        assert session.cues[0]["timeline_deleted"] is True
+        assert session.cues[0]["display_suppressed"] is True
+        assert session.cues[0]["media_muted"] is False
+        assert session.word_ledger == before_ledger
+        assert session._timeline_deleted_intervals() == [
+            {
+                "subtitle_ids": ["S0001"],
+                "start_ms": 0,
+                "end_ms": 900,
+            }
+        ]
+        assert session.undo() is True
+        assert session.cues == before_cues
+        assert session.word_ledger == before_ledger
+        assert session.redo() is True
+        assert session.cues[0]["timeline_deleted"] is True
+        assert session.set_cues_timeline_deleted(["S0001"], False)[
+            "changed"
+        ] is True
+        assert not session.cues[0].get("timeline_deleted")
+        assert not session.cues[0].get("display_suppressed")
+
+
+def test_timeline_delete_save_round_trip_projects_srt_and_binds_v3_media():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, _ = _session_fixture(root)
+        source_media = source_srt.with_suffix(".m4a")
+        source_media.write_bytes(b"original-audio-placeholder")
+        source_hash = file_sha256(source_media)
+        before_ledger = copy.deepcopy(session.word_ledger)
+        session.source_media_path = source_media.resolve()
+        session.set_cues_timeline_deleted(["S0001"], True)
+
+        def materialize_fixture_audio(source_path, output_path, **kwargs):
+            assert source_path.resolve() == source_media.resolve()
+            assert kwargs["cut_ms"] is None
+            assert kwargs["mute_intervals"] == []
+            assert kwargs["deleted_intervals"] == [
+                {
+                    "subtitle_ids": ["S0001"],
+                    "start_ms": 0,
+                    "end_ms": 900,
+                }
+            ]
+            shutil.copyfile(source_path, output_path)
+
+        with patch(
+            "app.core.subtitle_processor.manual_final_subtitle_editor."
+            "_materialize_media_derivation_audio",
+            side_effect=materialize_fixture_audio,
+        ):
+            paths = session.save_to_source_folder(source_media_path=source_media)
+
+        manifest_path = Path(paths["manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        derivation = manifest["media_derivation"]
+        assert derivation["schema_version"] == 3
+        assert derivation["deleted_intervals"] == [
+            {
+                "subtitle_ids": ["S0001"],
+                "start_ms": 0,
+                "end_ms": 900,
+            }
+        ]
+        assert derivation["kept_segments"] == [
+            {
+                "source_start_ms": 900,
+                "source_end_ms": None,
+                "output_start_ms": 0,
+            }
+        ]
+        assert derivation["source_media_sha256"] == source_hash
+        assert session.word_ledger == before_ledger
+        rendered_cues = parse_srt(Path(paths["subtitle_path"]))
+        assert len(rendered_cues) == 1
+        assert rendered_cues[0].start == 0.0
+        assert rendered_cues[0].end == 0.7
+        assert attach_article_word_timing(
+            rendered_cues,
+            Path(paths["subtitle_path"]),
+        ) is True
+        assert rendered_cues[0].subtitle_id == "S0002"
+        assert rendered_cues[0].word_timing[0]["start"] == 0.0
+        timeline = json.loads(
+            Path(paths["artifact_dir"], "final-cue-timeline.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert [item["subtitle_id"] for item in timeline["records"]] == [
+            "S0001",
+            "S0002",
+        ]
+        assert timeline["presentation_timeline"]["records"][0][
+            "timeline_deleted"
+        ] is True
+        assert timeline["presentation_timeline"]["records"][1][
+            "output_start_ms"
+        ] == 0
+
+        reloaded = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        assert reloaded.cues[0]["timeline_deleted"] is True
+        assert reloaded.media_derivation == derivation
+        resolved_media, _ = resolve_synthesis_package_inputs(
+            manifest_path,
+            str(source_media),
+        )
+        assert Path(resolved_media).resolve() == Path(
+            derivation["derived_media_path"]
+        ).resolve()
+
+
+def test_materialized_timeline_delete_removes_audio_and_compacts_duration():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_media = root / "source.m4a"
+        derived_media = root / "source-compacted.m4a"
+        _run_project_ffmpeg(
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2.000",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-y",
+            str(source_media),
+        )
+        source_hash = file_sha256(source_media)
+
+        _materialize_media_derivation_audio(
+            source_media,
+            derived_media,
+            cut_ms=None,
+            mute_intervals=[],
+            deleted_intervals=[
+                {
+                    "subtitle_ids": ["S0002"],
+                    "start_ms": 500,
+                    "end_ms": 1000,
+                }
+            ],
+        )
+
+        assert file_sha256(source_media) == source_hash
+        assert abs(_project_ffmpeg_audio_duration_ms(derived_media) - 1500) <= 140
+
+
 def test_hide_and_mute_save_round_trip_binds_derived_audio_and_timeline():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -4998,6 +5165,276 @@ def test_manual_package_reuses_only_exact_source_display_page_spans():
         changed = json.loads(json.dumps(parents))
         changed[0]["pages"][0]["word_end"] = 4
         assert session._reuse_source_page_translations(changed) is None
+
+
+def test_manual_package_reuses_id_bound_pages_when_chinese_order_is_reflowed():
+    """Page readability reordering must not turn every page into a draft."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_json(
+            session.artifact_dir / "display-page-translations.json",
+            {
+                "parents": [
+                    {
+                        "parent_subtitle_id": "S0001",
+                        "source_parent_chinese": "我们今天",
+                        "pages": [
+                            {
+                                "display_page_id": "S0001.P01",
+                                "word_start": 0,
+                                "word_end": 3,
+                                "english": "Right. It means our",
+                                "zh": "今天",
+                            },
+                            {
+                                "display_page_id": "S0001.P02",
+                                "word_start": 4,
+                                "word_end": 8,
+                                "english": "mental model is just completely",
+                                "zh": "我们",
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+        parents = [
+            {
+                "parent_subtitle_id": "S0001",
+                "chinese": "我们今天",
+                "pages": [
+                    {
+                        "display_page_id": "S0001.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "Right. It means our",
+                    },
+                    {
+                        "display_page_id": "S0001.P02",
+                        "word_start": 4,
+                        "word_end": 8,
+                        "english": "mental model is just completely",
+                    },
+                ],
+            }
+        ]
+
+        assert session._reuse_source_page_translations(parents) == {
+            "pages": [
+                {"display_page_id": "S0001.P01", "zh": "今天"},
+                {"display_page_id": "S0001.P02", "zh": "我们"},
+            ]
+        }
+
+
+def test_error_page_artifact_keeps_valid_frozen_plan_for_unrelated_save():
+    """Semantic page errors must not trigger a new whole-episode pagination."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        artifact_path = session.artifact_dir / "display-page-translations.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["status"] = "ERROR"
+        artifact["errors"] = [
+            {
+                "code": "display_page_semantic_validation_failed",
+                "parent_subtitle_id": "S0001",
+            }
+        ]
+        for plan in artifact["render_plans"]:
+            for page in plan.get("pages") or []:
+                page.setdefault("english_width", 1260)
+        _write_json(artifact_path, artifact)
+
+        blueprint = session._blueprint_from_frozen_display_page_edits()
+
+        assert blueprint is not None
+        assert [
+            plan["parent_subtitle_id"]
+            for plan in blueprint["render_plans"]
+        ] == ["S0001", "S0002"]
+        assert [
+            page["display_page_id"]
+            for page in blueprint["render_plans"][0]["pages"]
+        ] == ["S0001.P01", "S0001.P02"]
+
+
+def test_id_bound_page_cache_miss_returns_other_pages_for_precise_validation():
+    """A missing cached page must not erase valid sibling page translations."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_json(
+            session.artifact_dir / "display-page-translations.json",
+            {
+                "parents": [
+                    {
+                        "parent_subtitle_id": "S0001",
+                        "source_parent_chinese": "我们今天",
+                        "pages": [
+                            {
+                                "display_page_id": "S0001.P01",
+                                "word_start": 0,
+                                "word_end": 3,
+                                "english": "Right. It means our",
+                                "zh": "今天",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        parents = [
+            {
+                "parent_subtitle_id": "S0001",
+                "chinese": "我们今天",
+                "pages": [
+                    {
+                        "display_page_id": "S0001.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "Right. It means our",
+                    },
+                    {
+                        "display_page_id": "S0001.P02",
+                        "word_start": 4,
+                        "word_end": 8,
+                        "english": "mental model is just completely",
+                    },
+                ],
+            }
+        ]
+
+        assert session._reuse_source_page_translations(parents) == {
+            "pages": [
+                {"display_page_id": "S0001.P01", "zh": "今天"},
+            ]
+        }
+
+
+def test_source_page_error_scope_blocks_only_failed_parent_pages():
+    """A source semantic error must survive save without poisoning siblings."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_json(
+            session.artifact_dir / "display-page-translations.json",
+            {
+                "status": "ERROR",
+                "parents": [
+                    {
+                        "parent_subtitle_id": "S0001",
+                        "source_parent_chinese": "我们今天",
+                        "pages": [
+                            {
+                                "display_page_id": "S0001.P01",
+                                "word_start": 0,
+                                "word_end": 3,
+                                "english": "Right. It means our",
+                                "zh": "今天",
+                            },
+                            {
+                                "display_page_id": "S0001.P02",
+                                "word_start": 4,
+                                "word_end": 8,
+                                "english": "mental model is just completely",
+                                "zh": "我们",
+                            },
+                        ],
+                    },
+                    {
+                        "parent_subtitle_id": "S0002",
+                        "source_parent_chinese": "中文二",
+                        "pages": [
+                            {
+                                "display_page_id": "S0002.P01",
+                                "word_start": 9,
+                                "word_end": 11,
+                                "english": "out of date.",
+                                "zh": "中文二",
+                            }
+                        ],
+                    },
+                ],
+                "errors": [
+                    {
+                        "code": "display_page_semantic_validation_failed",
+                        "parent_subtitle_id": "S0001",
+                        "issues": [
+                            {
+                                "code": "number_allocation_mismatch",
+                                "expected_subtitle_id": "S0001.P02",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        parents = [
+            {
+                "parent_subtitle_id": "S0001",
+                "chinese": "我们今天",
+                "pages": [
+                    {
+                        "display_page_id": "S0001.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "Right. It means our",
+                    },
+                    {
+                        "display_page_id": "S0001.P02",
+                        "word_start": 4,
+                        "word_end": 8,
+                        "english": "mental model is just completely",
+                    },
+                ],
+            },
+            {
+                "parent_subtitle_id": "S0002",
+                "chinese": "中文二",
+                "pages": [
+                    {
+                        "display_page_id": "S0002.P01",
+                        "word_start": 9,
+                        "word_end": 11,
+                        "english": "out of date.",
+                    }
+                ],
+            },
+        ]
+
+        assert session._reuse_source_page_translations(parents) == {
+            "pages": [
+                {"display_page_id": "S0002.P01", "zh": "中文二"},
+            ]
+        }
+
+
+def test_unscoped_source_page_error_still_blocks_all_reuse():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_json(
+            session.artifact_dir / "display-page-translations.json",
+            {
+                "status": "ERROR",
+                "parents": [],
+                "errors": [{"code": "render_structural_overflow"}],
+            },
+        )
+        assert session._reuse_source_page_translations(
+            [
+                {
+                    "parent_subtitle_id": "S0001",
+                    "chinese": "中文一",
+                    "pages": [
+                        {
+                            "display_page_id": "S0001.P01",
+                            "word_start": 0,
+                            "word_end": 8,
+                            "english": "Right. It means our mental model is just completely",
+                        }
+                    ],
+                }
+            ]
+        ) is None
 
 
 def test_manual_package_blocks_cleanly_when_page_translation_validation_returns_error():

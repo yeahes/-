@@ -22,6 +22,11 @@ from app.core.subtitle_processor.stable_artifacts import (
     validate_manifest_artifact,
 )
 from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
+from app.core.subtitle_processor.derived_media_timeline import (
+    DerivedMediaTimelineError,
+    build_kept_segments,
+    normalize_deleted_intervals,
+)
 from app.core.utils.logger import setup_logger
 from app.core.utils.podcast_learning_video import render_podcast_learning_video
 from app.core.utils.video_utils import (
@@ -269,8 +274,12 @@ def resolve_synthesis_package_inputs(
         raise RuntimeError("稳定字幕包不能同时包含尾部裁剪和区间静音。")
     if media_derivation:
         intervals = list(media_derivation.get("mute_intervals") or [])
+        raw_deleted_intervals = list(
+            media_derivation.get("deleted_intervals") or []
+        )
         raw_cut = media_derivation.get("cut_ms")
         try:
+            derivation_schema = int(media_derivation.get("schema_version") or 0)
             cut_ms = int(raw_cut) if raw_cut is not None else None
             previous_end = -1
             intervals_valid = True
@@ -288,11 +297,31 @@ def resolve_synthesis_package_inputs(
                     intervals_valid = False
                     break
                 previous_end = end_ms
-        except (AttributeError, TypeError, ValueError):
+            deleted_intervals = normalize_deleted_intervals(
+                raw_deleted_intervals,
+                source_end_ms=cut_ms,
+            )
+            kept_segments = (
+                build_kept_segments(
+                    deleted_intervals,
+                    source_end_ms=cut_ms,
+                )
+                if deleted_intervals
+                else []
+            )
+        except (
+            AttributeError,
+            DerivedMediaTimelineError,
+            TypeError,
+            ValueError,
+        ):
+            derivation_schema = 0
             cut_ms = None
             intervals_valid = False
+            deleted_intervals = []
+            kept_segments = []
         decision_payload = {
-            "schema_version": 2,
+            "schema_version": derivation_schema,
             "source_media_sha256": str(
                 media_derivation.get("source_media_sha256") or ""
             ),
@@ -302,12 +331,25 @@ def resolve_synthesis_package_inputs(
             "cut_ms": cut_ms,
             "mute_intervals": intervals,
         }
+        if derivation_schema == 3:
+            decision_payload.update(
+                {
+                    "deleted_intervals": deleted_intervals,
+                    "kept_segments": kept_segments,
+                }
+            )
+        operation_valid = bool(
+            (derivation_schema == 2 and not deleted_intervals and (cut_ms is not None or intervals))
+            or (derivation_schema == 3 and deleted_intervals)
+        )
         if (
-            int(media_derivation.get("schema_version") or 0) != 2
-            or (cut_ms is None and not intervals)
+            not operation_valid
             or (raw_cut is not None and cut_ms is None)
             or (cut_ms is not None and cut_ms <= 0)
             or not intervals_valid
+            or raw_deleted_intervals != deleted_intervals
+            or list(media_derivation.get("kept_segments") or [])
+            != list(decision_payload.get("kept_segments") or [])
             or not decision_payload["source_media_sha256"]
             or not decision_payload["source_word_ledger_hash"]
             or str(media_derivation.get("decision_hash") or "")

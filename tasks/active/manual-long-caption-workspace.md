@@ -3,6 +3,36 @@
 Status: in_progress
 Last reviewed: 2026-08-19 07:14:07 Asia/Shanghai
 
+## 2026-08-24 Complete-parent media deletion
+
+- Added a parent-scoped, reversible context-menu operation that marks one or
+  more complete parent cues for timeline deletion. All rows of a multipage
+  parent must be selected together; page-only deletion, mixed delete states,
+  and deleting every parent are rejected.
+- Save publishes a schema-v3 source-bound media derivation and presentation
+  timeline. Retained source slices are concatenated into a new derived audio;
+  later cue, page, and word-card times are projected onto the compacted clock.
+  The original source timeline and word ledger remain immutable, so restore,
+  undo, redo, reload, and synthesis validate the same fixed IDs.
+- Focused automated coverage is complete. A real GUI mouse walkthrough and
+  full regression remain acceptance work. The captured full regression
+  completed 29/30 checks; its sole failure is the existing `S9522` article
+  readability expectation (`into` versus the current `in` page start), which
+  is outside this media-timeline change.
+
+## 2026-08-24 Frozen page reuse during manual-final save
+
+- Manual-final save now keeps an `ERROR` page artifact's valid frozen render
+  plans. Semantic page errors remain blocking, but they no longer cause an
+  unrelated deletion edit to replan the entire episode.
+- Page translation cache reuse is ID-bound and partial: valid pages survive a
+  sibling cache miss, while the formal contract reports only the missing page
+  ID. Legacy page artifacts keep their previous strict range checks.
+- Semantic errors keep their source parent/page scope, so a known bad parent
+  cannot be silently promoted to a valid page projection or poison unrelated
+  page caches.
+- Regression: `tests/test_manual_final_subtitle_editor.py` passes `128/128`.
+
 ## 2026-08-19 Failed Page-Plan Parent-Chinese Preview
 
 - A failed fixed-font display-page plan no longer becomes an empty actual-page
