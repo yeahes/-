@@ -378,6 +378,16 @@ Rule:
   ledger, final cue timeline, fixed-ID Chinese mapping, page contract, and
   existing audit artifacts. Existing artifacts are the checkpoint; reopening
   them does not rerun ASR, translation, or English segmentation.
+- The editor's `More` menu can discover recent stable runs, editable failure
+  checkpoints, and manual packages below the configured work directory. It
+  loads the selected manifest directly and never starts ASR, translation,
+  allocation, or pagination. Live aliases and immutable run copies with the
+  same attempt/run identity are shown once.
+- Closing a dirty editor session writes an atomic working draft bound to the
+  exact base manifest and subtitle hashes. Reopening that result restores the
+  draft automatically. A clean close writes nothing, and a draft-write failure
+  requires an explicit exit-with-loss decision rather than silently discarding
+  edits.
 - Review highlighting is intentionally narrow: structural blockers, genuine
   parent/page boundary risks, abnormal cue-edge alignment fallback, locally
   verified actual-page Chinese load, high-confidence ASR findings, and

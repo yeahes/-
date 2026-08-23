@@ -2,6 +2,35 @@
 
 Last updated: 2026-08-23
 
+## 2026-08-23 Page Experiments And Editor Recovery
+
+- The fixed-parent bilingual page experiment keeps English, IDs, word spans,
+  and timing frozen. On the newest White House checkpoint it changes four
+  parents: `S0097`, `S0201`, and `S0205` clearly improve; `S0072` improves
+  balance but retains an explicit REVIEW edge. All four page-Chinese sets pass
+  the current contract with one API request. Historical White House, two
+  Chocolate runs, and Employment produce zero changes.
+- The variable-parent-count experiment examined 18,457 `3 -> 2/4` partitions
+  across the 14 requested targets and found zero feasible candidates. Existing
+  short neighboring parents are now retained correctly, including the real
+  `S0132` window. The remaining failures belong to grammar, speaker, fragment,
+  timing, or actual-page contracts. No API request was made. Do not integrate
+  this design.
+- `More -> Restore Recent Subtitles` now loads trusted stable/checkpoint/manual
+  manifests from `work-dir` without rerunning ASR, translation, allocation, or
+  pagination. Dirty sessions save a manifest/hash-bound recovery draft on
+  normal close and restore it automatically on reopen.
+- A close-path regression that inferred dirty state without a clean checkpoint
+  was found during the complete publication suite. Dirty reconciliation now
+  requires that trusted checkpoint; explicit dirty flags remain the fallback.
+  Manual-editor tests pass 120/120 and stable-publication tests pass 93/93.
+- The complete offline regression passes 30/30 in 902.68 seconds. `py_compile`
+  and `git diff --check` also pass; the latter reports only existing line-ending
+  warnings. GUI-held `app.log` rotation emitted a harmless `WinError 32` warning
+  during the run without failing any check.
+- Full evidence and the accept/reject decisions are in
+  `docs/handoffs/2026-08-23-page-planning-experiments-and-editor-recovery.md`.
+
 ## 2026-08-23 Offline Inside-Parent Material Ordering
 
 - Added a production-independent selector to the page-frontier audit. It may
