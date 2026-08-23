@@ -2,6 +2,39 @@
 
 Last updated: 2026-08-23
 
+## 2026-08-23 Offline Inside-Parent Material Ordering
+
+- Added a production-independent selector to the page-frontier audit. It may
+  promote an existing fixed-English candidate only when it gives material
+  short-page, over-16-word, font, or pressure relief without adding page,
+  timing, font, structural-risk, or unsupported REVIEW-boundary regressions.
+- On the newest 217-parent White House checkpoint, the final guard proposes
+  four changes. `S0072`, `S0201`, and `S0205` are clear viewing improvements,
+  while `S0097` is a modest reduction from three pages to two. `S0201` keeps a
+  long subject intact before a pause-supported `would be ...` restart instead
+  of splitting `set | a maximum threshold`; the existing
+  `balanced_predicate_restart_beats_attached_preposition_restart` contract
+  explicitly prefers this shape, although the boundary remains REVIEW.
+- A first selector also changed `S0051` from 4+17 to 16+5 words but produced the
+  false fragment `in tariff rates would backfire.` The final generic guard
+  rejects every new candidate with an unsupported REVIEW boundary, including
+  this case even when the production baseline is already unsupported.
+- Of the ten requested renderable targets, `S0037`, `S0107`, `S0158`, and
+  `S0206` have no second page candidate; `S0051`, `S0081`, `S0083`, and
+  `S0110` retain production; only `S0072` and `S0201` change. The unrelated
+  `S0097` and `S0205` improvements came from the same
+  whole-episode candidate frontier.
+- The historical White House guard remains 217/217 with zero promoted
+  candidates and identical aggregate page, font, pressure, and REVIEW counts.
+  The newest checkpoint still has structural planning failures at
+  `S0123`, `S0132`, and `S0192`; candidate ordering cannot solve them.
+- This experiment does not change production and does not establish Chinese
+  page quality. Do not integrate it until changed page boundaries pass a
+  separate page-Chinese A/B.
+- Focused selector tests pass 6/6, and the complete offline regression passes
+  30/30 in 948.16 seconds. No API, GUI run, subtitle, audio, cache, checkpoint,
+  `work-dir`, or untracked `output/` file was changed.
+
 ## 2026-08-23 Offline Pre-ID Joint Page Feasibility
 
 - Added a production-independent, offline experiment that moves the two cuts

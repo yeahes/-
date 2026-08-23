@@ -139,6 +139,228 @@ def _aggregate(records: Sequence[Mapping[str, object]], key: str) -> dict[str, o
     }
 
 
+_MATERIAL_FINITE_AUXILIARIES = frozenset(
+    {
+        "am",
+        "are",
+        "be",
+        "been",
+        "being",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "had",
+        "has",
+        "have",
+        "is",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "should",
+        "was",
+        "were",
+        "will",
+        "would",
+    }
+)
+
+
+def _material_boundary_has_support(
+    decision: Mapping[str, object],
+    page: Mapping[str, object],
+) -> bool:
+    if str(decision.get("classification") or "allow") != "review":
+        return True
+    if decision.get("complete_prepositional_continuation"):
+        words = [
+            "".join(character for character in token.casefold() if character.isalpha())
+            for token in str(page.get("en") or "").split()
+        ]
+        if any(word in _MATERIAL_FINITE_AUXILIARIES for word in words[1:]):
+            return False
+    return any(
+        bool(decision.get(key))
+        for key in (
+            "strong_pause_evidence",
+            "complete_page_clause_start",
+            "complete_content_clause_start",
+            "complete_title_restart",
+            "balanced_predicate_restart",
+            "complete_prepositional_continuation",
+            "complete_object_continuation",
+            "forced_complete_predicate_phrase",
+            "forced_complete_to_phrase",
+        )
+    )
+
+
+def _material_candidate_metrics(
+    candidate: Mapping[str, object],
+) -> dict[str, float | int]:
+    pages = list((candidate.get("plan") or {}).get("pages") or [])
+    word_counts = [len(str(page.get("en") or "").split()) for page in pages]
+    font_sizes = [
+        int(
+            page.get("english_font_size")
+            or podcast_learning_video.ARTICLE_SUBTITLE_EN_FONT_SIZE
+        )
+        for page in pages
+    ]
+    stored_pressures = tuple(
+        float(value) for value in candidate.get("page_pressures") or ()
+    )
+    if len(stored_pressures) == len(pages):
+        pressures = list(stored_pressures)
+    else:
+        pressures = [
+            podcast_learning_video._article_display_page_pressure(page)
+            for page in pages
+        ]
+    review_pages = [
+        page
+        for page in pages[1:]
+        if str((page.get("boundary_before") or {}).get("classification") or "allow")
+        == "review"
+    ]
+    minimum_words = podcast_learning_video.ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS
+    soft_max_words = podcast_learning_video.ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS
+    default_font = podcast_learning_video.ARTICLE_SUBTITLE_EN_FONT_SIZE
+    return {
+        "page_count": len(pages),
+        "under_five_pages": sum(value < 5 for value in word_counts),
+        "short_page_deficit": sum(
+            max(0, minimum_words - value) for value in word_counts
+        ),
+        "over_16_word_excess": sum(
+            max(0, value - soft_max_words) for value in word_counts
+        ),
+        "font_deficit": sum(max(0, default_font - value) for value in font_sizes),
+        "three_line_pages": sum(
+            len(list(page.get("en_lines") or [])) > 2 for page in pages
+        ),
+        "review_boundaries": len(review_pages),
+        "unsupported_review_boundaries": sum(
+            not _material_boundary_has_support(
+                page.get("boundary_before") or {},
+                page,
+            )
+            for page in review_pages
+        ),
+        "severe_risk_count": int(candidate.get("severe_risk_count") or 0),
+        "incomplete_review_count": int(
+            candidate.get("incomplete_review_count") or 0
+        ),
+        "risk_score": int(candidate.get("risk_score") or 0),
+        "max_pressure": max(pressures, default=0.0),
+        "word_count_imbalance": (
+            max(word_counts, default=0) - min(word_counts, default=0)
+        ),
+    }
+
+
+def _material_improvement_reason(
+    baseline: Mapping[str, float | int],
+    candidate: Mapping[str, float | int],
+) -> str | None:
+    short_relief = int(candidate["short_page_deficit"]) < int(
+        baseline["short_page_deficit"]
+    )
+    over_16_relief = int(candidate["over_16_word_excess"]) < int(
+        baseline["over_16_word_excess"]
+    )
+    font_relief = int(candidate["font_deficit"]) < int(baseline["font_deficit"])
+    pressure_relief = (
+        float(baseline["max_pressure"]) - float(candidate["max_pressure"])
+        >= podcast_learning_video.ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA
+    )
+    if short_relief and over_16_relief:
+        return "short_page_and_over_16_relief"
+    if short_relief:
+        return "short_page_relief"
+    if over_16_relief:
+        return "over_16_relief"
+    if font_relief:
+        return "font_floor_relief"
+    if pressure_relief:
+        return "maximum_pressure_relief"
+    return None
+
+
+def _select_material_readability_candidate(
+    baseline: Mapping[str, object],
+    candidates: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], str]:
+    """Select only non-regressive candidates with material display relief.
+
+    This is an offline policy probe. It deliberately ignores small balance-only
+    improvements so the experiment cannot justify broad page churn.
+    """
+    baseline_metrics = _material_candidate_metrics(baseline)
+    eligible: list[
+        tuple[
+            tuple[float | int, ...],
+            Mapping[str, object],
+            str,
+        ]
+    ] = []
+    for candidate in candidates:
+        if candidate is baseline:
+            continue
+        metrics = _material_candidate_metrics(candidate)
+        if (
+            int(metrics["unsupported_review_boundaries"]) > 0
+            or int(metrics["under_five_pages"])
+            > int(baseline_metrics["under_five_pages"])
+            or int(metrics["short_page_deficit"])
+            > int(baseline_metrics["short_page_deficit"])
+            or int(metrics["over_16_word_excess"])
+            > int(baseline_metrics["over_16_word_excess"])
+            or int(metrics["font_deficit"])
+            > int(baseline_metrics["font_deficit"])
+            or int(metrics["three_line_pages"])
+            > int(baseline_metrics["three_line_pages"])
+            or int(metrics["review_boundaries"])
+            > int(baseline_metrics["review_boundaries"])
+            or int(metrics["severe_risk_count"])
+            > int(baseline_metrics["severe_risk_count"])
+            or int(metrics["incomplete_review_count"])
+            > int(baseline_metrics["incomplete_review_count"])
+            or int(metrics["risk_score"]) > int(baseline_metrics["risk_score"])
+            or float(metrics["max_pressure"])
+            > float(baseline_metrics["max_pressure"])
+            or int(metrics["word_count_imbalance"])
+            > int(baseline_metrics["word_count_imbalance"])
+            or int(metrics["page_count"])
+            > int(baseline_metrics["page_count"]) + 1
+        ):
+            continue
+        reason = _material_improvement_reason(baseline_metrics, metrics)
+        if reason is None:
+            continue
+        rank = (
+            int(metrics["under_five_pages"]),
+            int(metrics["short_page_deficit"]),
+            int(metrics["over_16_word_excess"]),
+            int(metrics["font_deficit"]),
+            int(metrics["unsupported_review_boundaries"]),
+            int(metrics["severe_risk_count"]),
+            int(metrics["incomplete_review_count"]),
+            float(metrics["max_pressure"]),
+            int(metrics["word_count_imbalance"]),
+            int(metrics["risk_score"]),
+            int(metrics["page_count"]),
+            float(candidate.get("quality_cost") or 0.0),
+        )
+        eligible.append((rank, candidate, reason))
+    if not eligible:
+        return baseline, "baseline_retained"
+    _rank, selected, reason = min(eligible, key=lambda item: item[0])
+    return selected, reason
+
+
 def audit(
     artifact_dir: Path,
     *,
@@ -205,20 +427,33 @@ def audit(
             production_selected,
         )
     ]
+    material_selections = [
+        _select_material_readability_candidate(
+            production_candidate,
+            bundle["shadow_candidates"],
+        )
+        for (_cue, bundle), production_candidate in zip(
+            bundle_entries,
+            production_selected,
+        )
+    ]
     records = []
     for (
         (cue, bundle),
         production_candidate,
         shadow_candidate,
         conservative_candidate,
+        material_selection,
     ) in zip(
         bundle_entries,
         production_selected,
         shadow_selected,
         conservative_selected,
+        material_selections,
     ):
         if requested_ids and cue.subtitle_id not in requested_ids:
             continue
+        material_candidate, material_reason = material_selection
         production_plan = _final_plan(cue, draw, bundle, production_candidate)
         shadow_plan = _final_plan(cue, draw, bundle, shadow_candidate)
         conservative_plan = _final_plan(
@@ -226,6 +461,12 @@ def audit(
             draw,
             bundle,
             conservative_candidate,
+        )
+        material_plan = _final_plan(
+            cue,
+            draw,
+            bundle,
+            material_candidate,
         )
         production_pages = [
             _page_summary(page) for page in production_plan.get("pages") or []
@@ -237,6 +478,9 @@ def audit(
             _page_summary(page)
             for page in conservative_plan.get("pages") or []
         ]
+        material_pages = [
+            _page_summary(page) for page in material_plan.get("pages") or []
+        ]
         if " ".join(page["english"] for page in production_pages) != cue.en:
             raise ValueError(f"production English coverage failed for {cue.subtitle_id}")
         if " ".join(page["english"] for page in shadow_pages) != cue.en:
@@ -244,6 +488,10 @@ def audit(
         if " ".join(page["english"] for page in conservative_pages) != cue.en:
             raise ValueError(
                 f"conservative English coverage failed for {cue.subtitle_id}"
+            )
+        if " ".join(page["english"] for page in material_pages) != cue.en:
+            raise ValueError(
+                f"material candidate English coverage failed for {cue.subtitle_id}"
             )
         record = {
                 "subtitle_id": cue.subtitle_id,
@@ -273,6 +521,17 @@ def audit(
                     ),
                     "pages": conservative_pages,
                 },
+                "material_changed": _plan_signature(production_plan)
+                != _plan_signature(material_plan),
+                "material_selection_reason": material_reason,
+                "material": {
+                    "page_count": len(material_pages),
+                    "sequence_cost": podcast_learning_video._article_candidate_sequence_cost(
+                        material_candidate
+                    ),
+                    "metrics": _material_candidate_metrics(material_candidate),
+                    "pages": material_pages,
+                },
             }
         if include_frontier:
             record["frontier"] = [
@@ -294,7 +553,7 @@ def audit(
             ]
         records.append(record)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "partial" if failures else "ok",
         "artifact_dir": str(artifact_dir.resolve()),
         "source_cue_count": len(cues),
@@ -308,9 +567,22 @@ def audit(
             bool(record["conservative_changed"]) for record in records
         ),
         "conservative": _aggregate(records, "conservative"),
+        "material_changed_cue_count": sum(
+            bool(record["material_changed"]) for record in records
+        ),
+        "material": _aggregate(records, "material"),
+        "material_policy": {
+            "name": "material-readability-non-regression-v1",
+            "minimum_page_words": 5,
+            "pressure_relief_minimum": podcast_learning_video.ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA,
+            "production_behavior_changed": False,
+        },
         "changed_cues": [record for record in records if record["changed"]],
         "conservative_changed_cues": [
             record for record in records if record["conservative_changed"]
+        ],
+        "material_changed_cues": [
+            record for record in records if record["material_changed"]
         ],
     }
     if include_frontier:
@@ -348,6 +620,10 @@ def main() -> None:
                     "production": report.get("production"),
                     "shadow": report.get("shadow"),
                     "conservative": report.get("conservative"),
+                    "material_changed_cue_count": report.get(
+                        "material_changed_cue_count"
+                    ),
+                    "material": report.get("material"),
                     "output": str(args.output.resolve()),
                 },
                 ensure_ascii=False,
