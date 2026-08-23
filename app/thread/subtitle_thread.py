@@ -38,6 +38,9 @@ from app.core.article_context import (
     save_article_artifacts,
 )
 from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
+from app.core.subtitle_processor.review_evidence_identity import (
+    load_bound_semantic_review_queue,
+)
 from app.core.subtitle_processor.stable_artifacts import (
     file_sha256,
     stable_artifact_dir,
@@ -1006,6 +1009,12 @@ class SubtitleThread(QThread):
             artifact_target,
             ignore=shutil.ignore_patterns("translation-quality-audit-cache"),
         )
+        semantic_queue = artifact_target / "semantic-review-queue.json"
+        if (
+            semantic_queue.is_file()
+            and load_bound_semantic_review_queue(artifact_target) is None
+        ):
+            semantic_queue.unlink()
         return str(report_target), artifact_source, artifact_target
 
     @staticmethod

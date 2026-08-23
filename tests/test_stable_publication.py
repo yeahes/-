@@ -1830,6 +1830,94 @@ class StablePublicationTests(unittest.TestCase):
                 ["final_timeline_invalid"],
             )
 
+    def test_stable_snapshot_keeps_only_identity_bound_semantic_review_queue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report = root / "source-coverage-report.txt"
+            report.write_text("PASS", encoding="utf-8")
+            artifact_dir = root / "source-artifacts"
+            artifact_dir.mkdir()
+            word_ledger = {
+                "hash": "current-ledger",
+                "words": [
+                    {
+                        "word_id": 0,
+                        "surface": "Current.",
+                        "start_ms": 0,
+                        "end_ms": 500,
+                    }
+                ],
+            }
+            subtitle_spans = [
+                {
+                    "subtitle_id": "S0001",
+                    "original": "Current.",
+                    "word_start": 0,
+                    "word_end": 0,
+                }
+            ]
+            (artifact_dir / "word-ledger.json").write_text(
+                json.dumps(word_ledger),
+                encoding="utf-8",
+            )
+            (artifact_dir / "subtitle-spans.json").write_text(
+                json.dumps(subtitle_spans),
+                encoding="utf-8",
+            )
+            queue_path = artifact_dir / "semantic-review-queue.json"
+
+            def write_queue(source_run):
+                queue_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "source_run": source_run,
+                            "items": [
+                                {
+                                    "subtitle_ids": ["S0001"],
+                                    "context": [
+                                        {
+                                            "subtitle_id": "S0001",
+                                            "english": "Current.",
+                                            "word_start": 0,
+                                            "word_end": 0,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            write_queue(build_review_source_identity(word_ledger, subtitle_spans))
+            valid_run = root / "valid-run"
+            valid_run.mkdir()
+            _, _, valid_artifacts = SubtitleThread._snapshot_stable_validation_artifacts(
+                str(report),
+                valid_run,
+            )
+            self.assertTrue(
+                (valid_artifacts / "semantic-review-queue.json").is_file()
+            )
+
+            write_queue(
+                {
+                    **build_review_source_identity(word_ledger, subtitle_spans),
+                    "frozen_span_hash": "stale-span",
+                }
+            )
+            stale_run = root / "stale-run"
+            stale_run.mkdir()
+            _, _, stale_artifacts = SubtitleThread._snapshot_stable_validation_artifacts(
+                str(report),
+                stale_run,
+            )
+            self.assertFalse(
+                (stale_artifacts / "semantic-review-queue.json").exists()
+            )
+            self.assertTrue(queue_path.is_file())
+
     def test_display_page_failure_writes_complete_editable_blocked_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
