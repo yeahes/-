@@ -129,11 +129,16 @@ ARTICLE_VOCAB_DETAIL_COLOR = ARTICLE_SUBTITLE_ZH_COLOR
 ARTICLE_VOCAB_DETAIL_FONT_SIZE = 28
 ARTICLE_VOCAB_DETAIL_MIN_FONT_SIZE = 22
 ARTICLE_VOCAB_DETAIL_FONT_WEIGHT = 500
+ARTICLE_VOCAB_DETAIL_EN_FONT_SCALE = 1.14
 ARTICLE_VOCAB_PHRASE_MAX_FONT_SIZE = 58
 ARTICLE_VOCAB_PHRASE_SINGLE_LINE_MIN_FONT_SIZE = 46
 ARTICLE_VOCAB_PHRASE_MIN_FONT_SIZE = 32
 ARTICLE_VOCAB_UNBROKEN_WORD_MIN_FONT_SIZE = 20
 ARTICLE_VOCAB_PHRASE_LINE_BALANCE_RATIO = 0.55
+# Keep every line inside the rounded card's safe edge without wasting width.
+# These values are design-grid pixels.
+ARTICLE_VOCAB_CONTENT_LEFT = 64
+ARTICLE_VOCAB_CONTENT_RIGHT = 40
 MUTED = (153, 153, 153, 255)
 WHITE = (245, 248, 255, 255)
 TITLE_FILL = (255, 255, 255, 179)
@@ -9767,13 +9772,37 @@ def article_vocab_detail_mixed_tokens(text: str) -> list[str]:
     )
 
 
+def article_vocab_display_phrase(text: str) -> str:
+    """Capitalize only the first Latin letter in a vocabulary expression."""
+    phrase = " ".join(str(text or "").split())
+    return re.sub(
+        r"[A-Za-z]",
+        lambda match: match.group(0).upper(),
+        phrase,
+        count=1,
+    )
+
+
+def article_vocab_detail_is_english_only(text: str) -> bool:
+    """Return whether a detail contains Latin text but no CJK text."""
+    value = str(text or "").strip()
+    return bool(re.search(r"[A-Za-z]", value)) and not bool(
+        re.search(r"[\u4e00-\u9fff]", value)
+    )
+
+
 def article_vocab_detail_mixed_font(
     token: str,
     size: int,
+    *,
+    english_only: bool = False,
 ) -> ImageFont.FreeTypeFont:
     """Use Roboto Slab for Latin text and the existing Medium face for CJK."""
     if re.search(r"[A-Za-z0-9]", token):
-        return article_subtitle_en_font(size, 400)
+        english_size = max(1, round(size * ARTICLE_VOCAB_DETAIL_EN_FONT_SCALE))
+        if not english_only:
+            english_size = size
+        return article_subtitle_en_font(english_size, 400)
     return article_vocab_detail_font(size)
 
 
@@ -9781,9 +9810,19 @@ def article_vocab_detail_mixed_width(
     draw: ImageDraw.ImageDraw,
     tokens: Sequence[str],
     size: int,
+    *,
+    english_only: bool = False,
 ) -> int:
     return sum(
-        text_w(draw, token, article_vocab_detail_mixed_font(token, size))
+        text_w(
+            draw,
+            token,
+            article_vocab_detail_mixed_font(
+                token,
+                size,
+                english_only=english_only,
+            ),
+        )
         for token in tokens
     )
 
@@ -9793,6 +9832,8 @@ def _wrap_article_vocab_detail_tokens_by_width(
     text: str,
     size: int,
     max_width: int,
+    *,
+    english_only: bool,
 ) -> list[list[str]]:
     lines: list[list[str]] = []
     current: list[str] = []
@@ -9801,7 +9842,12 @@ def _wrap_article_vocab_detail_tokens_by_width(
         if (
             current
             and token not in "，。！？；：、,.!?;:)]}】》〉」』"
-            and article_vocab_detail_mixed_width(draw, candidate, size) > max_width
+            and article_vocab_detail_mixed_width(
+                draw,
+                candidate,
+                size,
+                english_only=english_only,
+            ) > max_width
         ):
             lines.append(current)
             current = [token.lstrip()]
@@ -9822,11 +9868,13 @@ def wrap_article_vocab_detail_mixed_text(
 ) -> list[list[str]]:
     """Wrap mixed-script explanations using the fonts used for final drawing."""
     paragraph = str(text).strip()
+    english_only = article_vocab_detail_is_english_only(paragraph)
     full_tokens = article_vocab_detail_mixed_tokens(paragraph)
     if not paragraph or article_vocab_detail_mixed_width(
         draw,
         full_tokens,
         size,
+        english_only=english_only,
     ) <= max_width:
         return [full_tokens]
 
@@ -9851,8 +9899,18 @@ def wrap_article_vocab_detail_mixed_text(
             continue
         before_tokens = article_vocab_detail_mixed_tokens(before)
         after_tokens = article_vocab_detail_mixed_tokens(after)
-        before_width = article_vocab_detail_mixed_width(draw, before_tokens, size)
-        after_width = article_vocab_detail_mixed_width(draw, after_tokens, size)
+        before_width = article_vocab_detail_mixed_width(
+            draw,
+            before_tokens,
+            size,
+            english_only=english_only,
+        )
+        after_width = article_vocab_detail_mixed_width(
+            draw,
+            after_tokens,
+            size,
+            english_only=english_only,
+        )
         if before_width > max_width or after_width > max_width:
             continue
         candidates.append(
@@ -9872,6 +9930,7 @@ def wrap_article_vocab_detail_mixed_text(
         paragraph,
         size,
         max_width,
+        english_only=english_only,
     )
 
 
@@ -9886,6 +9945,7 @@ def fit_article_vocab_detail_mixed_font(
     prefer_semantic_break: bool,
 ) -> tuple[int, list[list[str]]]:
     rendered_max_width = acx(max_width)
+    english_only = article_vocab_detail_is_english_only(text)
     for size in range(max_size, min_size - 1, -2):
         lines = wrap_article_vocab_detail_mixed_text(
             draw,
@@ -9895,7 +9955,12 @@ def fit_article_vocab_detail_mixed_font(
             prefer_semantic_break=prefer_semantic_break,
         )
         if len(lines) <= max_lines and all(
-            article_vocab_detail_mixed_width(draw, line, size)
+            article_vocab_detail_mixed_width(
+                draw,
+                line,
+                size,
+                english_only=english_only,
+            )
             <= rendered_max_width
             for line in lines
         ):
@@ -9924,18 +9989,27 @@ def _coalesce_article_vocab_detail_tokens(tokens: Sequence[str]) -> list[str]:
 
 def draw_article_vocab_detail_mixed_line(
     draw: ImageDraw.ImageDraw,
-    center_x: int,
+    left_x: int,
     y: int,
     tokens: Sequence[str],
     size: int,
     fill: tuple[int, int, int, int],
+    *,
+    english_only: bool = False,
 ) -> None:
     runs = _coalesce_article_vocab_detail_tokens(tokens)
     if not runs:
         return
-    fonts = [article_vocab_detail_mixed_font(run, size) for run in runs]
+    fonts = [
+        article_vocab_detail_mixed_font(
+            run,
+            size,
+            english_only=english_only,
+        )
+        for run in runs
+    ]
     widths = [text_w(draw, run, fnt) for run, fnt in zip(runs, fonts)]
-    cursor = center_x - sum(widths) // 2
+    cursor = left_x
     baseline = y + max(
         (text_h(draw, run, fnt) for run, fnt in zip(runs, fonts)),
         default=0,
@@ -10340,7 +10414,7 @@ def decorate_article_cover(
 def _draw_article_vocab_card_legacy(img: Image.Image, item: dict | None, rect: tuple[int, int, int, int]) -> None:
     d = ImageDraw.Draw(img, "RGBA")
     draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
-    word = str(item.get("word") or "").strip().capitalize()
+    word = article_vocab_display_phrase(item.get("word") or "")
     phonetic = str(item.get("phonetic") or "").strip()
     pos = str(item.get("pos") or "词性").strip()
     meaning = str(item.get("meaning") or "").strip()
@@ -10492,13 +10566,30 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
     """Render one calm expression card; concepts alone receive a third line."""
     draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
     d = ImageDraw.Draw(img, "RGBA")
-    phrase = str(item.get("word") or "").strip()
+    x0, y0, x1, y1 = rect
+    content_left_x = x0 + acx(ARTICLE_VOCAB_CONTENT_LEFT)
+    content_width = max(
+        1,
+        round((x1 - x0) / ARTICLE_SCALE_X)
+        - ARTICLE_VOCAB_CONTENT_LEFT
+        - ARTICLE_VOCAB_CONTENT_RIGHT,
+    )
+    phrase = article_vocab_display_phrase(item.get("word") or "")
     meaning = str(item.get("meaning") or "").strip()
     detail = str(item.get("detail") or "").strip()
+    detail_english_only = article_vocab_detail_is_english_only(detail)
     is_concept = vocab_card_type(item) == "concept" and bool(detail)
 
-    phrase_font, phrase_lines = fit_article_vocab_phrase_font(d, phrase)
-    meaning_font, meaning_lines = fit_article_vocab_meaning_font(d, meaning)
+    phrase_font, phrase_lines = fit_article_vocab_phrase_font(
+        d,
+        phrase,
+        max_width=content_width,
+    )
+    meaning_font, meaning_lines = fit_article_vocab_meaning_font(
+        d,
+        meaning,
+        max_width=content_width,
+    )
     detail_lines: list[list[str]] = []
     detail_size = 0
     detail_font = None
@@ -10506,7 +10597,7 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
         detail_size, detail_lines = fit_article_vocab_detail_mixed_font(
             d,
             detail,
-            max_width=500,
+            max_width=content_width,
             max_lines=2,
             max_size=ARTICLE_VOCAB_DETAIL_FONT_SIZE,
             min_size=ARTICLE_VOCAB_DETAIL_MIN_FONT_SIZE,
@@ -10517,7 +10608,7 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
         detail_size, detail_lines = fit_article_vocab_detail_mixed_font(
             d,
             detail,
-            max_width=500,
+            max_width=content_width,
             max_lines=1,
             max_size=24,
             min_size=18,
@@ -10527,23 +10618,35 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
 
     phrase_gap = int(phrase_font.size * 1.18)
     meaning_gap = int(meaning_font.size * 1.28)
-    detail_gap = int(detail_font.size * 1.3) if detail_font else 0
+    mixed_detail_line_size = 0
+    if detail_font:
+        mixed_detail_line_size = max(
+            (
+                article_vocab_detail_mixed_font(
+                    token,
+                    detail_size,
+                    english_only=detail_english_only,
+                ).size
+                for line_tokens in detail_lines
+                for token in line_tokens
+            ),
+            default=detail_font.size,
+        )
+    detail_gap = int(mixed_detail_line_size * 1.3) if detail_font else 0
     group_gap = acy(24)
     block_height = len(phrase_lines) * phrase_gap + group_gap + len(meaning_lines) * meaning_gap
     if detail_lines:
         block_height += group_gap + len(detail_lines) * detail_gap
-    x0, y0, x1, y1 = rect
     cursor_y = (y0 + y1 - block_height) // 2
-    center_x = (x0 + x1) // 2
 
     for line in phrase_lines:
         draw_stroked_text(
             d,
-            (center_x, cursor_y),
+            (content_left_x, cursor_y),
             line,
             phrase_font,
             ARTICLE_BLUE,
-            anchor="ma",
+            anchor="la",
             stroke_width=0,
         )
         cursor_y += phrase_gap
@@ -10551,11 +10654,11 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
     for line in meaning_lines:
         draw_stroked_text(
             d,
-            (center_x, cursor_y),
+            (content_left_x, cursor_y),
             line,
             meaning_font,
             ARTICLE_VOCAB_MEANING_COLOR,
-            anchor="ma",
+            anchor="la",
             stroke_width=0,
         )
         cursor_y += meaning_gap
@@ -10564,11 +10667,12 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
         for line_tokens in detail_lines:
             draw_article_vocab_detail_mixed_line(
                 d,
-                center_x,
+                content_left_x,
                 cursor_y,
                 line_tokens,
                 detail_size,
                 ARTICLE_VOCAB_DETAIL_COLOR,
+                english_only=detail_english_only,
             )
             cursor_y += detail_gap
 
@@ -10582,7 +10686,7 @@ def _draw_article_vocab_review_bar_legacy(
     draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
     d = ImageDraw.Draw(img, "RGBA")
     x0, y0, x1, _ = rect
-    word = str(item.get("word") or "").strip().capitalize()
+    word = article_vocab_display_phrase(item.get("word") or "")
     pos = str(item.get("pos") or "").strip()
     meaning = str(item.get("meaning") or "").strip()
     word_font = fit_article_font_to_width(
@@ -10632,7 +10736,7 @@ def draw_article_vocab_review_bar(
     """Keep the card container but leave only the expression and its gloss."""
     draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
     d = ImageDraw.Draw(img, "RGBA")
-    phrase = str(item.get("word") or "").strip()
+    phrase = article_vocab_display_phrase(item.get("word") or "")
     meaning = str(item.get("meaning") or "").strip()
     phrase_font = fit_article_font_to_width(
         d,
@@ -10847,7 +10951,7 @@ def draw_article_vocab_overview(
     word_x = 116
     word_to_meaning_gap = 32
     for index, item in enumerate(upcoming):
-        word = str(item.get("word") or "").strip().capitalize()
+        word = article_vocab_display_phrase(item.get("word") or "")
         meaning = meanings[index]
         # This is deliberately based on rendered pixel width rather than the
         # generic design-width helper: the overview card is drawn at a native

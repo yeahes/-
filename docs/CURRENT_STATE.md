@@ -555,7 +555,9 @@ Last updated: 2026-08-23
 - English and numeric runs embedded in Chinese vocabulary explanations use
   bundled Roboto Slab Regular, while Chinese runs retain Chill Yunmo Gothic
   Medium. Mixed-script measurement, wrapping, and drawing share the same font
-  selection, so embedded English cannot create post-layout overflow.
+  selection, so embedded English cannot create post-layout overflow. Embedded
+  English keeps the base explanation size; only a detail containing Latin text
+  with no Chinese characters is enlarged (1.14x) as a whole.
 - Combined visual verification is available at
   `output/article-vocab-common-audit/all-vocab-typography-color-updates.png`.
   It includes the Source Serif Pro card expression, the `#2A3F5D` Chinese

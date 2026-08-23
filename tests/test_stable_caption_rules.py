@@ -8260,8 +8260,41 @@ def test_article_vocab_detail_uses_roboto_slab_for_embedded_english():
     assert Path(
         podcast_learning_video.article_vocab_detail_mixed_font("企业", size).path
     ).name == "ChillYunmoGothicMedium.otf"
+    assert podcast_learning_video.article_vocab_detail_mixed_font("AI", size).size == (
+        podcast_learning_video.article_vocab_detail_mixed_font("企业", size).size
+    )
     assert all(
         podcast_learning_video.article_vocab_detail_mixed_width(draw, line, size)
+        <= podcast_learning_video.acx(500)
+        for line in lines
+    )
+
+
+def test_article_vocab_detail_all_english_uses_larger_latin_face():
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+    size, lines = podcast_learning_video.fit_article_vocab_detail_mixed_font(
+        draw,
+        "A concise explanation of the concept.",
+        max_width=500,
+        max_lines=2,
+        max_size=28,
+        min_size=22,
+        prefer_semantic_break=True,
+    )
+
+    assert podcast_learning_video.article_vocab_detail_is_english_only(
+        "A concise explanation of the concept."
+    )
+    assert podcast_learning_video.article_vocab_detail_mixed_font(
+        "A",
+        size,
+        english_only=True,
+    ).size > podcast_learning_video.article_vocab_detail_mixed_font(
+        "企业",
+        size,
+    ).size
+    assert all(
+        podcast_learning_video.article_vocab_detail_mixed_width(draw, line, size, english_only=True)
         <= podcast_learning_video.acx(500)
         for line in lines
     )
@@ -8475,7 +8508,7 @@ def test_article_vocab_card_uses_only_expression_gloss_and_concept_note():
 
     labels = [call.args[2] for call in draw_text.call_args_list]
     rendered_text = "".join(labels)
-    assert "black-box algorithm" in labels
+    assert "Black-box algorithm" in labels
     assert "黑箱算法" in rendered_text
     assert "能给出结论，却无法说明判断过程。" in rendered_text
     assert "adj." not in rendered_text
@@ -8504,6 +8537,52 @@ def test_article_vocab_card_uses_only_expression_gloss_and_concept_note():
         call.args[4] == podcast_learning_video.ARTICLE_VOCAB_DETAIL_COLOR
         for call in detail_calls
     )
+
+
+def test_article_vocab_display_phrase_capitalizes_only_the_first_latin_letter():
+    assert podcast_learning_video.article_vocab_display_phrase(
+        "black-box algorithm"
+    ) == "Black-box algorithm"
+    assert podcast_learning_video.article_vocab_display_phrase("AI agent") == "AI agent"
+    assert podcast_learning_video.article_vocab_display_phrase("123abc") == "123Abc"
+
+
+def test_article_vocab_card_left_aligns_all_content_to_card_safe_edge():
+    image = Image.new(
+        "RGBA",
+        (podcast_learning_video.ARTICLE_WIDTH, podcast_learning_video.ARTICLE_HEIGHT),
+        (255, 255, 255, 255),
+    )
+    item = {
+        "word": "black-box algorithm",
+        "meaning": "黑箱算法",
+        "card_type": "concept",
+        "detail": "能给出结论，却无法说明判断过程。",
+    }
+    rect = podcast_learning_video.article_rect(916, 16, 1584, 530)
+    expected_left = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_CONTENT_LEFT
+    )
+
+    with patch.object(podcast_learning_video, "draw_stroked_text") as draw_text:
+        podcast_learning_video.draw_article_vocab_card(image, item, rect)
+
+    phrase_call = next(
+        call for call in draw_text.call_args_list if call.args[2] == "Black-box algorithm"
+    )
+    meaning_call = next(
+        call for call in draw_text.call_args_list if call.args[2] == "黑箱算法"
+    )
+    detail_call = next(
+        call for call in draw_text.call_args_list if "能给出结论" in call.args[2]
+    )
+
+    assert phrase_call.args[1][0] == expected_left
+    assert meaning_call.args[1][0] == expected_left
+    assert detail_call.args[1][0] == expected_left
+    assert phrase_call.kwargs["anchor"] == "la"
+    assert meaning_call.kwargs["anchor"] == "la"
+    assert detail_call.kwargs["anchor"] == "ls"
 
 
 def test_vocab_prompt_requests_expression_card_fields_without_dictionary_metadata():
@@ -15319,6 +15398,9 @@ if __name__ == "__main__":
     test_article_vocab_phrase_fails_instead_of_shrinking_a_long_phrase_below_floor()
     test_article_vocab_typography_uses_bundled_role_specific_faces()
     test_article_vocab_detail_uses_roboto_slab_for_embedded_english()
+    test_article_vocab_detail_all_english_uses_larger_latin_face()
+    test_article_vocab_display_phrase_capitalizes_only_the_first_latin_letter()
+    test_article_vocab_card_left_aligns_all_content_to_card_safe_edge()
     test_vocab_highlight_keeps_attached_punctuation_but_not_whitespace()
     test_standard_subtitle_highlight_colors_attached_punctuation()
     test_article_subtitle_highlight_colors_attached_punctuation()
