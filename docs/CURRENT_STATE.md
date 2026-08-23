@@ -2,6 +2,33 @@
 
 Last updated: 2026-08-23
 
+## 2026-08-23 Fixed-Parent Production Selection And Recovery List
+
+- Integrated the verified fixed-parent material-readability selector into the
+  production article-page planner. Planner identity is now
+  `article-fixed-font-pages-v32`. It runs after whole-episode and existing
+  dominant-readability selection and may choose only an already-enumerated
+  page projection with measurable relief and zero structural/display
+  regression. Frozen parent English, IDs, word ranges, word times, and cue
+  times remain unchanged.
+- A real read-only replay of the newest White House checkpoint rebuilt 217
+  plans and changed only `S0072`, `S0097`, `S0201`, and `S0205`. The existing
+  `S0123`, `S0132`, and `S0192` structural failures remain explicit editable
+  seeds. All four changed page-Chinese candidates had already passed the
+  current contract in the experiment.
+- Recent-result discovery now collapses historical runs to one entry per audio
+  title, preserving an unsaved draft ahead of newer clean results. It also
+  discovers the deterministic manual-final package beside the declared source
+  media. On the real work directory, White House is one entry backed by five
+  distinct historical runs instead of multiple checkpoint rows.
+- The recent-result dialog now uses the shared native review-dialog palette,
+  including dark theme, word wrapping, and non-elided paths. It displays the
+  exact manual-final package destination.
+- Focused production-selector, recovery, editor, and publication tests pass
+  (`223 passed`). Syntax and diff checks also pass.
+  The user will run `scripts/run_regression.py`; it was intentionally not run
+  in this stage.
+
 ## 2026-08-23 Page Experiments And Editor Recovery
 
 - The fixed-parent bilingual page experiment keeps English, IDs, word spans,

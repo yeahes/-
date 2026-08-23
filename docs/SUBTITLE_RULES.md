@@ -95,6 +95,14 @@
   a comfortable 56px page. The decision and reason are recorded in the page
   artifact. This pass chooses among already enumerated word-ledger candidates
   and cannot create a new cut or mutate the frozen cue.
+- After that conservative pass, the fixed-parent material selector may choose
+  another already-enumerated projection only when it measurably reduces a
+  short-page deficit, over-16-word excess, font deficit, or maximum page
+  pressure. It must add no unsupported REVIEW boundary, below-five-word page,
+  imbalance, page count beyond one extra page, font/line regression, or
+  structural risk. The selected reason is written into the frozen render plan.
+  This selector cannot move a word across a parent, change an ID or time, or
+  repair a parent that has no valid page plan.
 - A multipage cue uses deterministic display-page IDs below the frozen parent
   subtitle ID. Chinese page meaning must be assigned to those IDs explicitly;
   proportional character slicing is forbidden.

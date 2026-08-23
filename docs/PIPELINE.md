@@ -380,9 +380,11 @@ Rule:
   them does not rerun ASR, translation, or English segmentation.
 - The editor's `More` menu can discover recent stable runs, editable failure
   checkpoints, and manual packages below the configured work directory. It
-  loads the selected manifest directly and never starts ASR, translation,
-  allocation, or pagination. Live aliases and immutable run copies with the
-  same attempt/run identity are shown once.
+  also checks the deterministic manual-package directory beside each declared
+  source media file. It loads the selected manifest directly and never starts
+  ASR, translation, allocation, or pagination. Live aliases are deduplicated,
+  then all historical runs for one episode title are collapsed to one current
+  entry. An unsaved draft wins; otherwise the newest result wins.
 - Closing a dirty editor session writes an atomic working draft bound to the
   exact base manifest and subtitle hashes. Reopening that result restores the
   draft automatically. A clean close writes nothing, and a draft-write failure
@@ -525,6 +527,10 @@ Rule:
     视频成片/            # formal and manual-draft rendered videos
     人工终稿字幕包/      # root manifest and immutable generations
   ```
+
+  For example, saving a source media file at
+  `C:/Users/.../Desktop/Episode/Episode.m4a` publishes the root manual manifest
+  under `C:/Users/.../Desktop/Episode/Episode-处理结果/人工终稿字幕包/`.
 
   Internal work directories, immutable stable-run artifacts, and source media
   stay in place. Existing loose legacy files are not moved or deleted. Legacy
