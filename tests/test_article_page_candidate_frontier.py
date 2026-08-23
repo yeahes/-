@@ -86,7 +86,11 @@ def test_material_selector_removes_overlong_four_word_lead_in():
     )
     candidate["plan"]["pages"][1]["en"] = "in every major overseas market."
 
-    selected, reason = frontier._select_material_readability_candidate(
+    selector = (
+        frontier.podcast_learning_video
+        ._select_article_material_readability_candidate
+    )
+    selected, reason = selector(
         baseline,
         (baseline, candidate),
     )
@@ -115,7 +119,11 @@ def test_material_selector_rejects_false_prepositional_completion():
     )
     candidate["plan"]["pages"][1]["en"] = "in tariff rates would backfire."
 
-    selected, reason = frontier._select_material_readability_candidate(
+    selector = (
+        frontier.podcast_learning_video
+        ._select_article_material_readability_candidate
+    )
+    selected, reason = selector(
         baseline,
         (baseline, candidate),
     )
@@ -146,7 +154,11 @@ def test_material_selector_accepts_complete_predicate_to_remove_short_tail():
         },
     )
 
-    selected, reason = frontier._select_material_readability_candidate(
+    selector = (
+        frontier.podcast_learning_video
+        ._select_article_material_readability_candidate
+    )
+    selected, reason = selector(
         baseline,
         (baseline, candidate),
     )
@@ -178,13 +190,63 @@ def test_material_selector_uses_supported_pause_for_pressure_relief():
         },
     )
 
-    selected, reason = frontier._select_material_readability_candidate(
+    selector = (
+        frontier.podcast_learning_video
+        ._select_article_material_readability_candidate
+    )
+    selected, reason = selector(
         baseline,
         (baseline, candidate),
     )
 
     assert selected is candidate
     assert reason == "maximum_pressure_relief"
+
+
+def test_material_selector_records_the_production_decision():
+    baseline = _rank_candidate(
+        (16, 6),
+        (1.333, 0.8),
+        risk_score=2,
+        boundary={
+            "classification": "review",
+            "complete_object_continuation": True,
+        },
+    )
+    candidate = _rank_candidate(
+        (11, 11),
+        (1.028, 0.95),
+        risk_score=2,
+        relaxed_raw_hard_count=1,
+        boundary={
+            "classification": "review",
+            "relaxed_raw_hard": True,
+            "strong_pause_evidence": True,
+            "balanced_predicate_restart": True,
+        },
+    )
+
+    promote = (
+        frontier.podcast_learning_video
+        ._promote_article_material_readability_candidate
+    )
+    promoted = promote(
+        baseline,
+        (baseline, candidate),
+    )
+    finalized = frontier.podcast_learning_video._finalize_article_sequence_candidate(
+        promoted,
+        {"preferred_page_count": 2, "candidate_mode": "strict"},
+    )
+
+    assert promoted["material_readability_promoted"] == "maximum_pressure_relief"
+    assert finalized["readability_selection"] == {
+        "basis": "material_readability_non_regression",
+        "reason": "maximum_pressure_relief",
+    }
+    assert finalized["page_count_decision"]["basis"] == (
+        "material_readability_non_regression"
+    )
 
 
 def test_material_selector_rejects_visual_churn_and_font_regression():
@@ -208,7 +270,11 @@ def test_material_selector_rejects_visual_churn_and_font_regression():
         boundary={"classification": "allow"},
     )
 
-    selected, reason = frontier._select_material_readability_candidate(
+    selector = (
+        frontier.podcast_learning_video
+        ._select_article_material_readability_candidate
+    )
+    selected, reason = selector(
         baseline,
         (baseline, merely_balanced, lower_font),
     )

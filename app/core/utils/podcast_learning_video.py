@@ -6393,6 +6393,10 @@ def _build_article_english_page_plan(
             selected,
             shadow_candidates,
         )
+        selected = _promote_article_material_readability_candidate(
+            selected,
+            shadow_candidates,
+        )
         selected["plan"]["page_count_decision"] = {
             "preferred": base_preferred_page_count,
             "selected": int(selected.get("page_count") or selected_page_count),
@@ -6400,9 +6404,13 @@ def _build_article_english_page_plan(
                 candidate_mode
             ),
             "basis": (
-                "dominant_cross_page_count_candidate"
-                if selected.get("dominant_readability_promoted")
-                else "pixel_word_chinese_duration_load"
+                "material_readability_non_regression"
+                if selected.get("material_readability_promoted")
+                else (
+                    "dominant_cross_page_count_candidate"
+                    if selected.get("dominant_readability_promoted")
+                    else "pixel_word_chinese_duration_load"
+                )
             ),
         }
         return _finalize_article_same_screen_layout(
@@ -7173,6 +7181,261 @@ def _article_candidate_relaxes_only_complete_prepositional_continuations(
     )
 
 
+_ARTICLE_MATERIAL_FINITE_AUXILIARIES = frozenset(
+    {
+        "am",
+        "are",
+        "be",
+        "been",
+        "being",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "had",
+        "has",
+        "have",
+        "is",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "should",
+        "was",
+        "were",
+        "will",
+        "would",
+    }
+)
+
+
+def _article_material_boundary_has_support(
+    decision: Mapping[str, object],
+    page: Mapping[str, object],
+) -> bool:
+    """Reject REVIEW edges that only look complete without a finite clause."""
+    if str(decision.get("classification") or "allow") != "review":
+        return True
+    if decision.get("complete_prepositional_continuation"):
+        words = [
+            "".join(
+                character
+                for character in token.casefold()
+                if character.isalpha()
+            )
+            for token in str(page.get("en") or "").split()
+        ]
+        if any(
+            word in _ARTICLE_MATERIAL_FINITE_AUXILIARIES
+            for word in words[1:]
+        ):
+            return False
+    return any(
+        bool(decision.get(key))
+        for key in (
+            "strong_pause_evidence",
+            "complete_page_clause_start",
+            "complete_content_clause_start",
+            "complete_title_restart",
+            "balanced_predicate_restart",
+            "complete_prepositional_continuation",
+            "complete_object_continuation",
+            "forced_complete_predicate_phrase",
+            "forced_complete_to_phrase",
+        )
+    )
+
+
+def _article_material_candidate_metrics(
+    candidate: Mapping[str, object],
+) -> dict[str, float | int]:
+    """Measure only display defects that justify changing a valid projection."""
+    pages = list((candidate.get("plan") or {}).get("pages") or [])
+    word_counts = [len(str(page.get("en") or "").split()) for page in pages]
+    font_sizes = [
+        int(
+            page.get("english_font_size")
+            or ARTICLE_SUBTITLE_EN_FONT_SIZE
+        )
+        for page in pages
+    ]
+    stored_pressures = tuple(
+        float(value) for value in candidate.get("page_pressures") or ()
+    )
+    if len(stored_pressures) == len(pages):
+        pressures = list(stored_pressures)
+    else:
+        pressures = [_article_display_page_pressure(page) for page in pages]
+    review_pages = [
+        page
+        for page in pages[1:]
+        if str((page.get("boundary_before") or {}).get("classification") or "allow")
+        == "review"
+    ]
+    return {
+        "page_count": len(pages),
+        "under_five_pages": sum(value < 5 for value in word_counts),
+        "short_page_deficit": sum(
+            max(0, ARTICLE_PAGE_SECONDARY_REVIEW_MIN_WORDS - value)
+            for value in word_counts
+        ),
+        "over_16_word_excess": sum(
+            max(0, value - ARTICLE_VISUAL_PAGE_SOFT_MAX_WORDS)
+            for value in word_counts
+        ),
+        "font_deficit": sum(
+            max(0, ARTICLE_SUBTITLE_EN_FONT_SIZE - value)
+            for value in font_sizes
+        ),
+        "three_line_pages": sum(
+            len(list(page.get("en_lines") or [])) > 2 for page in pages
+        ),
+        "review_boundaries": len(review_pages),
+        "unsupported_review_boundaries": sum(
+            not _article_material_boundary_has_support(
+                page.get("boundary_before") or {},
+                page,
+            )
+            for page in review_pages
+        ),
+        "severe_risk_count": int(candidate.get("severe_risk_count") or 0),
+        "incomplete_review_count": int(
+            candidate.get("incomplete_review_count") or 0
+        ),
+        "risk_score": int(candidate.get("risk_score") or 0),
+        "max_pressure": max(pressures, default=0.0),
+        "word_count_imbalance": (
+            max(word_counts, default=0) - min(word_counts, default=0)
+        ),
+    }
+
+
+def _article_material_improvement_reason(
+    baseline: Mapping[str, float | int],
+    candidate: Mapping[str, float | int],
+) -> str | None:
+    short_relief = int(candidate["short_page_deficit"]) < int(
+        baseline["short_page_deficit"]
+    )
+    over_16_relief = int(candidate["over_16_word_excess"]) < int(
+        baseline["over_16_word_excess"]
+    )
+    font_relief = int(candidate["font_deficit"]) < int(
+        baseline["font_deficit"]
+    )
+    pressure_relief = (
+        float(baseline["max_pressure"]) - float(candidate["max_pressure"])
+        >= ARTICLE_PAGE_PRESSURE_TRANSITION_FREE_DELTA
+    )
+    if short_relief and over_16_relief:
+        return "short_page_and_over_16_relief"
+    if short_relief:
+        return "short_page_relief"
+    if over_16_relief:
+        return "over_16_relief"
+    if font_relief:
+        return "font_floor_relief"
+    if pressure_relief:
+        return "maximum_pressure_relief"
+    return None
+
+
+def _select_article_material_readability_candidate(
+    baseline: Mapping[str, object],
+    candidates: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], str]:
+    """Choose a materially better fixed-parent projection with no regression."""
+    baseline_metrics = _article_material_candidate_metrics(baseline)
+    eligible: list[
+        tuple[tuple[float | int, ...], Mapping[str, object], str]
+    ] = []
+    for candidate in candidates:
+        if candidate is baseline:
+            continue
+        metrics = _article_material_candidate_metrics(candidate)
+        if (
+            int(metrics["unsupported_review_boundaries"]) > 0
+            or int(metrics["under_five_pages"])
+            > int(baseline_metrics["under_five_pages"])
+            or int(metrics["short_page_deficit"])
+            > int(baseline_metrics["short_page_deficit"])
+            or int(metrics["over_16_word_excess"])
+            > int(baseline_metrics["over_16_word_excess"])
+            or int(metrics["font_deficit"])
+            > int(baseline_metrics["font_deficit"])
+            or int(metrics["three_line_pages"])
+            > int(baseline_metrics["three_line_pages"])
+            or int(metrics["review_boundaries"])
+            > int(baseline_metrics["review_boundaries"])
+            or int(metrics["severe_risk_count"])
+            > int(baseline_metrics["severe_risk_count"])
+            or int(metrics["incomplete_review_count"])
+            > int(baseline_metrics["incomplete_review_count"])
+            or int(metrics["risk_score"]) > int(baseline_metrics["risk_score"])
+            or float(metrics["max_pressure"])
+            > float(baseline_metrics["max_pressure"])
+            or int(metrics["word_count_imbalance"])
+            > int(baseline_metrics["word_count_imbalance"])
+            or int(metrics["page_count"])
+            > int(baseline_metrics["page_count"]) + 1
+        ):
+            continue
+        reason = _article_material_improvement_reason(
+            baseline_metrics,
+            metrics,
+        )
+        if reason is None:
+            continue
+        rank = (
+            int(metrics["under_five_pages"]),
+            int(metrics["short_page_deficit"]),
+            int(metrics["over_16_word_excess"]),
+            int(metrics["font_deficit"]),
+            int(metrics["unsupported_review_boundaries"]),
+            int(metrics["severe_risk_count"]),
+            int(metrics["incomplete_review_count"]),
+            float(metrics["max_pressure"]),
+            int(metrics["word_count_imbalance"]),
+            int(metrics["risk_score"]),
+            int(metrics["page_count"]),
+            float(candidate.get("quality_cost") or 0.0),
+        )
+        eligible.append((rank, candidate, reason))
+    if not eligible:
+        return baseline, "baseline_retained"
+    _rank, selected, reason = min(eligible, key=lambda item: item[0])
+    return selected, reason
+
+
+def _article_mark_material_readability_candidate(
+    candidate: Mapping[str, object],
+    reason: str,
+) -> dict:
+    promoted = dict(candidate)
+    plan = dict(promoted.get("plan") or {})
+    plan["readability_selection"] = {
+        "basis": "material_readability_non_regression",
+        "reason": reason,
+    }
+    promoted["plan"] = plan
+    promoted["material_readability_promoted"] = reason
+    return promoted
+
+
+def _promote_article_material_readability_candidate(
+    baseline: Mapping[str, object],
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    selected, reason = _select_article_material_readability_candidate(
+        baseline,
+        candidates,
+    )
+    if selected is baseline:
+        return baseline
+    return _article_mark_material_readability_candidate(selected, reason)
+
+
 def _article_mark_dominant_readability_candidate(
     candidate: Mapping[str, object],
     reason: str,
@@ -7474,12 +7737,16 @@ def _finalize_article_sequence_candidate(
         "selected": int(candidate.get("page_count") or 1),
         "candidate_mode": str(bundle.get("candidate_mode") or "strict"),
         "basis": (
-            "dominant_cross_page_count_candidate"
-            if candidate.get("dominant_readability_promoted")
+            "material_readability_non_regression"
+            if candidate.get("material_readability_promoted")
             else (
-                "high_pressure_secondary_review"
-                if candidate.get("secondary_review_promoted")
-                else "semantic_pixel_duration_sequence_pressure"
+                "dominant_cross_page_count_candidate"
+                if candidate.get("dominant_readability_promoted")
+                else (
+                    "high_pressure_secondary_review"
+                    if candidate.get("secondary_review_promoted")
+                    else "semantic_pixel_duration_sequence_pressure"
+                )
             )
         ),
     }
@@ -7660,6 +7927,13 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
         )
         for (cue, bundle), selected in zip(bundle_entries, selected_candidates)
     ]
+    selected_candidates = [
+        _promote_article_material_readability_candidate(
+            selected,
+            bundle.get("shadow_candidates") or (),
+        )
+        for (_cue, bundle), selected in zip(bundle_entries, selected_candidates)
+    ]
 
     parents: list[dict] = []
     render_plans: list[dict] = []
@@ -7704,6 +7978,12 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
                 "word_end": int(pages[-1]["global_word_end"]),
                 "english_font_size": int(plan["font_size"]["english"]),
                 "font_fallback": dict(plan.get("font_fallback") or {"used": False}),
+                "page_count_decision": dict(
+                    plan.get("page_count_decision") or {}
+                ),
+                "readability_selection": dict(
+                    plan.get("readability_selection") or {}
+                ),
                 "pages": frozen_pages,
             }
         )

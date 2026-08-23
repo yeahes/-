@@ -293,72 +293,11 @@ def _select_material_readability_candidate(
     baseline: Mapping[str, object],
     candidates: Sequence[Mapping[str, object]],
 ) -> tuple[Mapping[str, object], str]:
-    """Select only non-regressive candidates with material display relief.
-
-    This is an offline policy probe. It deliberately ignores small balance-only
-    improvements so the experiment cannot justify broad page churn.
-    """
-    baseline_metrics = _material_candidate_metrics(baseline)
-    eligible: list[
-        tuple[
-            tuple[float | int, ...],
-            Mapping[str, object],
-            str,
-        ]
-    ] = []
-    for candidate in candidates:
-        if candidate is baseline:
-            continue
-        metrics = _material_candidate_metrics(candidate)
-        if (
-            int(metrics["unsupported_review_boundaries"]) > 0
-            or int(metrics["under_five_pages"])
-            > int(baseline_metrics["under_five_pages"])
-            or int(metrics["short_page_deficit"])
-            > int(baseline_metrics["short_page_deficit"])
-            or int(metrics["over_16_word_excess"])
-            > int(baseline_metrics["over_16_word_excess"])
-            or int(metrics["font_deficit"])
-            > int(baseline_metrics["font_deficit"])
-            or int(metrics["three_line_pages"])
-            > int(baseline_metrics["three_line_pages"])
-            or int(metrics["review_boundaries"])
-            > int(baseline_metrics["review_boundaries"])
-            or int(metrics["severe_risk_count"])
-            > int(baseline_metrics["severe_risk_count"])
-            or int(metrics["incomplete_review_count"])
-            > int(baseline_metrics["incomplete_review_count"])
-            or int(metrics["risk_score"]) > int(baseline_metrics["risk_score"])
-            or float(metrics["max_pressure"])
-            > float(baseline_metrics["max_pressure"])
-            or int(metrics["word_count_imbalance"])
-            > int(baseline_metrics["word_count_imbalance"])
-            or int(metrics["page_count"])
-            > int(baseline_metrics["page_count"]) + 1
-        ):
-            continue
-        reason = _material_improvement_reason(baseline_metrics, metrics)
-        if reason is None:
-            continue
-        rank = (
-            int(metrics["under_five_pages"]),
-            int(metrics["short_page_deficit"]),
-            int(metrics["over_16_word_excess"]),
-            int(metrics["font_deficit"]),
-            int(metrics["unsupported_review_boundaries"]),
-            int(metrics["severe_risk_count"]),
-            int(metrics["incomplete_review_count"]),
-            float(metrics["max_pressure"]),
-            int(metrics["word_count_imbalance"]),
-            int(metrics["risk_score"]),
-            int(metrics["page_count"]),
-            float(candidate.get("quality_cost") or 0.0),
-        )
-        eligible.append((rank, candidate, reason))
-    if not eligible:
-        return baseline, "baseline_retained"
-    _rank, selected, reason = min(eligible, key=lambda item: item[0])
-    return selected, reason
+    """Replay the production material-readability policy read-only."""
+    return podcast_learning_video._select_article_material_readability_candidate(
+        baseline,
+        candidates,
+    )
 
 
 def audit(
@@ -429,12 +368,12 @@ def audit(
     ]
     material_selections = [
         _select_material_readability_candidate(
-            production_candidate,
+            conservative_candidate,
             bundle["shadow_candidates"],
         )
-        for (_cue, bundle), production_candidate in zip(
+        for (_cue, bundle), conservative_candidate in zip(
             bundle_entries,
-            production_selected,
+            conservative_selected,
         )
     ]
     records = []
@@ -521,7 +460,7 @@ def audit(
                     ),
                     "pages": conservative_pages,
                 },
-                "material_changed": _plan_signature(production_plan)
+                "material_changed": _plan_signature(conservative_plan)
                 != _plan_signature(material_plan),
                 "material_selection_reason": material_reason,
                 "material": {
