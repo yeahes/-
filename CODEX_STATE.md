@@ -1,9 +1,9 @@
 # Project State
 Status: active
-Last verified: 2026-08-23 11:13:44 Asia/Shanghai
+Last verified: 2026-08-23 11:14:38 Asia/Shanghai
 Branch: main
-Verified HEAD: 825d36f
-Working tree: offline page-candidate audit/test/docs modified; unrelated untracked output/ preserved
+Verified HEAD: 10b8ff3
+Working tree: unrelated untracked output/ only
 
 ## Current Goal
 Improve difficult long subtitles without destabilizing frozen English ownership.
