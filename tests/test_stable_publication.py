@@ -4593,6 +4593,44 @@ class StablePublicationTests(unittest.TestCase):
         self.assertIn("background-color: #292929", style)
         self.assertIn("color: #f2f2f2", style)
 
+    def test_restore_recent_dialog_applies_theme_palette(self):
+        interface = SubtitleInterface()
+        interface.setAttribute(Qt.WA_DontShowOnScreen, True)
+        self.addCleanup(
+            lambda: (
+                interface.close(),
+                self._qt_app.processEvents(),
+            )
+        )
+        records = [
+            {
+                "title": "Episode",
+                "state": "稳定字幕",
+                "subtitle_count": 2,
+                "created_at": "2026-08-23T12:00:00",
+                "manifest_path": "C:/missing/stable-final-manifest.json",
+                "history_count": 3,
+                "manual_output_dir": "C:/output/人工终稿字幕包",
+            }
+        ]
+
+        with (
+            patch.object(
+                ManualFinalSubtitleSession,
+                "discover_recent_editable_manifests",
+                return_value=records,
+            ),
+            patch.object(
+                interface,
+                "_style_manual_review_dialog",
+            ) as style_dialog,
+            patch("app.view.subtitle_interface.QDialog.exec_", return_value=0),
+        ):
+            restored = interface.restore_recent_subtitle_result()
+
+        self.assertFalse(restored)
+        style_dialog.assert_called_once()
+
     def test_boundary_editor_requires_an_explicit_row_click_and_can_be_disarmed(self):
         calls = []
 

@@ -2560,7 +2560,7 @@ class SubtitleInterface(QWidget):
         label.setWordWrap(True)
         layout.addWidget(label)
         listing = QListWidget(dialog)
-        listing.setAlternatingRowColors(True)
+        self._style_manual_review_dialog(dialog, listing)
         for record in records:
             created_at = str(record.get("created_at") or "").replace("T", " ")
             count = int(record.get("subtitle_count") or 0)
@@ -2570,11 +2570,29 @@ class SubtitleInterface(QWidget):
                     created_at,
                     str(record.get("state") or ""),
                     f"{count} 条" if count else "",
+                    (
+                        f"已合并 {int(record.get('history_count') or 0)} 次历史结果"
+                        if int(record.get("history_count") or 0) > 1
+                        else ""
+                    ),
                 )
                 if value
             )
+            output_dir = str(record.get("manual_output_dir") or "").strip()
             item = QListWidgetItem(
-                f"{record.get('title') or self.tr('未命名字幕')}\n{details}",
+                "\n".join(
+                    value
+                    for value in (
+                        str(record.get("title") or self.tr("未命名字幕")),
+                        details,
+                        (
+                            self.tr("人工终稿位置：") + output_dir
+                            if output_dir
+                            else ""
+                        ),
+                    )
+                    if value
+                ),
                 listing,
             )
             item.setData(Qt.UserRole, str(record["manifest_path"]))

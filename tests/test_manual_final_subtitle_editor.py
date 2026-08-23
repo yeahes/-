@@ -9,7 +9,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.config import BIN_PATH
-from app.core.output_paths import media_result_dir, media_result_subtitle_dir
+from app.core.output_paths import (
+    media_result_dir,
+    media_result_manual_package_dir,
+    media_result_subtitle_dir,
+)
 from app.core.subtitle_processor.manual_final_subtitle_editor import (
     ManualFinalSubtitleEditError,
     ManualFinalSubtitleSession,
@@ -2947,6 +2951,83 @@ def test_recent_editable_manifest_discovery_finds_checkpoint_and_draft():
         assert records[0]["has_recovery_draft"] is True
         assert records[0]["subtitle_count"] == 2
         assert draft_path.is_file()
+
+
+def test_recent_editable_manifest_discovery_collapses_episode_history():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        _, _, manifest_path = _session_fixture(root)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "attempt_id": "attempt-old",
+                "stable_run_id": "run-old",
+                "created_at": "2026-08-22T12:00:00",
+            }
+        )
+        _write_json(manifest_path, manifest)
+        newer_manifest = (
+            root
+            / "work"
+            / "subtitle"
+            / "stable-checkpoints"
+            / "newer"
+            / "stable-final-manifest.json"
+        )
+        newer_manifest.parent.mkdir(parents=True)
+        newer = copy.deepcopy(manifest)
+        newer.update(
+            {
+                "attempt_id": "attempt-new",
+                "stable_run_id": "run-new",
+                "created_at": "2026-08-23T12:00:00",
+            }
+        )
+        _write_json(newer_manifest, newer)
+        os.utime(manifest_path, (1, 1))
+        os.utime(newer_manifest, (2, 2))
+
+        records = ManualFinalSubtitleSession.discover_recent_editable_manifests(
+            root / "work"
+        )
+
+        assert len(records) == 1
+        assert Path(records[0]["manifest_path"]) == newer_manifest.resolve()
+        assert records[0]["history_count"] == 2
+
+
+def test_recent_discovery_finds_source_adjacent_manual_package():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, _, manifest_path = _session_fixture(root)
+        source_media = root / "source" / "bilingual.m4a"
+        source_media.write_bytes(b"test-audio-placeholder")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "source_media_path": str(source_media),
+                "attempt_id": "attempt-1",
+                "stable_run_id": "run-1",
+                "created_at": "2026-08-22T12:00:00",
+            }
+        )
+        _write_json(manifest_path, manifest)
+        session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        saved = session.save_to_source_folder(source_media_path=source_media)
+
+        records = ManualFinalSubtitleSession.discover_recent_editable_manifests(
+            root / "work"
+        )
+
+        assert len(records) == 1
+        assert records[0]["state"] == "人工终稿"
+        assert Path(records[0]["manifest_path"]) == Path(
+            saved["manifest_path"]
+        ).resolve()
+        assert Path(records[0]["manual_output_dir"]) == (
+            media_result_manual_package_dir(source_media).resolve()
+        )
+        assert records[0]["history_count"] == 2
 
 
 def test_merge_only_combines_adjacent_continuous_word_ranges():

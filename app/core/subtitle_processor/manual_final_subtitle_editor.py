@@ -650,9 +650,31 @@ class ManualFinalSubtitleSession:
         if not root.is_dir() or limit < 1:
             return []
 
+        manifest_paths = list(root.rglob("stable-final-manifest.json"))
+        # Current manual packages live beside the source media rather than in
+        # work-dir. Follow only exact, existing source-media paths declared by
+        # a work-dir manifest, then inspect the deterministic package location.
+        for manifest_path in tuple(manifest_paths):
+            try:
+                manifest = cls._read_json(manifest_path.resolve())
+                source_media = cls._manifest_source_media_path(
+                    manifest,
+                    manifest_path,
+                )
+                if source_media is None:
+                    continue
+                manual_manifest = (
+                    media_result_manual_package_dir(source_media)
+                    / "stable-final-manifest.json"
+                )
+                if manual_manifest.is_file():
+                    manifest_paths.append(manual_manifest)
+            except (ManualFinalSubtitleEditError, OSError, TypeError, ValueError):
+                continue
+
         candidates: List[Dict[str, Any]] = []
         seen_manifests: set[str] = set()
-        for manifest_path in root.rglob("stable-final-manifest.json"):
+        for manifest_path in manifest_paths:
             try:
                 resolved_manifest = manifest_path.resolve()
                 manifest_key = os.path.normcase(str(resolved_manifest))
@@ -685,11 +707,12 @@ class ManualFinalSubtitleSession:
                 if subtitle_path is None:
                     continue
 
-                source_media_text = str(
-                    override.get("source_media_path")
-                    or manifest.get("source_media_path")
-                    or ""
-                ).strip()
+                source_media = cls._manifest_source_media_path(
+                    manifest,
+                    resolved_manifest,
+                    subtitle_path,
+                )
+                source_media_text = str(source_media or "")
                 source_subtitle_text = str(manifest.get("source_subtitle") or "").strip()
                 if source_media_text:
                     title = Path(source_media_text).stem
@@ -735,6 +758,16 @@ class ManualFinalSubtitleSession:
                         "attempt_id": str(manifest.get("attempt_id") or ""),
                         "stable_run_id": str(manifest.get("stable_run_id") or ""),
                         "is_manual_package": is_manual,
+                        "source_media_path": source_media_text,
+                        "manual_output_dir": str(
+                            media_result_manual_package_dir(source_media).resolve()
+                            if source_media is not None
+                            else (
+                                resolved_manifest.parent
+                                if is_manual
+                                else ""
+                            )
+                        ),
                     }
                 )
             except (ManualFinalSubtitleEditError, OSError, TypeError, ValueError):
@@ -771,8 +804,30 @@ class ManualFinalSubtitleSession:
                 float(current.get("updated_timestamp") or 0.0),
             ):
                 deduplicated[identity] = item
+        episodes: Dict[str, List[Dict[str, Any]]] = {}
+        for item in deduplicated.values():
+            title_key = re.sub(
+                r"\s+",
+                "",
+                str(item.get("title") or "未命名字幕"),
+            ).casefold()
+            episodes.setdefault(title_key, []).append(item)
+
+        selected_records: List[Dict[str, Any]] = []
+        for history in episodes.values():
+            selected = max(
+                history,
+                key=lambda item: (
+                    bool(item.get("has_recovery_draft")),
+                    float(item.get("updated_timestamp") or 0.0),
+                    path_rank(item),
+                ),
+            )
+            selected = dict(selected)
+            selected["history_count"] = len(history)
+            selected_records.append(selected)
         return sorted(
-            deduplicated.values(),
+            selected_records,
             key=lambda item: float(item.get("updated_timestamp") or 0.0),
             reverse=True,
         )[:limit]
