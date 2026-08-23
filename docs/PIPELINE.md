@@ -129,6 +129,14 @@ Rules:
   groups and at most two in-flight requests. Each initial batch gets one HTTP
   attempt; every valid completion is validated and written to its unit cache
   before another batch is admitted.
+- Full-translation unit cache v2 follows semantic content rather than sequence
+  position. Its identity includes the complete English, current translation,
+  translation budget, bounded previous/next semantic context, article context,
+  prompt policy, and request model. It excludes semantic-group numbers, frozen
+  subtitle IDs, and internal cue boundaries. A shifted but semantically
+  identical group can therefore reuse its verified translation, while any
+  wording, budget, context, model, or prompt change invalidates it. Valid v1
+  unit entries remain readable once and are migrated to v2 on reuse.
 - Two consecutive retryable provider failures open the full-translation
   circuit and prevent unstarted batches from being submitted. Already in-flight
   requests may finish and valid results are still cached. One successful batch
@@ -220,6 +228,13 @@ allocation/review model
 and a naturalness or semantic retry uses the full-translation model. A residual
 non-blocking continuation after that retry stays explicit REVIEW evidence and
 cannot replace the authoritative parent translation.
+Each validated parent page set also has an independent content-bound unit
+cache. Its identity includes parent English and authoritative Chinese, every
+page English span, page duration and Chinese budget, article context, prompt,
+algorithm, and model, but not parent/page IDs or absolute word-number offsets.
+A hit is rebound to current `Sxxxx.Pxx` IDs and must pass the complete current
+page contract and quality validation before use. Parent Chinese, page English,
+timing budget, or policy changes invalidate the unit.
 Missing, duplicate, or cardinality-mismatched page IDs are scoped to the
 affected parent whenever the page IDs identify that parent. Unknown IDs or
 otherwise unscoped malformed responses still retry the complete contract.
@@ -352,6 +367,10 @@ Rule:
   final cue timeline pass the same structural contracts used by the editor.
   The newly written checkpoint is opened once by the real loader before its
   path is published. Corrupt or incomplete authority remains unavailable.
+- A checkpoint snapshot retains `semantic-review-queue.json` only when the
+  queue binds to the copied word ledger and complete frozen English spans.
+  An identity-mismatched copied queue is removed from the new checkpoint while
+  the historical source directory remains unchanged.
 
 ### Manual final checkpoint
 

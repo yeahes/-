@@ -1,39 +1,37 @@
 # Project State
 Status: active
-Last verified: 2026-08-23 05:42:38 Asia/Shanghai
+Last verified: 2026-08-23 09:10:54 Asia/Shanghai
 Branch: main
-Verified HEAD: 119ca93
-Working tree: clean except unrelated untracked output/
+Verified HEAD: 4f68993
+Working tree: documentation updates plus unrelated untracked output/
 
 ## Current Goal
-Repair the verified causes of reduced automatic subtitle quality in independently tested commits.
+Evaluate a pre-ID English-boundary and display-page feasibility joint planner offline.
 
 ## Confirmed Facts
-- White House English replay removes 6/6 confirmed boundary defects with 2,586/2,586 ordered words preserved.
-- Chocolate real-timing replay restores its complete 11+5 display plan; the passing White House guard changes 0/217 frozen page/font signatures.
-- Page-Chinese v9 distinguishes HMM-only function-word joins from lexical word splits and source-owned wording plus one Chinese grammar marker from added meaning.
-- White House frozen-contract replay passes 42/42 multipage parents and 92/92 page-Chinese IDs with zero contract error.
-- Compatible dependency/participial evidence restores the numeric-range 7+10+7 plan; complete predicate evidence restores the expected `into ...` continuation without relaxing unrelated atomic issues.
-- Planner v31 invalidates older page blueprints. Article readability passes 106/106 and the full regression passes 30/30 in 1010.71s.
+- Content-bound full-translation cache identity can reuse 182/188 unchanged White House semantic groups while invalidating six changed groups.
+- Parent-level page-Chinese units rebind shifted IDs only after full current-contract validation.
+- New checkpoint snapshots exclude identity-mismatched copied semantic review queues.
+- The 14-ID page frontier has 11 frozen-parent solutions; S0123/S0132/S0192 require an upstream boundary change.
 
 ## Approved Decisions
-- A routine new-run audit checks one raw automatic result; regression claims require the same word ledger.
-- Identity, pagination, parent-boundary, page-Chinese, quantifier, and cross-stage compatibility fixes remain independently tested commits.
+- Test the joint planner offline before changing production segmentation.
+- Preserve exact word coverage, timestamps, frozen-contract policy, and passing non-target page signatures.
 
 ## Relevant Paths
-- Page translation: `app/core/subtitle_processor/stable_display_page_contract.py`
-- Request/retry owner: `app/core/subtitle_processor/screen_editor.py`
+- Existing frontier audit: `scripts/audit_article_page_candidate_frontier.py`
+- English boundary owner: `app/core/subtitle_processor/screen_editor.py`
 - Page planner: `app/core/utils/podcast_learning_video.py`
-- Audit: `docs/audits/2026-08-23/recent-actual-page-quality-audit.md`
+- Target report: `output/white-house-14-id-frontier-20260823-v2.json`
 
 ## Last Verification
-- `runtime\python.exe scripts\run_regression.py`: 30/30 PASS; focused planner-version guards: 7/7 PASS.
+- Affected pytest files: 705/705 PASS. Full regression: 30/30 PASS in 908.59s.
 
 ## Next Action
-Restart the application, run one fresh held-out audio through the GUI, and audit its actual bilingual display pages.
+Estimate and implement a read-only local joint-boundary/page-feasibility experiment.
 
 ## Do Not Regress
-- Do not mutate production artifacts or relax word coverage, timing, font, semantic ownership, or genuine lexical-word split checks.
+- Do not mutate production artifacts or relax word coverage, timing, font, semantic ownership, or lexical-word split checks.
 
 ## Unknowns
-- Held-out end-to-end GUI quality remains unverified.
+- Whether local boundary movement solves the three frozen-parent failures without regressing passing cues.

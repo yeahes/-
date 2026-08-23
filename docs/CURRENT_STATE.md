@@ -2,6 +2,30 @@
 
 Last updated: 2026-08-23
 
+## 2026-08-23 Content-Bound Translation Cache And Snapshot Isolation
+
+- Complete semantic-group translations now use a v2 content identity that
+  excludes sequence numbers, fixed subtitle IDs, and internal cue boundaries.
+  It retains every wording dependency: full English, current translation,
+  length budget, two neighboring groups on each side, article context, prompt,
+  model, and policy. Valid v1 unit entries remain compatible and migrate on
+  reuse.
+- Display-page Chinese now has an independently reusable parent-unit cache.
+  A semantically identical parent may move to another `Sxxxx` ID or absolute
+  word range without an API request; cached rows are rebound to current page
+  IDs and rerun through the full page, source-echo, semantic, and renderability
+  contracts. Changed parent Chinese, page English, durations, budgets, model,
+  prompt, or article context invalidates the entry.
+- A stable checkpoint snapshot no longer copies an identity-mismatched
+  `semantic-review-queue.json` into a new run. A valid current queue is kept,
+  while the historical source artifact is never modified.
+- The newest same-content White House comparison has 186/188 unchanged
+  complete-English semantic groups. The old run actually reused 95 groups;
+  the v2 identity can reuse 182/188 (`96.8%`) and correctly invalidates six.
+- The complete affected pytest files pass 705/705. The full offline regression
+  passes 30/30 in 908.59 seconds. Verification made no API request and did not
+  modify subtitles, audio, checkpoints, caches, or the untracked `output/`.
+
 ## 2026-08-23 Cross-Stage Page Evidence Compatibility
 
 - Formal English cutting and renderer-only pagination intentionally consume

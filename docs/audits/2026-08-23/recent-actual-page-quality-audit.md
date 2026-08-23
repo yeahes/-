@@ -245,6 +245,30 @@ be a hard renderability rule when the terminal page is a complete phrase, fits
 at 56px, has sufficient duration, preserves every word, and is objectively
 safer than the alternatives.
 
+## Targeted 14-ID Page-Frontier Follow-Up
+
+The follow-up report is
+`output/white-house-14-id-frontier-20260823-v2.json`. It uses the immutable
+checkpoint `20260823T063436.783343-e950e557` and word-ledger hash
+`07a8d2473d53bf5e34b0afbe987f5bbd8528d25015f6fd2f5cb777a469f90ec0`.
+This is a targeted page-candidate experiment, not an all-page automation score.
+
+- Eleven of the requested fourteen parents have at least one complete page
+  candidate inside their already frozen parent span.
+- `S0123`, `S0132`, and `S0192` have no complete normal-font partition under
+  the current parent boundary, timing, two-line, and syntax contracts.
+- Current production has clear page-boundary defects at `S0037`, `S0051`,
+  `S0072`, `S0081`, `S0083`, `S0107`, and `S0201`. `S0110` remains watchable
+  review evidence; `S0158`, `S0183`, and `S0206` are usable as displayed.
+- The experimental selector changed only `S0081`, replacing four balanced
+  pages with a three-page plan containing a 19-word page. Across the eleven
+  solvable parents, pages over 16 words increased from three to four, pages
+  below 56px from four to five, and high-pressure pages from thirteen to
+  fourteen. That selector is therefore not suitable for production.
+- The evidence separates two causes: some frozen parents have no legal page
+  solution, while other parents have legal candidates but weak ordering. A
+  single downstream threshold change cannot repair both classes.
+
 ## Cross-Case Conclusions
 
 - Dreamcore shows the basic architecture can produce good results: about
