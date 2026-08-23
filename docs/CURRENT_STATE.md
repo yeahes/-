@@ -19,6 +19,28 @@ Last updated: 2026-08-24
   `tests/test_manual_final_subtitle_editor.py` 130 passed. GUI interaction
   timing after restarting the working-copy editor remains to be checked.
 
+### Frozen page refresh and article analysis window isolation
+
+- The manual editor now reuses an `ERROR` display-page artifact whenever it
+  still contains frozen `render_plans`, including after a local page edit. It
+  no longer rebuilds every parent through Pillow just because the artifact
+  status is not `PASS`; a real 241-parent Japanese X-generation refresh fell
+  from about 5-8 seconds to about 50ms on the first refresh and about 10ms
+  after caching. Semantic errors remain visible and blocking.
+- Article analysis content is opened in its own non-modal `文章分析` dialog.
+  The task-creation page keeps only the compact header, so expanding article
+  analysis no longer changes the main window's layout or default size. The
+  dialog owns the larger text editor and switches, and closing it returns the
+  content to the panel without changing task state. Its custom background,
+  editor surface, text, and border colors follow qfluentwidgets' completed
+  theme-change signal, so switching between light and dark mode while the
+  dialog is open refreshes the dialog immediately.
+- Focused editor tests cover frozen-plan reuse and legacy error evidence. Qt
+  offscreen interaction could not be used in this environment because the
+  bundled Qt platform plugin does not initialize reliably; source syntax and
+  non-Qt behavior are verified. Article-context state and dark-theme style
+  tests pass 4/4.
+
 ## 2026-08-24 Vocabulary card left alignment
 
 - The article vocabulary card uses a `64px` left safe edge and a `40px` right

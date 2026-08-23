@@ -2203,7 +2203,7 @@ def test_stale_single_page_uses_current_parent_chinese_without_confirmation():
         assert single_page["display_page_chinese_confirmed"] is True
 
 
-def test_complete_manual_pages_replace_legacy_error_artifact_before_review():
+def test_complete_manual_pages_keep_legacy_error_artifact_without_replanning():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
         _write_display_page_preview_artifact(session)
@@ -2236,13 +2236,12 @@ def test_complete_manual_pages_replace_legacy_error_artifact_before_review():
             if row.get("manual_cue_id") == "S0002"
         )
 
-        assert effective["recovery_source"] == "complete_manual_page_edits"
-        assert "display_page_blueprint_invalid" not in single_page[
+        assert effective["status"] == "ERROR"
+        assert effective["render_plans"]
+        assert "display_page_blueprint_invalid" in single_page[
             "display_page_issue_codes"
         ]
-        assert single_page["display_page_review_required"] is False
-        assert single_page["display_page_chinese_confirmed"] is True
-        assert single_page["chinese_review_required"] is False
+        assert single_page["display_page_review_required"] is True
 
 
 def test_stale_page_chinese_remains_visible_but_cannot_publish_until_confirmed():
@@ -5257,6 +5256,41 @@ def test_error_page_artifact_keeps_valid_frozen_plan_for_unrelated_save():
             page["display_page_id"]
             for page in blueprint["render_plans"][0]["pages"]
         ] == ["S0001.P01", "S0001.P02"]
+
+
+def test_error_page_artifact_with_local_edits_does_not_replan_frozen_pages():
+    """Local editor refreshes must reuse an ERROR artifact's frozen plans."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        artifact_path = session.artifact_dir / "display-page-translations.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["status"] = "ERROR"
+        artifact["errors"] = [
+            {
+                "code": "display_page_semantic_validation_failed",
+                "parent_subtitle_id": "S0001",
+            }
+        ]
+        _write_json(artifact_path, artifact)
+
+        # Opening the page view establishes the local edit checkpoint. The
+        # next model refresh must consume the existing render plans directly.
+        rows = session.to_model_data()
+        session.display_page_edits = [
+            session._unchanged_display_page_edit_from_model_row(row)
+            for row in rows.values()
+            if row.get("display_page_id")
+        ]
+        with patch.object(
+            session,
+            "_recover_display_page_artifact_from_complete_edits",
+            side_effect=AssertionError("frozen plans must not be replanned"),
+        ):
+            effective = session._effective_display_page_artifact()
+
+        assert effective["status"] == "ERROR"
+        assert effective["render_plans"]
 
 
 def test_id_bound_page_cache_miss_returns_other_pages_for_precise_validation():

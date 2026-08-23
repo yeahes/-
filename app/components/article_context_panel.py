@@ -1,7 +1,14 @@
 from pathlib import Path
 
 from PyQt5.QtCore import QEvent, Qt
-from PyQt5.QtWidgets import QFrame, QHBoxLayout, QToolButton, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import (
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import (
     BodyLabel,
     InfoBar,
@@ -10,7 +17,7 @@ from qfluentwidgets import (
     SwitchButton,
     TextEdit,
 )
-from qfluentwidgets.common.config import isDarkTheme
+from qfluentwidgets.common.config import isDarkTheme, qconfig
 
 from app.common.config import cfg
 from app.core.article_context import (
@@ -32,9 +39,18 @@ class ArticleContextPanel(QFrame):
         self._applying_theme = False
         self._last_theme_is_dark = None
         self._content_expanded = False
+        self._content_dialog = None
 
         self.setObjectName("ArticleContextPanel")
         self._setup_ui()
+        # qfluentwidgets updates its registered styles from this signal. The
+        # dialog also owns custom colors, so refresh those after the global
+        # theme stylesheet has finished applying.
+        qconfig.themeChangedFinished.connect(self._on_theme_changed)
+        self._apply_theme()
+
+    def _on_theme_changed(self) -> None:
+        self._last_theme_is_dark = None
         self._apply_theme()
 
     def _apply_theme(self):
@@ -67,8 +83,51 @@ class ArticleContextPanel(QFrame):
                 self.status_label.setStyleSheet(f"color: {muted};")
             if hasattr(self, "summary_label"):
                 self.summary_label.setStyleSheet(f"color: {muted};")
+            self._apply_content_dialog_theme(
+                dark=is_dark,
+                text=("#F3F3F3" if is_dark else "#202020"),
+                muted=muted,
+            )
         finally:
             self._applying_theme = False
+
+    def _apply_content_dialog_theme(
+        self,
+        *,
+        dark: bool | None = None,
+        text: str | None = None,
+        muted: str | None = None,
+    ) -> None:
+        dialog = self._content_dialog
+        if dialog is None:
+            return
+        is_dark = isDarkTheme() if dark is None else bool(dark)
+        foreground = text or ("#F3F3F3" if is_dark else "#202020")
+        secondary = muted or (
+            "rgba(255, 255, 255, 0.62)" if is_dark else "#666666"
+        )
+        background = "#202020" if is_dark else "#FFFFFF"
+        editor_background = "#292929" if is_dark else "#FFFFFF"
+        border = "rgba(255, 255, 255, 0.14)" if is_dark else "rgba(0, 0, 0, 0.12)"
+        dialog.setStyleSheet(
+            f"""
+            QDialog#ArticleContextDialog {{
+                background-color: {background};
+                color: {foreground};
+            }}
+            QDialog#ArticleContextDialog QLabel {{
+                color: {foreground};
+            }}
+            QDialog#ArticleContextDialog QTextEdit {{
+                background-color: {editor_background};
+                color: {foreground};
+                border: 1px solid {border};
+            }}
+            QDialog#ArticleContextDialog QLabel#ArticleContextStatus {{
+                color: {secondary};
+            }}
+            """
+        )
 
     def changeEvent(self, event):
         if event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange):
@@ -133,8 +192,6 @@ class ArticleContextPanel(QFrame):
 
         self.status_label = BodyLabel(self.tr("未分析"), self)
         content_layout.addWidget(self.status_label)
-        layout.addWidget(self.content_widget)
-
         self.analyze_button.clicked.connect(self.analyze_article)
         self.clear_button.clicked.connect(self.clear_article)
         self._set_content_expanded(False)
@@ -143,16 +200,68 @@ class ArticleContextPanel(QFrame):
         self._set_content_expanded(not self._content_expanded)
 
     def _set_content_expanded(self, expanded: bool) -> None:
-        self._content_expanded = bool(expanded)
-        self.content_widget.setVisible(self._content_expanded)
+        expanded = bool(expanded)
+        if expanded:
+            self._open_content_dialog()
+            return
+        self._close_content_dialog()
+
+    def _open_content_dialog(self) -> None:
+        if self._content_dialog is not None:
+            self._content_dialog.show()
+            self._content_dialog.raise_()
+            self._content_dialog.activateWindow()
+            self._content_expanded = True
+            return
+
+        dialog = QDialog(self.window())
+        dialog.setObjectName("ArticleContextDialog")
+        dialog.setWindowTitle(self.tr("文章分析"))
+        dialog.setModal(False)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, False)
+        dialog.setMinimumSize(560, 360)
+        dialog.resize(680, 470)
+        dialog_layout = QVBoxLayout(dialog)
+        dialog_layout.setContentsMargins(16, 16, 16, 16)
+        dialog_layout.addWidget(self.content_widget)
+        self.content_widget.show()
+
+        dialog.finished.connect(self._on_content_dialog_finished)
+        self._content_dialog = dialog
+        self._apply_content_dialog_theme()
+        self._content_expanded = True
         self.expand_button.setArrowType(
-            Qt.DownArrow if self._content_expanded else Qt.RightArrow
+            Qt.DownArrow
         )
-        self.expand_button.setToolTip(
-            self.tr("收起参考原文设置")
-            if self._content_expanded
-            else self.tr("展开参考原文设置")
-        )
+        self.expand_button.setToolTip(self.tr("关闭文章分析窗口"))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _close_content_dialog(self) -> None:
+        dialog = self._content_dialog
+        if dialog is None:
+            self._content_expanded = False
+            self.expand_button.setArrowType(Qt.RightArrow)
+            self.expand_button.setToolTip(self.tr("展开参考原文设置"))
+            self.content_widget.hide()
+            return
+        dialog.close()
+
+    def _on_content_dialog_finished(self, _result: int) -> None:
+        dialog = self._content_dialog
+        if dialog is None:
+            return
+        dialog_layout = dialog.layout()
+        if dialog_layout is not None:
+            dialog_layout.removeWidget(self.content_widget)
+        self.content_widget.setParent(self)
+        self.content_widget.hide()
+        self._content_dialog = None
+        self._content_expanded = False
+        self.expand_button.setArrowType(Qt.RightArrow)
+        self.expand_button.setToolTip(self.tr("展开参考原文设置"))
+        dialog.deleteLater()
 
     def get_state(self):
         current_text = self.text_edit.toPlainText().strip()

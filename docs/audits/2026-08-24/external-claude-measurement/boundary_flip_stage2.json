@@ -1,0 +1,1012 @@
+{
+ "stage_a2_falsification": {
+  "production_accepted_boundaries_checked": 5180,
+  "now_judged_illegal_by_harness": 516,
+  "illegal_pct": 9.96,
+  "illegal_code_histogram": [
+   [
+    "open_subordinate_prefix_fragment",
+    110
+   ],
+   [
+    "dependency_phrase_entrance_split",
+    64
+   ],
+   [
+    "right_orphaned_finite_predicate",
+    64
+   ],
+   [
+    "predicate_attached_continuation_split",
+    62
+   ],
+   [
+    "coordinated_constituent_split",
+    52
+   ],
+   [
+    "short_open_prefix_fragment",
+    47
+   ],
+   [
+    "relative_clause_entrance_split",
+    40
+   ],
+   [
+    "weak_subject_fragment",
+    37
+   ],
+   [
+    "dependent_clause_entrance_split",
+    32
+   ],
+   [
+    "incomplete_short_fragment",
+    23
+   ],
+   [
+    "post_noun_participial_modifier_split",
+    14
+   ],
+   [
+    "subject_finite_verb_split",
+    12
+   ],
+   [
+    "incomplete_interrogative_fragment",
+    10
+   ],
+   [
+    "unfinished_wh_complement_fragment",
+    10
+   ],
+   [
+    "object_attached_modifier_split",
+    10
+   ],
+   [
+    "short_verb_complement_split",
+    6
+   ],
+   [
+    "trailing_modifier_fragment",
+    5
+   ],
+   [
+    "clause_scope_modifier_split",
+    4
+   ],
+   [
+    "trailing_auxiliary_fragment",
+    4
+   ],
+   [
+    "verb_particle_preposition_chain_split",
+    4
+   ]
+  ],
+  "of_which_our_two_target_predicates": {
+   "dependent_clause_entrance_split": 32,
+   "relative_clause_entrance_split": 40
+  },
+  "per_episode": {
+   "AI竞赛：中美殊途": {
+    "accepted_boundaries": 225,
+    "now_illegal": 20
+   },
+   "中国AI为何更省钱？": {
+    "accepted_boundaries": 187,
+    "now_illegal": 19
+   },
+   "中国人会爱上巧克力吗？": {
+    "accepted_boundaries": 216,
+    "now_illegal": 9
+   },
+   "中国会有爱上巧克力的一天吗？": {
+    "accepted_boundaries": 216,
+    "now_illegal": 9
+   },
+   "中国已成为世界石油强国": {
+    "accepted_boundaries": 169,
+    "now_illegal": 23
+   },
+   "中国年轻人为何不爱留学了？": {
+    "accepted_boundaries": 259,
+    "now_illegal": 25
+   },
+   "中式梦核：千禧一代的怀旧密码": {
+    "accepted_boundaries": 201,
+    "now_illegal": 13
+   },
+   "创业者的天堂": {
+    "accepted_boundaries": 337,
+    "now_illegal": 59
+   },
+   "好莱坞最新热潮：姐弟恋": {
+    "accepted_boundaries": 264,
+    "now_illegal": 14
+   },
+   "如何停止拖延": {
+    "accepted_boundaries": 286,
+    "now_illegal": 34
+   },
+   "如何识别人工智能写作": {
+    "accepted_boundaries": 285,
+    "now_illegal": 57
+   },
+   "心理治疗，中国社会的奢侈品": {
+    "accepted_boundaries": 194,
+    "now_illegal": 24
+   },
+   "无论怎么衡量，就业市场都很疲软": {
+    "accepted_boundaries": 259,
+    "now_illegal": 19
+   },
+   "日本X世代的困境：被反复诅咒的一代人": {
+    "accepted_boundaries": 240,
+    "now_illegal": 6
+   },
+   "烂到爆红：一部动画的逆袭": {
+    "accepted_boundaries": 184,
+    "now_illegal": 17
+   },
+   "牛来": {
+    "accepted_boundaries": 223,
+    "now_illegal": 23
+   },
+   "白宫对中国转运骗局的荒谬指控": {
+    "accepted_boundaries": 216,
+    "now_illegal": 7
+   },
+   "石油市场，现在中国说了算？": {
+    "accepted_boundaries": 139,
+    "now_illegal": 10
+   },
+   "美国已成为创业者的天堂": {
+    "accepted_boundaries": 321,
+    "now_illegal": 54
+   },
+   "肠道菌群，能人为操控吗？": {
+    "accepted_boundaries": 216,
+    "now_illegal": 17
+   },
+   "英伟达的硅基大决战": {
+    "accepted_boundaries": 253,
+    "now_illegal": 25
+   },
+   "蜜雪冰城为何卖起了啤酒": {
+    "accepted_boundaries": 212,
+    "now_illegal": 20
+   },
+   "识别": {
+    "accepted_boundaries": 78,
+    "now_illegal": 12
+   }
+  },
+  "examples": [
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0007",
+     "S0008"
+    ],
+    "hard": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "Yeah. Let's unpack that divergence",
+    "right_head": "because the US and China are playing",
+    "pause_ms": 200
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0018",
+     "S0019"
+    ],
+    "hard": [
+     "coordinated_constituent_split"
+    ],
+    "left_tail": "It's really about how distinct market environments",
+    "right_head": "and, you know, regulatory frameworks allow these",
+    "pause_ms": 260
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0060",
+     "S0061"
+    ],
+    "hard": [
+     "coordinated_constituent_split"
+    ],
+    "left_tail": "But they are making undeniable, steady progress,",
+    "right_head": "reaching a level of miniaturization that many",
+    "pause_ms": 80
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0070",
+     "S0071"
+    ],
+    "hard": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left_tail": "access to the underlying architecture, the weights,",
+    "right_head": "they can custom-tailor the model to distribute",
+    "pause_ms": 420
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0080",
+     "S0081"
+    ],
+    "hard": [
+     "short_open_prefix_fragment"
+    ],
+    "left_tail": "But through incredible routing software,",
+    "right_head": "all the cargo is arriving at the",
+    "pause_ms": 100
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0083",
+     "S0084"
+    ],
+    "hard": [
+     "short_open_prefix_fragment"
+    ],
+    "left_tail": "Yeah. The raw, headline-grabbing metric,",
+    "right_head": "you know, how many cutting-edge chips you",
+    "pause_ms": 20
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0112",
+     "S0113"
+    ],
+    "hard": [
+     "predicate_attached_continuation_split"
+    ],
+    "left_tail": "And Chinese policymakers are treating AI diffusion",
+    "right_head": "almost identically to how societies treated the",
+    "pause_ms": 120
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0123",
+     "S0124"
+    ],
+    "hard": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left_tail": "Because instead of hiring traditional film crews,",
+    "right_head": "production companies started heavily utilizing AI to",
+    "pause_ms": 441
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0124",
+     "S0125"
+    ],
+    "hard": [
+     "coordinated_constituent_split"
+    ],
+    "left_tail": "AI to generate backgrounds, write shooting scripts,",
+    "right_head": "and synthesize voice acting instantly.",
+    "pause_ms": 360
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0138",
+     "S0139"
+    ],
+    "hard": [
+     "coordinated_constituent_split"
+    ],
+    "left_tail": "a massive existential threat to that stability,",
+    "right_head": "and it is the paradox keeping policymakers",
+    "pause_ms": 241
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0146",
+     "S0147"
+    ],
+    "hard": [
+     "dependency_phrase_entrance_split"
+    ],
+    "left_tail": "In June, guidelines were released",
+    "right_head": "forcefully encouraging local regions and enterprises to",
+    "pause_ms": 200
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0158",
+     "S0159"
+    ],
+    "hard": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "up boxes, sorting objects, and stacking pallets,",
+    "right_head": "while a machine records and maps their",
+    "pause_ms": 500
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0162",
+     "S0163"
+    ],
+    "hard": [
+     "predicate_attached_continuation_split"
+    ],
+    "left_tail": "You are literally paying a worker",
+    "right_head": "today to teach a machine how to",
+    "pause_ms": 40
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0169",
+     "S0170"
+    ],
+    "hard": [
+     "predicate_attached_continuation_split"
+    ],
+    "left_tail": "humanoid robots and optimize that transport labor",
+    "right_head": "immediately to capture the profit margins.",
+    "pause_ms": 60
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0178",
+     "S0179"
+    ],
+    "hard": [
+     "dependency_phrase_entrance_split"
+    ],
+    "left_tail": "China faces an immense task",
+    "right_head": "just trying to match its massive number",
+    "pause_ms": 60
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0185",
+     "S0186"
+    ],
+    "hard": [
+     "coordinated_constituent_split"
+    ],
+    "left_tail": "massive productivity gains generated by the robots,",
+    "right_head": "and you use that revenue to support",
+    "pause_ms": 420
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0198",
+     "S0199"
+    ],
+    "hard": [
+     "weak_subject_fragment"
+    ],
+    "left_tail": "I see.",
+    "right_head": "The entire approach is engineered to balance",
+    "pause_ms": 160
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0205",
+     "S0206"
+    ],
+    "hard": [
+     "open_subordinate_prefix_fragment",
+     "short_open_prefix_fragment"
+    ],
+    "left_tail": "If the disruption gets too severe,",
+    "right_head": "they step in immediately to establish new",
+    "pause_ms": 60
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0220",
+     "S0221"
+    ],
+    "hard": [
+     "predicate_attached_continuation_split"
+    ],
+    "left_tail": "integration is actually happening on the ground,",
+    "right_head": "with warehouse workers physically demonstrating tasks to",
+    "pause_ms": 400
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "ids": [
+     "S0225",
+     "S0226"
+    ],
+    "hard": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left_tail": "is no longer to do the work,",
+    "right_head": "but simply to serve as the training",
+    "pause_ms": 381
+   }
+  ]
+ },
+ "stage_c_opened_analysis": {
+  "opened_cut_points": 98,
+  "distinct_parents_affected": 97,
+  "distinct_long_parents_affected_ge17w": 17,
+  "by_parent_word_bucket": {
+   "13-16": 43,
+   ">=20": 10,
+   "<=12": 38,
+   "17-19": 7
+  },
+  "evidence_breakdown": {
+   "dependent__left_no_finite_predicate": 32,
+   "pause_lt_450": 79,
+   "relative__left_ends_comma": 20,
+   "pause_ge_450": 19,
+   "relative__no_comma": 21,
+   "dependent__left_has_finite_predicate": 25
+  },
+  "hits_on_the_three_unpageable": [],
+  "samples": [
+   {
+    "subtitle_id": "S0006",
+    "parent_words": 16,
+    "gap": [
+     82,
+     83
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "And well, what it means",
+    "right_head": "when these high level models break",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 20,
+    "left_words": 5,
+    "episode": "AI竞赛：中美殊途"
+   },
+   {
+    "subtitle_id": "S0106",
+    "parent_words": 32,
+    "gap": [
+     1139,
+     1140
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "its economy away from basic manufacturing,",
+    "right_head": "that historical overinvestment in heavy power",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": false,
+    "pause_ms": 600,
+    "left_words": 11,
+    "episode": "AI竞赛：中美殊途"
+   },
+   {
+    "subtitle_id": "S0012",
+    "parent_words": 12,
+    "gap": [
+     174,
+     175
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "Let's track that panic",
+    "right_head": "because the numbers are almost hard",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 20,
+    "left_words": 4,
+    "episode": "中国AI为何更省钱？"
+   },
+   {
+    "subtitle_id": "S0044",
+    "parent_words": 12,
+    "gap": [
+     500,
+     501
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "And that fear gets magnified tenfold",
+    "right_head": "when investors look across the globe.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 80,
+    "left_words": 6,
+    "episode": "中国AI为何更省钱？"
+   },
+   {
+    "subtitle_id": "S0047",
+    "parent_words": 11,
+    "gap": [
+     541,
+     542
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "Right. Which brings us to what",
+    "right_head": "that software actually looks like.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 40,
+    "left_words": 6,
+    "episode": "中国AI为何更省钱？"
+   },
+   {
+    "subtitle_id": "S0103",
+    "parent_words": 15,
+    "gap": [
+     1064,
+     1065
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "The quality is globally recognized,",
+    "right_head": "which proves this domestic wave is",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": true,
+    "pause_ms": 80,
+    "left_words": 5,
+    "episode": "中国人会爱上巧克力吗？"
+   },
+   {
+    "subtitle_id": "S0153",
+    "parent_words": 10,
+    "gap": [
+     1586,
+     1587
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "they're going to buy the mine",
+    "right_head": "that extracts the solicon.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 620,
+    "left_words": 6,
+    "episode": "中国人会爱上巧克力吗？"
+   },
+   {
+    "subtitle_id": "S0169",
+    "parent_words": 17,
+    "gap": [
+     1733,
+     1734
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "their chocolate with uniquely Chinese flavors",
+    "right_head": "that the mass-market foreign brands just",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 100,
+    "left_words": 9,
+    "episode": "中国人会爱上巧克力吗？"
+   },
+   {
+    "subtitle_id": "S0181",
+    "parent_words": 13,
+    "gap": [
+     1865,
+     1866
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "if people are watching their wallets,",
+    "right_head": "that just doesn't seem like enough.",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": true,
+    "pause_ms": 200,
+    "left_words": 7,
+    "episode": "中国人会爱上巧克力吗？"
+   },
+   {
+    "subtitle_id": "S0211",
+    "parent_words": 22,
+    "gap": [
+     2152,
+     2153
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "a nation of 1.4 billion people",
+    "right_head": "who historically ate only 1% of",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 541,
+    "left_words": 10,
+    "episode": "中国人会爱上巧克力吗？"
+   },
+   {
+    "subtitle_id": "S0103",
+    "parent_words": 15,
+    "gap": [
+     1064,
+     1065
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "The quality is globally recognized,",
+    "right_head": "which proves this domestic wave is",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": true,
+    "pause_ms": 80,
+    "left_words": 5,
+    "episode": "中国会有爱上巧克力的一天吗？"
+   },
+   {
+    "subtitle_id": "S0153",
+    "parent_words": 10,
+    "gap": [
+     1586,
+     1587
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "they're going to buy the mine",
+    "right_head": "that extracts the solicon.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 620,
+    "left_words": 6,
+    "episode": "中国会有爱上巧克力的一天吗？"
+   },
+   {
+    "subtitle_id": "S0169",
+    "parent_words": 17,
+    "gap": [
+     1733,
+     1734
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "their chocolate with uniquely Chinese flavors",
+    "right_head": "that the mass-market foreign brands just",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 100,
+    "left_words": 9,
+    "episode": "中国会有爱上巧克力的一天吗？"
+   },
+   {
+    "subtitle_id": "S0181",
+    "parent_words": 13,
+    "gap": [
+     1865,
+     1866
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "if people are watching their wallets,",
+    "right_head": "that just doesn't seem like enough.",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": true,
+    "pause_ms": 200,
+    "left_words": 7,
+    "episode": "中国会有爱上巧克力的一天吗？"
+   },
+   {
+    "subtitle_id": "S0211",
+    "parent_words": 22,
+    "gap": [
+     2152,
+     2153
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "a nation of 1.4 billion people",
+    "right_head": "who historically ate only 1% of",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 541,
+    "left_words": 10,
+    "episode": "中国会有爱上巧克力的一天吗？"
+   },
+   {
+    "subtitle_id": "S0032",
+    "parent_words": 15,
+    "gap": [
+     356,
+     357
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "entire country to stop buying fuel",
+    "right_head": "because prices are too high.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 20,
+    "left_words": 10,
+    "episode": "中国已成为世界石油强国"
+   },
+   {
+    "subtitle_id": "S0001",
+    "parent_words": 41,
+    "gap": [
+     22,
+     23
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "about 12 800 yuan a month,",
+    "right_head": "which is only marginally higher than",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": true,
+    "pause_ms": 780,
+    "left_words": 23,
+    "episode": "中国年轻人为何不爱留学了？"
+   },
+   {
+    "subtitle_id": "S0043",
+    "parent_words": 15,
+    "gap": [
+     442,
+     443
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "from a Chinese television show recently",
+    "right_head": "that captures this perfectly.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 20,
+    "left_words": 11,
+    "episode": "中国年轻人为何不爱留学了？"
+   },
+   {
+    "subtitle_id": "S0050",
+    "parent_words": 5,
+    "gap": [
+     517,
+     518
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "But it makes sense",
+    "right_head": "because",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 40,
+    "left_words": 4,
+    "episode": "中国年轻人为何不爱留学了？"
+   },
+   {
+    "subtitle_id": "S0055",
+    "parent_words": 11,
+    "gap": [
+     580,
+     581
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "just to make ends meet",
+    "right_head": "while they look for professional work.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 420,
+    "left_words": 5,
+    "episode": "中国年轻人为何不爱留学了？"
+   },
+   {
+    "subtitle_id": "S0164",
+    "parent_words": 16,
+    "gap": [
+     1688,
+     1689
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "number had plummeted to 570 000",
+    "right_head": "Which is the lowest level since",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 569,
+    "left_words": 9,
+    "episode": "中国年轻人为何不爱留学了？"
+   },
+   {
+    "subtitle_id": "S0215",
+    "parent_words": 15,
+    "gap": [
+     2281,
+     2282
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "What happens to Western higher education",
+    "right_head": "when their most lucrative customer base",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 240,
+    "left_words": 6,
+    "episode": "中国年轻人为何不爱留学了？"
+   },
+   {
+    "subtitle_id": "S0236",
+    "parent_words": 16,
+    "gap": [
+     2540,
+     2541
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "The money flowed so reliably",
+    "right_head": "that it masked the underlying structural",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 40,
+    "left_words": 5,
+    "episode": "中国年轻人为何不爱留学了？"
+   },
+   {
+    "subtitle_id": "S0047",
+    "parent_words": 14,
+    "gap": [
+     509,
+     510
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "Wow. But dream core stands out",
+    "right_head": "because it intentionally strips away the",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 0,
+    "left_words": 6,
+    "episode": "中式梦核：千禧一代的怀旧密码"
+   },
+   {
+    "subtitle_id": "S0053",
+    "parent_words": 12,
+    "gap": [
+     561,
+     562
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "how did that translate",
+    "right_head": "when it crossed over into China",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 0,
+    "left_words": 4,
+    "episode": "中式梦核：千禧一代的怀旧密码"
+   },
+   {
+    "subtitle_id": "S0094",
+    "parent_words": 11,
+    "gap": [
+     1045,
+     1046
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "We hear it a lot",
+    "right_head": "when talking about modern Chinese society,",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 0,
+    "left_words": 5,
+    "episode": "中式梦核：千禧一代的怀旧密码"
+   },
+   {
+    "subtitle_id": "S0185",
+    "parent_words": 12,
+    "gap": [
+     2004,
+     2005
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "They can't go home again",
+    "right_head": "because home physically does not exist",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": true,
+    "pause_ms": 0,
+    "left_words": 5,
+    "episode": "中式梦核：千禧一代的怀旧密码"
+   },
+   {
+    "subtitle_id": "S0023",
+    "parent_words": 14,
+    "gap": [
+     235,
+     236
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "course of the 20 th century,",
+    "right_head": "that number just steadily plummeted.",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": false,
+    "pause_ms": 500,
+    "left_words": 9,
+    "episode": "创业者的天堂"
+   },
+   {
+    "subtitle_id": "S0085",
+    "parent_words": 8,
+    "gap": [
+     876,
+     877
+    ],
+    "issues": [
+     "dependent_clause_entrance_split"
+    ],
+    "left_tail": "See, the market voted",
+    "right_head": "when given the chance.",
+    "left_ends_comma": false,
+    "left_has_finite_predicate": false,
+    "pause_ms": 40,
+    "left_words": 4,
+    "episode": "好莱坞最新热潮：姐弟恋"
+   },
+   {
+    "subtitle_id": "S0143",
+    "parent_words": 25,
+    "gap": [
+     1506,
+     1507
+    ],
+    "issues": [
+     "relative_clause_entrance_split"
+    ],
+    "left_tail": "job who has zero social capital,",
+    "right_head": "that power struggle completely vanishes.",
+    "left_ends_comma": true,
+    "left_has_finite_predicate": true,
+    "pause_ms": 781,
+    "left_words": 20,
+    "episode": "好莱坞最新热潮：姐弟恋"
+   }
+  ]
+ }
+}

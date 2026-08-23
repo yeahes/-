@@ -1,0 +1,421 @@
+{
+ "cues_checked": 5219,
+ "helper_yes__spacy_yes": 2509,
+ "helper_no__spacy_no": 869,
+ "helper_NO_but_spacy_YES__over_strict": 1827,
+ "over_strict_pct_of_all_cues": 35.01,
+ "over_strict_pct_of_cues_spacy_calls_finite": 42.14,
+ "helper_YES_but_spacy_NO": 14,
+ "missed_verbs_top40": [
+  [
+   "be/VBZ",
+   230
+  ],
+  [
+   "be/VBP",
+   98
+  ],
+  [
+   "know/VBP",
+   44
+  ],
+  [
+   "mean/VBP",
+   42
+  ],
+  [
+   "make/VBZ",
+   34
+  ],
+  [
+   "see/VBP",
+   29
+  ],
+  [
+   "look/VBP",
+   22
+  ],
+  [
+   "get/VBP",
+   18
+  ],
+  [
+   "bring/VBZ",
+   17
+  ],
+  [
+   "can/MD",
+   17
+  ],
+  [
+   "use/VBP",
+   15
+  ],
+  [
+   "want/VBP",
+   14
+  ],
+  [
+   "have/VBP",
+   14
+  ],
+  [
+   "hit/VBD",
+   13
+  ],
+  [
+   "feel/VBZ",
+   13
+  ],
+  [
+   "require/VBZ",
+   12
+  ],
+  [
+   "use/VBD",
+   12
+  ],
+  [
+   "happen/VBZ",
+   12
+  ],
+  [
+   "point/VBZ",
+   12
+  ],
+  [
+   "leave/VBZ",
+   11
+  ],
+  [
+   "take/VBD",
+   10
+  ],
+  [
+   "become/VBZ",
+   10
+  ],
+  [
+   "find/VBD",
+   10
+  ],
+  [
+   "use/VBZ",
+   9
+  ],
+  [
+   "get/VBZ",
+   9
+  ],
+  [
+   "force/VBZ",
+   9
+  ],
+  [
+   "make/VBD",
+   9
+  ],
+  [
+   "love/VBP",
+   9
+  ],
+  [
+   "mean/VBZ",
+   8
+  ],
+  [
+   "sound/VBZ",
+   8
+  ],
+  [
+   "come/VBZ",
+   8
+  ],
+  [
+   "see/VBD",
+   8
+  ],
+  [
+   "go/VBD",
+   8
+  ],
+  [
+   "go/VBZ",
+   8
+  ],
+  [
+   "create/VBZ",
+   8
+  ],
+  [
+   "take/VBZ",
+   7
+  ],
+  [
+   "think/VBP",
+   7
+  ],
+  [
+   "launch/VBD",
+   6
+  ],
+  [
+   "spend/VBP",
+   6
+  ],
+  [
+   "cost/VBZ",
+   6
+  ]
+ ],
+ "distinct_missed_verb_lemmas": 649,
+ "over_strict_samples": [
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0004",
+   "words": 6,
+   "text": "cheap, you know, perpetually lagging software.",
+   "spacy_verb": "know(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0006",
+   "words": 16,
+   "text": "And well, what it means when these high level models break loose from their test beds.",
+   "spacy_verb": "means(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0011",
+   "words": 16,
+   "text": "They're optimizing the trade-offs between the cost of running the model and its pure benchmark intelligence.",
+   "spacy_verb": "'re(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0014",
+   "words": 13,
+   "text": "Right. So we're essentially watching a collision of two completely different developmental ecosystems.",
+   "spacy_verb": "'re(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0018",
+   "words": 7,
+   "text": "It's really about how distinct market environments",
+   "spacy_verb": "'s(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0019",
+   "words": 14,
+   "text": "and, you know, regulatory frameworks allow these tools to actually operate in the wild.",
+   "spacy_verb": "know(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0020",
+   "words": 8,
+   "text": "But before we get into the broader economy,",
+   "spacy_verb": "get(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0021",
+   "words": 9,
+   "text": "I'm just stuck on the physical reality of this.",
+   "spacy_verb": "'m(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0023",
+   "words": 13,
+   "text": "when China builds only a fraction of the data-centre capacity of the US?",
+   "spacy_verb": "builds(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0024",
+   "words": 13,
+   "text": "And I mean, they're essentially cut off from the world's most advanced microships.",
+   "spacy_verb": "mean(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0026",
+   "words": 5,
+   "text": "There's no getting around that.",
+   "spacy_verb": "'s(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0028",
+   "words": 11,
+   "text": "When they hit a wall domestically, they just route around it.",
+   "spacy_verb": "hit(VBD)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0031",
+   "words": 13,
+   "text": "So leveraging international data centers to they're basically supplement their domestic computational grid.",
+   "spacy_verb": "'re(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0032",
+   "words": 9,
+   "text": "Okay. So they're securing advanced hardware through global channels.",
+   "spacy_verb": "'re(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0033",
+   "words": 9,
+   "text": "But they're also building their own hardware internally, right?",
+   "spacy_verb": "'re(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0036",
+   "words": 7,
+   "text": "I'm confused about the manufacturing here, though.",
+   "spacy_verb": "'m(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0037",
+   "words": 11,
+   "text": "Global restrictions block them from acquiring extreme ultraviolet or UV machines.",
+   "spacy_verb": "block(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0043",
+   "words": 17,
+   "text": "Well, EUV uses this incredibly fine wavelength of light to draw tiny molecular level circuits on silicon.",
+   "spacy_verb": "uses(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0045",
+   "words": 14,
+   "text": "They're stuck with DUV, which uses a much thicker beam of light. Oh, right.",
+   "spacy_verb": "'re(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0046",
+   "words": 15,
+   "text": "So it's like trying to draw a highly detailed architectural blueprint using a thick Sharpie.",
+   "spacy_verb": "'s(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0047",
+   "words": 8,
+   "text": "Exactly. That's a great way to put it.",
+   "spacy_verb": "'s(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0051",
+   "words": 16,
+   "text": "they take that thick Sharpie and carefully trace the lines four, five, or six times over.",
+   "spacy_verb": "take(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0052",
+   "words": 8,
+   "text": "They slightly shift the angle of the silicon",
+   "spacy_verb": "shift(VBP)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0054",
+   "words": 11,
+   "text": "Wow. That sounds incredibly tedious and, frankly, highly prone to error.",
+   "spacy_verb": "sounds(VBZ)"
+  },
+  {
+   "episode": "AI竞赛：中美殊途",
+   "id": "S0055",
+   "words": 6,
+   "text": "You're talking about microscopic alignments here.",
+   "spacy_verb": "'re(VBP)"
+  }
+ ],
+ "helper_yes_spacy_no_samples": [
+  {
+   "episode": "中国AI为何更省钱？",
+   "id": "S0188",
+   "text": "being built in America right now?"
+  },
+  {
+   "episode": "中国年轻人为何不爱留学了？",
+   "id": "S0034",
+   "text": "a Western education transitioned from being an exclusive signal of elite talent to just, well, a mass market p"
+  },
+  {
+   "episode": "中国年轻人为何不爱留学了？",
+   "id": "S0058",
+   "text": "only to be forced to use it for DoorDash,"
+  },
+  {
+   "episode": "中式梦核：千禧一代的怀旧密码",
+   "id": "S0020",
+   "text": "Yeah. Yeah. So back in May 2019, on a 4 chan thread dedicated to the paranormal..."
+  },
+  {
+   "episode": "好莱坞最新热潮：姐弟恋",
+   "id": "S0033",
+   "text": "beyond being, like, a dangerous sexual object."
+  },
+  {
+   "episode": "如何停止拖延",
+   "id": "S0096",
+   "text": "Right. Have human beings always been this bad at doing things?"
+  },
+  {
+   "episode": "心理治疗，中国社会的奢侈品",
+   "id": "S0195",
+   "text": "as a math tutor be the ultimate way to eradicate stigma worldwide?"
+  },
+  {
+   "episode": "日本X世代的困境：被反复诅咒的一代人",
+   "id": "S0053",
+   "text": "From being wined and dined to fighting just to get an interview."
+  },
+  {
+   "episode": "白宫对中国转运骗局的荒谬指控",
+   "id": "S0019",
+   "text": "So let me be perfectly clear right up front."
+  },
+  {
+   "episode": "美国已成为创业者的天堂",
+   "id": "S0047",
+   "text": "over the desire to be the boss."
+  },
+  {
+   "episode": "美国已成为创业者的天堂",
+   "id": "S0211",
+   "text": "Right. In business, that spark used to be tens of thousands of dollars in legal fees,"
+  },
+  {
+   "episode": "美国已成为创业者的天堂",
+   "id": "S0221",
+   "text": "on their own to finally do it without needing a team of developers, copywriters, or paralegals."
+  },
+  {
+   "episode": "英伟达的硅基大决战",
+   "id": "S0019",
+   "text": "And the rules of that game just completely changed."
+  },
+  {
+   "episode": "英伟达的硅基大决战",
+   "id": "S0061",
+   "text": "well, you sort of stop being a software company."
+  }
+ ]
+}

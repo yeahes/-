@@ -1,14 +1,15 @@
 # Project State
 Status: active
-Last verified: 2026-08-24 04:08:06 Asia/Shanghai
+Last verified: 2026-08-24 05:40:47 Asia/Shanghai
 Branch: main
-Verified HEAD: 946585c
-Working tree: clean for tracked project files; unrelated generated `output/`
+Verified HEAD: db46f68
+Working tree: tracked changes for frozen-page refresh reuse and article-analysis
+dialog isolation; unrelated generated `output/`
   directories remain untracked and preserved
 
 ## Current Goal
-Prevent manual-final saves after timeline deletion from discarding valid frozen
-display pages or expanding one page error into a whole-episode pending queue.
+Keep manual editor local actions interactive and prevent article analysis from
+resizing the main task window.
 
 ## Confirmed Facts
 - Fixed-parent bilingual A/B changes four newest White House parents; three clear improvements and one REVIEW improvement pass page-Chinese contracts.
@@ -20,6 +21,12 @@ display pages or expanding one page error into a whole-episode pending queue.
   source-to-presentation time map; source authority remains immutable.
 - An `ERROR` display-page artifact with render plans remains a usable frozen
   geometry checkpoint; semantic errors still block publication.
+- Local editor refreshes reuse those frozen plans instead of invoking a full
+  Pillow page replan after every page edit, boundary move, merge, or confirm.
+- Article analysis is hosted in an independent non-modal dialog; the task page
+  remains at the compact default layout while the dialog is open.
+- Article dialog custom colors refresh from qfluentwidgets' completed theme
+  signal, including when the theme changes while the dialog is open.
 - ID-bound page translation reuse preserves valid sibling pages and leaves
   exact missing/blank pages for formal contract validation.
 - Source-scoped page errors remain blocking for their recorded parent/page;
@@ -42,8 +49,12 @@ display pages or expanding one page error into a whole-episode pending queue.
 - Commits: production selector `bb9d98d`; consolidated recovery `815c497`.
 
 ## Last Verification
-- `runtime\\python.exe -m pytest tests/test_manual_final_subtitle_editor.py -q`:
-  130 passed.
+- Frozen-plan focused tests: 3 passed.
+- Article-context state and dark-theme style tests: 4 passed.
+- Full offline regression: 29/30 checks passed; the existing article display
+  readability contract still fails at `test_three_line_fallback_promotes_complete_two_page_alternative`.
+- Real Japanese X-generation model refresh: about 0.05s first refresh and
+  about 0.01s subsequent refreshes after local page edits.
 - `runtime\\python.exe -m pytest tests/test_stable_publication.py -q`: 96
   passed after isolating internal Qt model publication from user edits.
 - Read-only original Japanese X-generation checkpoint replay keeps 241 frozen
@@ -52,14 +63,14 @@ display pages or expanding one page error into a whole-episode pending queue.
   the unrelated existing article-display readability assertion.
 
 ## Next Action
-Measure text edit, split, merge, boundary, and page-confirm actions in the
-restarted source GUI (PID 31388).
+Restart the working-copy GUI and verify article analysis in dark mode, then
+decide separately whether to commit the current tracked changes.
 
 ## Do Not Regress
 - Do not mutate production artifacts, frozen English/IDs/timing, caches, audio, checkpoints, or untracked `output/`.
 
 ## Unknowns
-- GUI acceptance of the editor latency fix is still pending; source GUI PID
-  31388 is running for manual interaction.
+- Direct Qt GUI acceptance is pending because the bundled offscreen Qt plugin
+  hangs during QApplication initialization in this environment.
 - The pre-existing S9522 article readability assertion needs a separately
   scoped pagination decision.

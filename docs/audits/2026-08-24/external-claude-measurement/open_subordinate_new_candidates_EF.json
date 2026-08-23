@@ -1,0 +1,1064 @@
+{
+ "gaps_in_gate": 3537,
+ "gaps_total": 49678,
+ "newly_legal_E": 105,
+ "newly_legal_F": 69,
+ "distinct_left_right_F": 64,
+ "distinct_left_right_E_only": 34,
+ "samples": {
+  "E_only": [
+   {
+    "episode": "AI竞赛：中美殊途",
+    "parent_subtitle_id": "S0215",
+    "gap": [
+     2434,
+     2435
+    ],
+    "left": "While balancing safety and innovation is a global challenge, Chinese leaders are willing to forcefully intervene in the market",
+    "right": "to ensure the technology serves the state's broader social goals, rather than allowing the technology to dicta"
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "parent_subtitle_id": "S0062",
+    "gap": [
+     723,
+     724
+    ],
+    "left": "Yeah. If the legacy brands are just completely ignoring the nuances of the local palette and they're keeping average consumption stuck at like one bar",
+    "right": "a year, that leaves a massive void for domestic chocolatiers to step into."
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "parent_subtitle_id": "S0137",
+    "gap": [
+     1413,
+     1414
+    ],
+    "left": "Because you build the playbook, you set up the local roasting facilities, and then",
+    "right": "everyone else just learns how to do it."
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "parent_subtitle_id": "S0062",
+    "gap": [
+     723,
+     724
+    ],
+    "left": "Yeah. If the legacy brands are just completely ignoring the nuances of the local palette and they're keeping average consumption stuck at like one bar",
+    "right": "a year, that leaves a massive void for domestic chocolatiers to step into."
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "parent_subtitle_id": "S0137",
+    "gap": [
+     1413,
+     1414
+    ],
+    "left": "Because you build the playbook, you set up the local roasting facilities, and then",
+    "right": "everyone else just learns how to do it."
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "parent_subtitle_id": "S0001",
+    "gap": [
+     12,
+     13
+    ],
+    "left": "When recent Middle East tensions trapped 14 million barrels a day of crude",
+    "right": "inside the Gulf,"
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "parent_subtitle_id": "S0027",
+    "gap": [
+     310,
+     311
+    ],
+    "left": "Because buyers are usually just way",
+    "right": "too fragmented."
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "parent_subtitle_id": "S0026",
+    "gap": [
+     284,
+     285
+    ],
+    "left": "When those students came back, they were handed these plum jobs",
+    "right": "because they had skills."
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0202",
+    "gap": [
+     2197,
+     2198
+    ],
+    "left": "If this generation is spending so much time projecting their need for safety onto these abandoned pre 2008 neighborhoods, what happens to that shared cultural memory",
+    "right": "when the last of those old buildings is finally torn down?"
+   },
+   {
+    "episode": "创业者的天堂",
+    "parent_subtitle_id": "S0167",
+    "gap": [
+     1571,
+     1572
+    ],
+    "left": "If you opened a brick-and mortar store on Main Street",
+    "right": "50 years ago,"
+   },
+   {
+    "episode": "创业者的天堂",
+    "parent_subtitle_id": "S0167",
+    "gap": [
+     1573,
+     1574
+    ],
+    "left": "If you opened a brick-and mortar store on Main Street 50 years",
+    "right": "ago,"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "parent_subtitle_id": "S0135",
+    "gap": [
+     1394,
+     1395
+    ],
+    "left": "When she dates a man",
+    "right": "her own age or older,"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "parent_subtitle_id": "S0268",
+    "gap": [
+     2718,
+     2719
+    ],
+    "left": "If modern relationships are increasingly functioning as temporary tools for individual self-actualization and creative fuel",
+    "right": "rather than lifelong partnerships,"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "parent_subtitle_id": "S0268",
+    "gap": [
+     2720,
+     2721
+    ],
+    "left": "If modern relationships are increasingly functioning as temporary tools for individual self-actualization and creative fuel rather than",
+    "right": "lifelong partnerships,"
+   },
+   {
+    "episode": "如何停止拖延",
+    "parent_subtitle_id": "S0015",
+    "gap": [
+     160,
+     161
+    ],
+    "left": "If you're listening to this right now",
+    "right": "and you're actively avoiding a project,"
+   },
+   {
+    "episode": "如何停止拖延",
+    "parent_subtitle_id": "S0094",
+    "gap": [
+     938,
+     939
+    ],
+    "left": "If procrastination is this",
+    "right": "deeply destructive, if it's costing us 15 000 a year,"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "parent_subtitle_id": "S0097",
+    "gap": [
+     1039,
+     1040
+    ],
+    "left": "If you feed a machine",
+    "right": "a massive diet of New York Times reporting or Economist articles"
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "parent_subtitle_id": "S0048",
+    "gap": [
+     506,
+     507
+    ],
+    "left": "Because that phrasing is, you know, it's a bit",
+    "right": "academic."
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "parent_subtitle_id": "S0093",
+    "gap": [
+     971,
+     972
+    ],
+    "left": "Because mathematically, how is that level of strong resilience even possible",
+    "right": "in a dynamic world?"
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0089",
+    "gap": [
+     987,
+     988
+    ],
+    "left": "When a downturn hits, irregular workers are the first ones",
+    "right": "let go because there is no social contract protecting them."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0198",
+    "gap": [
+     2200,
+     2201
+    ],
+    "left": "If an entire generation reaches their late 60s with no savings and low lifetime earnings, what happens",
+    "right": "when the Mammoth Club actually hits retirement age?"
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0241",
+    "gap": [
+     2740,
+     2741
+    ],
+    "left": "If an entire generation's lifetime wealth, their housing security, and their dignity in retirement can be permanently crippled",
+    "right": "simply by the exact calendar year they happen to graduate college, how safe is any worker's economic future in"
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0241",
+    "gap": [
+     2758,
+     2759
+    ],
+    "left": "If an entire generation's lifetime wealth, their housing security, and their dignity in retirement can be permanently crippled simply by the exact calendar year they happen to graduate college, how safe is any worker's economic future",
+    "right": "in a rigidly structured labor system?"
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "parent_subtitle_id": "S0006",
+    "gap": [
+     76,
+     77
+    ],
+    "left": "because the plot is incomprehensible",
+    "right": "and the animation is shockingly terrible."
+   },
+   {
+    "episode": "白宫对中国转运骗局的荒谬指控",
+    "parent_subtitle_id": "S0158",
+    "gap": [
+     1810,
+     1811
+    ],
+    "left": "If mere proximity to Chinese inputs, Chinese financing, or even Chinese transit hubs is suddenly considered evidence of complicity",
+    "right": "in an anti-American scam, then America isn't just fighting a trade war with China."
+   },
+   {
+    "episode": "白宫对中国转运骗局的荒谬指控",
+    "parent_subtitle_id": "S0158",
+    "gap": [
+     1815,
+     1816
+    ],
+    "left": "If mere proximity to Chinese inputs, Chinese financing, or even Chinese transit hubs is suddenly considered evidence of complicity in an anti-American scam, then",
+    "right": "America isn't just fighting a trade war with China."
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "parent_subtitle_id": "S0126",
+    "gap": [
+     1342,
+     1343
+    ],
+    "left": "if China stops buying during glitz, they won't have the stocks",
+    "right": "to release during a crisis."
+   },
+   {
+    "episode": "肠道菌群，能人为操控吗？",
+    "parent_subtitle_id": "S0106",
+    "gap": [
+     1171,
+     1172
+    ],
+    "left": "if they don't know what the final picture is supposed",
+    "right": "to look like?"
+   },
+   {
+    "episode": "英伟达的硅基大决战",
+    "parent_subtitle_id": "S0029",
+    "gap": [
+     294,
+     295
+    ],
+    "left": "Because the hyperscalers are no longer content",
+    "right": "just buying Adidas chips,"
+   },
+   {
+    "episode": "英伟达的硅基大决战",
+    "parent_subtitle_id": "S0038",
+    "gap": [
+     375,
+     376
+    ],
+    "left": "Because it's like a famous restaurant realizing they spend so much money on a specific rare ingredient that they decide it's cheaper",
+    "right": "to just buy the farm and grow it themselves."
+   },
+   {
+    "episode": "英伟达的硅基大决战",
+    "parent_subtitle_id": "S0053",
+    "gap": [
+     504,
+     505
+    ],
+    "left": "because the scale of this is hard",
+    "right": "to wrap my head around."
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "parent_subtitle_id": "S0039",
+    "gap": [
+     449,
+     450
+    ],
+    "left": "because the economics at play here just seem completely upside down",
+    "right": "to me."
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "parent_subtitle_id": "S0159",
+    "gap": [
+     1748,
+     1749
+    ],
+    "left": "If your pipe is already reaching every corner of the country, you can pour whatever you want into it",
+    "right": "and instantly undercut every single competitor at the destination just because they are still paying tradition"
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "parent_subtitle_id": "S0159",
+    "gap": [
+     1757,
+     1758
+    ],
+    "left": "If your pipe is already reaching every corner of the country, you can pour whatever you want into it and instantly undercut every single competitor at the destination",
+    "right": "just because they are still paying traditional shipping costs."
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "parent_subtitle_id": "S0161",
+    "gap": [
+     1798,
+     1799
+    ],
+    "left": "When you combine a supply chain that has illuminated transport friction, with a franchising model that only costs 8 300",
+    "right": "to buy into, you create a rate of expansion that just defies traditional business logic."
+   },
+   {
+    "episode": "识别",
+    "parent_subtitle_id": "S0049",
+    "gap": [
+     464,
+     465
+    ],
+    "left": "Because if you're using a detection algorithm",
+    "right": "like Pangram, which claims a, what, 99.98% success rate,"
+   }
+  ],
+  "F": [
+   {
+    "episode": "AI竞赛：中美殊途",
+    "parent_subtitle_id": "S0070",
+    "gap": [
+     743,
+     744
+    ],
+    "left": "Because developers have access to the underlying architecture,",
+    "right": "the weights,"
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "parent_subtitle_id": "S0215",
+    "gap": [
+     2424,
+     2425
+    ],
+    "left": "While balancing safety and innovation is a global challenge,",
+    "right": "Chinese leaders are willing to forcefully intervene in the market to ensure the technology serves the state's "
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "parent_subtitle_id": "S0215",
+    "gap": [
+     2444,
+     2445
+    ],
+    "left": "While balancing safety and innovation is a global challenge, Chinese leaders are willing to forcefully intervene in the market to ensure the technology serves the state's broader social goals,",
+    "right": "rather than allowing the technology to dictate the social reality."
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "parent_subtitle_id": "S0011",
+    "gap": [
+     165,
+     166
+    ],
+    "left": "because investors are, well,",
+    "right": "they're suddenly terrified of it."
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "parent_subtitle_id": "S0101",
+    "gap": [
+     1106,
+     1107
+    ],
+    "left": "Because when compute is functionally unlimited,",
+    "right": "developers can afford to be somewhat inefficient."
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "parent_subtitle_id": "S0119",
+    "gap": [
+     1288,
+     1289
+    ],
+    "left": "Because the restrictions also cover the sophisticated chip-making gear,",
+    "right": "right?"
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "parent_subtitle_id": "S0034",
+    "gap": [
+     421,
+     422
+    ],
+    "left": "If you look at all the chocolate eaten worldwide,",
+    "right": "only a microscopic 2% of it caresses Chinese taste buds."
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "parent_subtitle_id": "S0037",
+    "gap": [
+     445,
+     446
+    ],
+    "left": "Because if we look at other trends,",
+    "right": "Chinese consumers, I mean, they completely embrace foreign food and beverage concept."
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "parent_subtitle_id": "S0037",
+    "gap": [
+     447,
+     448
+    ],
+    "left": "Because if we look at other trends, Chinese consumers,",
+    "right": "I mean, they completely embrace foreign food and beverage concept."
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "parent_subtitle_id": "S0037",
+    "gap": [
+     449,
+     450
+    ],
+    "left": "Because if we look at other trends, Chinese consumers, I mean,",
+    "right": "they completely embrace foreign food and beverage concept."
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "parent_subtitle_id": "S0137",
+    "gap": [
+     1411,
+     1412
+    ],
+    "left": "Because you build the playbook, you set up the local roasting facilities,",
+    "right": "and then everyone else just learns how to do it."
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "parent_subtitle_id": "S0034",
+    "gap": [
+     421,
+     422
+    ],
+    "left": "If you look at all the chocolate eaten worldwide,",
+    "right": "only a microscopic 2% of it caresses Chinese taste buds."
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "parent_subtitle_id": "S0037",
+    "gap": [
+     445,
+     446
+    ],
+    "left": "Because if we look at other trends,",
+    "right": "Chinese consumers, I mean, they completely embrace foreign food and beverage concept."
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "parent_subtitle_id": "S0037",
+    "gap": [
+     447,
+     448
+    ],
+    "left": "Because if we look at other trends, Chinese consumers,",
+    "right": "I mean, they completely embrace foreign food and beverage concept."
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "parent_subtitle_id": "S0037",
+    "gap": [
+     449,
+     450
+    ],
+    "left": "Because if we look at other trends, Chinese consumers, I mean,",
+    "right": "they completely embrace foreign food and beverage concept."
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "parent_subtitle_id": "S0137",
+    "gap": [
+     1411,
+     1412
+    ],
+    "left": "Because you build the playbook, you set up the local roasting facilities,",
+    "right": "and then everyone else just learns how to do it."
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "parent_subtitle_id": "S0075",
+    "gap": [
+     731,
+     732
+    ],
+    "left": "because commercial firms usually act in their own financial interest,",
+    "right": "right?"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0069",
+    "gap": [
+     706,
+     707
+    ],
+    "left": "If Chinese creators look at American suburbia with green lawns and say,",
+    "right": "you know, this means nothing to us, and they drop the eye motif and they drop the MS Paint text, why is it eve"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0069",
+    "gap": [
+     708,
+     709
+    ],
+    "left": "If Chinese creators look at American suburbia with green lawns and say, you know,",
+    "right": "this means nothing to us, and they drop the eye motif and they drop the MS Paint text, why is it even consider"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0069",
+    "gap": [
+     726,
+     727
+    ],
+    "left": "If Chinese creators look at American suburbia with green lawns and say, you know, this means nothing to us, and they drop the eye motif and they drop the MS Paint text,",
+    "right": "why is it even considered the same genre?"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0081",
+    "gap": [
+     866,
+     867
+    ],
+    "left": "Because if you spend enough time in these Chinese Dream Core communities,",
+    "right": "you start to notice a very specific sonic signature."
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0125",
+    "gap": [
+     1359,
+     1360
+    ],
+    "left": "If you scroll through these videos on social media,",
+    "right": "there is a recurring title that keeps popping up."
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0128",
+    "gap": [
+     1396,
+     1397
+    ],
+    "left": "if you are the only person left in a city,",
+    "right": "that's a zombie apocalypse."
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0150",
+    "gap": [
+     1612,
+     1613
+    ],
+    "left": "Because if you actually look closely at these meticulously reconstructed digital environments,",
+    "right": "you realize something shocking."
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0193",
+    "gap": [
+     2084,
+     2085
+    ],
+    "left": "If we connect this to the bigger picture,",
+    "right": "the Canadian philosopher Marshall McLuhan captured this mechanism perfectly in his book, The Medium is the Mas"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0193",
+    "gap": [
+     2096,
+     2097
+    ],
+    "left": "If we connect this to the bigger picture, the Canadian philosopher Marshall McLuhan captured this mechanism perfectly in his book,",
+    "right": "The Medium is the Massage."
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "parent_subtitle_id": "S0202",
+    "gap": [
+     2190,
+     2191
+    ],
+    "left": "If this generation is spending so much time projecting their need for safety onto these abandoned pre 2008 neighborhoods,",
+    "right": "what happens to that shared cultural memory when the last of those old buildings is finally torn down?"
+   },
+   {
+    "episode": "创业者的天堂",
+    "parent_subtitle_id": "S0335",
+    "gap": [
+     3204,
+     3205
+    ],
+    "left": "If technology continues to relentlessly strip away the barriers to entry,",
+    "right": "lowering the activation energy"
+   },
+   {
+    "episode": "如何停止拖延",
+    "parent_subtitle_id": "S0020",
+    "gap": [
+     210,
+     211
+    ],
+    "left": "Because the financial penalty is brutal,",
+    "right": "sure, but the bodily toll is genuinely counterintuitive."
+   },
+   {
+    "episode": "如何停止拖延",
+    "parent_subtitle_id": "S0020",
+    "gap": [
+     211,
+     212
+    ],
+    "left": "Because the financial penalty is brutal, sure,",
+    "right": "but the bodily toll is genuinely counterintuitive."
+   },
+   {
+    "episode": "如何停止拖延",
+    "parent_subtitle_id": "S0085",
+    "gap": [
+     858,
+     859
+    ],
+    "left": "Yeah. When that self-betrayal happens repeatedly, day after day,",
+    "right": "year after year,"
+   },
+   {
+    "episode": "如何停止拖延",
+    "parent_subtitle_id": "S0143",
+    "gap": [
+     1507,
+     1508
+    ],
+    "left": "When you wake up the next day,",
+    "right": "your executive function is running on fumes."
+   },
+   {
+    "episode": "如何停止拖延",
+    "parent_subtitle_id": "S0285",
+    "gap": [
+     3108,
+     3109
+    ],
+    "left": "If procrastination is deeply tied to executive function, and modern life constantly drains that battery,",
+    "right": "maybe"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "parent_subtitle_id": "S0024",
+    "gap": [
+     291,
+     292
+    ],
+    "left": "Yeah. When people get spooked, they develop survival mechanisms,",
+    "right": "right?"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "parent_subtitle_id": "S0038",
+    "gap": [
+     436,
+     437
+    ],
+    "left": "Because human writers have idiosyncrasies based on, you know,",
+    "right": "their era,"
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "parent_subtitle_id": "S0019",
+    "gap": [
+     192,
+     193
+    ],
+    "left": "If you're trying to anticipate supply chains or investments,",
+    "right": "you just sort of treat these stats as the absolute truth."
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "parent_subtitle_id": "S0048",
+    "gap": [
+     503,
+     504
+    ],
+    "left": "Because that phrasing is, you know,",
+    "right": "it's a bit academic."
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "parent_subtitle_id": "S0124",
+    "gap": [
+     1307,
+     1308
+    ],
+    "left": "Right. Because if I lose my job in Chicago,",
+    "right": "I'm probably staying in Chicago."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0018",
+    "gap": [
+     225,
+     226
+    ],
+    "left": "Right. When we say Japan's Ice Age generation,",
+    "right": "we are essentially looking at their equivalent of Generation X."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0096",
+    "gap": [
+     1091,
+     1092
+    ],
+    "left": "Because the regular entry-level jobs were gone,",
+    "right": "those irregular supplementary positions were suddenly the only option for young people who actually needed to "
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0167",
+    "gap": [
+     1828,
+     1829
+    ],
+    "left": "Once you miss the entrance at the top,",
+    "right": "you can't just jump in halfway down."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0198",
+    "gap": [
+     2198,
+     2199
+    ],
+    "left": "If an entire generation reaches their late 60s with no savings and low lifetime earnings,",
+    "right": "what happens when the Mammoth Club actually hits retirement age?"
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0209",
+    "gap": [
+     2307,
+     2308
+    ],
+    "left": "Because their wages were suppressed for decades,",
+    "right": "their pensions are microscopic. Right."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0210",
+    "gap": [
+     2317,
+     2318
+    ],
+    "left": "Because their pensions are microscopic,",
+    "right": "they can't afford to buy property, so they are forced to rent."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0210",
+    "gap": [
+     2323,
+     2324
+    ],
+    "left": "Because their pensions are microscopic, they can't afford to buy property,",
+    "right": "so they are forced to rent."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0220",
+    "gap": [
+     2463,
+     2464
+    ],
+    "left": "If you multiply that by millions of retirees living into their 80s,",
+    "right": "that's not just a budget deficit, that's a sovereign debt crisis scale problem."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0220",
+    "gap": [
+     2469,
+     2470
+    ],
+    "left": "If you multiply that by millions of retirees living into their 80s, that's not just a budget deficit,",
+    "right": "that's a sovereign debt crisis scale problem."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0222",
+    "gap": [
+     2493,
+     2494
+    ],
+    "left": "Because the Ice Agers were a massive population bulge,",
+    "right": "but the birth rate in Japan crashed immediately after them."
+   },
+   {
+    "episode": "日本X世代的困境：被反复诅咒的一代人",
+    "parent_subtitle_id": "S0241",
+    "gap": [
+     2751,
+     2752
+    ],
+    "left": "If an entire generation's lifetime wealth, their housing security, and their dignity in retirement can be permanently crippled simply by the exact calendar year they happen to graduate college,",
+    "right": "how safe is any worker's economic future in a rigidly structured labor system?"
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "parent_subtitle_id": "S0155",
+    "gap": [
+     1539,
+     1540
+    ],
+    "left": "Right. If the audience controls what's valuable,",
+    "right": "the gatekeepers have no power."
+   },
+   {
+    "episode": "牛来",
+    "parent_subtitle_id": "S0008",
+    "gap": [
+     92,
+     93
+    ],
+    "left": "because, I mean, it really breaks the fundamental assumption of the entertainment economy,",
+    "right": "right?"
+   },
+   {
+    "episode": "牛来",
+    "parent_subtitle_id": "S0031",
+    "gap": [
+     297,
+     298
+    ],
+    "left": "Because netizens who actually sat through those early screenings,",
+    "right": "they describe a fundamentally hollow plot."
+   },
+   {
+    "episode": "牛来",
+    "parent_subtitle_id": "S0062",
+    "gap": [
+     571,
+     572
+    ],
+    "left": "because their signature soup tastes exactly like dishwater,",
+    "right": "people might line up, ironically, to taste it."
+   },
+   {
+    "episode": "牛来",
+    "parent_subtitle_id": "S0062",
+    "gap": [
+     575,
+     576
+    ],
+    "left": "because their signature soup tastes exactly like dishwater, people might line up,",
+    "right": "ironically, to taste it."
+   },
+   {
+    "episode": "牛来",
+    "parent_subtitle_id": "S0062",
+    "gap": [
+     576,
+     577
+    ],
+    "left": "because their signature soup tastes exactly like dishwater, people might line up, ironically,",
+    "right": "to taste it."
+   },
+   {
+    "episode": "白宫对中国转运骗局的荒谬指控",
+    "parent_subtitle_id": "S0031",
+    "gap": [
+     382,
+     383
+    ],
+    "left": "Because if you look at the data in the text,",
+    "right": "at the beginning of 2018, the average tariff rate differential between China and the rest of the world was inc"
+   },
+   {
+    "episode": "白宫对中国转运骗局的荒谬指控",
+    "parent_subtitle_id": "S0031",
+    "gap": [
+     387,
+     388
+    ],
+    "left": "Because if you look at the data in the text, at the beginning of 2018,",
+    "right": "the average tariff rate differential between China and the rest of the world was incredibly small."
+   },
+   {
+    "episode": "白宫对中国转运骗局的荒谬指控",
+    "parent_subtitle_id": "S0158",
+    "gap": [
+     1814,
+     1815
+    ],
+    "left": "If mere proximity to Chinese inputs, Chinese financing, or even Chinese transit hubs is suddenly considered evidence of complicity in an anti-American scam,",
+    "right": "then America isn't just fighting a trade war with China."
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "parent_subtitle_id": "S0124",
+    "gap": [
+     1315,
+     1316
+    ],
+    "left": "If they need less oil,",
+    "right": "they will logically hold fewer reserves."
+   },
+   {
+    "episode": "美国已成为创业者的天堂",
+    "parent_subtitle_id": "S0034",
+    "gap": [
+     326,
+     327
+    ],
+    "left": "Because if you look at Gallup polling over the last two decades,",
+    "right": "around 60% of people"
+   },
+   {
+    "episode": "肠道菌群，能人为操控吗？",
+    "parent_subtitle_id": "S0084",
+    "gap": [
+     912,
+     913
+    ],
+    "left": "If the scientific consensus proves that eating 30 plants a week and a side of kimchi empirically diversifies the microbiome and lowers inflammation,",
+    "right": "why drop 300 on a direct-to consumer DNA stool test?"
+   },
+   {
+    "episode": "肠道菌群，能人为操控吗？",
+    "parent_subtitle_id": "S0089",
+    "gap": [
+     974,
+     975
+    ],
+    "left": "If you can quantify it,",
+    "right": "you assume you can optimize it."
+   },
+   {
+    "episode": "肠道菌群，能人为操控吗？",
+    "parent_subtitle_id": "S0138",
+    "gap": [
+     1521,
+     1522
+    ],
+    "left": "Though, to be fair to the landscape we are evaluating,",
+    "right": "there are exceptions in the industry."
+   },
+   {
+    "episode": "英伟达的硅基大决战",
+    "parent_subtitle_id": "S0015",
+    "gap": [
+     171,
+     172
+    ],
+    "left": "Because while everyone is distracted by the latest AI software,",
+    "right": "you know, the shiny new chatbots."
+   },
+   {
+    "episode": "英伟达的硅基大决战",
+    "parent_subtitle_id": "S0015",
+    "gap": [
+     173,
+     174
+    ],
+    "left": "Because while everyone is distracted by the latest AI software, you know,",
+    "right": "the shiny new chatbots."
+   },
+   {
+    "episode": "英伟达的硅基大决战",
+    "parent_subtitle_id": "S0060",
+    "gap": [
+     595,
+     596
+    ],
+    "left": "Because when three quarters of a hundred million dollar data centre is just the cost of NVIDIA Silicon,",
+    "right": "you..."
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "parent_subtitle_id": "S0007",
+    "gap": [
+     93,
+     94
+    ],
+    "left": "Because we have this massive stack of business analyses, market reports,",
+    "right": "and supply chain breakdowns in front of us."
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "parent_subtitle_id": "S0159",
+    "gap": [
+     1740,
+     1741
+    ],
+    "left": "If your pipe is already reaching every corner of the country,",
+    "right": "you can pour whatever you want into it and instantly undercut every single competitor at the destination just "
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "parent_subtitle_id": "S0161",
+    "gap": [
+     1789,
+     1790
+    ],
+    "left": "When you combine a supply chain that has illuminated transport friction,",
+    "right": "with a franchising model that only costs 8 300 to buy into, you create a rate of expansion that just defies tr"
+   }
+  ]
+ }
+}

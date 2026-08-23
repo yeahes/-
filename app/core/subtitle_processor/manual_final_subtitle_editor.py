@@ -7042,7 +7042,19 @@ class ManualFinalSubtitleSession:
             and file_sha256(artifact_path) != expected_artifact_hash
         ):
             return {}
-        if str(artifact.get("status") or "") != "PASS" and self.display_page_edits:
+        # An ERROR artifact can still contain a complete, authoritative
+        # renderer projection. Once the user has local page edits, keep that
+        # frozen projection and overlay the edits below. Rebuilding every
+        # parent here is both unnecessary and very expensive (Pillow measures
+        # every candidate page), and it makes each local editor action block
+        # the UI for seconds. Recovery is only needed when the artifact does
+        # not carry a usable frozen plan.
+        has_frozen_plans = bool(artifact.get("render_plans"))
+        if (
+            str(artifact.get("status") or "") != "PASS"
+            and self.display_page_edits
+            and not has_frozen_plans
+        ):
             recovered_artifact = (
                 self._recover_display_page_artifact_from_complete_edits()
             )
