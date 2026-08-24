@@ -2,6 +2,23 @@
 
 Last updated: 2026-08-24
 
+## 2026-08-25 Conservative display-capacity review signal
+
+- New runs add a read-only `display_page_capacity_review` marker for a dense
+  one-page parent whose English exceeds 85 characters and whose authoritative
+  Chinese contains at least 26 Han characters. The signal is conjunctive and
+  does not re-plan pages or modify English, timing, Chinese, or synthesis.
+- The thresholds were measured against the three available manual-final
+  samples: 17 of 18 candidate parents were ones where the user added a page;
+  one unedited parent remains an intentional false-positive guard. A forced
+  automatic re-plan for `S0094` selected an inferior `and | illegal` boundary,
+  so review evidence is safer than changing the default page count.
+- The current `测试音频` immutable artifact would receive one new marker at
+  `S0094`; its existing on-disk review ledger is unchanged and was not
+  rewritten.
+- Focused review-mark tests pass 28/28; this change has not regenerated any
+  production subtitle or manual-final artifact.
+
 ## 2026-08-24 Review Queue Run Identity Isolation
 
 - Stable validation snapshots now bind copied review evidence to the current

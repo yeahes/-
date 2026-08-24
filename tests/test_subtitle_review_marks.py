@@ -378,6 +378,45 @@ def test_display_page_chinese_order_review_marks_strong_reversal_only():
         assert "S0032" not in marks
 
 
+def test_dense_one_page_capacity_is_review_evidence_only():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
+        _write_json(
+            artifact_dir / "display-page-translations.json",
+            {
+                "status": "PASS",
+                "render_plans": [
+                    {
+                        "parent_subtitle_id": "S0094",
+                        "english": (
+                            "The line between legal manufacturing and illegal customs "
+                            "fraud is basically the entire battleground of this paper."
+                        ),
+                        "chinese": "合法制造与非法海关欺诈的界线，基本上就是这份报告的整个战场。",
+                        "pages": [{"display_page_id": "S0094.P01"}],
+                    },
+                    {
+                        "parent_subtitle_id": "S0095",
+                        "english": "Right. So let's break that down.",
+                        "chinese": "那我们拆解一下。",
+                        "pages": [{"display_page_id": "S0095.P01"}],
+                    },
+                ],
+            },
+        )
+
+        marks = load_subtitle_review_marks(artifact_dir)
+
+        assert (
+            "REVIEW",
+            "visual_page",
+            "both",
+            "display_page_capacity_review",
+        ) in _marks_for(marks, "S0094")
+        assert "S0095" not in marks
+
+
 def test_semantic_review_queue_is_loaded_as_id_bound_read_only_marks():
     with tempfile.TemporaryDirectory() as temp_dir:
         artifact_dir = Path(temp_dir)

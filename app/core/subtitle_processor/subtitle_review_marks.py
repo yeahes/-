@@ -32,6 +32,10 @@ _SUBTITLE_ID_RE = re.compile(r"S\d{4}")
 _TERMINAL_SENTENCE_RE = re.compile(r"[.!?][\"'”’\)\]]*$")
 _REVIEW_LEDGER_NAME = "editor-review-ledger.json"
 _REVIEW_LEDGER_SCHEMA_VERSION = 2
+# Conservative display-pressure evidence.  This is a review signal only: it
+# must not change the frozen page count or trigger an automatic re-plan.
+_CAPACITY_REVIEW_EN_CHARS = 85
+_CAPACITY_REVIEW_CJK_CHARS = 26
 
 
 @dataclass(frozen=True)
@@ -181,6 +185,7 @@ def _collect_subtitle_review_marks(directory: Path) -> List[SubtitleReviewMark]:
         marks.extend(_high_confidence_chinese_marks(validation))
         marks.extend(_allocation_unresolved_marks(directory))
     marks.extend(_visual_page_review_marks(directory))
+    marks.extend(_display_page_capacity_review_marks(directory))
     marks.extend(_display_page_chinese_review_marks(directory))
     marks.extend(_display_page_chinese_order_review_marks(directory))
     marks.extend(_model_translation_quality_marks(directory))
@@ -822,6 +827,55 @@ def _visual_page_review_marks(directory: Path) -> List[SubtitleReviewMark]:
                 ),
             )
             break
+    return marks
+
+
+def _display_page_capacity_review_marks(directory: Path) -> List[SubtitleReviewMark]:
+    """Mark dense one-page parents without changing their page projection.
+
+    The signal is deliberately conjunctive.  A one-page parent is only marked
+    when both the English surface (>85 characters) and the authoritative
+    Chinese (>25 Han characters) are under pressure.  Three manual-final
+    samples showed this combination was a strong predictor of a user adding a
+    page, while forcing a new page can still select a poor English boundary.
+    """
+    artifact = _read_json(directory / "display-page-translations.json", {})
+    plans = artifact.get("render_plans") if isinstance(artifact, Mapping) else None
+    if not isinstance(plans, list):
+        return []
+
+    marks: List[SubtitleReviewMark] = []
+    for plan in plans:
+        if not isinstance(plan, Mapping):
+            continue
+        subtitle_id = str(plan.get("parent_subtitle_id") or "")
+        pages = plan.get("pages")
+        if (
+            not _SUBTITLE_ID_RE.fullmatch(subtitle_id)
+            or not isinstance(pages, list)
+            or len(pages) != 1
+        ):
+            continue
+        english = " ".join(str(plan.get("english") or "").split())
+        chinese = str(plan.get("chinese") or "")
+        chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", chinese))
+        if (
+            len(english) <= _CAPACITY_REVIEW_EN_CHARS
+            or chinese_chars < _CAPACITY_REVIEW_CJK_CHARS
+        ):
+            continue
+        _append_marks(
+            marks,
+            [subtitle_id],
+            severity="REVIEW",
+            category="visual_page",
+            target="both",
+            code="display_page_capacity_review",
+            reason=(
+                f"单页显示负载偏高：英文 {len(english)} 字符、中文 {chinese_chars} 字；"
+                "建议确认是否需要拆成两页。"
+            ),
+        )
     return marks
 
 
