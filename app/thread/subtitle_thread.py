@@ -1091,6 +1091,32 @@ class SubtitleThread(QThread):
         return f"{timestamp}-{uuid.uuid4().hex[:8]}"
 
     @staticmethod
+    def _bind_stable_review_artifact_identity(
+        artifact_dir: Path | None,
+        *,
+        stable_run_id: str,
+        manifest: Mapping[str, Any],
+        run_dir: Path,
+    ) -> None:
+        """Bind copied review artifacts to the stable run that owns them."""
+        if artifact_dir is None:
+            return
+        manifest_path = artifact_dir / "run-manifest.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        payload["stable_run_id"] = str(stable_run_id or "")
+        payload["stable_run_dir"] = str(run_dir)
+        payload["attempt_id"] = str(manifest.get("attempt_id") or "")
+        code_commit = str(manifest.get("code_commit") or "").strip()
+        if code_commit:
+            payload["code_commit"] = code_commit
+        write_json_artifact(manifest_path, payload)
+
+    @staticmethod
     def _snapshot_stable_validation_artifacts(
         coverage_report_path: str | None,
         run_dir: Path,
@@ -1381,6 +1407,18 @@ class SubtitleThread(QThread):
                 "source_media_path": source_media_path,
             }
             manifest.update(published_meta)
+            self._bind_stable_review_artifact_identity(
+                artifact_target,
+                stable_run_id=run_id,
+                manifest=manifest,
+                run_dir=run_dir,
+            )
+            qa_review_paths = self._write_source_audio_qc_queue(
+                published_coverage_report,
+                artifact_dir=artifact_target or artifact_source,
+            )
+            if qa_review_paths:
+                manifest["qa_review_queue"] = qa_review_paths
             manifest_path = run_dir / "stable-final-manifest.json"
             write_json_artifact(manifest_path, manifest)
             from app.core.subtitle_processor.manual_final_subtitle_editor import (
@@ -1512,6 +1550,12 @@ class SubtitleThread(QThread):
                 },
             }
             manifest.update(published_meta)
+            self._bind_stable_review_artifact_identity(
+                artifact_target,
+                stable_run_id=run_id,
+                manifest=manifest,
+                run_dir=run_dir,
+            )
             run_manifest_path = run_dir / "stable-final-manifest.json"
             manifest_path = output_dir / "stable-final-manifest.json"
             # The run-local manifest is a private candidate needed by the
@@ -1544,7 +1588,10 @@ class SubtitleThread(QThread):
                     for key, value in source_subtitle_paths.items()
                     if value and Path(value).is_file()
                 }
-            qa_review_paths = self._write_source_audio_qc_queue(coverage_report_path)
+            qa_review_paths = self._write_source_audio_qc_queue(
+                published_coverage_report,
+                artifact_dir=artifact_target or artifact_source,
+            )
             if qa_review_paths:
                 manifest["qa_review_queue"] = qa_review_paths
             summary_paths = self._write_stable_result_summary(manifest)
@@ -1589,14 +1636,19 @@ class SubtitleThread(QThread):
 
         logger.info("Stable subtitle manifest published: %s", manifest_path)
 
-    def _write_source_audio_qc_queue(self, coverage_report_path: str | None) -> dict:
+    def _write_source_audio_qc_queue(
+        self,
+        coverage_report_path: str | None,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> dict:
         """Create one concise, time-addressable review SRT beside the source audio."""
         source_dir = self._source_audio_quality_dir()
         if source_dir is None or not coverage_report_path:
             return {}
         source_dir.mkdir(parents=True, exist_ok=True)
         report_path = Path(coverage_report_path)
-        artifact_dir = report_path.with_name(
+        artifact_dir = artifact_dir or report_path.with_name(
             f"{report_path.stem.removesuffix('-coverage-report')}-artifacts"
         )
         if not artifact_dir.exists():

@@ -861,15 +861,20 @@ def write_qa_review_artifacts(
     _write_json(json_path, summary)
     md_path.write_text(_markdown(summary), encoding="utf-8")
     queue_srt, queue_meta = _review_queue_srt(summary, review_limit=review_limit)
+    source_run = {
+        "artifact_dir": str(artifact_dir),
+        "code_commit": summary["summary"].get("code_commit"),
+        "translation_model": summary["summary"].get("translation_model"),
+        "subtitle_count": summary["summary"].get("subtitle_count"),
+        **build_review_source_identity(builder.word_ledger, builder.spans),
+    }
+    for key in ("stable_run_id", "attempt_id"):
+        value = str(builder.manifest.get(key) or "").strip()
+        if value:
+            source_run[key] = value
     queue_payload = {
         "schema_version": 1,
-        "source_run": {
-            "artifact_dir": str(artifact_dir),
-            "code_commit": summary["summary"].get("code_commit"),
-            "translation_model": summary["summary"].get("translation_model"),
-            "subtitle_count": summary["summary"].get("subtitle_count"),
-            **build_review_source_identity(builder.word_ledger, builder.spans),
-        },
+        "source_run": source_run,
         "queue": queue_meta,
         "items": _review_queue_items(summary, review_limit=review_limit)[0],
     }
@@ -881,7 +886,7 @@ def write_qa_review_artifacts(
         semantic_json_path,
         {
             "schema_version": SEMANTIC_REVIEW_QUEUE_SCHEMA_VERSION,
-            "source_run": queue_payload["source_run"],
+            "source_run": source_run,
             "queue": semantic_meta,
             "items": semantic_items,
         },

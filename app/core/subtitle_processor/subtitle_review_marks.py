@@ -23,6 +23,7 @@ from app.core.subtitle_processor.user_facing_issue_text import (
 from app.core.subtitle_processor.review_evidence_identity import (
     build_review_source_identity,
     load_bound_semantic_review_queue,
+    review_run_identity_matches,
 )
 from app.core.subtitle_processor.stable_artifacts import write_json_artifact
 
@@ -121,6 +122,14 @@ def write_subtitle_review_ledger(artifact_dir: str | Path) -> Dict[str, Any]:
         },
         "items": items,
     }
+    run_manifest = _read_json(directory / "run-manifest.json", {})
+    if isinstance(run_manifest, Mapping):
+        code_commit = str(run_manifest.get("code_commit") or "").strip()
+        stable_run_id = str(run_manifest.get("stable_run_id") or "").strip()
+        if code_commit:
+            payload["source_code_commit"] = code_commit
+        if stable_run_id:
+            payload["source_stable_run_id"] = stable_run_id
     payload["artifact_hash"] = hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
@@ -258,6 +267,15 @@ def _review_marks_from_ledger(
         != current_identity["frozen_span_hash"]
         or payload.get("source_subtitle_count")
         != current_identity["subtitle_count"]
+    ):
+        return None
+    current_run_manifest = _read_json(directory / "run-manifest.json", {})
+    if isinstance(current_run_manifest, Mapping) and not review_run_identity_matches(
+        {
+            "code_commit": payload.get("source_code_commit"),
+            "stable_run_id": payload.get("source_stable_run_id"),
+        },
+        current_run_manifest,
     ):
         return None
 

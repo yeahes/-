@@ -82,6 +82,31 @@ def review_source_identity_matches(
     )
 
 
+def review_run_identity_matches(
+    source: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    artifact_dir: str | Path | None = None,
+) -> bool:
+    """Reject review evidence copied from another run or code revision."""
+    for key in ("code_commit", "stable_run_id", "attempt_id"):
+        current_value = str(current.get(key) or "")
+        source_value = str(source.get(key) or "")
+        # Once the current artifact declares a run identity, an older payload
+        # that predates that field is not evidence for this run.  Artifacts
+        # without a manifest retain the legacy source/span contract.
+        if current_value and source_value != current_value:
+            return False
+    source_artifact_dir = str(source.get("artifact_dir") or "").strip()
+    if source_artifact_dir and artifact_dir is not None:
+        try:
+            if Path(source_artifact_dir).resolve() != Path(artifact_dir).resolve():
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
@@ -112,6 +137,16 @@ def load_bound_semantic_review_queue(
     if not isinstance(source_identity, Mapping) or not review_source_identity_matches(
         source_identity,
         current_identity,
+    ):
+        return None
+    run_manifest = _read_json(directory / "run-manifest.json")
+    current_run_identity = (
+        run_manifest if isinstance(run_manifest, Mapping) else {}
+    )
+    if not review_run_identity_matches(
+        source_identity,
+        current_run_identity,
+        artifact_dir=directory,
     ):
         return None
 

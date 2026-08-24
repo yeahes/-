@@ -31,6 +31,7 @@ def test_review_queue_uses_final_times_and_excludes_invalid_audit_mapping():
                 "subtitle_count": 2,
                 "translation_model": "test-model",
                 "code_commit": "test-commit",
+                "stable_run_id": "run-current",
             },
         )
         _write_json(
@@ -92,6 +93,12 @@ def test_review_queue_uses_final_times_and_excludes_invalid_audit_mapping():
         )
 
         result = write_qa_review_artifacts(artifact_dir, source_audio_dir=source_dir)
+
+        queue_payload = json.loads(
+            Path(result["qa_review_queue_json"]).read_text(encoding="utf-8")
+        )
+        assert queue_payload["source_run"]["code_commit"] == "test-commit"
+        assert queue_payload["source_run"]["stable_run_id"] == "run-current"
 
         queue_text = Path(result["qa_review_queue_srt"]).read_text(encoding="utf-8-sig")
         source_queue_text = Path(result["source_audio_qa_review_queue_srt"]).read_text(

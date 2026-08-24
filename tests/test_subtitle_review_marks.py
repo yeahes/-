@@ -19,6 +19,7 @@ from app.core.subtitle_processor.subtitle_review_marks import (
 )
 from app.core.subtitle_processor.review_evidence_identity import (
     build_review_source_identity,
+    load_bound_semantic_review_queue,
 )
 from app.view.subtitle_interface import SubtitleTableModel
 from PyQt5.QtCore import Qt
@@ -515,6 +516,92 @@ def test_semantic_review_queue_rejects_unbound_legacy_payload():
         )
 
         assert load_subtitle_review_marks(artifact_dir) == {}
+
+
+def test_semantic_review_queue_rejects_stale_code_revision_with_matching_spans():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        current_ledger = {"hash": "current-ledger", "words": []}
+        current_spans = [
+            {
+                "subtitle_id": "S0002",
+                "original": "The current English sentence.",
+                "word_start": 4,
+                "word_end": 7,
+            }
+        ]
+        _write_json(
+            artifact_dir / "run-manifest.json",
+            {"code_commit": "current-commit", "stable_run_id": "run-current"},
+        )
+        _write_json(artifact_dir / "word-ledger.json", current_ledger)
+        _write_json(artifact_dir / "subtitle-spans.json", current_spans)
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
+        source_run = build_review_source_identity(current_ledger, current_spans)
+        source_run.update(
+            {
+                "artifact_dir": str(artifact_dir),
+                "code_commit": "stale-commit",
+                "stable_run_id": "run-old",
+            }
+        )
+        _write_json(
+            artifact_dir / "semantic-review-queue.json",
+            {
+                "schema_version": 2,
+                "source_run": source_run,
+                "items": [
+                    {
+                        "code": "translation_fluency_review",
+                        "subtitle_ids": ["S0002"],
+                        "context": [
+                            {
+                                "subtitle_id": "S0002",
+                                "english": "The current English sentence.",
+                                "word_start": 4,
+                                "word_end": 7,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+        assert load_bound_semantic_review_queue(artifact_dir) is None
+
+
+def test_semantic_review_queue_rejects_missing_run_identity_when_manifest_is_bound():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        current_ledger = {"hash": "current-ledger", "words": []}
+        current_spans = [
+            {
+                "subtitle_id": "S0002",
+                "original": "The current English sentence.",
+                "word_start": 4,
+                "word_end": 7,
+            }
+        ]
+        _write_json(
+            artifact_dir / "run-manifest.json",
+            {"code_commit": "current-commit", "stable_run_id": "run-current"},
+        )
+        _write_json(artifact_dir / "word-ledger.json", current_ledger)
+        _write_json(artifact_dir / "subtitle-spans.json", current_spans)
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
+        _write_json(
+            artifact_dir / "semantic-review-queue.json",
+            {
+                "schema_version": 2,
+                "source_run": {
+                    **build_review_source_identity(current_ledger, current_spans),
+                    "artifact_dir": str(artifact_dir),
+                },
+                "items": [],
+            },
+        )
+
+        assert load_bound_semantic_review_queue(artifact_dir) is None
 
 
 def test_article_asr_review_marks_require_matching_frozen_ledger_hash():
