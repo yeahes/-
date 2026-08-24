@@ -225,7 +225,7 @@ def test_parent_boundary_gate_rejects_dependent_fragment_shapes_before_ids_freez
             "trailing_modifier_fragment",
         ),
         (
-            "If every piece of that manufacturing puzzle is intrinsically Chinese,",
+            "If every piece of that manufacturing puzzle,",
             "at what point does the assembled product become Vietnamese?",
             "open_subordinate_prefix_fragment",
         ),
@@ -4646,7 +4646,7 @@ def test_terminal_affirmation_attaches_to_following_clause_before_ids():
     ]
 
 
-def test_open_subordinate_prefix_merges_with_its_main_clause_before_ids():
+def test_finite_comma_subordinate_prefix_can_split_before_ids():
     text = (
         "Yeah. Because if you actually look closely at these meticulously "
         "reconstructed digital environments, you realize something shocking."
@@ -4656,16 +4656,84 @@ def test_open_subordinate_prefix_merges_with_its_main_clause_before_ids():
     finalized = editor._finalize_stable_english_boundaries([])
 
     assert [item.original for item in finalized] == [
-        "Yeah.",
-        "Because if you actually look closely at these meticulously "
-        "reconstructed digital environments, you realize something shocking.",
+        "Yeah. Because if you actually look closely at these meticulously "
+        "reconstructed digital environments,",
+        "you realize something shocking.",
     ]
-    assert editor._word_count(finalized[1].original) == 16
+    assert editor._word_count(finalized[0].original) == 13
+    assert editor._word_count(finalized[1].original) == 4
+    assert not editor._is_open_subordinate_prefix_for_structural_boundary(
+        finalized[0]
+    )
     assert not editor._is_open_subordinate_prefix(finalized[1])
     assert editor._items_word_tokens(finalized) == [
         editor._clean_boundary_token(entry["token"])
         for entry in editor._active_word_entries
     ]
+
+
+def test_structural_arm_f_falls_back_to_spacy_and_caches_by_token_text():
+    editor = _marker_editor(["gets"])
+    calls = []
+
+    class _Token:
+        pos_ = "VERB"
+        tag_ = "VBZ"
+
+    def fake_nlp(text):
+        calls.append(text)
+        return [_Token()]
+
+    editor._load_syntax_nlp = lambda: fake_nlp
+
+    assert editor._structural_fragment_has_finite_predicate(["gets"])
+    assert editor._structural_fragment_has_finite_predicate(["gets"])
+    assert calls == ["gets"]
+
+
+def test_structural_arm_f_spacy_unavailable_keeps_legacy_conservative_result():
+    editor = _marker_editor(["gets"])
+    editor._load_syntax_nlp = lambda: None
+
+    assert not editor._structural_fragment_has_finite_predicate(["gets"])
+
+
+def test_open_subordinate_prefix_allows_finite_comma_clause_only():
+    editor = _marker_editor("If prices rise, demand changes.".split())
+
+    class _Token:
+        pos_ = "VERB"
+        tag_ = "VBP"
+
+    editor._load_syntax_nlp = lambda: (lambda _text: [_Token()])
+    comma_clause = _word_item(editor, 0, 2)
+    no_comma_clause = _word_item(editor, 0, 1)
+
+    assert editor._is_open_subordinate_prefix(comma_clause)
+    assert not editor._is_open_subordinate_prefix_for_structural_boundary(comma_clause)
+    assert editor._is_open_subordinate_prefix_for_structural_boundary(no_comma_clause)
+
+
+def test_final_boundary_consumer_filters_arm_f_display_fragment_emission():
+    editor = _marker_editor("If prices rise, demand changes.".split())
+
+    editor._syntax_nlp = False
+    editor._structural_finite_predicate_cache = {"if prices rise": True}
+    left = _word_item(editor, 0, 2, source_id=2)
+    right = _word_item(editor, 3, 4, source_id=3)
+
+    fragment = editor._evaluate_final_display_fragment(left, None, right)
+    assert "open_subordinate_prefix_fragment" in fragment["hard_fragment_issues"]
+
+    evaluation = editor._evaluate_item_pair_for_final_boundary(left, right)
+    assert "open_subordinate_prefix_fragment" not in evaluation["hard_issues"]
+
+
+def test_shared_finite_predicate_helper_keeps_classmethod_contract():
+    descriptor = ScreenSubtitleEditor.__dict__["_fragment_has_finite_predicate"]
+
+    assert isinstance(descriptor, classmethod)
+    assert not descriptor.__func__(ScreenSubtitleEditor, ["gets"])
 
 
 def test_cross_cue_dependency_guards_keep_independent_boundaries_legal():
@@ -7323,6 +7391,28 @@ def test_article_visual_pages_use_local_token_boundaries_without_punctuation():
     assert all(page for page in pages)
     assert pages[0].endswith("尖端")
     assert pages[1].startswith("芯片")
+
+
+def test_article_visual_pages_prefer_punctuation_over_nearer_token_boundary():
+    chinese = "甲乙丙丁，戊己庚辛壬癸子"
+
+    # The proportional target lands on a valid token boundary after ``戊``.
+    # A slightly earlier comma boundary is semantically stronger and should
+    # win now that punctuation is preferred within the same safe window.
+    with patch.object(
+        podcast_learning_video,
+        "_chinese_visual_token_boundaries",
+        return_value={7: (2, 2)},
+    ):
+        pages = podcast_learning_video._strict_split_chinese_visual_pages(
+            chinese,
+            2,
+            page_word_counts=[7, 5],
+            strict=True,
+        )
+
+    assert pages == ["甲乙丙丁，", "戊己庚辛壬癸子"]
+    assert "".join(pages) == chinese
 
 
 def test_article_page_timeline_uses_fixed_fonts_and_word_boundaries():
@@ -13758,6 +13848,32 @@ def test_failed_display_page_translation_skips_network_quality_audit():
     assert payload["batch_errors"] == [
         {"code": "translation_quality_audit_skipped_page_projection_failed"}
     ]
+
+
+def test_partial_translation_quality_audit_is_a_warning_not_a_render_blocker():
+    summary = SubtitleThread._merge_translation_quality_audit_warning(
+        {
+            "status": "WARNING",
+            "errors": [],
+            "warnings": [],
+            "info": [],
+        },
+        {
+            "status": "PARTIAL",
+            "source_subtitle_count": 3,
+            "audited_subtitle_count": 2,
+            "unaudited_subtitle_ids": ["S0003"],
+            "batch_errors": [
+                {"code": "translation_quality_audit_request_failed"}
+            ],
+        },
+    )
+
+    assert summary["status"] == "WARNING"
+    assert summary["errors"] == []
+    assert summary["warnings"][0]["code"] == "translation_quality_audit_incomplete"
+    assert summary["warnings"][0]["missing_subtitle_ids"] == ["S0003"]
+    assert SubtitleThread._stable_validation_summary_blocks_render(summary) is False
 
 
 def test_non_structural_validation_errors_do_not_block_render_gate():

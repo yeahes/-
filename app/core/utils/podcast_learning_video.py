@@ -3518,6 +3518,15 @@ def _strict_split_chinese_visual_pages(
             if strict:
                 return None
             candidates = [target]
+        # A punctuation boundary is a stronger page-local semantic signal
+        # than being a few characters closer to the proportional target. Keep
+        # the choice deterministic: punctuation wins within the same safe
+        # window, then distance and the existing rightmost tie-break apply.
+        punctuation_candidates = [
+            value for value in candidates if compact[value - 1] in punctuation
+        ]
+        if punctuation_candidates:
+            candidates = punctuation_candidates
         boundaries.append(
             min(
                 candidates,
@@ -7936,6 +7945,11 @@ def _article_editable_page_seed_plan(
         for error in errors
         if str(error.get("cue_index") or "") == str(cue.index)
     ]
+    # This is an explicit non-renderable recovery checkpoint, not a normal
+    # page layout. Keep the English visible for editor review even when no
+    # legal two-line layout exists; an empty line array makes the checkpoint
+    # look like missing content and violates the display-page artifact shape.
+    preview_lines = [" ".join(words)]
     return {
         "parent_subtitle_id": str(cue.subtitle_id),
         "english": str(cue.en or ""),
@@ -7955,7 +7969,7 @@ def _article_editable_page_seed_plan(
                 "english": " ".join(words),
                 "start_ms": round(float(cue.start) * 1000),
                 "end_ms": round(float(cue.end) * 1000),
-                "english_lines": [],
+                "english_lines": preview_lines,
                 "english_font_size": ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE,
                 "english_width": ARTICLE_SUBTITLE_EN_WIDE_SAFE_WIDTH,
                 "boundary_before": {},

@@ -1697,6 +1697,23 @@ def test_no_safe_normal_font_partition_fails_closed_instead_of_using_50px():
         )
 
 
+def test_nonrenderable_page_seed_keeps_an_english_preview_line():
+    text = (
+        "Because the government shifted all its macroeconomic stabilization "
+        "efforts over to the new 2018 survey rate."
+    )
+    _, cue = _syntax_backed_cue(text, "S0223")
+
+    seed = podcast_learning_video._article_editable_page_seed_plan(
+        cue,
+        [{"cue_index": cue.index, "reason": "no_complete_normal_font_page_partition"}],
+    )
+
+    assert seed["renderable"] is False
+    assert seed["pages"][0]["english_lines"] == [text]
+    assert " ".join(seed["pages"][0]["english_lines"]).split() == text.split()
+
+
 def test_v10_short_comfortable_cue_is_not_paginated_by_break_reward():
     """V10 pages 4-5: punctuation quality cannot decide page count."""
     text = "AI stocks in the U Japan, and South Korea just plummeted."

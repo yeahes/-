@@ -2,6 +2,50 @@
 
 Last updated: 2026-08-24
 
+## 2026-08-24 Test-audio publication and review audit
+
+- The first automatic run for `测试音频.MP3` completed ASR, article correction,
+  frozen English IDs, parent Chinese, display-page Chinese, final timing, and
+  page validation. It contains 120 parents, 156 actual pages, 32 multipage
+  parents, zero empty Chinese pages, zero empty English-line arrays, and zero
+  final-timeline coverage gaps.
+- The model translation audit is `PARTIAL` at 80/120 because one 40-parent
+  fluency batch timed out. This is audit evidence, not a content or timeline
+  failure. Stable publication now preserves the partial result as an explicit
+  warning with the missing IDs and batch errors instead of raising the generic
+  optimization failure.
+- The review-mark layer now adds a conservative
+  `display_page_chinese_order_review` signal when adjacent page Chinese has
+  anchored source phrases in a clearly reversed order. The current read-only
+  artifact exposes two such candidates (`S0010`, `S0031`); the model audit
+  independently marked `S0045`. The signal never rewrites text or blocks
+  publication.
+- Focused publication, page-contract, translation-audit, and review-mark tests
+  pass `207` tests. The changed source has not been used to regenerate the
+  automatic run yet; the next new run should show the warning in the editor and
+  retain the quality audit file for a bounded retry.
+
+## 2026-08-24 Structural arm F scope correction
+
+- The shared `_is_open_subordinate_prefix` and
+  `_fragment_has_finite_predicate` contracts remain unchanged; the latter is
+  still a classmethod so the external boundary-measurement scripts can use
+  its `__func__` compatibility hook.
+- The finite-predicate-plus-comma exemption is isolated in
+  `_is_open_subordinate_prefix_for_structural_boundary`. It is used by the
+  pre-ID structural emitter and by the single final-boundary consumer that
+  merges fragment evidence; visual fragment checks and other display-layer
+  callers retain the shipped conservative behavior.
+- The private structural predicate caches by joined token text and falls back
+  to the legacy lexical helper when spaCy or its model is unavailable.
+- Focused verification: the arm F/contract tests pass, the external stage-2
+  replay reports 452/5180 illegal boundaries with 37
+  `open_subordinate_prefix_fragment` cases, and the reverse candidate replay
+  reports 69 newly legal / 0 newly illegal. The complete offline regression
+  remains 28/30: the two remaining failures are the pending 1260px
+  article-pagination experiment's line-rendering and fallback-page
+  expectations, not structural arm F or classmethod behavior.
+
 ## 2026-08-24 Manual editor interaction latency
 
 - The common lag path was the table publication signal: internal session

@@ -79,6 +79,8 @@ _ISSUE_LABELS = {
     "display_page_review": "实际分页切点需要人工确认",
     "display_page_blueprint_invalid": "实际分页方案无法安全生成",
     "display_page_translation_invalid": "实际分页中文未通过检查",
+    "display_page_chinese_order_review": "逐页中文顺序可能倒置",
+    "translation_quality_audit_incomplete": "中文质量审计未覆盖全部字幕",
     "display_page_translation_request_failed": "实际分页中文生成失败",
     "display_page_translation_retry_failed": "实际分页中文局部重试失败",
     "display_page_translation_retry_invalid": "实际分页中文重试后仍需人工复核",

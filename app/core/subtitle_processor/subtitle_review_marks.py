@@ -173,6 +173,7 @@ def _collect_subtitle_review_marks(directory: Path) -> List[SubtitleReviewMark]:
         marks.extend(_allocation_unresolved_marks(directory))
     marks.extend(_visual_page_review_marks(directory))
     marks.extend(_display_page_chinese_review_marks(directory))
+    marks.extend(_display_page_chinese_order_review_marks(directory))
     marks.extend(_model_translation_quality_marks(directory))
     if not complete_model_audit:
         marks.extend(_semantic_review_queue_marks(directory))
@@ -876,6 +877,71 @@ def _display_page_chinese_review_marks(directory: Path) -> List[SubtitleReviewMa
                 code="display_page_chinese_load_review",
                 reason=f"{page_id} 中文偏长：" + "；".join(reasons) + "。",
             )
+    return marks
+
+
+def _display_page_chinese_order_review_marks(directory: Path) -> List[SubtitleReviewMark]:
+    """Flag a strong, observable reversal of page-local Chinese meaning.
+
+    This is intentionally narrower than model fluency checking. A page is
+    marked only when adjacent page strings contain CJK runs of at least four
+    characters that occur in the authoritative parent Chinese, and the later
+    page's earliest anchored run starts materially before the prior page's
+    anchored run. It is REVIEW evidence, never a publication blocker.
+    """
+    artifact = _read_json(directory / "display-page-translations.json", {})
+    if not isinstance(artifact, Mapping):
+        return []
+    marks: List[SubtitleReviewMark] = []
+    cjk_runs = re.compile(r"[\u3400-\u9fff]{4,}")
+    for parent in _as_list(artifact.get("parents")):
+        if not isinstance(parent, Mapping):
+            continue
+        parent_id = str(parent.get("parent_subtitle_id") or "")
+        source = str(parent.get("source_parent_chinese") or "")
+        pages = [
+            page
+            for page in _as_list(parent.get("pages"))
+            if isinstance(page, Mapping)
+        ]
+        if not _SUBTITLE_ID_RE.fullmatch(parent_id) or not source or len(pages) < 2:
+            continue
+        for previous, current in zip(pages, pages[1:]):
+            previous_anchors = [
+                (source.find(run), run)
+                for run in cjk_runs.findall(str(previous.get("zh") or ""))
+                if source.find(run) >= 0
+            ]
+            current_anchors = [
+                (source.find(run), run)
+                for run in cjk_runs.findall(str(current.get("zh") or ""))
+                if source.find(run) >= 0
+            ]
+            if not previous_anchors or not current_anchors:
+                continue
+            previous_position, previous_run = min(
+                previous_anchors, key=lambda item: item[0]
+            )
+            current_position, current_run = min(
+                current_anchors, key=lambda item: item[0]
+            )
+            if current_position >= previous_position - 2:
+                continue
+            previous_id = str(previous.get("display_page_id") or "")
+            current_id = str(current.get("display_page_id") or "")
+            _append_marks(
+                marks,
+                [parent_id],
+                severity="REVIEW",
+                category="chinese_coherence",
+                target="chinese",
+                code="display_page_chinese_order_review",
+                reason=(
+                    f"逐页中文顺序可能倒置：{previous_id} 的“{previous_run}”"
+                    f"位于 {current_id} 的“{current_run}”之后；请按实际播放顺序复核。"
+                ),
+            )
+            break
     return marks
 
 

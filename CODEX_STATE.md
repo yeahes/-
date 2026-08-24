@@ -1,15 +1,33 @@
 # Project State
 Status: active
-Last verified: 2026-08-24 05:40:47 Asia/Shanghai
+Last verified: 2026-08-24 14:39:00 Asia/Shanghai
 Branch: main
-Verified HEAD: db46f68
-Working tree: tracked changes for frozen-page refresh reuse and article-analysis
-dialog isolation; unrelated generated `output/`
-  directories remain untracked and preserved
+Verified HEAD: 2c108a5
+Working tree: existing tracked changes remain untouched; this turn changed the
+partial translation-audit publication contract, added a deterministic page-
+Chinese order review signal, and added focused tests/docs. Generated `output/`
+directories remain untracked and preserved.
 
 ## Current Goal
-Keep manual editor local actions interactive and prevent article analysis from
-resizing the main task window.
+Make a fresh automatic run publishable and human-reviewable when the model
+quality audit is incomplete, while preserving all hard subtitle contracts and
+raising only high-confidence page-Chinese order issues.
+
+Next action: run the required full regression, then use the changed source for
+one clean new-audio run or a bounded replay of the existing test-audio cache.
+
+Unknowns: whether the editor's stable-result discovery displays the new partial-
+audit warning correctly; whether the next provider call completes the missing
+40 audit rows; and whether any remaining page-local issues require manual edits.
+
+## Next action
+Run `runtime\\python.exe scripts\\run_regression.py`, then inspect the next
+clean test-audio result using the long-caption audit skill.
+
+## Unknowns
+The current test-audio automatic artifact has 120 parents and 156 pages;
+quality audit coverage is 80/120 due a timeout, while timing and page contracts
+pass. The changed source has not yet regenerated that result.
 
 ## Confirmed Facts
 - Fixed-parent bilingual A/B changes four newest White House parents; three clear improvements and one REVIEW improvement pass page-Chinese contracts.
@@ -63,8 +81,7 @@ resizing the main task window.
   the unrelated existing article-display readability assertion.
 
 ## Next Action
-Restart the working-copy GUI and verify article analysis in dark mode, then
-decide separately whether to commit the current tracked changes.
+Implement only P1 A-grade offline marks, then measure P2 per set before wiring them.
 
 ## Do Not Regress
 - Do not mutate production artifacts, frozen English/IDs/timing, caches, audio, checkpoints, or untracked `output/`.

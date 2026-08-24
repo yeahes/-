@@ -704,6 +704,7 @@ class ScreenSubtitleEditor:
         self._syntax_hard_cut_issues: Dict[tuple[int, int], List[str]] = {}
         self._syntax_soft_cut_issues: Dict[tuple[int, int], List[str]] = {}
         self._orphaned_finite_predicate_cache: Dict[tuple, tuple[str, ...]] = {}
+        self._structural_finite_predicate_cache: Dict[str, bool] = {}
         self._syntax_nlp = None
         self._last_semantic_full_translations: Dict[int, str] = {}
         self._last_semantic_group_audit_contexts: Dict[str, Dict] = {}
@@ -6242,6 +6243,17 @@ class ScreenSubtitleEditor:
             previous_item,
             right,
         )
+        if (
+            "open_subordinate_prefix_fragment"
+            in fragment_evaluation.get("hard_fragment_issues", ())
+            and not self._is_open_subordinate_prefix_for_structural_boundary(left)
+        ):
+            fragment_evaluation = dict(fragment_evaluation)
+            fragment_evaluation["hard_fragment_issues"] = [
+                issue
+                for issue in fragment_evaluation["hard_fragment_issues"]
+                if issue != "open_subordinate_prefix_fragment"
+            ]
         for issue in fragment_evaluation["hard_fragment_issues"]:
             if issue not in hard_issues:
                 hard_issues.append(issue)
@@ -6287,7 +6299,7 @@ class ScreenSubtitleEditor:
         left_last = left_words[-1]
         right_first = right_words[0]
 
-        if self._is_open_subordinate_prefix(left):
+        if self._is_open_subordinate_prefix_for_structural_boundary(left):
             result["hard"].append("open_subordinate_prefix_fragment")
 
         trailing_issue = self._trailing_dependent_fragment_issue(left, right)
@@ -6589,6 +6601,64 @@ class ScreenSubtitleEditor:
                 normalized,
             )
         )
+
+    def _is_open_subordinate_prefix_for_structural_boundary(
+        self,
+        item: ScreenSubtitleItem,
+    ) -> bool:
+        """Apply arm F only to the pre-ID structural boundary contract."""
+        if not self._is_open_subordinate_prefix(item):
+            return False
+        text = self._normalize_text(item.original)
+        if not text.rstrip().endswith(","):
+            return True
+        return not self._structural_fragment_has_finite_predicate(
+            self._word_tokens(text)
+        )
+
+    def _structural_fragment_has_finite_predicate(
+        self,
+        words: Sequence[str],
+    ) -> bool:
+        """Detect arm-F finite predicates without changing shared consumers."""
+        normalized_words = [str(word).strip() for word in words if str(word).strip()]
+        cache_key = " ".join(normalized_words)
+        if not cache_key:
+            return False
+        cache = getattr(self, "_structural_finite_predicate_cache", None)
+        if cache is None:
+            cache = {}
+            self._structural_finite_predicate_cache = cache
+        if cache_key in cache:
+            return bool(cache[cache_key])
+
+        try:
+            nlp = self._load_syntax_nlp()
+        except Exception:
+            nlp = None
+        if nlp:
+            try:
+                doc = nlp(cache_key)
+            except Exception:
+                doc = None
+            if doc is not None:
+                result = any(
+                    token.pos_ in {"VERB", "AUX"}
+                    and token.tag_ not in {"VB", "VBG", "VBN"}
+                    for token in doc
+                )
+                cache[cache_key] = bool(result)
+                return bool(result)
+
+        # Preserve the shipped conservative behavior when spaCy/model loading
+        # is unavailable or the parser rejects this short text.
+        result = bool(
+            self._fragment_has_finite_predicate(
+                [word.casefold() for word in normalized_words]
+            )
+        )
+        cache[cache_key] = result
+        return result
 
     @classmethod
     def _is_short_affirmative_response(cls, text: str) -> bool:
@@ -10096,6 +10166,7 @@ class ScreenSubtitleEditor:
         self._syntax_hard_cut_issues = {}
         self._syntax_soft_cut_issues = {}
         self._orphaned_finite_predicate_cache = {}
+        self._structural_finite_predicate_cache = {}
         if not self._active_word_entries:
             return
         nlp = self._load_syntax_nlp()

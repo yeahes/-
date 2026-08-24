@@ -136,6 +136,16 @@ def main(argv: list[str] | None = None) -> int:
             False,
         ),
         (
+            "historical boundary ratchet",
+            ["tests/test_historical_boundary_ratchet.py"],
+            False,
+        ),
+        (
+            "historical empty display pages",
+            ["tests/test_historical_empty_display_pages.py"],
+            False,
+        ),
+        (
             "rule regression library",
             ["tests/test_rule_regression_library.py"],
             False,
@@ -241,6 +251,8 @@ def main(argv: list[str] | None = None) -> int:
                 "app/core/subtitle_processor/final_cue_timeline.py",
                 "app/core/subtitle_processor/stable_ts_alignment.py",
                 "tests/test_stable_caption_rules.py",
+                "tests/test_historical_boundary_ratchet.py",
+                "tests/test_historical_empty_display_pages.py",
                 "tests/test_asr_trust_contract.py",
                 "tests/test_version_manager_security.py",
                 "tests/test_video_synthesis_safety.py",

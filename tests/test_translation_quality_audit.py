@@ -91,6 +91,7 @@ def test_model_audit_is_id_bound_and_filters_false_parent_length_warning():
 
     assert result["status"] == "PASS"
     assert result["audited_subtitle_count"] == 4
+    assert result["unaudited_subtitle_ids"] == []
     assert {
         (tuple(item["subtitle_ids"]), item["code"])
         for item in result["items"]
@@ -117,6 +118,7 @@ def test_model_audit_fails_closed_when_batch_ids_are_incomplete():
 
     assert result["status"] == "PARTIAL"
     assert result["audited_subtitle_count"] == 0
+    assert result["unaudited_subtitle_ids"] == ["S0001", "S0002"]
     assert result["batch_errors"][0]["code"] == (
         "translation_quality_audit_binding_failed"
     )

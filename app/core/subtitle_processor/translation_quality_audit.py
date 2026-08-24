@@ -354,6 +354,12 @@ def audit_fixed_id_translation_quality(
         for subtitle_id, completed_focuses in audit_passes_by_id.items()
         if len(completed_focuses) == len(AUDIT_FOCUSES)
     ]
+    audited_id_set = set(audited_ids)
+    unaudited_ids = [
+        str(row["subtitle_id"])
+        for row in ordered
+        if str(row["subtitle_id"]) not in audited_id_set
+    ]
     return {
         "schema_version": 1,
         "prompt_version": PROMPT_VERSION,
@@ -361,6 +367,7 @@ def audit_fixed_id_translation_quality(
         "status": "PASS" if len(audited_ids) == len(ordered) else "PARTIAL",
         "source_subtitle_count": len(ordered),
         "audited_subtitle_count": len(audited_ids),
+        "unaudited_subtitle_ids": unaudited_ids,
         "candidate_issue_count": len(deduplicated),
         "issue_count": len(verified_issues),
         "items": verified_issues,

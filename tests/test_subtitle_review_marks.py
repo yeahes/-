@@ -320,6 +320,63 @@ def test_english_boundary_marks_drop_complete_sentence_false_positive():
         ) in _marks_for(marks, "S0004")
 
 
+def test_display_page_chinese_order_review_marks_strong_reversal_only():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_dir = Path(temp_dir)
+        _write_json(
+            artifact_dir / "display-page-translations.json",
+            {
+                "status": "PASS",
+                "parents": [
+                    {
+                        "parent_subtitle_id": "S0031",
+                        "source_parent_chinese": "但同样一张入场券，轮到中国人就得要50美元",
+                        "pages": [
+                            {
+                                "display_page_id": "S0031.P01",
+                                "zh": "轮到中国人",
+                                "start_ms": 0,
+                                "end_ms": 2000,
+                            },
+                            {
+                                "display_page_id": "S0031.P02",
+                                "zh": "但同样一张入场券，就得要50美元",
+                                "start_ms": 2000,
+                                "end_ms": 5000,
+                            },
+                        ],
+                    },
+                    {
+                        "parent_subtitle_id": "S0032",
+                        "source_parent_chinese": "同样一张票，轮到中国人就得付钱",
+                        "pages": [
+                            {
+                                "display_page_id": "S0032.P01",
+                                "zh": "同样一张票，",
+                                "start_ms": 0,
+                                "end_ms": 2000,
+                            },
+                            {
+                                "display_page_id": "S0032.P02",
+                                "zh": "轮到中国人就得付钱",
+                                "start_ms": 2000,
+                                "end_ms": 5000,
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
+        _write_json(artifact_dir / "english-boundary-audit.json", {"records": []})
+
+        marks = load_subtitle_review_marks(artifact_dir)
+
+        assert "display_page_chinese_order_review" in {
+            mark.code for mark in marks["S0031"]
+        }
+        assert "S0032" not in marks
+
+
 def test_semantic_review_queue_is_loaded_as_id_bound_read_only_marks():
     with tempfile.TemporaryDirectory() as temp_dir:
         artifact_dir = Path(temp_dir)

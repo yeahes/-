@@ -6,7 +6,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping
 
 from PyQt5.QtCore import QSettings, QThread, pyqtSignal
 from openai import OpenAI
@@ -489,7 +489,110 @@ class SubtitleThread(QThread):
                 ),
             },
         }
+        translation_audit = self.__dict__.get("_translation_quality_audit")
+        if isinstance(translation_audit, dict):
+            metadata["translation_quality_audit"] = {
+                "status": str(translation_audit.get("status") or "UNKNOWN"),
+                "source_subtitle_count": int(
+                    translation_audit.get("source_subtitle_count") or 0
+                ),
+                "audited_subtitle_count": int(
+                    translation_audit.get("audited_subtitle_count") or 0
+                ),
+                "issue_count": int(translation_audit.get("issue_count") or 0),
+                "batch_error_count": len(
+                    translation_audit.get("batch_errors") or []
+                ),
+                "unaudited_subtitle_ids": [
+                    str(value)
+                    for value in translation_audit.get("unaudited_subtitle_ids") or []
+                    if str(value)
+                ],
+            }
+            audit_path = str(
+                self.__dict__.get("_translation_quality_audit_path") or ""
+            ).strip()
+            if audit_path:
+                metadata["translation_quality_audit_path"] = audit_path
         return metadata
+
+    @staticmethod
+    def _merge_translation_quality_audit_warning(
+        validation_summary: Mapping[str, Any] | None,
+        audit: Mapping[str, Any] | None,
+    ) -> dict:
+        """Keep incomplete model-audit evidence without blocking valid pages."""
+        base = validation_summary or {}
+        summary = {
+            "status": str(base.get("status") or "WARNING"),
+            "errors": [
+                dict(item)
+                for item in base.get("errors") or []
+                if isinstance(item, Mapping)
+            ],
+            "warnings": [
+                dict(item)
+                for item in base.get("warnings") or []
+                if isinstance(item, Mapping)
+            ],
+            "info": [
+                dict(item)
+                for item in base.get("info") or []
+                if isinstance(item, Mapping)
+            ],
+        }
+        if not isinstance(audit, Mapping):
+            return summary
+        status = str(audit.get("status") or "UNKNOWN")
+        if status == "PASS":
+            return summary
+        source_count = int(audit.get("source_subtitle_count") or 0)
+        audited_count = int(audit.get("audited_subtitle_count") or 0)
+        missing_ids = [
+            str(value)
+            for value in audit.get("unaudited_subtitle_ids") or []
+            if str(value)
+        ]
+        if not missing_ids:
+            missing_ids = sorted(
+                {
+                    str(value)
+                    for item in audit.get("batch_errors") or []
+                    if isinstance(item, Mapping)
+                    for value in item.get("subtitle_ids") or []
+                    if str(value)
+                },
+                key=lambda value: (
+                    0,
+                    int(value[1:]),
+                )
+                if value.startswith("S") and value[1:].isdigit()
+                else (1, value),
+            )
+        warning = {
+            "code": "translation_quality_audit_incomplete",
+            "message": (
+                f"中文质量审计只完成 {audited_count}/{source_count} 条；"
+                "未完成部分保留在审计文件中，不影响已通过分页和时间轴的结果进入编辑器。"
+            ),
+            "status": status,
+            "audited_subtitle_count": audited_count,
+            "source_subtitle_count": source_count,
+            "missing_subtitle_ids": missing_ids,
+            "batch_errors": [
+                dict(item)
+                for item in audit.get("batch_errors") or []
+                if isinstance(item, Mapping)
+            ],
+        }
+        if not any(
+            str(item.get("code") or "") == warning["code"]
+            for item in summary["warnings"]
+        ):
+            summary["warnings"].append(warning)
+        if not summary["errors"] and summary["status"] == "ERROR":
+            summary["status"] = "WARNING"
+        return summary
 
     @staticmethod
     def _require_valid_final_timeline_before_display_pages(
@@ -2425,18 +2528,45 @@ class SubtitleThread(QThread):
                     coverage_report_path,
                     progress_callback=audit_progress,
                 )
+                self.__dict__["_translation_quality_audit"] = dict(
+                    translation_audit or {}
+                )
+                self.__dict__["_translation_quality_audit_path"] = (
+                    str(
+                        stable_artifact_dir(Path(coverage_report_path))
+                        / "translation-quality-audit.json"
+                    )
+                    if coverage_report_path
+                    else ""
+                )
                 self._complete_stage(
                     "translation_quality_audit",
                     "翻译质量审计",
                     audit_stage_started,
+                    details={
+                        "status": str(
+                            translation_audit.get("status") or "UNKNOWN"
+                        ),
+                        "audited_subtitle_count": int(
+                            translation_audit.get("audited_subtitle_count") or 0
+                        ),
+                        "source_subtitle_count": int(
+                            translation_audit.get("source_subtitle_count") or 0
+                        ),
+                    },
                 )
                 if translation_audit.get("status") != "PASS":
-                    raise RuntimeError(
-                        self.tr(
-                            "中文质量审计未覆盖全部固定字幕，已保留完成批次；"
-                            "请重试以补齐未完成批次。"
-                        )
+                    logger.warning(
+                        "Translation quality audit is %s (%s/%s); publishing the "
+                        "bound display result with an explicit warning.",
+                        translation_audit.get("status") or "UNKNOWN",
+                        translation_audit.get("audited_subtitle_count") or 0,
+                        translation_audit.get("source_subtitle_count") or 0,
                     )
+                final_validation_summary = self._merge_translation_quality_audit_warning(
+                    screen_editor.last_validation_summary,
+                    translation_audit,
+                )
                 final_duration_errors = screen_editor._subtitle_duration_issues(
                     asr_data.segments,
                     "ERROR",
@@ -2521,7 +2651,7 @@ class SubtitleThread(QThread):
                 coverage_report_path=coverage_report_path,
                 validation_status="passed",
                 validation_summary=(
-                    screen_editor.last_validation_summary
+                    final_validation_summary
                     if subtitle_config.need_screen_subtitle_edit
                     else None
                 ),
