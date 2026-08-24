@@ -7378,6 +7378,17 @@ def test_article_visual_pages_fail_closed_when_no_safe_chinese_boundary_exists()
     assert pages is None
 
 
+def test_article_visual_pages_best_effort_fallback_never_starts_with_punctuation():
+    pages = podcast_learning_video._strict_split_chinese_visual_pages(
+        "甲，",
+        2,
+        page_word_counts=[1, 1],
+        strict=False,
+    )
+
+    assert pages is None
+
+
 def test_article_visual_pages_use_local_token_boundaries_without_punctuation():
     pages = podcast_learning_video._strict_split_chinese_visual_pages(
         "中国AI小公司不必把有限资金砸进尖端芯片无底洞跑原始数据",

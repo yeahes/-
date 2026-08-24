@@ -2,6 +2,27 @@
 
 Last updated: 2026-08-24
 
+## 2026-08-24 Review Queue Run Identity Isolation
+
+- Stable validation snapshots now bind copied review evidence to the current
+  `code_commit`, `stable_run_id`, `attempt_id`, and artifact directory. When a
+  current manifest declares any of these fields, a legacy queue that omits one
+  is rejected instead of being accepted from matching subtitle IDs alone.
+- QA queue generation writes the run identity into the copied artifact before
+  rebuilding the source-audio review queue, so the queue and manifest refer to
+  the same stable run. This affects review evidence only; English, timing,
+  translation, and synthesis outputs are unchanged.
+- Focused queue, review-mark, and stable-caption tests pass after the change.
+
+## 2026-08-24 Chinese Page Fallback Safety
+
+- Non-strict Chinese page projection no longer falls back blindly to the
+  proportional target. It only uses a nearby boundary that does not start with
+  punctuation or split a contiguous ASCII/number token; otherwise it returns a
+  recoverable failure for review.
+- This prevents malformed page starts such as a leading comma without changing
+  strict pagination, page count policy, parent IDs, English text, or timing.
+
 ## 2026-08-24 Test-audio publication and review audit
 
 - The first automatic run for `测试音频.MP3` completed ASR, article correction,

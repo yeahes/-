@@ -3517,7 +3517,27 @@ def _strict_split_chinese_visual_pages(
         if not candidates:
             if strict:
                 return None
-            candidates = [target]
+            # Legacy best-effort callers still need a page projection, but the
+            # fallback must not create a page that starts with punctuation or
+            # splits a glued ASCII token.  If no such projection exists, fail
+            # closed instead of manufacturing a visibly malformed page.
+            fallback_candidates = [
+                value
+                for value in nearby
+                if 0 < value < len(compact)
+                and compact[value] not in punctuation
+                and not (
+                    compact[value - 1].isascii()
+                    and compact[value].isascii()
+                    and (
+                        compact[value - 1].isalnum()
+                        or compact[value].isalnum()
+                    )
+                )
+            ]
+            if not fallback_candidates:
+                return None
+            candidates = fallback_candidates
         # A punctuation boundary is a stronger page-local semantic signal
         # than being a few characters closer to the proportional target. Keep
         # the choice deterministic: punctuation wins within the same safe
