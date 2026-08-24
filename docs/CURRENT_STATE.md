@@ -4539,3 +4539,17 @@ Result:
   visibility regression passes. Read-only replay of the real White House
   checkpoint produces zero semantic-queue marks while preserving all current
   non-semantic evidence. No production subtitle artifact was rewritten.
+
+## 2026-08-25 Short-Chain Signal Measurement
+
+- Added the read-only `scripts/audit_short_chain_and_backchannel.py` experiment.
+  It compares an immutable stable run with the manual-final history and never
+  writes to stable artifacts, caches, review ledgers, or manual-final files.
+- On `测试音频` (120 parents), the existing editor ledger hit 14/24 manually
+  modified parents and missed 10. The proposed short-chain lexical signal
+  marked 26/120 parents, hit 4/24 (16.7% recall), and falsely marked 22.
+  It is not production-safe and remains an offline measurement only.
+- Thirteen of the 24 modified parents contain a spoken marker. A conservative
+  Chinese-marker comparison found three parents where the manual final restored
+  marker evidence absent from automatic Chinese and one where it removed it;
+  this is insufficient to change the translation prompt without a provider A/B.

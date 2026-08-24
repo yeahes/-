@@ -1,93 +1,42 @@
 # Project State
+
 Status: active
-Last verified: 2026-08-24 14:39:00 Asia/Shanghai
+Last verified: 2026-08-25 00:31:04 Asia/Shanghai
 Branch: main
-Verified HEAD: 2c108a5
-Working tree: existing tracked changes remain untouched; this turn changed the
-partial translation-audit publication contract, added a deterministic page-
-Chinese order review signal, and added focused tests/docs. Generated `output/`
-directories remain untracked and preserved.
+Verified HEAD: 5d22606
+Working tree: modified (pre-existing audit artifacts plus this read-only measurement)
 
 ## Current Goal
-Make a fresh automatic run publishable and human-reviewable when the model
-quality audit is incomplete, while preserving all hard subtitle contracts and
-raising only high-confidence page-Chinese order issues.
-
-Next action: run the required full regression, then use the changed source for
-one clean new-audio run or a bounded replay of the existing test-audio cache.
-
-Unknowns: whether the editor's stable-result discovery displays the new partial-
-audit warning correctly; whether the next provider call completes the missing
-40 audit rows; and whether any remaining page-local issues require manual edits.
-
-## Next action
-Run `runtime\\python.exe scripts\\run_regression.py`, then inspect the next
-clean test-audio result using the long-caption audit skill.
-
-## Unknowns
-The current test-audio automatic artifact has 120 parents and 156 pages;
-quality audit coverage is 80/120 due a timeout, while timing and page contracts
-pass. The changed source has not yet regenerated that result.
+Improve stable subtitle review coverage without changing frozen English, IDs, timing, or production defaults without evidence.
 
 ## Confirmed Facts
-- Fixed-parent bilingual A/B changes four newest White House parents; three clear improvements and one REVIEW improvement pass page-Chinese contracts.
-- Historical White House, Chocolate v27/v29, and Employment guards have zero fixed-parent changes.
-- Variable-parent `3 -> 2/4` checked 18,457 partitions for 14 targets and found zero feasible candidates; it made zero API calls.
-- `More -> Restore Recent Subtitles` loads manifests directly and normal close retains dirty edits in a hash-bound draft.
-- Real `work-dir` discovery returns 20 episode entries in 0.367 seconds; newest White House is one entry backed by five historical runs.
-- Complete-parent deletion now uses schema-v3 media derivation and a pure
-  source-to-presentation time map; source authority remains immutable.
-- An `ERROR` display-page artifact with render plans remains a usable frozen
-  geometry checkpoint; semantic errors still block publication.
-- Local editor refreshes reuse those frozen plans instead of invoking a full
-  Pillow page replan after every page edit, boundary move, merge, or confirm.
-- Article analysis is hosted in an independent non-modal dialog; the task page
-  remains at the compact default layout while the dialog is open.
-- Article dialog custom colors refresh from qfluentwidgets' completed theme
-  signal, including when the theme changes while the dialog is open.
-- ID-bound page translation reuse preserves valid sibling pages and leaves
-  exact missing/blank pages for formal contract validation.
-- Source-scoped page errors remain blocking for their recorded parent/page;
-  the Japanese X-generation replay reports only `S0136.P01/P02` after the
-  six-parent deletion.
-- Focused deletion/editor/publication/synthesis regression: 262 passed.
-- Full regression: 29/30 checks passed. The isolated failure is the existing
-  `S9522` article page-start assertion (`into` expected, `in` selected), with
-  no production pagination diff in this task.
+- Two production fixes are committed: `3925520` run-bound review evidence and `5d22606` punctuation-safe Chinese fallback.
+- Immutable `测试音频` run has 120 parents, 156 pages, 32 multipage parents, zero empty Chinese pages, and `render_blocked=false`.
+- Manual-final history modifies 24 parents; the editor ledger hits 14 and misses 10: S0062/S0063/S0093/S0094/S0103/S0104/S0105/S0107/S0117/S0118.
+- Proposed short-chain signal marks 26/120, hits 4/24 (16.7% recall), and false-marks 22; it is rejected for production.
+- Full regression: 31/32 checks passed. The only failure is the existing S9522 article page-start fixture (`into` expected, `in` selected).
 
 ## Approved Decisions
-- Integrate only the fixed-parent material-improvement selector; reject the tested variable-parent design.
-- Group recovery entries per audio while preserving unsaved drafts and discovering source-adjacent manual packages.
-- The user will run the complete regression; Codex runs focused tests and real read-only replays.
+- Keep short-chain and backchannel work offline until a stronger, reproducible signal passes its own gate.
+- Do not rerun or mutate manually reviewed audio results.
 
 ## Relevant Paths
-- Evidence: `docs/handoffs/2026-08-23-fixed-parent-production-and-recovery-list.md`
-- Recovery: `app/core/subtitle_processor/manual_final_subtitle_editor.py`, `app/view/subtitle_interface.py`
-- Experiments: `scripts/experiment_fixed_parent_bilingual_pages.py`, `scripts/audit_variable_parent_count_joint_planning.py`
-- Commits: production selector `bb9d98d`; consolidated recovery `815c497`.
+- Measurement: `scripts/audit_short_chain_and_backchannel.py`
+- Current run: `work-dir/测试音频-当前代码/subtitle/stable-runs/20260824T201840.701773-2290bd40`
+- Progress: `执行进展-给用户.md`
+- Task log: `tasks/active/stable-subtitle-production-v1-log.md`
 
 ## Last Verification
-- Frozen-plan focused tests: 3 passed.
-- Article-context state and dark-theme style tests: 4 passed.
-- Full offline regression: 29/30 checks passed; the existing article display
-  readability contract still fails at `test_three_line_fallback_promotes_complete_two_page_alternative`.
-- Real Japanese X-generation model refresh: about 0.05s first refresh and
-  about 0.01s subsequent refreshes after local page edits.
-- `runtime\\python.exe -m pytest tests/test_stable_publication.py -q`: 96
-  passed after isolating internal Qt model publication from user edits.
-- Read-only original Japanese X-generation checkpoint replay keeps 241 frozen
-  plans (235 after deleting S0001-S0006) and reuses all 296 remaining pages.
-- Full `scripts/run_regression.py` completed 29/30 checks; the only failure is
-  the unrelated existing article-display readability assertion.
+- Measurement script: `py_compile` passed; read-only output reproduced C1 numbers.
+- `runtime\\python.exe scripts\\run_regression.py`: 31/32; stable publication, page translation, boundaries, review evidence, manual-final, synthesis safety, and syntax checks passed.
+- `git diff --check`: only existing line-ending warnings.
 
 ## Next Action
-Implement only P1 A-grade offline marks, then measure P2 per set before wiring them.
+Design a boundary-aware offline signal from the ten missed IDs; do not wire the rejected lexical signal or change translation prompts.
 
 ## Do Not Regress
-- Do not mutate production artifacts, frozen English/IDs/timing, caches, audio, checkpoints, or untracked `output/`.
+- Preserve one authoritative word ledger, frozen English/IDs/timing, current page contracts, run identity isolation, and no writes to `D:\\软件缓存\\VideoCaptioner`.
 
 ## Unknowns
-- Direct Qt GUI acceptance is pending because the bundled offscreen Qt plugin
-  hangs during QApplication initialization in this environment.
-- The pre-existing S9522 article readability assertion needs a separately
-  scoped pagination decision.
+- Whether a boundary-aware signal can improve recall without making the review queue exceed the user's practical reading budget.
+- Whether the existing S9522 fixture should be separately updated; it is unrelated to this measurement.
