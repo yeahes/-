@@ -26,6 +26,7 @@ from app.core.bk_asr.asr_data import ASRData
 from app.config import BIN_PATH
 from app.core.entities import SupportedAudioFormats, SupportedVideoFormats
 from app.core.output_paths import (
+    MEDIA_RESULT_DIR_SUFFIX,
     MEDIA_RESULT_MANUAL_PACKAGE_DIR,
     containing_media_result_dir,
     media_result_dir,
@@ -727,23 +728,59 @@ class ManualFinalSubtitleSession:
 
         manifest_paths = list(root.rglob("stable-final-manifest.json"))
         # Current manual packages live beside the source media rather than in
-        # work-dir. Follow only exact, existing source-media paths declared by
-        # a work-dir manifest, then inspect the deterministic package location.
+        # work-dir. Follow only exact, hash-verified paths declared by a
+        # work-dir manifest, then inspect the deterministic package location.
         for manifest_path in tuple(manifest_paths):
             try:
                 manifest = cls._read_json(manifest_path.resolve())
+                manual_manifest_paths: list[Path] = []
                 source_media = cls._manifest_source_media_path(
                     manifest,
                     manifest_path,
                 )
-                if source_media is None:
-                    continue
-                manual_manifest = (
-                    media_result_manual_package_dir(source_media)
-                    / "stable-final-manifest.json"
+                if source_media is not None:
+                    manual_manifest_paths.append(
+                        media_result_manual_package_dir(source_media)
+                        / "stable-final-manifest.json"
+                    )
+                for declared_paths, declared_hashes in (
+                    (
+                        manifest.get("source_subtitle_paths") or {},
+                        manifest.get("source_subtitle_paths_sha256") or {},
+                    ),
+                    (
+                        manifest.get("paths") or {},
+                        manifest.get("paths_sha256") or {},
+                    ),
+                ):
+                    if not isinstance(declared_paths, Mapping):
+                        continue
+                    hashes = (
+                        declared_hashes
+                        if isinstance(declared_hashes, Mapping)
+                        else {}
+                    )
+                    for key, recorded_path in declared_paths.items():
+                        resolved_path = resolve_manifest_owned_path(
+                            manifest_path,
+                            manifest,
+                            recorded_path,
+                            str(hashes.get(key) or ""),
+                        )
+                        if resolved_path is None:
+                            continue
+                        result_dir = containing_media_result_dir(resolved_path)
+                        if result_dir is not None:
+                            manual_manifest_paths.append(
+                                result_dir
+                                / MEDIA_RESULT_MANUAL_PACKAGE_DIR
+                                / "stable-final-manifest.json"
+                            )
+                manifest_paths.extend(
+                    candidate
+                    for candidate in manual_manifest_paths
+                    if candidate.is_file()
                 )
-                if manual_manifest.is_file():
-                    manifest_paths.append(manual_manifest)
             except (ManualFinalSubtitleEditError, OSError, TypeError, ValueError):
                 continue
 
@@ -789,7 +826,22 @@ class ManualFinalSubtitleSession:
                 )
                 source_media_text = str(source_media or "")
                 source_subtitle_text = str(manifest.get("source_subtitle") or "").strip()
-                if source_media_text:
+                result_dir = (
+                    containing_media_result_dir(resolved_manifest)
+                    or containing_media_result_dir(subtitle_path)
+                )
+                if result_dir is None and source_media is not None:
+                    expected_result_dir = media_result_dir(source_media)
+                    if expected_result_dir.is_dir():
+                        result_dir = expected_result_dir
+                if result_dir is not None:
+                    result_name = result_dir.name
+                    title = (
+                        result_name[: -len(MEDIA_RESULT_DIR_SUFFIX)]
+                        if result_name.endswith(MEDIA_RESULT_DIR_SUFFIX)
+                        else result_name
+                    )
+                elif source_media_text:
                     title = Path(source_media_text).stem
                 elif source_subtitle_text:
                     title = Path(source_subtitle_text).stem
@@ -824,7 +876,11 @@ class ManualFinalSubtitleSession:
                     {
                         "title": title or "未命名字幕",
                         "state": state,
-                        "subtitle_count": int(manifest.get("subtitle_count") or 0),
+                        "subtitle_count": int(
+                            manifest.get("subtitle_count")
+                            or override.get("manual_cue_count")
+                            or 0
+                        ),
                         "created_at": str(manifest.get("created_at") or ""),
                         "updated_timestamp": max(manifest_mtime, draft_mtime),
                         "manifest_path": str(resolved_manifest),
@@ -834,8 +890,17 @@ class ManualFinalSubtitleSession:
                         "stable_run_id": str(manifest.get("stable_run_id") or ""),
                         "is_manual_package": is_manual,
                         "source_media_path": source_media_text,
+                        "episode_identity": (
+                            os.path.normcase(str(result_dir.resolve()))
+                            if result_dir is not None
+                            else ""
+                        ),
                         "manual_output_dir": str(
-                            media_result_manual_package_dir(source_media).resolve()
+                            (
+                                result_dir / MEDIA_RESULT_MANUAL_PACKAGE_DIR
+                            ).resolve()
+                            if result_dir is not None
+                            else media_result_manual_package_dir(source_media).resolve()
                             if source_media is not None
                             else (
                                 resolved_manifest.parent
@@ -870,31 +935,33 @@ class ManualFinalSubtitleSession:
                 identity = ("", "", os.path.normcase(str(item["manifest_path"])))
             current = deduplicated.get(identity)
             if current is None or (
+                float(item.get("updated_timestamp") or 0.0),
                 bool(item.get("has_recovery_draft")),
                 path_rank(item),
-                float(item.get("updated_timestamp") or 0.0),
             ) > (
+                float(current.get("updated_timestamp") or 0.0),
                 bool(current.get("has_recovery_draft")),
                 path_rank(current),
-                float(current.get("updated_timestamp") or 0.0),
             ):
                 deduplicated[identity] = item
         episodes: Dict[str, List[Dict[str, Any]]] = {}
         for item in deduplicated.values():
-            title_key = re.sub(
-                r"\s+",
-                "",
-                str(item.get("title") or "未命名字幕"),
-            ).casefold()
-            episodes.setdefault(title_key, []).append(item)
+            episode_key = str(item.get("episode_identity") or "")
+            if not episode_key:
+                episode_key = re.sub(
+                    r"\s+",
+                    "",
+                    str(item.get("title") or "未命名字幕"),
+                ).casefold()
+            episodes.setdefault(episode_key, []).append(item)
 
         selected_records: List[Dict[str, Any]] = []
         for history in episodes.values():
             selected = max(
                 history,
                 key=lambda item: (
-                    bool(item.get("has_recovery_draft")),
                     float(item.get("updated_timestamp") or 0.0),
+                    bool(item.get("has_recovery_draft")),
                     path_rank(item),
                 ),
             )

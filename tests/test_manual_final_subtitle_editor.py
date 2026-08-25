@@ -3030,6 +3030,109 @@ def test_recent_discovery_finds_source_adjacent_manual_package():
         assert records[0]["history_count"] == 2
 
 
+def test_recent_discovery_follows_declared_result_subtitle_to_manual_package():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        _, source_srt, manifest_path = _session_fixture(root)
+        source_media = root / "source" / "episode.m4a"
+        source_media.parent.mkdir(parents=True, exist_ok=True)
+        source_media.write_bytes(b"test-audio-placeholder")
+        subtitle_dir = media_result_subtitle_dir(source_media)
+        subtitle_dir.mkdir(parents=True, exist_ok=True)
+        named_source_subtitle = subtitle_dir / "episode-原文在上双语字幕.srt"
+        shutil.copyfile(source_srt, named_source_subtitle)
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("source_media_path", None)
+        manifest.update(
+            {
+                "attempt_id": "attempt-1",
+                "stable_run_id": "run-1",
+                "created_at": "2026-08-22T12:00:00",
+                "source_subtitle_paths": {
+                    "bilingual_original_top_srt": str(named_source_subtitle),
+                },
+                "source_subtitle_paths_sha256": {
+                    "bilingual_original_top_srt": file_sha256(
+                        named_source_subtitle
+                    ),
+                },
+            }
+        )
+        _write_json(manifest_path, manifest)
+        session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        saved = session.save_to_source_folder(source_media_path=source_media)
+
+        records = ManualFinalSubtitleSession.discover_recent_editable_manifests(
+            root / "work"
+        )
+
+        assert len(records) == 1
+        assert records[0]["state"] == "人工终稿"
+        assert Path(records[0]["manifest_path"]) == Path(
+            saved["manifest_path"]
+        ).resolve()
+        assert records[0]["title"] == "episode"
+        assert records[0]["subtitle_count"] == 2
+        assert records[0]["history_count"] == 2
+
+
+def test_recent_discovery_prefers_new_final_but_keeps_newer_draft_recoverable():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, source_srt, manifest_path = _session_fixture(root)
+        source_media = root / "source" / "episode.m4a"
+        source_media.parent.mkdir(parents=True, exist_ok=True)
+        source_media.write_bytes(b"test-audio-placeholder")
+        subtitle_dir = media_result_subtitle_dir(source_media)
+        subtitle_dir.mkdir(parents=True, exist_ok=True)
+        named_source_subtitle = subtitle_dir / "episode-原文在上双语字幕.srt"
+        shutil.copyfile(source_srt, named_source_subtitle)
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "attempt_id": "attempt-1",
+                "stable_run_id": "run-1",
+                "created_at": "2026-08-22T12:00:00",
+                "source_subtitle_paths": {
+                    "bilingual_original_top_srt": str(named_source_subtitle),
+                },
+                "source_subtitle_paths_sha256": {
+                    "bilingual_original_top_srt": file_sha256(
+                        named_source_subtitle
+                    ),
+                },
+            }
+        )
+        _write_json(manifest_path, manifest)
+        session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+        session.move_suffix_to_next(0, 1)
+        draft_path = session.save_recovery_draft()
+        saved = session.save_to_source_folder(source_media_path=source_media)
+        manual_manifest = Path(saved["manifest_path"])
+        os.utime(manifest_path, (10, 10))
+        os.utime(draft_path, (20, 20))
+        os.utime(manual_manifest, (30, 30))
+
+        records = ManualFinalSubtitleSession.discover_recent_editable_manifests(
+            root / "work"
+        )
+
+        assert len(records) == 1
+        assert records[0]["state"] == "人工终稿"
+        assert Path(records[0]["manifest_path"]) == manual_manifest.resolve()
+
+        os.utime(draft_path, (40, 40))
+        records = ManualFinalSubtitleSession.discover_recent_editable_manifests(
+            root / "work"
+        )
+
+        assert len(records) == 1
+        assert records[0]["state"] == "未保存草稿"
+        assert Path(records[0]["manifest_path"]) == manifest_path.resolve()
+
+
 def test_merge_only_combines_adjacent_continuous_word_ranges():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
