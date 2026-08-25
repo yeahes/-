@@ -799,6 +799,13 @@ class SubtitleInterface(QWidget):
         self._manual_save_in_progress = False
         self._manual_refresh_requested = False
         self._manual_active_save_context = None
+        self._failed_checkpoint_retry_available = False
+        self._failed_checkpoint_retry_source_subtitle = ""
+        self._failed_checkpoint_retry_source_media = ""
+        self._failed_checkpoint_retry_article_reference_text = ""
+        self._failed_checkpoint_retry_article_context_data = None
+        self._failed_checkpoint_retry_use_article_reference_assist = False
+        self._failed_checkpoint_retry_use_article_translation_terms = False
         self._manual_pending_page_split = None
         self._manual_long_caption_parent_id = ""
         self._manual_long_caption_queue_row = 0
@@ -1019,13 +1026,118 @@ class SubtitleInterface(QWidget):
 
         # 添加开始按钮到水平布局
         self.start_button = PrimaryPushButton(self.tr("开始"), self, icon=FIF.PLAY)
-        self.start_button.clicked.connect(
-            lambda: self.start_subtitle_optimization(need_create_task=True)
-        )
+        self.start_button.clicked.connect(self._on_start_button_clicked)
         self.start_button.setFixedHeight(34)
         top_layout.addWidget(self.start_button)
 
         self.main_layout.addLayout(top_layout)
+
+    def _on_start_button_clicked(self) -> None:
+        """Start a new run or retry the task that produced the current checkpoint."""
+        if bool(getattr(self, "_failed_checkpoint_retry_available", False)):
+            self._retry_failed_checkpoint()
+            return
+        self.start_subtitle_optimization(need_create_task=True)
+
+    def _set_failed_checkpoint_retry_available(self, available: bool) -> None:
+        """Expose the processing entry while a failed checkpoint is being reviewed."""
+        self._failed_checkpoint_retry_available = bool(available)
+        if not available:
+            self._failed_checkpoint_retry_source_subtitle = ""
+            self._failed_checkpoint_retry_source_media = ""
+            self._failed_checkpoint_retry_article_reference_text = ""
+            self._failed_checkpoint_retry_article_context_data = None
+            self._failed_checkpoint_retry_use_article_reference_assist = False
+            self._failed_checkpoint_retry_use_article_translation_terms = False
+        button = getattr(self, "start_button", None)
+        if button is None:
+            return
+        if available:
+            button.setText(self.tr("重试"))
+            button.setToolTip(
+                self.tr("重新运行当前字幕任务；已完成的翻译会按缓存复用。")
+            )
+        else:
+            button.setText(self.tr("开始"))
+            button.setToolTip("")
+        manual_mode = bool(
+            getattr(self, "manual_final_session", None) is not None
+        )
+        button.setVisible(not manual_mode or bool(available))
+
+    def _retry_failed_checkpoint(self) -> None:
+        """Retry the failed task after protecting any edits made in its preview."""
+        source_subtitle = str(
+            getattr(self, "_failed_checkpoint_retry_source_subtitle", "") or ""
+        ).strip()
+        source_media = str(
+            getattr(self, "_failed_checkpoint_retry_source_media", "") or ""
+        ).strip()
+        if not source_subtitle:
+            source_subtitle = str(getattr(self, "subtitle_path", "") or "").strip()
+        if not source_subtitle:
+            self._set_failed_checkpoint_retry_available(False)
+            return
+        if not self._confirm_discard_manual_edits(self.tr("重试自动处理")):
+            return
+        if self.task is None:
+            self.task = TaskFactory.create_subtitle_task(
+                file_path=source_subtitle,
+                video_path=source_media or None,
+                source_audio_path=source_media or None,
+                need_next_task=True,
+                require_manual_review_before_synthesis=True,
+            )
+        retry_article_text = str(
+            getattr(self, "_failed_checkpoint_retry_article_reference_text", "")
+            or ""
+        ).strip()
+        retry_article_context = getattr(
+            self, "_failed_checkpoint_retry_article_context_data", None
+        )
+        if retry_article_text and (
+            bool(
+                getattr(
+                    self,
+                    "_failed_checkpoint_retry_use_article_reference_assist",
+                    False,
+                )
+            )
+            or bool(
+                getattr(
+                    self,
+                    "_failed_checkpoint_retry_use_article_translation_terms",
+                    False,
+                )
+            )
+        ):
+            # A retry must keep the original run's article contract.  Reusing
+            # only the source path would silently change the translation prompt
+            # and invalidate every otherwise safe semantic cache entry.
+            self.task.article_reference_text = retry_article_text
+            self.task.article_context_data = (
+                copy.deepcopy(retry_article_context)
+                if isinstance(retry_article_context, Mapping)
+                else None
+            )
+            self.task.use_article_reference_assist = bool(
+                getattr(
+                    self,
+                    "_failed_checkpoint_retry_use_article_reference_assist",
+                    False,
+                )
+            )
+            self.task.use_article_translation_terms = bool(
+                getattr(
+                    self,
+                    "_failed_checkpoint_retry_use_article_translation_terms",
+                    False,
+                )
+            )
+        self.subtitle_path = source_subtitle
+        self._set_failed_checkpoint_retry_available(False)
+        self._reset_manual_editor_state()
+        self.start_subtitle_optimization(need_create_task=True)
 
     def _set_manual_editor_mode(self, enabled: bool) -> None:
         """Expose one coherent command set for processing or manual final editing."""
@@ -1040,7 +1152,10 @@ class SubtitleInterface(QWidget):
             self.target_language_button,
         ):
             self.command_bar.setWidgetAvailable(widget, not manual_mode)
-        self.start_button.setVisible(not manual_mode)
+        self.start_button.setVisible(
+            not manual_mode
+            or bool(getattr(self, "_failed_checkpoint_retry_available", False))
+        )
         self.translate_button.setVisible(not manual_mode)
         menu_actions = self.more_menu.menuActions()
         if manual_mode:
@@ -2310,6 +2425,7 @@ class SubtitleInterface(QWidget):
         """设置任务并更新UI"""
         if hasattr(self, "subtitle_optimization_thread"):
             self.subtitle_optimization_thread.stop()
+        self._set_failed_checkpoint_retry_available(False)
         self.start_button.setEnabled(True)
         self.task = task
         self.subtitle_path = task.subtitle_path
@@ -2365,6 +2481,7 @@ class SubtitleInterface(QWidget):
         self.start_subtitle_optimization(need_create_task=False)
 
     def on_subtitle_optimization_finished(self, video_path, output_path):
+        self._set_failed_checkpoint_retry_available(False)
         self.start_button.setEnabled(True)
         self.cancel_button.hide()  # 隐藏取消按钮
         self._load_manual_final_session_from_output(output_path)
@@ -2400,7 +2517,19 @@ class SubtitleInterface(QWidget):
                 parent=self,
             )
             return
-        InfoBar.error(self.tr("优化失败"), self.tr(error), duration=20000, parent=self)
+        self._set_retry_context_from_task()
+        retryable = bool(
+            self._failed_checkpoint_retry_source_subtitle
+            and (self.task is not None or self.subtitle_path)
+        )
+        self._set_failed_checkpoint_retry_available(retryable)
+        InfoBar.error(
+            self.tr("优化失败"),
+            self.tr(error)
+            + (self.tr("；可点击顶部“重试”再次运行。") if retryable else ""),
+            duration=20000,
+            parent=self,
+        )
 
     def on_subtitle_optimization_progress(self, value, status):
         self.progress_bar.setValue(value)
@@ -2637,8 +2766,16 @@ class SubtitleInterface(QWidget):
             return False
 
         manifest_path = Path(str(listing.currentItem().data(Qt.UserRole)))
+        failure_match = self._failure_record_for_manifest(manifest_path)
         try:
-            session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+            if failure_match is not None:
+                failure_path, failure = failure_match
+                session = ManualFinalSubtitleSession.load_from_failure_record(
+                    failure_path
+                )
+            else:
+                failure = None
+                session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
         except ManualFinalSubtitleEditError as exc:
             InfoBar.error(
                 self.tr("恢复失败"),
@@ -2651,6 +2788,14 @@ class SubtitleInterface(QWidget):
         SubtitleInterface._reset_manual_editor_state(self)
         self.manual_final_session = session
         self.subtitle_path = str(session.subtitle_path)
+        if failure is not None:
+            self._active_subtitle_attempt_id = str(
+                failure.get("attempt_id") or ""
+            )
+            self._set_failed_checkpoint_retry_context(
+                failure,
+            )
+            self._set_failed_checkpoint_retry_available(True)
         self._set_manual_clean_checkpoint()
         draft_restored = False
         try:
@@ -2799,6 +2944,11 @@ class SubtitleInterface(QWidget):
 
     def _reset_manual_editor_state(self) -> None:
         """Return the table to one neutral, non-manual editor state."""
+        set_retry_available = getattr(
+            self, "_set_failed_checkpoint_retry_available", None
+        )
+        if callable(set_retry_available):
+            set_retry_available(False)
         set_manual_mode = getattr(self, "_set_manual_editor_mode", None)
         if callable(set_manual_mode):
             set_manual_mode(False)
@@ -2954,6 +3104,173 @@ class SubtitleInterface(QWidget):
                 )
             )
 
+    @staticmethod
+    def _failure_record_for_manifest(
+        manifest_path: str | Path,
+    ) -> tuple[Path, dict[str, Any]] | None:
+        """Find the matching run-level failure record for a checkpoint manifest."""
+        resolved_manifest = Path(manifest_path).resolve()
+        for parent in (resolved_manifest.parent, *resolved_manifest.parents):
+            failure_path = parent / "stable-last-failure.json"
+            if not failure_path.is_file():
+                continue
+            try:
+                failure = json.loads(failure_path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(failure, dict) or not failure.get("render_blocked"):
+                continue
+            recorded_manifest = str(
+                failure.get("editable_checkpoint_manifest_path") or ""
+            ).strip()
+            if recorded_manifest:
+                try:
+                    if Path(recorded_manifest).resolve() != resolved_manifest:
+                        continue
+                except OSError:
+                    continue
+            return failure_path, failure
+        return None
+
+    def _set_failed_checkpoint_retry_context(
+        self,
+        failure: Mapping[str, Any],
+    ) -> None:
+        """Keep the original subtitle/media inputs needed after a restart."""
+        self._failed_checkpoint_retry_source_subtitle = str(
+            failure.get("source_subtitle") or ""
+        ).strip()
+        self._failed_checkpoint_retry_source_media = ""
+        manifest_text = str(
+            failure.get("editable_checkpoint_manifest_path") or ""
+        ).strip()
+        if not manifest_text:
+            return
+        try:
+            manifest = json.loads(
+                Path(manifest_text).resolve().read_text(encoding="utf-8-sig")
+            )
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(manifest, dict):
+            self._failed_checkpoint_retry_source_media = str(
+                manifest.get("source_media_path") or ""
+            ).strip()
+            loader = getattr(self, "_load_retry_article_context_from_manifest", None)
+            if callable(loader):
+                loader(manifest_text, manifest)
+            else:
+                SubtitleInterface._load_retry_article_context_from_manifest(
+                    self,
+                    manifest_text,
+                    manifest,
+                )
+
+    def _load_retry_article_context_from_manifest(
+        self,
+        manifest_path: str | Path,
+        manifest: Mapping[str, Any],
+    ) -> None:
+        """Restore only the article contract recorded by this checkpoint."""
+        comparison = manifest.get("run_comparison")
+        article = comparison.get("article_reference") if isinstance(comparison, Mapping) else None
+        if not isinstance(article, Mapping):
+            return
+        use_assist = bool(article.get("use_article_reference_assist"))
+        use_terms = bool(article.get("use_article_translation_terms"))
+        if not (use_assist or use_terms) or not bool(article.get("reference_text_present")):
+            return
+
+        source_subtitle = str(manifest.get("source_subtitle") or "").strip()
+        source_dir = Path(source_subtitle).parent if source_subtitle else Path(manifest_path).parent.parent.parent
+        article_source_path = source_dir / "article_source.txt"
+        try:
+            article_text = article_source_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return
+        if not article_text:
+            return
+
+        context_data = None
+        context_path = source_dir / "article_context.json"
+        try:
+            loaded = json.loads(context_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, Mapping):
+                context_data = dict(loaded)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            context_data = None
+
+        self._failed_checkpoint_retry_article_reference_text = article_text
+        self._failed_checkpoint_retry_article_context_data = context_data
+        self._failed_checkpoint_retry_use_article_reference_assist = use_assist
+        self._failed_checkpoint_retry_use_article_translation_terms = use_terms
+
+    def _set_retry_context_from_task(self) -> None:
+        """Keep a generic failed task retryable when no stable checkpoint exists."""
+        task = getattr(self, "task", None)
+        self._failed_checkpoint_retry_source_subtitle = str(
+            getattr(task, "subtitle_path", "")
+            or getattr(self, "subtitle_path", "")
+            or ""
+        ).strip()
+        self._failed_checkpoint_retry_source_media = str(
+            getattr(task, "source_audio_path", "")
+            or getattr(task, "video_path", "")
+            or ""
+        ).strip()
+        article_text = str(getattr(task, "article_reference_text", "") or "").strip()
+        use_assist = bool(getattr(task, "use_article_reference_assist", False))
+        use_terms = bool(getattr(task, "use_article_translation_terms", False))
+        if article_text and (use_assist or use_terms):
+            self._failed_checkpoint_retry_article_reference_text = article_text
+            self._failed_checkpoint_retry_article_context_data = copy.deepcopy(
+                getattr(task, "article_context_data", None)
+            )
+            self._failed_checkpoint_retry_use_article_reference_assist = use_assist
+            self._failed_checkpoint_retry_use_article_translation_terms = use_terms
+            return
+
+        # Early provider failures do not create a stable-final manifest.  The
+        # durable run state still identifies whether this same run used article
+        # assistance; load its source-scoped artifacts without consulting older
+        # runs or unrelated subtitle directories.
+        output_path = str(getattr(task, "output_path", "") or "").strip()
+        output_dir = Path(output_path).parent if output_path else None
+        if output_dir is None:
+            return
+        state_path = output_dir / "run-state.json"
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        fingerprint = state.get("fingerprint") if isinstance(state, Mapping) else None
+        config = fingerprint.get("subtitle_config") if isinstance(fingerprint, Mapping) else None
+        if not isinstance(config, Mapping):
+            return
+        use_assist = bool(fingerprint.get("use_article_reference_assist"))
+        use_terms = bool(fingerprint.get("use_article_translation_terms"))
+        if not (use_assist or use_terms):
+            return
+        try:
+            article_text = (output_dir / "article_source.txt").read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return
+        if not article_text:
+            return
+        context_data = None
+        try:
+            loaded = json.loads(
+                (output_dir / "article_context.json").read_text(encoding="utf-8-sig")
+            )
+            if isinstance(loaded, Mapping):
+                context_data = dict(loaded)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            context_data = None
+        self._failed_checkpoint_retry_article_reference_text = article_text
+        self._failed_checkpoint_retry_article_context_data = context_data
+        self._failed_checkpoint_retry_use_article_reference_assist = use_assist
+        self._failed_checkpoint_retry_use_article_translation_terms = use_terms
+
     def _load_manual_failure_checkpoint_from_output(self, output_path: str) -> bool:
         if self._manual_save_in_progress:
             return False
@@ -2975,6 +3292,7 @@ class SubtitleInterface(QWidget):
             or str(failure.get("attempt_id") or "") != expected_attempt_id
         ):
             return False
+        SubtitleInterface._set_failed_checkpoint_retry_context(self, failure)
         try:
             session = ManualFinalSubtitleSession.load_from_failure_record(
                 failure_path
@@ -2997,6 +3315,11 @@ class SubtitleInterface(QWidget):
         self.next_review_action.setEnabled(False)
         self.next_review_action.setVisible(False)
         self._manual_page_view = True
+        set_retry_available = getattr(
+            self, "_set_failed_checkpoint_retry_available", None
+        )
+        if callable(set_retry_available):
+            set_retry_available(True)
         if hasattr(self, "manual_page_view_action"):
             self.manual_page_view_action.setEnabled(False)
             self.manual_page_view_action.setVisible(False)
@@ -3900,8 +4223,25 @@ class SubtitleInterface(QWidget):
             error = ""
         except Exception as exc:
             LOG.exception("Unable to save manual final subtitle package")
-            paths = {}
             error = str(exc)
+            error_code = str(getattr(exc, "code", "") or "").strip()
+            if not error_code:
+                match = re.match(r"([a-z][a-z0-9_]+)(?::|$)", error)
+                error_code = match.group(1) if match else ""
+            try:
+                review_summary = dict(
+                    session.display_page_review_summary() or {}
+                )
+            except Exception:
+                review_summary = {}
+            # Keep a structured failure response even when the package could
+            # not be created.  The UI must show the actionable validation code
+            # and page IDs instead of falling back to an "unknown" warning.
+            paths = {
+                "render_blocked": True,
+                "render_block_reason": error_code or "unknown",
+                "display_page_review_summary": review_summary,
+            }
         finally:
             _manual_final_save_worker_finished()
         try:
@@ -3958,8 +4298,11 @@ class SubtitleInterface(QWidget):
             )
             if callable(review_summary_method):
                 current_review_summary = dict(review_summary_method() or {})
+            failure_reason = str(
+                (paths or {}).get("render_block_reason") or error
+            )
             issue_summary = SubtitleInterface._manual_publication_issue_summary(
-                error,
+                failure_reason,
                 current_review_summary,
             )
             focus_problem = getattr(self, "_focus_manual_problem_position", None)

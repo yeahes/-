@@ -1,6 +1,30 @@
 # Current State
 
-Last updated: 2026-08-24
+Last updated: 2026-08-25
+
+## 2026-08-25 Vocabulary meaning size
+
+- Article vocabulary-card Chinese meanings now start at an actual rendered
+  `45px` and step down only when the complete meaning cannot fit within two
+  lines. The lower bound remains `29px` rendered.
+- Meaning wrapping remains independent of horizontal alignment: it measures
+  the selected font and available width, then preserves lexical units and
+  rejects a third line. Left alignment changes only the text origin.
+
+## 2026-08-25 Failed-run retry context preservation
+
+- A retry opened from a blocked checkpoint now restores that run's article
+  source text, analyzed context, and article-assist/translation-term flags from
+  the checkpoint manifest instead of rebuilding a context-free task.
+- Early provider failures without a stable-final manifest can restore the same
+  run's article artifacts from `run-state.json`; older runs and unrelated audio
+  directories are not consulted.
+- This keeps the semantic translation cache contract unchanged. When the
+  original article context is present, retry requests use the same prompt scope
+  and can reuse verified unit translations; frozen English, IDs, timing,
+  review queues, and synthesis behavior are unchanged.
+- Focused retry and publication tests pass 101/101. A real retry still requires
+  the translation provider to stop returning HTTP 500/timeouts.
 
 ## 2026-08-25 Conservative display-capacity review signal
 
@@ -4570,3 +4594,43 @@ Result:
   Chinese-marker comparison found three parents where the manual final restored
   marker evidence absent from automatic Chinese and one where it removed it;
   this is insufficient to change the translation prompt without a provider A/B.
+
+## 2026-08-25 Failed-Checkpoint Retry Entry
+
+- A failed stable checkpoint is loaded into manual-editor mode so the frozen
+  English, IDs, word ledger, and cached Chinese remain available for review.
+  That mode previously hid the only processing entry, leaving no way to retry
+  a provider-timeout failure from the editor.
+- The existing `开始` button now becomes `重试` while that failure checkpoint is
+  active. It protects unsaved manual edits, returns to processing mode, and
+  starts the same subtitle task with the existing cache contracts; it does not
+  publish or alter the failed checkpoint in place.
+- Normal manual-final packages still hide the processing entry, and successful
+  runs restore the original `开始` behavior. The change is UI/workflow-only;
+  subtitle, pagination, timing, and synthesis contracts are unchanged.
+- The recent-results loader now recognizes a matching `stable-last-failure.json`
+  beside a failed checkpoint. Reopening that result preserves the original
+  subtitle/audio inputs and exposes the same `重试` entry; ordinary stable and
+  manual-final packages continue to load without a retry action.
+- Provider or other early pipeline failures that occur before a stable editable
+  checkpoint now also keep a generic `重试` entry when the original subtitle
+  task is still available. The error remains a failure and no incomplete output
+  is treated as publishable.
+
+## 2026-08-25 Manual-final save after parent/page edits
+
+- Root cause of the Japanese X-generation save failure: the frozen page artifact
+  still contained two render plans for parents removed by earlier cross-parent
+  merges (`S0003` and `S0109`). The save path treated those historical plans as
+  current IDs and failed before returning a structured result.
+- The authoritative save path now ignores only orphan plans whose removal is
+  proven by the append-only merge history and which have no current page edit or
+  boundary override. An unexplained orphan remains a hard contract failure.
+- When a current manual boundary override successfully rebuilds a page plan,
+  the old `display_page_blueprint_invalid` geometry error is not carried into
+  the page-Chinese confirmation state. Genuine page-translation errors remain
+  blocking.
+- Background save exceptions now return a structured block reason and review
+  positions, so the editor no longer collapses a known save failure into an
+  `unknown`/未分类 message. Frozen English, IDs, word ledger, and timing are
+  unchanged.

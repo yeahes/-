@@ -3391,6 +3391,20 @@ class StablePublicationTests(unittest.TestCase):
         self.assertTrue(interface.subtitle_settings_action.isVisible())
         self.assertEqual(interface.more_button.text(), "更多")
 
+    def test_failed_checkpoint_keeps_retry_entry_visible_in_manual_mode(self):
+        app, interface, _moves = self._manual_boundary_interaction_fixture()
+
+        interface._set_failed_checkpoint_retry_available(True)
+        interface._set_manual_editor_mode(True)
+        app.processEvents()
+
+        self.assertFalse(interface.start_button.isHidden())
+        self.assertEqual(interface.start_button.text(), "重试")
+
+        interface._set_failed_checkpoint_retry_available(False)
+        app.processEvents()
+        self.assertTrue(interface.start_button.isHidden())
+
         interface._set_manual_editor_mode(False)
         self.assertEqual(
             interface.more_menu.menuActions(),
@@ -3403,6 +3417,155 @@ class StablePublicationTests(unittest.TestCase):
                 interface.import_subtitle_action,
             ],
         )
+
+    def test_recent_restore_can_identify_matching_failed_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest_path = (
+                root
+                / "subtitle"
+                / "stable-checkpoints"
+                / "run-1"
+                / "stable-final-manifest.json"
+            )
+            manifest_path.parent.mkdir(parents=True)
+            failure_path = root / "subtitle" / "stable-last-failure.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            failure_path.write_text(
+                json.dumps(
+                    {
+                        "render_blocked": True,
+                        "editable_checkpoint_manifest_path": str(manifest_path),
+                        "attempt_id": "attempt-1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            match = SubtitleInterface._failure_record_for_manifest(manifest_path)
+
+            self.assertIsNotNone(match)
+            self.assertEqual(match[0], failure_path.resolve())
+            self.assertEqual(match[1]["attempt_id"], "attempt-1")
+
+    def test_provider_failure_keeps_generic_task_retryable(self):
+        app, interface, _moves = self._manual_boundary_interaction_fixture()
+        interface.subtitle_path = "source.srt"
+        interface.task = SubtitleTask(subtitle_path="source.srt")
+
+        with patch.object(
+            interface,
+            "_load_manual_failure_checkpoint_from_output",
+            return_value=False,
+        ):
+            interface.on_subtitle_optimization_error("provider unavailable")
+        app.processEvents()
+
+        self.assertFalse(interface.start_button.isHidden())
+        self.assertEqual(interface.start_button.text(), "重试")
+
+    def test_failed_checkpoint_retry_restores_article_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            subtitle_dir = root / "subtitle"
+            subtitle_dir.mkdir()
+            source_subtitle = subtitle_dir / "input.srt"
+            source_subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nCurrent.\n", encoding="utf-8")
+            article_text = "A source article used for the original run."
+            (subtitle_dir / "article_source.txt").write_text(article_text, encoding="utf-8")
+            context = {"schema_version": 2, "title": "Source article"}
+            (subtitle_dir / "article_context.json").write_text(
+                json.dumps(context), encoding="utf-8"
+            )
+            manifest_path = (
+                subtitle_dir
+                / "stable-checkpoints"
+                / "run-1"
+                / "stable-final-manifest.json"
+            )
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "source_subtitle": str(source_subtitle),
+                        "source_media_path": str(root / "audio.m4a"),
+                        "run_comparison": {
+                            "article_reference": {
+                                "reference_text_present": True,
+                                "use_article_reference_assist": True,
+                                "use_article_translation_terms": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            interface = SimpleNamespace()
+            interface._load_retry_article_context_from_manifest = (
+                lambda path, manifest: SubtitleInterface._load_retry_article_context_from_manifest(
+                    interface, path, manifest
+                )
+            )
+            SubtitleInterface._set_failed_checkpoint_retry_context(
+                interface,
+                {
+                    "source_subtitle": str(source_subtitle),
+                    "editable_checkpoint_manifest_path": str(manifest_path),
+                },
+            )
+
+            self.assertEqual(
+                interface._failed_checkpoint_retry_article_reference_text,
+                article_text,
+            )
+            self.assertEqual(
+                interface._failed_checkpoint_retry_article_context_data,
+                context,
+            )
+            self.assertTrue(interface._failed_checkpoint_retry_use_article_reference_assist)
+            self.assertTrue(interface._failed_checkpoint_retry_use_article_translation_terms)
+
+    def test_early_failure_retry_restores_article_contract_from_run_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "subtitle"
+            output_dir.mkdir()
+            article_text = "A source article used for the current run."
+            (output_dir / "article_source.txt").write_text(article_text, encoding="utf-8")
+            context = {"schema_version": 2, "title": "Current article"}
+            (output_dir / "article_context.json").write_text(
+                json.dumps(context), encoding="utf-8"
+            )
+            (output_dir / "run-state.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "fingerprint": {
+                            "use_article_reference_assist": True,
+                            "use_article_translation_terms": True,
+                            "subtitle_config": {},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = SubtitleTask(
+                subtitle_path=str(root / "input.srt"),
+                output_path=str(output_dir / "output.ass"),
+            )
+            interface = SimpleNamespace(task=task, subtitle_path=str(task.subtitle_path))
+            SubtitleInterface._set_retry_context_from_task(interface)
+
+            self.assertEqual(
+                interface._failed_checkpoint_retry_article_reference_text,
+                article_text,
+            )
+            self.assertEqual(
+                interface._failed_checkpoint_retry_article_context_data,
+                context,
+            )
+            self.assertTrue(interface._failed_checkpoint_retry_use_article_reference_assist)
+            self.assertTrue(interface._failed_checkpoint_retry_use_article_translation_terms)
 
     def test_failed_manual_session_load_restores_processing_controls(self):
         _app, interface, _moves = self._manual_boundary_interaction_fixture()

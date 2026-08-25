@@ -7236,6 +7236,17 @@ class ManualFinalSubtitleSession:
                 or cue.get("translated_subtitle")
                 or ""
             ).strip()
+            # A manual boundary override replaces the failed geometry plan for
+            # this parent.  Keep genuine page-translation errors blocking, but
+            # do not carry the old blueprint failure into the newly rebuilt
+            # page model.
+            parent_translation_issue_codes = set(
+                translation_errors_by_parent.get(parent_id, set())
+            )
+            if override_starts is not None:
+                parent_translation_issue_codes.discard(
+                    "display_page_blueprint_invalid"
+                )
             parent_cache_key = stable_payload_hash(
                 {
                     "source_word_ledger_hash": self.source_word_ledger_hash,
@@ -7261,9 +7272,7 @@ class ManualFinalSubtitleSession:
                         parent_id,
                         "",
                     ),
-                    "parent_errors": sorted(
-                        translation_errors_by_parent.get(parent_id, set())
-                    ),
+                    "parent_errors": sorted(parent_translation_issue_codes),
                     "page_errors": {
                         page_id: sorted(codes)
                         for page_id, codes in translation_errors_by_page.items()
@@ -7440,7 +7449,7 @@ class ManualFinalSubtitleSession:
                     break
                 page_id = str(raw_page.get("display_page_id") or "")
                 translation_issue_codes = sorted(
-                    translation_errors_by_parent.get(parent_id, set())
+                    parent_translation_issue_codes
                     | translation_errors_by_page.get(page_id, set())
                 )
                 translated = translated_pages.get(page_id, {})
@@ -8780,6 +8789,28 @@ class ManualFinalSubtitleSession:
             for item in self.display_page_edits
             if isinstance(item, Mapping)
         }
+        # Parent merges intentionally remove one parent ID while an older
+        # display-page artifact can still contain its pre-merge render plan.
+        # Those orphan plans are not part of the current authoritative cue
+        # set.  Only skip an orphan when the append-only history proves which
+        # parent was removed and no current manual page state still references
+        # it; an unexplained orphan remains a hard contract failure below.
+        removed_parent_ids: set[str] = set()
+        for entry in self.history:
+            if not isinstance(entry, Mapping):
+                continue
+            operation = str(entry.get("operation") or "")
+            if operation not in {"merge_adjacent", "merge_adjacent_display_pages"}:
+                continue
+            surviving_parent_id = str(entry.get("parent_subtitle_id") or "")
+            affected_parent_ids = {
+                str(value)
+                for value in entry.get("affected_parent_ids") or []
+                if str(value)
+            }
+            if surviving_parent_id:
+                affected_parent_ids.discard(surviving_parent_id)
+            removed_parent_ids.update(affected_parent_ids)
         plans: List[Dict[str, Any]] = []
         parents: List[Dict[str, Any]] = []
         seen_parents: set[str] = set()
@@ -8803,6 +8834,19 @@ class ManualFinalSubtitleSession:
                 in set(self.tail_trim.get("removed_subtitle_ids") or [])
             ):
                 continue
+            if cue is None:
+                orphan_page_ids = {
+                    str(page.get("display_page_id") or "")
+                    for page in raw_plan.get("pages") or []
+                    if isinstance(page, Mapping)
+                    and str(page.get("display_page_id") or "")
+                }
+                orphan_is_unreferenced = not (
+                    source_parent_id in self.display_page_boundary_overrides
+                    or orphan_page_ids & set(edits)
+                )
+                if source_parent_id in removed_parent_ids and orphan_is_unreferenced:
+                    continue
             override_starts = self.display_page_boundary_overrides.get(
                 source_parent_id
             )

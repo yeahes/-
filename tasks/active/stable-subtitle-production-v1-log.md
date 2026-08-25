@@ -1,5 +1,34 @@
 # Progress Log
 
+## 2026-08-25 - Manual-final save accepts current page state after parent merges
+
+- Reproduced the failed Japanese X-generation save from its recovery draft.
+  The current draft had valid manual pages for `S0001` and `S0242`, while the
+  source artifact still carried orphan plans for merged-away `S0003` and
+  `S0109`.
+- The save contract now skips only history-proven, unreferenced orphan plans;
+  current page edits and boundary overrides still require exact identity checks.
+  A manual override also clears the stale geometry-only blueprint error from
+  the page confirmation projection.
+- Added regressions for cross-parent merge save and manual confirmation after
+  an old blueprint failure. Background exceptions now return structured error
+  codes and page positions instead of an unknown UI warning.
+- Focused verification: `tests/test_manual_final_subtitle_editor.py` passed
+  132/132. A full regression and a post-restart real save remain to be checked.
+
+## 2026-08-25 - Failed-run retry keeps the original translation context
+
+- Root cause: reopening a blocked checkpoint kept only subtitle/media paths.
+  Recreating the task therefore dropped article assistance and terminology
+  context, invalidating otherwise reusable semantic translation cache keys.
+- Retry now restores the source article, cached article context, and both
+  article feature flags from the checkpoint manifest. Early provider failures
+  use the same run's `run-state.json` and source-adjacent article artifacts.
+- The cache contract itself was not relaxed, so a translation is reused only
+  when its source, prompt, model, and validated context still match.
+- Focused publication/retry tests: 101 passed. The latest real run remains
+  blocked by DeepSeek HTTP 500/timeouts and must be retried after service recovery.
+
 ## 2026-08-24 - Review evidence identity and page fallback hardening
 
 - Completed the run-identity binding change for copied semantic/QA review
@@ -78,6 +107,16 @@
   the `1.14x` Latin size multiplier applies only to all-English explanations.
   Embedded Latin text in a Chinese explanation keeps the normal mixed-script
   size, and the Chinese font and wrapping policy stay unchanged.
+
+## 2026-08-25 - Article vocabulary meaning size
+
+- Raised the article vocabulary Chinese-meaning starting size to an actual
+  rendered `45px`. The existing two-line fitter still measures actual glyph
+  width and lowers the size only when needed, down to the unchanged `29px`
+  rendered floor.
+- Horizontal alignment does not participate in line breaking; it only changes
+  the drawing origin after wrapping is selected.
+- Added a focused regression for the short-meaning `45px` rendered size.
 
 ## 2026-08-24 Complete-parent timeline deletion
 
@@ -3641,3 +3680,20 @@ human-review aid: it must not turn WARNING evidence into a render blocker.
   marker evidence absent from automatic Chinese and one removes it. This is a
   prompt hypothesis, not a provider A/B result, so no translation prompt was
   changed.
+
+## 2026-08-25 Failed-Checkpoint Retry Entry
+
+- Fixed the editor workflow that hid the processing entry after a failed stable
+  checkpoint was loaded. The top button now shows `重试` in that state and
+  protects unsaved manual edits before restarting the same task.
+- Normal manual editing still hides the processing entry; successful runs and
+  new imports restore the ordinary `开始` state. This change does not mutate
+  subtitle artifacts or timing contracts.
+- Verification: `tests/test_stable_publication.py` passes 97/97.
+- The recent-results recovery path also distinguishes a matching failed
+  checkpoint from an ordinary stable package, so restarting the app does not
+  turn a retryable failure into a read-only manual preview. The original raw
+  subtitle and media paths are retained only for rebuilding the retry task.
+- Early provider failures without a stable checkpoint now keep the same generic
+  `重试` action while retaining the failure status; this covers API 500 errors
+  during full translation without allowing an incomplete run into synthesis.

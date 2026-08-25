@@ -4038,6 +4038,15 @@ def test_cross_parent_actual_page_merge_is_one_atomic_operation():
         assert len(session.history) == before_history_count + 1
         assert session.history[-1]["operation"] == "merge_adjacent_display_pages"
 
+        # The source artifact still contains the pre-merge S0002 plan.  It is
+        # historical evidence, not an active page, and must not block saving
+        # the merged S0001 checkpoint.
+        blueprint = session._blueprint_from_frozen_display_page_edits()
+        assert {
+            str(plan.get("parent_subtitle_id") or "")
+            for plan in blueprint["render_plans"]
+        } == {"S0001"}
+
         assert session.undo() is True
         assert session.cues == before_cues
         assert session.to_model_data() == before_rows
@@ -6119,6 +6128,47 @@ def test_unrenderable_parent_seed_can_be_split_without_a_frozen_page_plan():
         )
         assert " ".join(row["original_subtitle"] for row in rows) == (
             cue["original_subtitle"]
+        )
+
+
+def test_manual_override_replaces_old_blueprint_error_for_page_confirmation():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _splittable_parent_session(Path(temp_dir))
+        cue = session.cues[0]
+        artifact_path = session.artifact_dir / "display-page-translations.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["status"] = "ERROR"
+        artifact["errors"] = [
+            {
+                "code": "display_page_blueprint_invalid",
+                "parent_subtitle_id": "S0001",
+            }
+        ]
+        artifact["render_plans"][0]["renderable"] = False
+        _write_json(artifact_path, artifact)
+        manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
+        manifest["display_page_translation_sha256"] = file_sha256(artifact_path)
+        _write_json(session.manifest_path, manifest)
+
+        session.split_parent_into_display_pages(
+            "S0001",
+            2,
+            allow_high_risk=True,
+        )
+        rows = session.to_model_data()
+        for index, row in rows.items():
+            row["translated_subtitle"] = f"第{index}屏"
+            row["display_page_chinese_confirmed"] = True
+        session.apply_display_page_model_data(
+            rows,
+            allow_incomplete_chinese=True,
+        )
+
+        refreshed = list(session.to_model_data().values())
+        assert all(
+            row["display_page_chinese_confirmed"] is True
+            and row["chinese_review_required"] is False
+            for row in refreshed
         )
 
 
