@@ -17,6 +17,7 @@ from app.core.subtitle_processor.word_timing_trust import (
 )
 from app.thread.transcript_thread import (
     _require_plausible_word_timing,
+    _require_resolved_acoustic_gaps,
     _write_srt_atomically,
     TranscriptThread,
     can_reuse_downloaded_subtitle,
@@ -166,6 +167,24 @@ class ASRTrustContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "implausibly compressed"):
             _require_plausible_word_timing(data)
+
+    def test_transcript_pipeline_blocks_unresolved_acoustic_gap(self):
+        data = ASRData([ASRDataSeg("quoted", 1000, 1200)])
+        data.unresolved_internal_gap_candidates = [
+            {
+                "start_ms": 1200,
+                "end_ms": 8200,
+                "reason": "local_retry_not_anchored",
+            }
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "unresolved internal gap"):
+            _require_resolved_acoustic_gaps(data)
+
+    def test_transcript_pipeline_accepts_asr_without_gap_diagnostics(self):
+        data = ASRData([ASRDataSeg("quoted", 1000, 1200)])
+
+        _require_resolved_acoustic_gaps(data)
 
     def test_empty_backend_result_is_not_cached(self):
         asr = _FakeASR({"segments": []})
@@ -661,6 +680,26 @@ class ASRTrustContractTests(unittest.TestCase):
         self.assertEqual(len(asr.cache_manager.writes), 1)
         self.assertIn("Which", asr.cache_manager.writes[0][2])
 
+    def test_faster_whisper_exports_unresolved_gap_diagnostics_on_asr_data(self):
+        asr = object.__new__(FasterWhisperASR)
+        asr.use_cache = False
+        asr.last_internal_gap_repairs = []
+        asr.last_unresolved_internal_gap_candidates = [
+            {"start_ms": 1200, "end_ms": 8200, "reason": "local_retry_empty"}
+        ]
+        asr.last_compressed_timing_repairs = []
+        asr.last_unresolved_compressed_timing_candidates = []
+        asr.last_tail_hallucination_repair = {}
+        repaired = ASRData([ASRDataSeg("quoted", 1000, 1200)])
+
+        with patch.object(BaseASR, "run", return_value=repaired):
+            result = asr.run()
+
+        self.assertEqual(
+            result.unresolved_internal_gap_candidates[0]["reason"],
+            "local_retry_empty",
+        )
+
     @staticmethod
     def _compressed_timing_fixture():
         words = (
@@ -958,6 +997,63 @@ class ASRTrustContractTests(unittest.TestCase):
         _, report = result
         self.assertEqual(report["left_anchor_skipped_words"], 1)
         self.assertEqual(report["right_anchor_skipped_words"], 0)
+
+    def test_faster_whisper_anchor_merge_fits_small_local_edge_overrun(self):
+        source, local = self._missing_speech_gap_fixture()
+        missing = local[5:-4]
+        step = (538420 - 530780) // len(missing)
+        for index, segment in enumerate(missing):
+            segment.start_time = 530780 + index * step
+            segment.end_time = 530780 + (index + 1) * step - 10
+        for index, segment in enumerate(local[:5]):
+            segment.start_time = source[index].start_time
+            segment.end_time = source[index].end_time
+        for index, segment in enumerate(local[-4:]):
+            segment.start_time = source[5 + index].start_time
+            segment.end_time = source[5 + index].end_time + 300
+
+        result = FasterWhisperASR._merge_anchored_gap_repair(
+            source,
+            left_index=4,
+            local_segments=local,
+        )
+
+        self.assertIsNotNone(result)
+        merged, report = result
+        inserted = merged[5:-4]
+        self.assertTrue(report["timing_fitted_to_gap"])
+        self.assertEqual(inserted[-1].end_time, source[5].start_time)
+        self.assertTrue(
+            all(item.end_time > item.start_time for item in inserted)
+        )
+        self.assertTrue(
+            all(
+                left.end_time <= right.start_time
+                for left, right in zip(merged, merged[1:])
+            )
+        )
+
+    def test_faster_whisper_anchor_merge_rejects_large_local_edge_overrun(self):
+        source, local = self._missing_speech_gap_fixture()
+        missing = local[5:-4]
+        step = (540000 - 530780) // len(missing)
+        for index, segment in enumerate(missing):
+            segment.start_time = 530780 + index * step
+            segment.end_time = 530780 + (index + 1) * step - 10
+        for index, segment in enumerate(local[:5]):
+            segment.start_time = source[index].start_time
+            segment.end_time = source[index].end_time
+        for index, segment in enumerate(local[-4:]):
+            segment.start_time = source[5 + index].start_time
+            segment.end_time = 540000 + index * 300
+
+        self.assertIsNone(
+            FasterWhisperASR._merge_anchored_gap_repair(
+                source,
+                left_index=4,
+                local_segments=local,
+            )
+        )
 
     @staticmethod
     def _tail_duplicate_word_srt(candidate_words):

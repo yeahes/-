@@ -20,8 +20,10 @@ Important rules:
   gaps before any English boundary or ID is frozen. A gap is locally
   retranscribed without previous-text conditioning only when FFmpeg confirms
   audio activity. New words are inserted only when exact text anchors match on
-  both sides; an unanchored local result is diagnostic evidence and cannot
-  mutate the transcript.
+  both sides; an unanchored local result cannot mutate the transcript and now
+  hard-blocks the stable word-timestamp pipeline. Empty and short local
+  retries are blockers too, so confirmed speech cannot silently disappear
+  from the frozen English ledger.
 - Native Faster-Whisper word timing is also checked for implausibly compressed
   local runs before it becomes cache or ledger authority. A bounded
   context-free retranscription may restore only the timing and acoustic order

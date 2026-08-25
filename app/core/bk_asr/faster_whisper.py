@@ -28,6 +28,8 @@ class FasterWhisperASR(BaseASR):
     INTERNAL_GAP_MIN_INSERTED_WORDS = 3
     INTERNAL_GAP_ACTIVITY_DB = -42.0
     INTERNAL_GAP_MAX_REPAIRS = 8
+    INTERNAL_GAP_EDGE_OVERRUN_FRACTION = 0.125
+    INTERNAL_GAP_MAX_EDGE_OVERRUN_MS = 1000
     TAIL_HALLUCINATION_MIN_WORDS = 6
     TAIL_HALLUCINATION_MAX_WORDS = 24
     TAIL_HALLUCINATION_MIN_WPS = 12.0
@@ -126,9 +128,25 @@ class FasterWhisperASR(BaseASR):
 
     def run(self, callback=None, **kwargs) -> ASRData:
         asr_data = super().run(callback, **kwargs)
-        repaired = bool(
+        # Keep repair evidence on the returned object.  The stable pipeline
+        # must be able to reject an acoustically active gap that could not be
+        # anchored, instead of treating the original (possibly incomplete)
+        # transcript as authoritative.
+        asr_data.internal_gap_repairs = list(
             getattr(self, "last_internal_gap_repairs", [])
-            or getattr(self, "last_compressed_timing_repairs", [])
+        )
+        asr_data.unresolved_internal_gap_candidates = list(
+            getattr(self, "last_unresolved_internal_gap_candidates", [])
+        )
+        asr_data.compressed_timing_repairs = list(
+            getattr(self, "last_compressed_timing_repairs", [])
+        )
+        asr_data.unresolved_compressed_timing_candidates = list(
+            getattr(self, "last_unresolved_compressed_timing_candidates", [])
+        )
+        repaired = bool(
+            asr_data.internal_gap_repairs
+            or asr_data.compressed_timing_repairs
             or getattr(self, "last_tail_hallucination_repair", {})
         )
         if repaired and getattr(self, "use_cache", False):
@@ -425,12 +443,33 @@ class FasterWhisperASR(BaseASR):
         ]
         gap_start_ms = int(segments[left_index].end_time)
         gap_end_ms = int(segments[left_index + 1].start_time)
+        if not inserted:
+            return None
+        first_start_ms = int(inserted[0].start_time)
+        last_end_ms = int(inserted[-1].end_time)
+        gap_duration_ms = max(0, gap_end_ms - gap_start_ms)
+        allowed_edge_overrun_ms = max(
+            250,
+            min(
+                cls.INTERNAL_GAP_MAX_EDGE_OVERRUN_MS,
+                int(gap_duration_ms * cls.INTERNAL_GAP_EDGE_OVERRUN_FRACTION),
+            ),
+        )
         if (
-            not inserted
-            or int(inserted[0].start_time) < gap_start_ms - 250
-            or int(inserted[-1].end_time) > gap_end_ms + 250
+            first_start_ms < gap_start_ms - 250
+            or last_end_ms > gap_end_ms + allowed_edge_overrun_ms
         ):
             return None
+        timing_fitted = first_start_ms < gap_start_ms or last_end_ms > gap_end_ms
+        if timing_fitted:
+            fitted = cls._fit_inserted_timings_to_gap(
+                inserted,
+                gap_start_ms=gap_start_ms,
+                gap_end_ms=gap_end_ms,
+            )
+            if fitted is None:
+                return None
+            inserted = fitted
         if any(int(segment.end_time) <= int(segment.start_time) for segment in inserted):
             return None
         if any(
@@ -450,7 +489,73 @@ class FasterWhisperASR(BaseASR):
             "inserted_text": " ".join(segment.text.strip() for segment in inserted),
             "left_anchor_skipped_words": left_edge_skip,
             "right_anchor_skipped_words": right_edge_skip,
+            "timing_fitted_to_gap": timing_fitted,
         }
+
+    @classmethod
+    def _fit_inserted_timings_to_gap(
+        cls,
+        inserted: list[ASRDataSeg],
+        *,
+        gap_start_ms: int,
+        gap_end_ms: int,
+    ) -> Optional[list[ASRDataSeg]]:
+        """Fit a locally anchored insertion into the authoritative gap.
+
+        Local ASR can quantize one word to a 1 ms placeholder or place the
+        right anchor slightly after the global cue.  Preserve the local pause
+        pattern, repair quantization-only zero widths with a robust duration,
+        and apply one monotonic scale to the complete insertion envelope.
+        """
+        gap_duration_ms = int(gap_end_ms) - int(gap_start_ms)
+        if not inserted or gap_duration_ms <= 0:
+            return None
+        positive_durations = sorted(
+            max(1, int(item.end_time) - int(item.start_time))
+            for item in inserted
+            if int(item.end_time) > int(item.start_time)
+        )
+        if not positive_durations:
+            return None
+        fallback_duration_ms = positive_durations[len(positive_durations) // 2]
+        normalized = []
+        cursor_ms = int(gap_start_ms)
+        for item in inserted:
+            desired_start_ms = max(int(gap_start_ms), int(item.start_time))
+            start_ms = max(cursor_ms, desired_start_ms)
+            duration_ms = int(item.end_time) - int(item.start_time)
+            if duration_ms <= 1:
+                duration_ms = fallback_duration_ms
+            end_ms = start_ms + max(1, duration_ms)
+            normalized.append((start_ms, end_ms, item))
+            cursor_ms = end_ms
+        envelope_end_ms = normalized[-1][1]
+        envelope_duration_ms = envelope_end_ms - int(gap_start_ms)
+        if envelope_duration_ms <= 0:
+            return None
+        scale = gap_duration_ms / envelope_duration_ms
+        fitted = []
+        previous_end_ms = int(gap_start_ms)
+        for start_ms, end_ms, item in normalized:
+            fitted_start_ms = int(gap_start_ms) + round(
+                (start_ms - int(gap_start_ms)) * scale
+            )
+            fitted_end_ms = int(gap_start_ms) + round(
+                (end_ms - int(gap_start_ms)) * scale
+            )
+            fitted_start_ms = max(previous_end_ms, fitted_start_ms)
+            fitted_end_ms = max(fitted_start_ms + 1, fitted_end_ms)
+            if fitted_end_ms > int(gap_end_ms):
+                fitted_end_ms = int(gap_end_ms)
+            if fitted_end_ms <= fitted_start_ms:
+                return None
+            item.start_time = fitted_start_ms
+            item.end_time = fitted_end_ms
+            fitted.append(item)
+            previous_end_ms = fitted_end_ms
+        if fitted[-1].end_time != int(gap_end_ms):
+            fitted[-1].end_time = int(gap_end_ms)
+        return fitted
 
     @staticmethod
     def _subsequence_starts(words: list[str], needle: list[str]) -> list[int]:
@@ -859,19 +964,27 @@ class FasterWhisperASR(BaseASR):
                     if int(segment.start_time) >= int(candidate["start_ms"])
                     and int(segment.end_time) <= int(candidate["end_ms"])
                 ]
-                if len(words_inside_gap) >= self.INTERNAL_GAP_MIN_INSERTED_WORDS:
-                    unresolved = {
-                        **candidate,
-                        "word_count": len(words_inside_gap),
-                        "local_text": " ".join(
-                            segment.text.strip() for segment in words_inside_gap
-                        ),
-                    }
-                    self.last_unresolved_internal_gap_candidates.append(unresolved)
-                    logger.warning(
-                        "Skipped unanchored Faster Whisper gap candidate: %s",
-                        describe_word_timing_issue(unresolved),
-                    )
+                # An active gap is a blocker even when the local retry returns
+                # no words (or only a fragment).  Previously this branch only
+                # recorded >=3 words, allowing a failed retry to pass silently.
+                unresolved = {
+                    **candidate,
+                    "word_count": len(words_inside_gap),
+                    "local_text": " ".join(
+                        segment.text.strip() for segment in words_inside_gap
+                    ),
+                    "local_segment_count": len(local_segments),
+                    "reason": (
+                        "local_retry_not_anchored"
+                        if local_segments
+                        else "local_retry_empty"
+                    ),
+                }
+                self.last_unresolved_internal_gap_candidates.append(unresolved)
+                logger.warning(
+                    "Skipped unanchored Faster Whisper gap candidate: %s",
+                    describe_word_timing_issue(unresolved),
+                )
             if not applied:
                 break
         return repaired

@@ -114,6 +114,30 @@ def _require_plausible_word_timing(asr_data: ASRData) -> None:
     )
 
 
+def _require_resolved_acoustic_gaps(asr_data: ASRData) -> None:
+    """Reject an ASR result when a confirmed speech gap was not repaired.
+
+    This diagnostic is emitted by the Faster Whisper backend after its local
+    retry.  It is deliberately a hard gate for the stable word-timestamp
+    pipeline: continuing would freeze an incomplete English ledger and make
+    the missing speech look like a translation or pagination defect.
+    """
+    unresolved = list(
+        getattr(asr_data, "unresolved_internal_gap_candidates", []) or []
+    )
+    if not unresolved:
+        return
+    first = unresolved[0]
+    start_ms = first.get("start_ms", "?")
+    end_ms = first.get("end_ms", "?")
+    reason = first.get("reason", "local_retry_not_anchored")
+    raise RuntimeError(
+        "ASR detected speech in an unresolved internal gap; "
+        f"stable subtitle generation stopped ({start_ms}-{end_ms} ms, {reason}). "
+        "Retry ASR or choose another ASR/alignment backend."
+    )
+
+
 def _mark_word_timing(asr_data: ASRData, *, source: str, trusted: bool) -> None:
     asr_data.timing_source = source
     asr_data.word_timing_trusted = bool(trusted)
@@ -233,6 +257,11 @@ class TranscriptThread(QThread):
                 callback=self.progress_callback,
             )
             _require_valid_asr_data(asr_data)
+            if (
+                self.task.need_next_task
+                and self.task.transcribe_config.need_word_time_stamp
+            ):
+                _require_resolved_acoustic_gaps(asr_data)
             if (
                 self.task.need_next_task
                 and self.task.transcribe_config.need_word_time_stamp
