@@ -130,6 +130,8 @@ ARTICLE_DATE_SCRIM_MIN_ALPHA = 110
 ARTICLE_DATE_SCRIM_MAX_ALPHA = 180
 ARTICLE_DATE_MIN_CONTRAST = 4.5
 ARTICLE_VOCAB_MEANING_FONT_WEIGHT = 600
+ARTICLE_VOCAB_MEANING_MAX_RENDER_SIZE = 45
+ARTICLE_VOCAB_MEANING_MIN_RENDER_SIZE = 29
 ARTICLE_VOCAB_DETAIL_COLOR = ARTICLE_SUBTITLE_ZH_COLOR
 ARTICLE_VOCAB_DETAIL_FONT_SIZE = 28
 ARTICLE_VOCAB_DETAIL_MIN_FONT_SIZE = 22
@@ -889,15 +891,21 @@ def article_source_han_serif_cn_bold_font(size: int) -> ImageFont.FreeTypeFont:
     return article_cjk_font(size, 700)
 
 
-def article_vocab_meaning_font(size: int) -> ImageFont.FreeTypeFont:
+def article_vocab_meaning_font(
+    size: int,
+    *,
+    rendered: bool = False,
+) -> ImageFont.FreeTypeFont:
     """Return the bundled 600-weight serif face for vocabulary meanings."""
+    render_size = size if rendered else acx(size)
     if FONT_SOURCE_HAN_SERIF_CN_SEMIBOLD.exists():
         return font(
             FONT_SOURCE_HAN_SERIF_CN_SEMIBOLD,
-            acx(size),
+            render_size,
             ARTICLE_VOCAB_MEANING_FONT_WEIGHT,
         )
-    return article_source_han_serif_cn_bold_font(size)
+    fallback_path = FONT_HANCHAN_BOLD if FONT_HANCHAN_BOLD.exists() else FONT_YAHEI
+    return font(fallback_path, render_size, 700)
 
 
 def article_vocab_detail_font(size: int) -> ImageFont.FreeTypeFont:
@@ -9758,13 +9766,13 @@ def fit_article_vocab_meaning_font(
     draw: ImageDraw.ImageDraw,
     text: str,
     max_width: int = 500,
-    max_size: int = 34,
-    min_size: int = 24,
+    max_size: int = ARTICLE_VOCAB_MEANING_MAX_RENDER_SIZE,
+    min_size: int = ARTICLE_VOCAB_MEANING_MIN_RENDER_SIZE,
 ) -> tuple[ImageFont.FreeTypeFont, list[str]]:
-    """Fit a complete meaning; never truncate an overflowing third line."""
+    """Fit a complete meaning using rendered-pixel font sizes."""
     rendered_max_width = acx(max_width)
     for size in range(max_size, min_size - 1, -2):
-        fnt = article_vocab_meaning_font(size)
+        fnt = article_vocab_meaning_font(size, rendered=True)
         lines = wrap_article_vocab_meaning(
             draw,
             text,

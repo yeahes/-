@@ -8211,6 +8211,18 @@ def test_article_vocab_meaning_prefers_a_balanced_longer_second_line():
     )
 
 
+def test_article_vocab_meaning_uses_the_new_45px_rendered_size_for_short_text():
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+
+    font, lines = podcast_learning_video.fit_article_vocab_meaning_font(
+        draw,
+        "黑箱算法",
+    )
+
+    assert lines == ["黑箱算法"]
+    assert font.size == 45
+
+
 def test_article_vocab_meaning_keeps_lexical_units_and_edge_particles_attached():
     meaning = "人工智能驱动的软件开发工作流与执行规范"
     draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
