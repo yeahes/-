@@ -749,6 +749,13 @@ class ScreenSubtitleEditor:
         self._final_word_timing_reconciliations: List[Dict[str, Any]] = []
         self._final_timeline_alignment: Dict[str, Any] = {}
         self._display_page_translation_artifact: Dict[str, Any] = {}
+        self._display_page_degradation: Dict[str, Any] = {
+            "degraded_page_count": 0,
+            "total_parent_count": 0,
+            "degraded_parent_ratio": 0.0,
+            "degraded_page_threshold": 0,
+            "degraded_parents": [],
+        }
         self._display_page_translation_reviews: List[Dict[str, Any]] = []
         self._display_page_translation_path: str = ""
         self._display_page_translation_sha256: str = ""
@@ -1397,6 +1404,25 @@ class ScreenSubtitleEditor:
         partial_blueprint: Dict[str, Any] = {}
         try:
             blueprint = build_article_display_page_blueprint(cues)
+            self._display_page_degradation = {
+                "degraded_page_count": int(
+                    blueprint.get("degraded_page_count") or 0
+                ),
+                "total_parent_count": int(
+                    blueprint.get("total_parent_count") or len(cues)
+                ),
+                "degraded_parent_ratio": float(
+                    blueprint.get("degraded_parent_ratio") or 0.0
+                ),
+                "degraded_page_threshold": int(
+                    blueprint.get("degraded_page_threshold") or 0
+                ),
+                "degraded_parents": [
+                    dict(item)
+                    for item in blueprint.get("degraded_parents") or []
+                    if isinstance(item, Mapping)
+                ],
+            }
             contract = build_display_page_contract(
                 blueprint.get("parents") or [],
                 layout_profile=blueprint.get("layout_profile") or {},
@@ -1405,6 +1431,25 @@ class ScreenSubtitleEditor:
             )
         except RenderStructuralOverflowError as exc:
             partial_blueprint = dict(exc.partial_blueprint or {})
+            self._display_page_degradation = {
+                "degraded_page_count": int(
+                    partial_blueprint.get("degraded_page_count") or 0
+                ),
+                "total_parent_count": int(
+                    partial_blueprint.get("total_parent_count") or len(cues)
+                ),
+                "degraded_parent_ratio": float(
+                    partial_blueprint.get("degraded_parent_ratio") or 0.0
+                ),
+                "degraded_page_threshold": int(
+                    partial_blueprint.get("degraded_page_threshold") or 0
+                ),
+                "degraded_parents": [
+                    dict(item)
+                    for item in partial_blueprint.get("degraded_parents") or []
+                    if isinstance(item, Mapping)
+                ],
+            }
             for error in exc.errors:
                 try:
                     cue_index = int(error.get("cue_index"))
@@ -1965,6 +2010,19 @@ class ScreenSubtitleEditor:
                 raise RuntimeError(
                     "display_page_translation_invalid: fixed-ID parent Chinese drifted"
                 )
+        artifact = {
+            **artifact,
+            **dict(
+                getattr(self, "_display_page_degradation", {})
+                or {
+                    "degraded_page_count": 0,
+                    "total_parent_count": 0,
+                    "degraded_parent_ratio": 0.0,
+                    "degraded_page_threshold": 0,
+                    "degraded_parents": [],
+                }
+            ),
+        }
         self._display_page_translation_artifact = artifact
         source_map = getattr(self, "_active_source_segments_by_id", {}) or {}
         source_segments = list(source_map.values()) if isinstance(source_map, dict) else list(source_map)
@@ -8421,6 +8479,18 @@ class ScreenSubtitleEditor:
                 (getattr(self, "_display_page_translation_artifact", {}) or {}).get("status")
                 or "NOT_BUILT"
             ),
+            "display_page_degraded_count": int(
+                (getattr(self, "_display_page_translation_artifact", {}) or {}).get(
+                    "degraded_page_count"
+                )
+                or 0
+            ),
+            "display_page_degraded_threshold": int(
+                (getattr(self, "_display_page_translation_artifact", {}) or {}).get(
+                    "degraded_page_threshold"
+                )
+                or 0
+            ),
             "display_page_translation_contract_hash": str(
                 (getattr(self, "_display_page_translation_artifact", {}) or {}).get(
                     "contract_hash"
@@ -13490,6 +13560,70 @@ class ScreenSubtitleEditor:
             )
             self._parent_chinese_authority_artifact = parent_chinese_authority
             self._display_page_translation_artifact = display_page_artifact
+            degraded_parent_markers = {
+                str(item.get("parent_subtitle_id") or ""): dict(item)
+                for item in display_page_artifact.get("degraded_parents") or []
+                if isinstance(item, Mapping)
+                and str(item.get("parent_subtitle_id") or "")
+            }
+            render_plans_by_id = {
+                str(plan.get("parent_subtitle_id") or ""): plan
+                for plan in display_page_artifact.get("render_plans") or []
+                if isinstance(plan, Mapping)
+                and str(plan.get("parent_subtitle_id") or "")
+            }
+            translated_parents_by_id = {
+                str(parent.get("parent_subtitle_id") or ""): parent
+                for parent in display_page_artifact.get("parents") or []
+                if isinstance(parent, Mapping)
+                and str(parent.get("parent_subtitle_id") or "")
+            }
+            degraded_checklist_rows = []
+            for parent_id, marker in degraded_parent_markers.items():
+                plan = render_plans_by_id.get(parent_id) or {}
+                translated_parent = translated_parents_by_id.get(parent_id) or {}
+                page_chinese_by_id = {
+                    str(page.get("display_page_id") or ""): str(
+                        page.get("zh") or page.get("chinese") or ""
+                    )
+                    for page in translated_parent.get("pages") or []
+                    if isinstance(page, Mapping)
+                }
+                degraded_checklist_rows.append(
+                    {
+                        "cue_index": marker.get("cue_index"),
+                        "parent_subtitle_id": parent_id,
+                        "pages": [
+                            {
+                                "display_page_id": str(
+                                    page.get("display_page_id") or ""
+                                ),
+                                "english": str(
+                                    page.get("english") or ""
+                                ),
+                                "chinese": page_chinese_by_id.get(
+                                    str(page.get("display_page_id") or ""),
+                                    "",
+                                ),
+                            }
+                            for page in plan.get("pages") or []
+                            if isinstance(page, Mapping)
+                        ],
+                        "degraded_reasons": list(
+                            marker.get("reasons")
+                            or plan.get("degraded_reasons")
+                            or ["render_structural_overflow"]
+                        ),
+                    }
+                )
+            degraded_checklist_path = artifact_dir / "degraded-review-checklist.jsonl"
+            degraded_checklist_path.write_text(
+                "".join(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                    for row in degraded_checklist_rows
+                ),
+                encoding="utf-8",
+            )
             translation_payload = self._translations_from_parent_chinese_authority(
                 final_segments,
                 parent_chinese_by_id,
@@ -13547,6 +13681,19 @@ class ScreenSubtitleEditor:
                     display_page_artifact.get("status")
                     or "NOT_BUILT"
                 ),
+                "display_page_degraded_count": int(
+                    display_page_artifact.get("degraded_page_count") or 0
+                ),
+                "display_page_degraded_threshold": int(
+                    display_page_artifact.get("degraded_page_threshold") or 0
+                ),
+                "display_page_total_parent_count": int(
+                    display_page_artifact.get("total_parent_count") or 0
+                ),
+                "display_page_degraded_parent_ratio": float(
+                    display_page_artifact.get("degraded_parent_ratio") or 0.0
+                ),
+                "degraded_review_checklist_path": str(degraded_checklist_path),
                 "parent_chinese_authority_hash": str(
                     parent_chinese_authority.get("artifact_hash") or ""
                 ),

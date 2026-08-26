@@ -1697,6 +1697,58 @@ def test_no_safe_normal_font_partition_fails_closed_instead_of_using_50px():
         )
 
 
+def test_renderable_review_fallback_is_degraded_without_blocking_the_blueprint():
+    text = (
+        "Because it's like a famous restaurant realizing they spend so much money "
+        "on a specific rare ingredient that they decide it's cheaper to just buy "
+        "the farm and grow it themselves."
+    )
+    _, cue = _syntax_backed_cue(text, "S0038")
+
+    blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+
+    assert blueprint["status"] == "PASS"
+    assert blueprint["degraded_page_count"] == 1
+    assert blueprint["total_parent_count"] == 1
+    assert blueprint["degraded_parent_ratio"] == 1.0
+    assert blueprint["degraded_page_threshold"] == 1
+    assert blueprint["degraded_parents"] == [
+        {
+            "cue_index": cue.index,
+            "parent_subtitle_id": "S0038",
+            "reasons": ["no_complete_normal_font_page_partition"],
+        }
+    ]
+    assert not blueprint.get("errors")
+    plan = next(
+        item
+        for item in blueprint["render_plans"]
+        if item["parent_subtitle_id"] == "S0038"
+    )
+    assert plan["renderable"] is True
+    assert plan["degraded"] is True
+
+
+def test_candidate_bundle_keeps_a_complete_short_cue_on_the_normal_path():
+    cue = _cue(
+        "A complete short sentence.",
+        "S0199",
+        chinese="一条完整的短句。",
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    bundle = podcast_learning_video._build_article_english_page_plan(
+        cue,
+        draw,
+        _return_candidates=True,
+    )
+
+    assert bundle.get("fallback_review") is not True
+    assert bundle["candidates"]
+    assert bundle["candidates"][0]["page_count"] == 1
+    assert bundle["candidates"][0]["incomplete_review_count"] == 0
+
+
 def test_nonrenderable_page_seed_keeps_an_english_preview_line():
     text = (
         "Because the government shifted all its macroeconomic stabilization "

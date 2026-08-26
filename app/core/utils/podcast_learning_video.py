@@ -30,6 +30,7 @@ from app.core.subtitle_processor.stable_display_planner import (
     plan_word_page_span_frontier,
     plan_word_page_spans,
 )
+from app.core.subtitle_processor.text_metrics import HARD_ENGLISH_WORD_LIMIT
 from app.core.subtitle_processor.chinese_token_boundaries import (
     chinese_token_boundaries,
 )
@@ -260,6 +261,9 @@ ARTICLE_VISUAL_PAGE_REVIEW_WORDS = 15
 ARTICLE_VISUAL_PAGE_SPLIT_PRIORITY_WORDS = 16
 ARTICLE_VISUAL_PAGE_MIN_WORDS = 4
 ARTICLE_VISUAL_PAGE_MAX_PAGES = 4
+# A small number of renderable review fallbacks is acceptable at episode level.
+# The fallback is tracked as degraded state; it is not a parent-level error.
+ARTICLE_DISPLAY_DEGRADED_MAX_RATIO = 0.02
 # Automatic planning stays conservative. An explicit editor action may use
 # more pages because the user reviews every new boundary and translation.
 ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES = 6
@@ -4854,6 +4858,13 @@ def _article_page_break_is_forbidden(
     supported_relative_start = bool(
         following in {"that", "which", "who", "whom", "whose", "where", "when"}
         and "dependency_phrase_entrance_split" in issue_codes
+        and (
+            punctuation_boundary
+            or (
+                pause_ms is not None
+                and int(pause_ms) >= ARTICLE_PAGE_BALANCED_CLAUSE_REVIEW_MS
+            )
+        )
     )
     if (
         "fronted_wh_clause_split" in issue_codes
@@ -4976,6 +4987,66 @@ def _article_page_has_tight_nonfinite_complement(
     return pause_ms <= ARTICLE_PAGE_NONFINITE_COMPLEMENT_MAX_PAUSE_MS
 
 
+def _article_boundary_has_incomplete_predicate(
+    decision: Mapping[str, object],
+    *,
+    words: Sequence[str] | None = None,
+    split: int | None = None,
+) -> bool:
+    """Keep explicit manual review from bisecting a predicate unit.
+
+    Manual pagination may relax layout and timing constraints, but it must not
+    turn a parser-backed predicate/object boundary into a displayable page
+    split. Completion flags are emitted by the normal boundary classifier when
+    the right page is a complete visible continuation.
+    """
+    issue_codes = {str(code or "") for code in decision.get("issue_codes") or []}
+    predicate_issues = {
+        "clause_introducer_split",
+        "dependency_phrase_entrance_split",
+        "object_attached_modifier_split",
+        "post_noun_participial_modifier_split",
+        "preposition_object_split",
+        "subject_finite_verb_split",
+        "subject_predicate_split",
+        "short_verb_complement_split",
+        "short_verb_object_split",
+        "verb_complement_split",
+        "verb_preposition_complement_split",
+        "predicate_attached_continuation_split",
+        "predicate_complement_chain_split",
+        "verb_adverb_preposition_split",
+    }
+    if not issue_codes & predicate_issues:
+        if (
+            "protected_syntax_cut" not in issue_codes
+            or words is None
+            or split is None
+        ):
+            return False
+        left_surface = str(words[split - 1] or "").strip()
+        right_surface = str(words[split] or "").strip()
+        adjacent_capitalized_name = bool(
+            split > 1
+            and re.match(r"^[A-Z][A-Za-z'’-]*[,.!?;:]?$", left_surface)
+            and re.match(r"^[A-Z][A-Za-z'’-]*[,.!?;:]?$", right_surface)
+        )
+        return bool(
+            _article_boundary_inside_title_entity(words, split)
+            or _article_boundary_between_title_entities(words, split)
+            or adjacent_capitalized_name
+        )
+    completion_flags = {
+        "balanced_predicate_restart",
+        "complete_object_continuation",
+        "complete_prepositional_continuation",
+        "complete_title_restart",
+        "forced_complete_predicate_phrase",
+        "forced_subject_predicate",
+    }
+    return not any(bool(decision.get(flag)) for flag in completion_flags)
+
+
 def _article_page_can_start_with_complete_phrase(words: list[str], split: int) -> bool:
     """Allow a full prepositional or infinitive phrase to start a new page."""
     return _caption_phrase_start_is_complete(words, split)
@@ -5075,6 +5146,7 @@ def _partition_article_english_pages(
     allow_forced_continuation: bool = False,
     allow_review_boundary: bool = False,
     allow_manual_override: bool = False,
+    prefer_punctuation_for_manual_review: bool = False,
     span_layout: Callable[[int, int, int, bool], Sequence[str]] | None = None,
     span_balance: Callable[[int, int, int, int], float] | None = None,
     max_candidates: int = 1,
@@ -5170,7 +5242,11 @@ def _partition_article_english_pages(
         ),
         "span_is_readable": span_is_readable,
         "break_score": lambda end, target: (
-            _article_manual_override_break_rank(
+            (
+                _article_manual_review_break_rank
+                if prefer_punctuation_for_manual_review
+                else _article_manual_override_break_rank
+            )(
                 cue,
                 words,
                 end,
@@ -5726,6 +5802,7 @@ def _build_article_english_page_plan(
         forced_continuation: bool,
         review_boundary_candidate: bool = False,
         emergency_font_candidate: bool = False,
+        manual_override_candidate: bool = False,
     ) -> tuple[dict | None, str]:
         if (
             page_count == 1
@@ -5765,8 +5842,9 @@ def _build_article_english_page_plan(
             )
             for start, _ in spans[1:]
         ]
-        boundary_costs = [
-            _article_page_break_score(
+        boundary_costs = []
+        for start, _ in spans[1:]:
+            cost = _article_page_break_score(
                 cue,
                 words,
                 start,
@@ -5775,8 +5853,20 @@ def _build_article_english_page_plan(
                 allow_forced_continuation=forced_continuation,
                 allow_review_boundary=review_boundary_candidate,
             )
-            for start, _ in spans[1:]
-        ]
+            if cost is None and manual_override_candidate:
+                # This path is only a review seed.  Keep the hard decision and
+                # its issue codes in the page artifact, but use the existing
+                # explicit-editor rank so a human can inspect the page map.
+                cost = int(
+                    _article_manual_override_break_rank(
+                        cue,
+                        words,
+                        start,
+                        len(words) / page_count,
+                        cue.word_timing,
+                    )[1]
+                )
+            boundary_costs.append(cost)
         if any(cost is None for cost in boundary_costs):
             return None, "hard_page_boundary"
         boundary_risks = [
@@ -6027,6 +6117,7 @@ def _build_article_english_page_plan(
                 "font_reduction": font_reduction,
                 "forced_continuation": forced_continuation,
                 "review_boundary_candidate": review_boundary_candidate,
+                "manual_override_candidate": manual_override_candidate,
                 "emergency_font_candidate": emergency_font_candidate,
                 "risk_score": risk_score,
                 "high_risk_count": high_risk_count,
@@ -6061,6 +6152,7 @@ def _build_article_english_page_plan(
         *,
         emergency_font_candidate: bool,
     ) -> None:
+        manual_fallback_candidates: list[dict] = []
         bounded_max_page_count = min(max(1, int(max_page_count)), len(words))
         for font_size in font_sizes:
             for page_count in range(1, bounded_max_page_count + 1):
@@ -6079,7 +6171,7 @@ def _build_article_english_page_plan(
                 )
                 partition_modes = []
                 if strict_partitions:
-                    partition_modes.append((strict_partitions, False, False))
+                    partition_modes.append((strict_partitions, False, False, False))
                 if page_count > 1 and (
                     not strict_partitions or enumerate_high_pressure_alternatives
                 ):
@@ -6097,7 +6189,7 @@ def _build_article_english_page_plan(
                         max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
                     )
                     if forced_partitions:
-                        partition_modes.append((forced_partitions, True, False))
+                        partition_modes.append((forced_partitions, True, False, False))
                     review_partitions = _partition_article_english_pages(
                         draw,
                         cue,
@@ -6112,14 +6204,41 @@ def _build_article_english_page_plan(
                         max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
                     )
                     if review_partitions:
-                        partition_modes.append((review_partitions, False, True))
+                        partition_modes.append((review_partitions, False, True, False))
+                if (
+                    not partition_modes
+                    and _return_candidates
+                    and page_count > 1
+                    and not candidates
+                ):
+                    manual_partitions = _partition_article_english_pages(
+                        draw,
+                        cue,
+                        words,
+                        page_count,
+                        cue.word_timing,
+                        font_size,
+                        diagnostics=attempt_diagnostics,
+                        allow_manual_override=True,
+                        prefer_punctuation_for_manual_review=True,
+                        span_layout=span_layout,
+                        span_balance=span_balance,
+                        max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
+                    )
+                    if manual_partitions:
+                        partition_modes.append((manual_partitions, False, False, True))
                 if not partition_modes:
                     failure_reasons.update(
                         attempt_diagnostics
                         or {"no_complete_legal_page_partition"}
                     )
                     continue
-                for partitions, forced_continuation, review_boundary_candidate in (
+                for (
+                    partitions,
+                    forced_continuation,
+                    review_boundary_candidate,
+                    manual_override_candidate,
+                ) in (
                     partition_modes
                 ):
                     for spans in partitions:
@@ -6129,28 +6248,80 @@ def _build_article_english_page_plan(
                             forced_continuation,
                             review_boundary_candidate,
                             emergency_font_candidate,
+                            manual_override_candidate,
                         )
                         if candidate is None:
                             failure_reasons.add(failure_reason)
                             continue
-                        candidates.append(candidate)
+                        if manual_override_candidate:
+                            manual_fallback_candidates.append(candidate)
+                        else:
+                            candidates.append(candidate)
 
-    collect_candidates(
+        return manual_fallback_candidates
+
+    manual_fallback_candidates = collect_candidates(
         ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES,
         emergency_font_candidate=False,
     )
+    all_candidates = list(candidates)
     complete_normal_font_candidates = [
         candidate
         for candidate in candidates
         if not int(candidate.get("incomplete_review_count") or 0)
         and int(candidate.get("relaxed_raw_hard_count") or 0) <= 1
     ]
+    fallback_review_candidate = None
     if (
         (candidates and not complete_normal_font_candidates)
         or (not candidates and not automatic_floor_static_lines)
     ):
         failure_reasons.add("no_complete_normal_font_page_partition")
+        if _return_candidates and candidates:
+            # Keep the best displayable review candidate available to the
+            # partial checkpoint.  It is never a formal success: the caller
+            # records the same structural error and keeps publication blocked.
+            fallback_pool = [
+                candidate
+                for candidate in candidates
+                if int(candidate.get("incomplete_review_count") or 0) == 0
+            ]
+            if fallback_pool:
+                fallback_review_candidate = min(
+                    fallback_pool,
+                key=lambda candidate: (
+                    int(candidate.get("incomplete_review_count") or 0),
+                    _article_candidate_fallback_tier(candidate),
+                    int(candidate.get("relaxed_raw_hard_count") or 0),
+                    int(candidate.get("severe_risk_count") or 0),
+                    int(candidate.get("high_risk_count") or 0),
+                    int(candidate.get("medium_risk_count") or 0),
+                    float(candidate.get("quality_cost") or 0.0),
+                    tuple(
+                        int(page.get("word_end") or 0)
+                        for page in candidate.get("plan", {}).get("pages") or []
+                    ),
+                )
+                )
+                fallback_review_candidate = dict(fallback_review_candidate)
+                fallback_review_candidate["fallback_review_candidate"] = True
     candidates = complete_normal_font_candidates
+
+    if fallback_review_candidate is not None:
+        return {
+            "status": "candidate_bundle",
+            "candidates": [fallback_review_candidate],
+            "shadow_candidates": all_candidates,
+            "preferred_page_count": base_preferred_page_count,
+            "candidate_mode": "review_fallback",
+            "fallback_review": True,
+            "fallback_errors": [
+                {
+                    "cue_index": cue.index,
+                    "reason": "no_complete_normal_font_page_partition",
+                }
+            ],
+        }
 
     if candidates:
         deduplicated: dict[tuple, dict] = {}
@@ -6525,9 +6696,9 @@ def _build_article_english_page_plan(
         )
     reason_priority = (
         "missing_or_mismatched_word_ledger",
+        "no_complete_normal_font_page_partition",
         "no_word_boundary_with_minimum_page_duration",
         "cue_duration_below_page_minimum",
-        "no_complete_normal_font_page_partition",
         "hard_page_boundary",
         "fixed_font_span_unreadable",
         "no_complete_legal_page_partition",
@@ -8006,10 +8177,97 @@ def _article_editable_page_seed_plan(
     }
 
 
+def _article_manual_degraded_render_plan(
+    cue: Cue,
+    errors: Sequence[Mapping[str, object]],
+) -> dict | None:
+    """Build a renderable, review-only plan after automatic planning fails."""
+    words = _article_boundary_words(cue)
+    if not cue.subtitle_id or len(words) != len(cue.word_timing):
+        return None
+    max_page_count = min(ARTICLE_MANUAL_VISUAL_PAGE_MAX_PAGES, len(words))
+    reasons = sorted(
+        {
+            str(error.get("reason") or "render_structural_overflow")
+            for error in errors
+        }
+    ) or ["render_structural_overflow"]
+    for requested_page_count in range(2, max_page_count + 1):
+        try:
+            ranges = propose_article_manual_page_word_ranges(
+                cue,
+                requested_page_count,
+                allow_review_boundary=True,
+                allow_hard_boundary=True,
+            )
+            local_spans = _article_local_spans_for_global_ranges(
+                list(cue.word_timing),
+                ranges,
+            )
+            minimum_page_words = max(
+                ARTICLE_VISUAL_PAGE_MIN_WORDS,
+                math.floor(len(words) / requested_page_count * 0.55),
+            )
+            if local_spans is None or any(
+                end - start < minimum_page_words
+                for start, end in local_spans
+            ):
+                continue
+            if any(
+                _article_boundary_has_incomplete_predicate(
+                    _article_display_boundary_decision(cue, local_start),
+                    words=words,
+                    split=local_start,
+                )
+                for local_start, _local_end in local_spans[1:]
+            ):
+                continue
+            seed = {
+                "pages": [
+                    {
+                        "display_page_id": display_page_id(
+                            str(cue.subtitle_id),
+                            index + 1,
+                        )
+                    }
+                    for index in range(len(ranges))
+                ]
+            }
+            rebuilt = rebuild_article_frozen_page_plan_from_word_ranges(
+                cue,
+                seed,
+                ranges,
+                {},
+                allow_page_count_change=True,
+                allow_incomplete_page_translations=True,
+                allow_manual_review=True,
+            )
+        except RenderStructuralOverflowError:
+            continue
+        rebuilt.update(
+            {
+                "review_only": True,
+                "renderable": True,
+                "degraded": True,
+                "degraded_reasons": reasons,
+                "review_reasons": ["automatic_page_plan_unavailable"],
+                "page_count_decision": {
+                    "preferred": requested_page_count,
+                    "selected": len(rebuilt.get("pages") or []),
+                    "basis": "manual_degraded_fallback",
+                },
+            }
+        )
+        return rebuilt
+    return None
+
+
 def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
     """Return only multi-page parents after final word timing is frozen."""
     draw = ImageDraw.Draw(Image.new("RGB", (ARTICLE_WIDTH, ARTICLE_HEIGHT)))
     errors: list[dict] = []
+    degraded_parents: list[dict] = []
+    degraded_render_plans: list[tuple[Cue, dict]] = []
     bundle_entries: list[tuple[Cue, dict]] = []
     for cue in cues:
         bundle = _build_article_english_page_plan(
@@ -8018,8 +8276,41 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
             _return_candidates=True,
         )
         if bundle.get("status") != "candidate_bundle":
-            errors.extend(bundle.get("errors") or [])
+            bundle_errors = list(bundle.get("errors") or [])
+            degraded_plan = _article_manual_degraded_render_plan(cue, bundle_errors)
+            if degraded_plan is None:
+                errors.extend(bundle_errors)
+                continue
+            degraded_parents.append(
+                {
+                    "cue_index": cue.index,
+                    "parent_subtitle_id": str(cue.subtitle_id or ""),
+                    "reasons": sorted(
+                        {
+                            str(error.get("reason") or "render_structural_overflow")
+                            for error in bundle_errors
+                        }
+                    )
+                    or ["render_structural_overflow"],
+                }
+            )
+            degraded_render_plans.append((cue, degraded_plan))
             continue
+        if bundle.get("fallback_review"):
+            fallback_errors = list(bundle.get("fallback_errors") or [])
+            degraded_parents.append(
+                {
+                    "cue_index": cue.index,
+                    "parent_subtitle_id": str(cue.subtitle_id or ""),
+                    "reasons": sorted(
+                        {
+                            str(error.get("reason") or "render_structural_overflow")
+                            for error in fallback_errors
+                        }
+                    )
+                    or ["render_structural_overflow"],
+                }
+            )
         bundle_entries.append((cue, bundle))
     selected_candidates = _select_article_page_plan_sequence(
         [bundle["candidates"] for _cue, bundle in bundle_entries]
@@ -8097,6 +8388,22 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
                 "pages": frozen_pages,
             }
         )
+        if bundle.get("fallback_review"):
+            render_plans[-1].update(
+                {
+                    "review_only": True,
+                    "renderable": True,
+                    "degraded": True,
+                    "degraded_reasons": [
+                        str(error.get("reason") or "render_structural_overflow")
+                        for error in bundle.get("fallback_errors") or []
+                    ]
+                    or ["render_structural_overflow"],
+                    "review_reasons": [
+                        "no_complete_normal_font_page_partition"
+                    ],
+                }
+            )
         if len(pages) <= 1:
             continue
         parents.append(
@@ -8107,6 +8414,53 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
                 "word_start": int(pages[0]["global_word_start"]),
                 "word_end": int(pages[-1]["global_word_end"]),
                 "pages": frozen_pages,
+            }
+        )
+    for cue, degraded_plan in degraded_render_plans:
+        render_plans.append(degraded_plan)
+        pages = list(degraded_plan.get("pages") or [])
+        if len(pages) > 1:
+            parents.append(
+                {
+                    "parent_subtitle_id": cue.subtitle_id,
+                    "english": cue.en,
+                    "chinese": cue.zh,
+                    "word_start": int(pages[0]["word_start"]),
+                    "word_end": int(pages[-1]["word_end"]),
+                    "pages": pages,
+                }
+            )
+    cue_order = {
+        str(cue.subtitle_id or ""): index
+        for index, cue in enumerate(cues)
+    }
+    render_plans.sort(
+        key=lambda plan: cue_order.get(str(plan.get("parent_subtitle_id") or ""), len(cues))
+    )
+    parents.sort(
+        key=lambda parent: cue_order.get(
+            str(parent.get("parent_subtitle_id") or ""),
+            len(cues),
+        )
+    )
+    degraded_page_count = len(degraded_parents)
+    total_parent_count = len(cues)
+    degraded_parent_ratio = (
+        degraded_page_count / total_parent_count if total_parent_count else 0.0
+    )
+    degraded_threshold = max(
+        1,
+        math.floor(total_parent_count * ARTICLE_DISPLAY_DEGRADED_MAX_RATIO),
+    )
+    if degraded_page_count > degraded_threshold:
+        errors.append(
+            {
+                "cue_index": "all",
+                "reason": "degraded_page_count_exceeded",
+                "degraded_page_count": degraded_page_count,
+                "total_parent_count": total_parent_count,
+                "degraded_parent_ratio": degraded_parent_ratio,
+                "degraded_page_threshold": degraded_threshold,
             }
         )
     if errors:
@@ -8127,6 +8481,11 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
             "status": "ERROR",
             "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
             "layout_profile": article_display_page_layout_profile(),
+            "degraded_page_count": degraded_page_count,
+            "total_parent_count": total_parent_count,
+            "degraded_parent_ratio": degraded_parent_ratio,
+            "degraded_page_threshold": degraded_threshold,
+            "degraded_parents": degraded_parents,
             "parents": [],
             "render_plans": [
                 plans_by_parent[parent_id]
@@ -8140,10 +8499,16 @@ def build_article_display_page_blueprint(cues: Sequence[Cue]) -> dict:
             partial_blueprint=partial_blueprint,
         )
     return {
+        "status": "PASS",
         "planner_version": DISPLAY_PAGE_PLANNER_VERSION,
         "layout_profile": article_display_page_layout_profile(),
         "parents": parents,
         "render_plans": render_plans,
+        "degraded_page_count": degraded_page_count,
+        "total_parent_count": total_parent_count,
+        "degraded_parent_ratio": degraded_parent_ratio,
+        "degraded_page_threshold": degraded_threshold,
+        "degraded_parents": degraded_parents,
     }
 
 
