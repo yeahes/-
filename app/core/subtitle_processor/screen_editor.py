@@ -16,7 +16,7 @@ from pathlib import Path
 from string import Template
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 
 from app.config import CACHE_PATH, RESOURCE_PATH
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg

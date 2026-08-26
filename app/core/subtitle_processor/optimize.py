@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
 
 import retry
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 
 from app.config import CACHE_PATH
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg

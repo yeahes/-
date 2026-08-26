@@ -12,7 +12,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Mapping
 
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 from PyQt5.QtCore import (
     Qt,
     QEvent,

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping
 
 from PyQt5.QtCore import QSettings, QThread, pyqtSignal
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 
 from app.common.config import cfg
 from app.core.bk_asr.asr_data import ASRData

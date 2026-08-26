@@ -304,6 +304,12 @@ Run-state rules:
   external request. It records task, model, attempt, latency, provider token
   usage, prompt-cache tokens, and reasoning tokens when returned by the API;
   it never stores prompts or API credentials.
+- All OpenAI-compatible calls share `app/core/llm_client.py`. OpenCode Zen/Go
+  uses `reasoning_effort=none`; TokenRhythm uses `thinking.type=disabled`.
+  Both gateways also use `max_completion_tokens` because their DeepSeek V4
+  routes can otherwise spend the entire completion budget on hidden reasoning
+  and may ignore legacy `max_tokens` on long requests. Other providers retain
+  their configured request fields.
 - A malformed optional allocation-quality retry is rejected locally. The
   original complete fixed-ID allocation remains authoritative, while the
   failed candidate and unresolved quality issue remain review evidence. This

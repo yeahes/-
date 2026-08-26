@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 from PIL import (
     Image,
     ImageChops,

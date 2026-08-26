@@ -4,7 +4,7 @@ import os
 import re
 from typing import List, Optional
 
-import openai
+from app.core.llm_client import OpenAI
 import retry
 
 from app.config import CACHE_PATH
@@ -98,7 +98,7 @@ def split_by_llm_retry(text: str,
             return cached_result
     logger.info(f"未命中缓存，开始断句")
     # 初始化OpenAI客户端
-    client = openai.OpenAI()
+    client = OpenAI()
     response = client.chat.completions.create(
         model=model,
         messages=[

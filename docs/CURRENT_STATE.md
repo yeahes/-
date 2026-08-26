@@ -48,6 +48,7 @@ timing, page contracts, translation cache identity, and recoverable checkpoints.
   original input/context and preserves completed cache entries.
 - Manual-final save handles proven orphan display plans after parent merges;
   unexplained orphan plans remain hard failures.
+- OpenCode Zen/Go and TokenRhythm now use the shared reasoning-gateway request adapter with bounded completions.
 
 ## Known Risks And Unknowns
 

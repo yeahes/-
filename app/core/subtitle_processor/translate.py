@@ -8,7 +8,7 @@ import retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
 from enum import Enum
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 import json
 from dataclasses import dataclass
 from functools import lru_cache

@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from app.config import CACHE_PATH

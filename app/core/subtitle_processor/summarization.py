@@ -1,6 +1,6 @@
 import os
 
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 
 from ..utils import json_repair
 from ..utils.logger import setup_logger
