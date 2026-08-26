@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -70,6 +71,27 @@ _ENGLISH_NUMBER_SCALES = {
     "million": Decimal(1_000_000),
     "billion": Decimal(1_000_000_000),
 }
+_REQUEST_MAX_RETRIES = 2
+_RETRY_BACKOFF_SECONDS = (0.1, 0.25)
+_NO_ERROR_REASON_RE = re.compile(
+    r"(?:无(?:明显)?(?:错误|问题)|没有(?:任何)?(?:错误|问题)|均正确|都正确|"
+    r"正确无误|不存在(?:错误|问题)|no errors?|no issues?|translation is correct|"
+    r"all translations? (?:are )?correct)",
+    re.IGNORECASE,
+)
+
+
+class _RequestRetryError(RuntimeError):
+    def __init__(self, cause: Exception, retries: int):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.retries = retries
+
+
+class _BindingFailure(ValueError):
+    def __init__(self, returned_ids: Sequence[str]):
+        super().__init__("translation quality audit binding failed")
+        self.returned_ids = list(returned_ids)
 
 
 SYSTEM_PROMPT = """You audit Simplified Chinese subtitles for an English podcast.
@@ -239,6 +261,9 @@ def audit_fixed_id_translation_quality(
     )
     completed_steps = 0
     cache_hits = 0
+    retry_count = 0
+    fallback_count = 0
+    self_contradiction_filtered_count = 0
 
     def emit_progress(*, request_error: bool = False) -> None:
         if progress_callback is None:
@@ -248,61 +273,54 @@ def audit_fixed_id_translation_quality(
                 "completed": completed_steps,
                 "total": total_steps,
                 "cache_hits": cache_hits,
-                "retries": 0,
+                "retries": retry_count,
                 "request_error": request_error,
             }
         )
 
-    emit_progress()
-    for offset in range(0, len(ordered), effective_batch_size):
-        batch = ordered[offset : offset + effective_batch_size]
+    def process_batch(
+        batch: Sequence[Mapping[str, Any]],
+        offset: int,
+        focus: str,
+        focus_instruction: str,
+    ) -> None:
+        nonlocal cache_hits, completed_steps, retry_count, fallback_count
+        nonlocal self_contradiction_filtered_count
+        nonlocal total_steps
         expected_ids = [str(row["subtitle_id"]) for row in batch]
         context_start = max(0, offset - 1)
         context_end = min(len(ordered), offset + len(batch) + 1)
         context_rows = ordered[context_start:context_end]
         context_ids = {str(row["subtitle_id"]) for row in context_rows}
-        for focus, focus_instruction in AUDIT_FOCUSES:
-            request = {
-                "model": str(model),
-                "prompt_version": PROMPT_VERSION,
-                "audit_focus": focus,
-                "system_prompt": SYSTEM_PROMPT + "\n" + focus_instruction,
-                "target_ids": expected_ids,
-                "rows": context_rows,
-            }
-            cache_key = hashlib.sha256(
-                json.dumps(
-                    request,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            cache_path = cache_root / f"{cache_key}.json" if cache_root else None
-            try:
-                if cache_path is not None and cache_path.is_file():
-                    response = json.loads(
-                        cache_path.read_text(encoding="utf-8-sig")
-                    )
-                    cache_hits += 1
-                else:
-                    response = completion(request)
-                    if cache_path is not None:
-                        write_json_artifact(cache_path, response)
-            except Exception as exc:
-                batch_errors.append(
-                    {
-                        "code": "translation_quality_audit_request_failed",
-                        "audit_focus": focus,
-                        "subtitle_ids": expected_ids,
-                        "reason": str(exc)[:500],
-                    }
-                )
-                completed_steps += 1
-                emit_progress(request_error=True)
-                continue
-            completed_steps += 1
-            emit_progress()
+        request = {
+            "model": str(model),
+            "prompt_version": PROMPT_VERSION,
+            "audit_focus": focus,
+            "system_prompt": SYSTEM_PROMPT + "\n" + focus_instruction,
+            "target_ids": expected_ids,
+            "rows": context_rows,
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(
+                request,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        cache_path = cache_root / f"{cache_key}.json" if cache_root else None
+
+        try:
+            if cache_path is not None and cache_path.is_file():
+                response = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+                cache_hits += 1
+            else:
+                response, retries = _complete_with_retries(completion, request)
+                retry_count += retries
+                if cache_path is not None:
+                    write_json_artifact(cache_path, response)
+            if not isinstance(response, Mapping):
+                raise ValueError("translation quality audit response is not an object")
             response_ids = [
                 str(value) for value in (response or {}).get("audited_ids") or []
             ]
@@ -311,25 +329,69 @@ def audit_fixed_id_translation_quality(
                 or not set(expected_ids).issubset(response_ids)
                 or not set(response_ids).issubset(context_ids)
             ):
-                batch_errors.append(
-                    {
-                        "code": "translation_quality_audit_binding_failed",
-                        "audit_focus": focus,
-                        "subtitle_ids": expected_ids,
-                        "returned_audited_ids": response_ids,
-                    }
-                )
-                continue
-            for subtitle_id in expected_ids:
-                audit_passes_by_id[subtitle_id].add(focus)
-            issues.extend(
-                _validated_model_issues(
-                    response,
-                    context_rows,
-                    target_ids=set(expected_ids),
-                    allowed_codes=FOCUS_CODES[focus],
-                )
+                raise _BindingFailure(response_ids)
+        except _BindingFailure as exc:
+            batch_errors.append(
+                {
+                    "code": "translation_quality_audit_binding_failed",
+                    "audit_focus": focus,
+                    "subtitle_ids": expected_ids,
+                    "returned_audited_ids": exc.returned_ids,
+                }
             )
+            completed_steps += 1
+            emit_progress(request_error=True)
+            return
+        except Exception as exc:
+            if isinstance(exc, _RequestRetryError):
+                retry_count += exc.retries
+            if len(batch) > 1:
+                fallback_count += 1
+                total_steps += 1
+                midpoint = max(1, len(batch) // 2)
+                process_batch(batch[:midpoint], offset, focus, focus_instruction)
+                process_batch(
+                    batch[midpoint:],
+                    offset + midpoint,
+                    focus,
+                    focus_instruction,
+                )
+                return
+            batch_errors.append(
+                {
+                    "code": "translation_quality_audit_request_failed",
+                    "audit_focus": focus,
+                    "subtitle_ids": expected_ids,
+                    "reason": str(exc)[:500],
+                }
+            )
+            completed_steps += 1
+            emit_progress(request_error=True)
+            return
+
+        completed_steps += 1
+        emit_progress()
+        for subtitle_id in expected_ids:
+            audit_passes_by_id[subtitle_id].add(focus)
+        issue_stats = {"self_contradiction_filtered": 0}
+        issues.extend(
+            _validated_model_issues(
+                response,
+                context_rows,
+                target_ids=set(expected_ids),
+                allowed_codes=FOCUS_CODES[focus],
+                stats=issue_stats,
+            )
+        )
+        self_contradiction_filtered_count += issue_stats[
+            "self_contradiction_filtered"
+        ]
+
+    emit_progress()
+    for offset in range(0, len(ordered), effective_batch_size):
+        batch = ordered[offset : offset + effective_batch_size]
+        for focus, focus_instruction in AUDIT_FOCUSES:
+            process_batch(batch, offset, focus, focus_instruction)
 
     deduplicated = []
     seen = set()
@@ -373,7 +435,31 @@ def audit_fixed_id_translation_quality(
         "items": verified_issues,
         "batch_errors": batch_errors,
         "verification_errors": verification_errors,
+        "retry_count": retry_count,
+        "fallback_count": fallback_count,
+        "self_contradiction_filtered_count": self_contradiction_filtered_count,
     }
+
+
+def _complete_with_retries(
+    completion: Callable[[dict[str, Any]], Any],
+    request: dict[str, Any],
+    *,
+    max_retries: int = _REQUEST_MAX_RETRIES,
+) -> tuple[Any, int]:
+    last_error: Exception | None = None
+    for attempt in range(max(0, int(max_retries)) + 1):
+        try:
+            return completion(request), attempt
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                break
+            time.sleep(_RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)])
+    raise _RequestRetryError(
+        last_error or RuntimeError("translation quality audit request failed"),
+        max(0, int(max_retries)),
+    )
 
 
 def _verify_candidate_issues(
@@ -444,7 +530,7 @@ def _verify_candidate_issues(
             if cache_path is not None and cache_path.is_file():
                 response = json.loads(cache_path.read_text(encoding="utf-8-sig"))
             else:
-                response = completion(request)
+                response, _retries = _complete_with_retries(completion, request)
                 if cache_path is not None:
                     write_json_artifact(cache_path, response)
             decisions = list((response or {}).get("decisions") or [])
@@ -488,6 +574,7 @@ def _validated_model_issues(
     *,
     target_ids: set[str] | None = None,
     allowed_codes: set[str] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     rows_by_id = {str(row["subtitle_id"]): row for row in rows}
     owned_ids = set(rows_by_id) if target_ids is None else set(target_ids)
@@ -505,6 +592,12 @@ def _validated_model_issues(
         )
         code = str(raw.get("code") or "")
         reason = str(raw.get("reason") or "").strip()[:500]
+        if _reason_asserts_no_error(reason):
+            if stats is not None:
+                stats["self_contradiction_filtered"] = (
+                    stats.get("self_contradiction_filtered", 0) + 1
+                )
+            continue
         source_quote = str(raw.get("source_quote") or "").strip()[:300]
         claimed_missing_chinese = str(
             raw.get("claimed_missing_chinese") or ""
@@ -588,6 +681,11 @@ def _validated_model_issues(
             }
         )
     return result
+
+
+def _reason_asserts_no_error(reason: str) -> bool:
+    """Reject an issue whose own conclusion says the translation is correct."""
+    return bool(_NO_ERROR_REASON_RE.search(str(reason or "")))
 
 
 def _semantic_loss_claim_is_already_present(
