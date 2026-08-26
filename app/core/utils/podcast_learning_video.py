@@ -138,15 +138,21 @@ ARTICLE_VOCAB_DETAIL_FONT_SIZE = 28
 ARTICLE_VOCAB_DETAIL_MIN_FONT_SIZE = 22
 ARTICLE_VOCAB_DETAIL_FONT_WEIGHT = 500
 ARTICLE_VOCAB_DETAIL_EN_FONT_SCALE = 1.14
+ARTICLE_VOCAB_DETAIL_MIN_TAIL_RATIO = 0.62
 ARTICLE_VOCAB_PHRASE_MAX_FONT_SIZE = 58
 ARTICLE_VOCAB_PHRASE_SINGLE_LINE_MIN_FONT_SIZE = 46
 ARTICLE_VOCAB_PHRASE_MIN_FONT_SIZE = 32
 ARTICLE_VOCAB_UNBROKEN_WORD_MIN_FONT_SIZE = 20
 ARTICLE_VOCAB_PHRASE_LINE_BALANCE_RATIO = 0.55
 # Keep every line inside the rounded card's safe edge without wasting width.
-# These values are design-grid pixels.
-ARTICLE_VOCAB_CONTENT_LEFT = 64
-ARTICLE_VOCAB_CONTENT_RIGHT = 40
+# These values are design-grid pixels. At 1920x1080 the accent gaps and the
+# right content inset each resolve to an actual 45px safe margin.
+ARTICLE_VOCAB_CONTENT_LEFT = 82.5
+ARTICLE_VOCAB_CONTENT_RIGHT = 37.5
+# Keep the accent aligned with the title card while leaving a deliberate
+# breathing space before the first card line.
+ARTICLE_VOCAB_ACCENT_LEFT = 37.5
+ARTICLE_VOCAB_ACCENT_WIDTH = 7.5
 MUTED = (153, 153, 153, 255)
 WHITE = (245, 248, 255, 255)
 TITLE_FILL = (255, 255, 255, 179)
@@ -165,7 +171,7 @@ EN_SUBTITLE_CENTER_Y0 = 700
 ZH_SUBTITLE_CENTER_Y0 = 912
 SUBTITLE_FADE_SECONDS = 0.22
 SUBTITLE_MIN_ALPHA = 175
-VOCAB_PROMPT_VERSION = 16
+VOCAB_PROMPT_VERSION = 17
 VOCAB_GROUP_MAX_CUES = 6
 VOCAB_GROUP_MAX_SECONDS = 18.0
 VOCAB_GROUP_SILENCE_SECONDS = 0.7
@@ -173,7 +179,7 @@ VOCAB_MIN_CARD_INTERVAL_SECONDS = 15.0
 VOCAB_CARDS_PER_MINUTE = 1.0
 VOCAB_MIN_CARDS_PER_EPISODE = 3
 VOCAB_MAX_CARDS_PER_EPISODE = 22
-VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 3
+VOCAB_MAX_CONCEPT_CARDS_PER_EPISODE = 6
 ARTICLE_SUBTITLE_EN_FONT_SIZE = 56
 ARTICLE_SUBTITLE_ZH_FONT_SIZE = 50
 # Percentage of the rendered font size applied between adjacent glyphs.
@@ -277,6 +283,7 @@ ARTICLE_MIXED_AVOID_LINE_START = frozenset(
 ARTICLE_MIXED_PREFERRED_BREAK_AFTER = frozenset(
     "，。；：、来的于与和及或但而并把被将让使为对从向给由因比像"
 )
+ARTICLE_VOCAB_PUNCTUATION_BREAKS = frozenset("，。；：、,.!?;:")
 ARTICLE_CONCEPT_LEAD_IN_SUBJECTS = ("本句", "这句", "文中", "这里")
 ARTICLE_CONCEPT_LEAD_IN_PREDICATES = (
     "说明",
@@ -1611,11 +1618,50 @@ def compact_vocab_meaning(value: object) -> str:
     return senses[0] if senses and len(senses[0]) <= 18 else compact[:18].rstrip("，、； ")
 
 
+def _reset_vocab_diagnostics(raw_items, diagnostics: dict | None) -> None:
+    if diagnostics is None:
+        return
+    diagnostics.clear()
+    diagnostics.update(
+        {
+            "raw_items": len(raw_items) if isinstance(raw_items, list) else 0,
+            "accepted_items": 0,
+            "rejected": {},
+        }
+    )
+
+
+def _record_vocab_diagnostic(diagnostics: dict | None, reason: str) -> None:
+    if diagnostics is None:
+        return
+    rejected = diagnostics.setdefault("rejected", {})
+    rejected[reason] = int(rejected.get(reason, 0)) + 1
+
+
+def _annotate_vocab_schedule_diagnostics(
+    diagnostics: dict | None,
+    plan: dict[int, dict],
+) -> None:
+    if diagnostics is None:
+        return
+    diagnostics["scheduled_items"] = len(plan)
+    diagnostics["scheduled_detail_items"] = sum(
+        bool(str(item.get("detail") or "").strip())
+        for item in plan.values()
+    )
+    diagnostics["scheduled_concept_items"] = sum(
+        vocab_card_type(item) == "concept"
+        for item in plan.values()
+    )
+
+
 def normalize_vocab_plan(
     raw_items,
     cues: list[Cue],
     groups: list[VocabSemanticGroup] | None = None,
+    diagnostics: dict | None = None,
 ) -> dict[int, dict]:
+    _reset_vocab_diagnostics(raw_items, diagnostics)
     cue_by_index = {cue.index: cue for cue in cues}
     groups = groups or build_vocab_semantic_groups(cues)
     group_by_id = {group.id: group for group in groups}
@@ -1626,13 +1672,16 @@ def normalize_vocab_plan(
     }
     plan: dict[int, dict] = {}
     if not isinstance(raw_items, list):
+        _record_vocab_diagnostic(diagnostics, "invalid_payload")
         return plan
     for item in raw_items:
         if not isinstance(item, dict):
+            _record_vocab_diagnostic(diagnostics, "item_not_object")
             continue
         try:
             cue_index = int(item.get("cue_index"))
         except Exception:
+            _record_vocab_diagnostic(diagnostics, "invalid_cue_index")
             continue
         group_id = str(item.get("group_id") or "").strip()
         group = group_by_id.get(group_id) if group_id else group_by_cue.get(cue_index)
@@ -1646,13 +1695,31 @@ def normalize_vocab_plan(
             or item.get("collocation")
             or ""
         ).strip()[:72]
-        if not group or not cue or cue_index not in group.cue_indices or not meaning:
+        if not group or not cue:
+            _record_vocab_diagnostic(diagnostics, "missing_group_or_cue")
+            continue
+        if cue_index not in group.cue_indices:
+            _record_vocab_diagnostic(diagnostics, "cue_not_in_group")
+            continue
+        if not meaning:
+            _record_vocab_diagnostic(diagnostics, "missing_meaning")
             continue
         phrase = find_vocab_source_phrase(cue.en, phrase_candidate)
+        if not phrase:
+            _record_vocab_diagnostic(diagnostics, "phrase_not_found")
+            continue
         phrase_terms = re.findall(r"[A-Za-z]+(?:['-][A-Za-z]+)?", phrase.lower())
-        if not phrase_terms or len(phrase_terms) > 8 or len(phrase) > 56:
+        if not phrase_terms:
+            _record_vocab_diagnostic(diagnostics, "no_english_terms")
+            continue
+        if len(phrase_terms) > 8:
+            _record_vocab_diagnostic(diagnostics, "too_many_terms")
+            continue
+        if len(phrase) > 56:
+            _record_vocab_diagnostic(diagnostics, "phrase_too_long")
             continue
         if all(term in COMMON_WORDS for term in phrase_terms):
+            _record_vocab_diagnostic(diagnostics, "all_common_words")
             continue
         key = phrase.lower()
         plan[cue.index] = {
@@ -1669,6 +1736,10 @@ def normalize_vocab_plan(
             "meaning": meaning,
             "detail": detail if card_type == "concept" or detail else "",
         }
+        if diagnostics is not None:
+            diagnostics["accepted_items"] = int(diagnostics.get("accepted_items", 0)) + 1
+    if diagnostics is not None:
+        diagnostics["normalized_items"] = len(plan)
     return plan
 
 
@@ -1853,11 +1924,7 @@ def schedule_vocab_card_plan(
         cue = cue_by_index.get(cue_index)
         key = str(item.get("key") or "").strip().lower()
         group = group_by_cue.get(cue_index)
-        if not cue or not key or not group:
-            continue
-        # Scores 1-2 let the model report a marginal candidate without making
-        # it eligible merely to fill a time bucket.
-        if vocab_card_priority(item) < 3:
+        if not cue or not key or not group or vocab_card_priority(item) < 3:
             continue
         display_start = float(cue.start)
         if align_to_article_pages:
@@ -1880,11 +1947,12 @@ def schedule_vocab_card_plan(
     ]
     for entry in eligible:
         display_start = display_starts[entry[0]]
-        if episode_duration <= 0:
-            bucket_index = 0
-        else:
-            relative = max(0.0, min(1.0, (display_start - episode_start) / episode_duration))
-            bucket_index = min(bucket_count - 1, int(relative * bucket_count))
+        relative = (
+            0.0
+            if episode_duration <= 0
+            else max(0.0, min(1.0, (display_start - episode_start) / episode_duration))
+        )
+        bucket_index = min(bucket_count - 1, int(relative * bucket_count))
         buckets[bucket_index].append(entry)
 
     scheduled: list[tuple[int, dict, Cue, VocabSemanticGroup, str]] = []
@@ -1908,9 +1976,8 @@ def schedule_vocab_card_plan(
         selected_starts.append(display_start)
         return True
 
-    # One strong candidate per timeline stratum prevents an opening cluster
-    # from consuming the entire episode budget. Empty strata stay empty rather
-    # than admitting a low-value word merely to meet the target count.
+    # First take one strong candidate from each timeline stratum so early
+    # high-priority candidates cannot consume the whole episode budget.
     for bucket in buckets:
         for entry in sorted(
             bucket,
@@ -1923,13 +1990,14 @@ def schedule_vocab_card_plan(
             if try_schedule(entry):
                 break
 
-    # If some strata had no candidate, fill the remaining budget with the best
-    # valid expressions while preferring distance from cards already selected.
+    # Empty strata may be filled by the best remaining candidate, but the
+    # minimum interval and exact-expression de-duplication still apply.
     while len(scheduled) < card_limit:
         remaining = [
             entry
             for entry in eligible
-            if entry[0] not in selected_cue_indices and entry[4] not in selected_keys
+            if entry[0] not in selected_cue_indices
+            and entry[4] not in selected_keys
             and all(
                 abs(display_starts[entry[0]] - selected_start)
                 >= VOCAB_MIN_CARD_INTERVAL_SECONDS
@@ -1942,7 +2010,10 @@ def schedule_vocab_card_plan(
             remaining,
             key=lambda value: (
                 -vocab_card_priority(value[1]),
-                -min(abs(display_starts[value[0]] - start) for start in selected_starts),
+                -min(
+                    (abs(display_starts[value[0]] - start) for start in selected_starts),
+                    default=0.0,
+                ),
                 display_starts[value[0]],
                 value[0],
             ),
@@ -2217,10 +2288,12 @@ def build_vocab_selection_prompt(groups: list[VocabSemanticGroup], max_cards: in
 - 词必须承担当前论点、机制、关键判断，或具有不能直接从字面猜出的语境义。仅仅“词长、考试难度高”不是入选理由。
 - 避免普通副词、基础动作、一般文学名词和标点名称；除非它正是当前讨论对象或不懂它会误解结论。
 - priority 用 1-5 表示学习必要性：5=理解意群核心结论不可缺少，4=关键机制或非透明语境义，3=明显有学习价值，1-2=通常不应入选。按 priority 从高到低返回。
-- 不选择口头语、基础词、专有名词、数字、缩略词或只靠上下文才成立的词。
+- 不选择普通填充口头语、基础词、专有名词、数字、缩略词或只靠上下文才成立的词；但有明确语境义的口语短语和习语可以入选。
+- 排除本集主题本身的专业术语，以及能从词根直接猜出大意的透明复合词。比如 tariff gap、connector economies、economies of scale、coping mechanism，除非它们在本集承担了不可替代且非字面意义的论点。
+- 优先选择中文字幕难以承载的口语、习语、比喻、反语和低频动词短语，例如 rule of thumb、a far cry from、shell out、barely a blip、draw the line。
 - phrase 必须是 cue_index 对应英文字幕中的连续原文，逐字保留原句写法；优先固定搭配、短语或完整概念，最多 8 个英文词。不要为了词典化而改写原文。
 - cue_index 必须是 phrase 实际出现的字幕序号，phrase 不能跨字幕行。
-- 不要为了凑数量选词。单词卡会从对应字幕出现时开始展示，先显示完整讲解卡，随后缩为复习条。
+- 不要为了凑数量选词。单词卡会从对应字幕出现时开始展示，并保持完整卡片直到下一张替换它。
 - meaning 只写当前语境的主释义：2-14 个汉字，最多两个核心义项（用；分隔）；禁止词性前缀、括号解释、例句或完整句。
 - card_type 只能是 standard 或 concept。standard 是默认；只有字面翻译无法理解的文化、技术、经济或抽象概念才用 concept。
 - detail：standard 可留空，只有存在明显迁移价值时才写一条简短英文搭配；concept 必须写一条不超过 28 个汉字的中文解释，说明它在当前语境中的实际概念。detail 不得重复 meaning。
@@ -2278,12 +2351,20 @@ def load_or_generate_vocab_plan(
     }
 
     def make_plan(cards: list[dict]) -> dict[int, dict]:
+        normalization_diagnostics: dict = {}
         plan = schedule_vocab_card_plan(
-            normalize_vocab_plan(cards, cues, groups),
+            normalize_vocab_plan(
+                cards,
+                cues,
+                groups,
+                diagnostics=normalization_diagnostics,
+            ),
             cues,
             max_cards=episode_card_target,
             align_to_article_pages=align_to_article_pages,
         )
+        _annotate_vocab_schedule_diagnostics(normalization_diagnostics, plan)
+        progress_payload["normalization_diagnostics"] = normalization_diagnostics
         if not plan:
             return {}
         return apply_episode_vocab_ranks(
@@ -2422,6 +2503,11 @@ def load_or_generate_vocab_plan(
         progress_payload["complete"] = set(completed_ids) == set(chunk_order)
         cards = _vocab_cards_from_progress(progress_payload)
         plan = make_plan(cards)
+        progress_payload["generation_diagnostics"] = {
+            "request_batches": len(request_groups),
+            "completed_batches": len(completed_ids),
+            "failed_batches": len(failed_chunks),
+        }
         if progress_payload["complete"]:
             for candidate in formal_cache_paths:
                 atomic_write_vocab_cache(candidate, progress_payload)
@@ -10118,8 +10204,11 @@ def wrap_article_vocab_meaning(
             and shorter / longer >= ARTICLE_VOCAB_MEANING_LINE_BALANCE_RATIO
         )
         score = (
-            0 if after_width >= before_width and balanced else 1,
+            # The second line should carry a little more visual weight. Keep
+            # this ahead of semantic preference so a lead-in cannot consume
+            # most of the first line and strand a short tail below it.
             0 if after_width >= before_width else 1,
+            0 if balanced else 1,
             abs(after_width - before_width),
         )
         candidates.append((score, [before, after]))
@@ -10354,7 +10443,9 @@ def wrap_article_vocab_detail_mixed_text(
         if prefer_semantic_break
         else set()
     )
-    candidates: list[tuple[tuple[int, int, int], list[list[str]]]] = []
+    total_cjk = len(re.findall(r"[\u4e00-\u9fff]", paragraph))
+    candidates: list[tuple[tuple[int, int, int, int], list[list[str]]]] = []
+    punctuation_candidates: list[tuple[tuple[int, int, int, int], list[list[str]]]] = []
     for offset in safe_offsets:
         if offset in {0, len(paragraph)}:
             continue
@@ -10383,18 +10474,39 @@ def wrap_article_vocab_detail_mixed_text(
         )
         if before_width > max_width or after_width > max_width:
             continue
-        candidates.append(
+        before_cjk = len(re.findall(r"[\u4e00-\u9fff]", before))
+        after_cjk = len(re.findall(r"[\u4e00-\u9fff]", after))
+        # Do not create a one- or two-character tail when the explanation is
+        # predominantly Chinese. Keep at least a quarter of the CJK content on
+        # each line, with a four-character floor for short notes.
+        if total_cjk >= 8 and min(before_cjk, after_cjk) < max(4, math.ceil(total_cjk * 0.25)):
+            continue
+        widest = max(before_width, after_width, 1)
+        tail_ratio = min(before_width, after_width) / widest
+        short_tail_penalty = int(tail_ratio < ARTICLE_VOCAB_DETAIL_MIN_TAIL_RATIO)
+        punctuation_penalty = int(before[-1:] not in ARTICLE_MIXED_PREFERRED_BREAK_AFTER)
+        candidate = (
             (
-                (
-                    0 if offset in semantic_offsets else 1,
-                    0 if after_width >= before_width else 1,
-                    abs(after_width - before_width),
-                ),
-                [before_tokens, after_tokens],
-            )
+                # Body explanations fill the first line toward the right
+                # safe edge, but never strand a very short second line.
+                short_tail_penalty,
+                -before_width,
+                punctuation_penalty,
+                0 if offset in semantic_offsets else 1,
+                abs(after_width - before_width),
+            ),
+            [before_tokens, after_tokens],
         )
-    if candidates:
-        return min(candidates, key=lambda candidate: candidate[0])[1]
+        candidates.append(candidate)
+        if before[-1:] in ARTICLE_VOCAB_PUNCTUATION_BREAKS:
+            punctuation_candidates.append(candidate)
+    # A comma is the author's explicit semantic boundary. Once the complete
+    # explanation is too wide, prefer a legal comma/semicolon boundary over a
+    # closer-looking lexical cut. If no punctuation boundary can fit at this
+    # font size, retain the existing safe-boundary fallback.
+    selected_candidates = punctuation_candidates or candidates
+    if selected_candidates:
+        return min(selected_candidates, key=lambda candidate: candidate[0])[1]
     return _wrap_article_vocab_detail_tokens_by_width(
         draw,
         paragraph,
@@ -10495,6 +10607,37 @@ def draw_article_vocab_detail_mixed_line(
             stroke_width=0,
         )
         cursor += width
+
+
+def article_vocab_detail_mixed_line_bounds(
+    draw: ImageDraw.ImageDraw,
+    y: int,
+    tokens: Sequence[str],
+    size: int,
+    *,
+    english_only: bool = False,
+) -> tuple[int, int]:
+    """Return the visible vertical bounds used by a mixed-script detail line."""
+    runs = _coalesce_article_vocab_detail_tokens(tokens)
+    if not runs:
+        return y, y
+    fonts = [
+        article_vocab_detail_mixed_font(
+            run,
+            size,
+            english_only=english_only,
+        )
+        for run in runs
+    ]
+    baseline = y + max(
+        (text_h(draw, run, fnt) for run, fnt in zip(runs, fonts)),
+        default=0,
+    )
+    boxes = [
+        draw.textbbox((0, baseline), run, font=fnt, anchor="ls")
+        for run, fnt in zip(runs, fonts)
+    ]
+    return min(box[1] for box in boxes), max(box[3] for box in boxes)
 
 
 def rebalance_article_mixed_lines(
@@ -11107,7 +11250,56 @@ def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int
     block_height = len(phrase_lines) * phrase_gap + group_gap + len(meaning_lines) * meaning_gap
     if detail_lines:
         block_height += group_gap + len(detail_lines) * detail_gap
-    cursor_y = (y0 + y1 - block_height) // 2
+    block_top = (y0 + y1 - block_height) // 2
+    block_bottom = block_top + block_height
+    # Match the opening title card's anchored blue rule to visible glyphs,
+    # rather than the vertical gaps between phrase, meaning, and detail.
+    visible_bounds: list[tuple[int, int]] = []
+    measure_cursor_y = block_top
+    for line in phrase_lines:
+        box = d.textbbox(
+            (content_left_x, measure_cursor_y),
+            line,
+            font=phrase_font,
+            anchor="la",
+        )
+        visible_bounds.append((box[1], box[3]))
+        measure_cursor_y += phrase_gap
+    measure_cursor_y += group_gap
+    for line in meaning_lines:
+        box = d.textbbox(
+            (content_left_x, measure_cursor_y),
+            line,
+            font=meaning_font,
+            anchor="la",
+        )
+        visible_bounds.append((box[1], box[3]))
+        measure_cursor_y += meaning_gap
+    if detail_lines and detail_font:
+        measure_cursor_y += group_gap
+        for line_tokens in detail_lines:
+            visible_bounds.append(
+                article_vocab_detail_mixed_line_bounds(
+                    d,
+                    measure_cursor_y,
+                    line_tokens,
+                    detail_size,
+                    english_only=detail_english_only,
+                )
+            )
+            measure_cursor_y += detail_gap
+    visible_top = min((bounds[0] for bounds in visible_bounds), default=block_top)
+    visible_bottom = max((bounds[1] for bounds in visible_bounds), default=block_bottom)
+    d.rectangle(
+        (
+            x0 + acx(ARTICLE_VOCAB_ACCENT_LEFT),
+            visible_top,
+            x0 + acx(ARTICLE_VOCAB_ACCENT_LEFT + ARTICLE_VOCAB_ACCENT_WIDTH),
+            visible_bottom,
+        ),
+        fill=ARTICLE_BLUE,
+    )
+    cursor_y = block_top
 
     for line in phrase_lines:
         draw_stroked_text(
@@ -11334,7 +11526,7 @@ def draw_article_opening_topic_panel(
     line_gap = int(title_font.size * 1.25)
     block_height = max(line_gap, len(title_lines) * line_gap)
     x0, y0, x1, y1 = rect
-    title_x = x0 + acx(92)
+    title_x = x0 + acx(ARTICLE_VOCAB_CONTENT_LEFT)
     first_y = (y0 + y1 - block_height) // 2
     title_bounds = [
         d.textbbox((title_x, first_y + index * line_gap), line, font=title_font)
@@ -11342,9 +11534,13 @@ def draw_article_opening_topic_panel(
     ]
     accent_y0 = min(bounds[1] for bounds in title_bounds)
     accent_y1 = max(bounds[3] for bounds in title_bounds)
-    d.rounded_rectangle(
-        (x0 + acx(48), accent_y0, x0 + acx(56), accent_y1),
-        radius=acx(4),
+    d.rectangle(
+        (
+            x0 + acx(ARTICLE_VOCAB_ACCENT_LEFT),
+            accent_y0,
+            x0 + acx(ARTICLE_VOCAB_ACCENT_LEFT + ARTICLE_VOCAB_ACCENT_WIDTH),
+            accent_y1,
+        ),
         fill=ARTICLE_BLUE,
     )
     for index, line in enumerate(title_lines):

@@ -8100,7 +8100,9 @@ def test_article_opening_title_accent_matches_the_visible_title_height():
     )
     line_gap = int(title_font.size * 1.25)
     block_height = max(line_gap, len(title_lines) * line_gap)
-    title_x = rect[0] + podcast_learning_video.acx(92)
+    title_x = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_CONTENT_LEFT
+    )
     first_y = (rect[1] + rect[3] - block_height) // 2
     bounds = [
         draw.textbbox((title_x, first_y + index * line_gap), line, font=title_font)
@@ -8115,7 +8117,17 @@ def test_article_opening_title_accent_matches_the_visible_title_height():
     )
     expected_y0 = min(box[1] for box in bounds)
     expected_y1 = max(box[3] for box in bounds)
-    accent_x = rect[0] + podcast_learning_video.acx(52)
+    accent_left = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+    )
+    accent_right = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+        + podcast_learning_video.ARTICLE_VOCAB_ACCENT_WIDTH
+    )
+    accent_x = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+        + podcast_learning_video.ARTICLE_VOCAB_ACCENT_WIDTH // 2
+    )
     accent_pixels = [
         y
         for y in range(rect[1], rect[3] + 1)
@@ -8123,6 +8135,17 @@ def test_article_opening_title_accent_matches_the_visible_title_height():
     ]
 
     assert (min(accent_pixels), max(accent_pixels)) == (expected_y0, expected_y1)
+    assert podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+    ) == 45
+    assert podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_WIDTH
+    ) == 9
+    assert title_x - accent_right == 45
+    assert all(
+        image.getpixel((x, expected_y0)) == podcast_learning_video.ARTICLE_BLUE
+        for x in range(accent_left, accent_right + 1)
+    )
 
 
 def test_article_mixed_wrapper_rebalances_a_short_chinese_tail_line():
@@ -8193,6 +8216,44 @@ def test_article_concept_detail_keeps_a_short_note_on_one_line():
     ) == [detail]
 
 
+def test_article_vocab_detail_keeps_a_short_comma_note_on_one_line():
+    detail = "用于快速估算，而不是精确计算。"
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+    size, lines = podcast_learning_video.fit_article_vocab_detail_mixed_font(
+        draw,
+        detail,
+        max_width=564,
+        max_lines=2,
+        max_size=28,
+        min_size=22,
+        prefer_semantic_break=True,
+    )
+
+    assert size == 28
+    assert ["".join(line) for line in lines] == [detail]
+
+
+def test_article_vocab_detail_prefers_a_comma_when_the_full_note_overflows():
+    detail = "这是一个很长的中文解释，说明它在当前语境中的具体含义。"
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+    size, lines = podcast_learning_video.fit_article_vocab_detail_mixed_font(
+        draw,
+        detail,
+        max_width=564,
+        max_lines=2,
+        max_size=28,
+        min_size=22,
+        prefer_semantic_break=True,
+    )
+
+    assert size == 28
+    assert ["".join(line) for line in lines] == [
+        "这是一个很长的中文解释，",
+        "说明它在当前语境中的具体含义。",
+    ]
+    assert "".join("".join(line) for line in lines) == detail
+
+
 def test_article_vocab_meaning_prefers_a_balanced_longer_second_line():
     meaning = "跨境监管合规制度框架与执行机制"
     draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
@@ -8209,6 +8270,59 @@ def test_article_vocab_meaning_prefers_a_balanced_longer_second_line():
     assert widths[0] / widths[1] >= (
         podcast_learning_video.ARTICLE_VOCAB_MEANING_LINE_BALANCE_RATIO
     )
+
+
+def test_article_vocab_detail_fills_toward_the_right_safe_edge_without_short_tail():
+    detail = "本句用数学隐喻说明留学回报的旧有优势已随市场变化而消失。"
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+    size, lines = podcast_learning_video.fit_article_vocab_detail_mixed_font(
+        draw,
+        detail,
+        max_width=564,
+        max_lines=2,
+        max_size=28,
+        min_size=22,
+        prefer_semantic_break=True,
+    )
+    widths = [
+        podcast_learning_video.article_vocab_detail_mixed_width(
+            draw,
+            line,
+            size,
+            english_only=False,
+        )
+        for line in lines
+    ]
+
+    assert len(lines) == 2
+    assert ["".join(line) for line in lines] == [
+        "本句用数学隐喻说明留学回报的旧有",
+        "优势已随市场变化而消失。",
+    ]
+    assert widths[0] >= widths[1]
+    assert widths[1] / widths[0] >= (
+        podcast_learning_video.ARTICLE_VOCAB_DETAIL_MIN_TAIL_RATIO
+    )
+
+
+def test_article_vocab_detail_does_not_split_a_lexical_cjk_unit():
+    detail = "它指的是一种由多重因素共同造成、但不能简单归因于单一原因的现象。"
+    draw = ImageDraw.Draw(Image.new("RGBA", (1920, 1080)))
+    size, lines = podcast_learning_video.fit_article_vocab_detail_mixed_font(
+        draw,
+        detail,
+        max_width=564,
+        max_lines=2,
+        max_size=28,
+        min_size=22,
+        prefer_semantic_break=True,
+    )
+    rendered_lines = ["".join(line) for line in lines]
+
+    assert size == 28
+    assert "".join(rendered_lines) == detail
+    assert not rendered_lines[0].endswith("造")
+    assert not rendered_lines[1].startswith("成")
 
 
 def test_article_vocab_meaning_uses_the_new_45px_rendered_size_for_short_text():
@@ -8596,9 +8710,9 @@ def test_article_vocab_card_uses_only_expression_gloss_and_concept_note():
     observed_meaning_sizes = []
     observed_detail_sizes = []
 
-    def record_meaning_font(size):
+    def record_meaning_font(size, *, rendered=False):
         observed_meaning_sizes.append(size)
-        return original_meaning_font(size)
+        return original_meaning_font(size, rendered=rendered)
 
     def record_detail_font(size):
         observed_detail_sizes.append(size)
@@ -8628,7 +8742,13 @@ def test_article_vocab_card_uses_only_expression_gloss_and_concept_note():
     assert "TOEFL" not in rendered_text
     assert "IN CONTEXT" not in rendered_text
     assert "Related to official rules or controls." not in rendered_text
-    assert 34 in observed_meaning_sizes
+    assert observed_meaning_sizes
+    assert all(
+        podcast_learning_video.ARTICLE_VOCAB_MEANING_MIN_RENDER_SIZE
+        <= size
+        <= podcast_learning_video.ARTICLE_VOCAB_MEANING_MAX_RENDER_SIZE
+        for size in observed_meaning_sizes
+    )
     assert podcast_learning_video.ARTICLE_VOCAB_DETAIL_FONT_SIZE in observed_detail_sizes
     meaning_calls = [
         call
@@ -8698,6 +8818,84 @@ def test_article_vocab_card_left_aligns_all_content_to_card_safe_edge():
     assert detail_call.kwargs["anchor"] == "ls"
 
 
+def test_article_vocab_card_draws_title_style_blue_vertical_accent():
+    image = Image.new("RGBA", (1920, 1080), (247, 243, 234, 255))
+    rect = podcast_learning_video.article_rect(916, 16, 1584, 530)
+    podcast_learning_video.draw_article_vocab_card(
+        image,
+        {
+            "word": "rule of thumb",
+            "meaning": "经验法则",
+            "detail": "用于快速估算，而不是精确计算。",
+            "card_type": "concept",
+        },
+        rect,
+    )
+
+    accent_x = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+        + podcast_learning_video.ARTICLE_VOCAB_ACCENT_WIDTH // 2
+    )
+    blue_pixels = sum(
+        image.getpixel((accent_x, y))[:3] == podcast_learning_video.ARTICLE_BLUE[:3]
+        for y in range(rect[1], rect[3])
+    )
+    assert blue_pixels >= podcast_learning_video.acy(40)
+
+    content_left = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_CONTENT_LEFT
+    )
+    accent_right = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+        + podcast_learning_video.ARTICLE_VOCAB_ACCENT_WIDTH
+    )
+    assert podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+    ) == 45
+    assert podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_WIDTH
+    ) == 9
+    assert content_left - accent_right == 45
+    assert (
+        rect[2]
+        - podcast_learning_video.acx(podcast_learning_video.ARTICLE_VOCAB_CONTENT_RIGHT)
+        == rect[2] - 45
+    )
+
+    accent_left = rect[0] + podcast_learning_video.acx(
+        podcast_learning_video.ARTICLE_VOCAB_ACCENT_LEFT
+    )
+    accent_pixels = [
+        (x, y)
+        for x in range(accent_left, accent_right + 1)
+        for y in range(rect[1], rect[3])
+        if image.getpixel((x, y))[:3] == podcast_learning_video.ARTICLE_BLUE[:3]
+    ]
+    accent_y0 = min(y for _, y in accent_pixels)
+    accent_y1 = max(y for _, y in accent_pixels)
+    assert all(
+        image.getpixel((x, accent_y0))[:3] == podcast_learning_video.ARTICLE_BLUE[:3]
+        for x in range(accent_left, accent_right + 1)
+    )
+    assert all(
+        image.getpixel((x, accent_y1))[:3] == podcast_learning_video.ARTICLE_BLUE[:3]
+        for x in range(accent_left, accent_right + 1)
+    )
+
+    content_pixels = [
+        (x, y)
+        for x in range(content_left, rect[2] - podcast_learning_video.acx(40))
+        for y in range(
+            rect[1] + podcast_learning_video.acy(20),
+            rect[3] - podcast_learning_video.acy(20),
+        )
+        if image.getpixel((x, y))[:3]
+        != podcast_learning_video.ARTICLE_CARD_CONTAINER[:3]
+    ]
+    assert accent_y0 == min(y for _, y in content_pixels)
+    assert abs(accent_y1 - max(y for _, y in content_pixels)) <= 1
+
+
 def test_vocab_prompt_requests_expression_card_fields_without_dictionary_metadata():
     group = podcast_learning_video.VocabSemanticGroup(
         "VG0001",
@@ -8747,10 +8945,10 @@ def test_vocab_source_phrase_does_not_match_inside_a_larger_word():
     assert podcast_learning_video.find_vocab_source_phrase(cue, "out-earn") == "out-earn"
 
 
-def test_vocab_plan_limits_concept_cards_to_three_per_episode():
+def test_vocab_plan_limits_concept_cards_to_six_per_episode():
     cues = [
         podcast_learning_video.Cue(index, (index - 1) * 20.0, (index - 1) * 20.0 + 2.0, f"Concept {index} appears.", "", "male")
-        for index in range(1, 5)
+        for index in range(1, 9)
     ]
     candidates = {
         index: {
@@ -8761,14 +8959,14 @@ def test_vocab_plan_limits_concept_cards_to_three_per_episode():
             "card_type": "concept",
             "priority": 5,
         }
-        for index in range(1, 5)
+        for index in range(1, 9)
     }
 
     plan = podcast_learning_video.schedule_vocab_card_plan(candidates, cues)
 
-    assert sum(item["card_type"] == "concept" for item in plan.values()) == 3
-    assert plan[4]["card_type"] == "standard"
-    assert plan[4]["detail"] == ""
+    assert sum(item["card_type"] == "concept" for item in plan.values()) == 6
+    assert plan[7]["card_type"] == "standard"
+    assert plan[7]["detail"] == ""
 
 
 def test_vocab_plan_keeps_each_llm_card_inside_its_frozen_group():
@@ -8902,6 +9100,30 @@ def test_vocab_plan_normalizes_verbose_model_meaning_before_rendering():
     )
 
     assert plan[1]["meaning"] == "破绽；暴露真相的线索"
+
+
+def test_vocab_normalization_records_rejection_reasons():
+    cues = [
+        podcast_learning_video.Cue(1, 0.0, 2.0, "A giveaway reveals the truth.", "", "male"),
+    ]
+    diagnostics = {}
+    plan = podcast_learning_video.normalize_vocab_plan(
+        [
+            {"group_id": "VG0001", "cue_index": 1, "phrase": "giveaway", "meaning": "破绽"},
+            {"group_id": "VG0001", "cue_index": 1, "phrase": "not present", "meaning": "缺失"},
+            {"group_id": "VG0001", "cue_index": 1, "phrase": "giveaway", "meaning": ""},
+            {"group_id": "VG0001", "cue_index": 99, "phrase": "giveaway", "meaning": "破绽"},
+        ],
+        cues,
+        diagnostics=diagnostics,
+    )
+
+    assert list(plan) == [1]
+    assert diagnostics["raw_items"] == 4
+    assert diagnostics["normalized_items"] == 1
+    assert diagnostics["rejected"]["phrase_not_found"] == 1
+    assert diagnostics["rejected"]["missing_meaning"] == 1
+    assert diagnostics["rejected"]["missing_group_or_cue"] == 1
 
 
 def test_vocab_card_plan_skips_low_priority_model_candidates():
@@ -15528,7 +15750,11 @@ if __name__ == "__main__":
     test_article_template_tip_font_and_wrapper_support_chinese_text()
     test_article_concept_detail_wraps_after_a_semantic_lead_in()
     test_article_concept_detail_keeps_a_short_note_on_one_line()
+    test_article_vocab_detail_keeps_a_short_comma_note_on_one_line()
+    test_article_vocab_detail_prefers_a_comma_when_the_full_note_overflows()
     test_article_vocab_meaning_prefers_a_balanced_longer_second_line()
+    test_article_vocab_detail_fills_toward_the_right_safe_edge_without_short_tail()
+    test_article_vocab_detail_does_not_split_a_lexical_cjk_unit()
     test_article_vocab_meaning_keeps_lexical_units_and_edge_particles_attached()
     test_article_vocab_meaning_fails_instead_of_truncating_a_third_line()
     test_article_vocab_phrase_wraps_before_becoming_tiny()
@@ -15558,7 +15784,7 @@ if __name__ == "__main__":
     test_vocab_prompt_requests_expression_card_fields_without_dictionary_metadata()
     test_vocab_plan_preserves_the_exact_phrase_from_its_subtitle()
     test_vocab_source_phrase_does_not_match_inside_a_larger_word()
-    test_vocab_plan_limits_concept_cards_to_three_per_episode()
+    test_vocab_plan_limits_concept_cards_to_six_per_episode()
     test_vocab_plan_keeps_each_llm_card_inside_its_frozen_group()
     test_article_vocab_card_starts_on_the_final_page_that_contains_its_phrase()
     test_article_vocab_card_drops_a_phrase_split_across_final_pages()
