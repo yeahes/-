@@ -28,6 +28,7 @@ RUN_STATE_FILE_NAME = "run-state.json"
 SAFE_RESUMABLE_STAGES = (
     "article_context",
     "article_asr_correction",
+    "frozen_parent_timeline",
 )
 
 

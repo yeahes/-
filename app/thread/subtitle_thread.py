@@ -100,10 +100,23 @@ class SubtitleThread(QThread):
         "translate_subtitle": (50, 64),
         "screen_subtitle_edit": (28, 92),
         "whisperx_time_only_alignment": (92, 96),
+        "frozen_parent_timeline": (96, 96),
         "display_page_translation": (96, 98),
         "translation_quality_audit": (98, 99),
         "final_subtitle_save": (99, 100),
     }
+    _FROZEN_PARENT_CHECKPOINT_FILES = (
+        "run-manifest.json",
+        "transcript.json",
+        "word-ledger.json",
+        "subtitle-spans.json",
+        "translations.json",
+        "semantic-groups.json",
+        "final-cue-timeline.json",
+        "authoritative-parent-chinese.json",
+        "display-boundary-evidence.json",
+        "stable-boundary-snapshots.json",
+    )
 
     def __init__(self, task: SubtitleTask):
         super().__init__()
@@ -325,6 +338,120 @@ class SubtitleThread(QThread):
         except Exception as exc:
             logger.warning("Resume ASR correction unavailable; recalculating: %s", exc)
             return None
+
+    def _recorded_frozen_parent_artifact_dir(self) -> Path | None:
+        if not self._resume_plan.can_reuse("frozen_parent_timeline"):
+            return None
+        record = self._resume_stage_records.get("frozen_parent_timeline") or {}
+        artifacts = record.get("artifacts") if isinstance(record, Mapping) else None
+        if not isinstance(artifacts, Mapping):
+            return None
+        paths = {
+            str(name): Path(str(value.get("path") or "")).resolve()
+            for name, value in artifacts.items()
+            if isinstance(value, Mapping) and value.get("path")
+        }
+        required = set(self._FROZEN_PARENT_CHECKPOINT_FILES)
+        if not required.issubset(paths):
+            return None
+        parents = {paths[name].parent for name in required}
+        return next(iter(parents)) if len(parents) == 1 else None
+
+    def _legacy_frozen_parent_artifact_dir(self, output_dir: Path) -> Path | None:
+        """Accept one old page-stage failure after full structural validation."""
+        if not self._resume_plan.compatible or self._resume_plan.previous_status != "failed":
+            return None
+        failure_path = output_dir / "stable-last-failure.json"
+        try:
+            failure = json.loads(failure_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        error_codes = [
+            str(value)
+            for value in failure.get("validation_error_codes") or []
+            if str(value)
+        ]
+        if not error_codes or any(
+            not code.startswith("display_page_") for code in error_codes
+        ):
+            return None
+        try:
+            if Path(str(failure.get("source_subtitle") or "")).resolve() != Path(
+                self.task.subtitle_path
+            ).resolve():
+                return None
+        except OSError:
+            return None
+        checkpoint_manifest_path = Path(
+            str(failure.get("editable_checkpoint_manifest_path") or "")
+        )
+        try:
+            checkpoint_manifest = json.loads(
+                checkpoint_manifest_path.resolve().read_text(encoding="utf-8-sig")
+            )
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            not checkpoint_manifest.get("editable_checkpoint")
+            or not checkpoint_manifest.get("render_blocked")
+            or str(checkpoint_manifest.get("source_subtitle") or "")
+            != str(failure.get("source_subtitle") or "")
+        ):
+            return None
+        timeline_path = Path(
+            str(checkpoint_manifest.get("final_cue_timeline_path") or "")
+        )
+        artifact_dir = timeline_path.resolve().parent
+        if not all(
+            (artifact_dir / name).is_file()
+            for name in self._FROZEN_PARENT_CHECKPOINT_FILES
+        ):
+            return None
+        return artifact_dir
+
+    def _load_resume_frozen_parent_checkpoint(
+        self,
+        screen_editor: ScreenSubtitleEditor,
+        output_dir: Path,
+    ) -> tuple[ASRData | None, Path | None]:
+        artifact_dir = self._recorded_frozen_parent_artifact_dir()
+        resume_kind = "recorded"
+        if artifact_dir is None:
+            artifact_dir = self._legacy_frozen_parent_artifact_dir(output_dir)
+            resume_kind = "legacy_page_failure"
+        if artifact_dir is None:
+            return None, None
+        try:
+            restored = screen_editor.restore_frozen_parent_checkpoint(artifact_dir)
+        except Exception as exc:
+            logger.warning(
+                "Frozen parent checkpoint rejected; running normal stable stage: %s",
+                exc,
+            )
+            return None, None
+        logger.info(
+            "Frozen parent/timeline checkpoint resumed without English, translation, or alignment rerun: kind=%s path=%s",
+            resume_kind,
+            artifact_dir,
+        )
+        return restored, artifact_dir
+
+    def _frozen_parent_checkpoint_paths(
+        self,
+        coverage_report_path: str,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> tuple[Path, ...]:
+        artifact_dir = artifact_dir or stable_artifact_dir(Path(coverage_report_path))
+        paths = tuple(
+            artifact_dir / name for name in self._FROZEN_PARENT_CHECKPOINT_FILES
+        )
+        missing = [path.name for path in paths if not path.is_file()]
+        if missing:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_incomplete: " + ", ".join(missing)
+            )
+        return paths
 
     def _handle_screen_editor_progress(self, event: Dict) -> None:
         """Translate editor events into the existing two-argument GUI signal."""
@@ -2372,80 +2499,107 @@ class SubtitleThread(QThread):
                     update_callback=self.callback,
                     progress_callback=self._handle_screen_editor_progress,
                 )
-                asr_data = screen_editor.edit(asr_data, word_time_asr_data=word_time_asr_data)
-                article_asr_review_artifact = (
-                    self._prepare_article_asr_review_artifact(
+                resumed_parent_data, resumed_artifact_dir = (
+                    self._load_resume_frozen_parent_checkpoint(
+                        screen_editor,
                         article_output_dir,
-                        asr_data,
-                        correction_ran=article_correction_ran,
                     )
                 )
-                pre_timeline_blocked = screen_editor.has_blocking_validation_errors()
-                frozen_word_ledger = screen_editor.export_frozen_word_ledger()
-                if not frozen_word_ledger.has_data():
-                    raise RuntimeError(self.tr("最终时间轴构建失败：缺少冻结词级账本。"))
-                try:
-                    timeline_stage_started = self._begin_stage(
-                        "whisperx_time_only_alignment",
-                        "最终词级时间轴对齐",
+                parent_checkpoint_resumed = resumed_parent_data is not None
+                if parent_checkpoint_resumed:
+                    asr_data = resumed_parent_data
+                    pre_timeline_blocked = False
+                    self._handle_screen_editor_progress(
+                        {
+                            "phase": "finalization",
+                            "completed": 1,
+                            "total": 1,
+                            "cache_hits": len(asr_data.segments),
+                            "resumed_stage": "frozen_parent_timeline",
+                        }
                     )
-                    asr_data = self._apply_whisperx_time_only_if_enabled(
+                else:
+                    asr_data = screen_editor.edit(
                         asr_data,
-                        alignment_source=alignment_source_asr_data,
-                        word_ledger=frozen_word_ledger,
-                        screen_editor=screen_editor,
+                        word_time_asr_data=word_time_asr_data,
                     )
-                    self._complete_stage(
-                        "whisperx_time_only_alignment",
-                        "最终词级时间轴对齐",
-                        timeline_stage_started,
+                    article_asr_review_artifact = (
+                        self._prepare_article_asr_review_artifact(
+                            article_output_dir,
+                            asr_data,
+                            correction_ran=article_correction_ran,
+                        )
                     )
-                    # The alignment backend has finished.  Any remaining
-                    # validation belongs to the still-running screen stage.
-                    self._active_stage = "screen_subtitle_edit"
-                    self._active_stage_started_at = stage_started
-                except RuntimeError as exc:
-                    validation_summary = {
-                        "status": "ERROR",
-                        "errors": [
-                            {
-                                "code": "whisperx_time_mapping_incomplete",
-                                "message": str(exc),
-                            }
-                        ],
-                        "warnings": [],
-                        "info": [],
-                    }
-                    self._save_stable_subtitle_outputs(
+                    pre_timeline_blocked = (
+                        screen_editor.has_blocking_validation_errors()
+                    )
+                    frozen_word_ledger = screen_editor.export_frozen_word_ledger()
+                    if not frozen_word_ledger.has_data():
+                        raise RuntimeError(
+                            self.tr("最终时间轴构建失败：缺少冻结词级账本。")
+                        )
+                    try:
+                        timeline_stage_started = self._begin_stage(
+                            "whisperx_time_only_alignment",
+                            "最终词级时间轴对齐",
+                        )
+                        asr_data = self._apply_whisperx_time_only_if_enabled(
+                            asr_data,
+                            alignment_source=alignment_source_asr_data,
+                            word_ledger=frozen_word_ledger,
+                            screen_editor=screen_editor,
+                        )
+                        self._complete_stage(
+                            "whisperx_time_only_alignment",
+                            "最终词级时间轴对齐",
+                            timeline_stage_started,
+                        )
+                        # The alignment backend has finished. Any remaining
+                        # validation belongs to the still-running screen stage.
+                        self._active_stage = "screen_subtitle_edit"
+                        self._active_stage_started_at = stage_started
+                    except RuntimeError as exc:
+                        validation_summary = {
+                            "status": "ERROR",
+                            "errors": [
+                                {
+                                    "code": "whisperx_time_mapping_incomplete",
+                                    "message": str(exc),
+                                }
+                            ],
+                            "warnings": [],
+                            "info": [],
+                        }
+                        self._save_stable_subtitle_outputs(
+                            asr_data,
+                            subtitle_config,
+                            coverage_report_path=coverage_report_path,
+                            validation_status="failed",
+                            validation_summary=validation_summary,
+                            manifest_meta=self._screen_manifest_metadata(
+                                screen_editor
+                            ),
+                        )
+                        raise
+                    if self._timeline_alignment_backend() != "whisperx-time-only":
+                        asr_data = screen_editor.rebuild_final_cue_timeline(
+                            asr_data,
+                            frozen_word_ledger,
+                            alignment_backend=self._timeline_alignment_backend(),
+                        )
+                    asr_data = screen_editor.repair_after_final_time_alignment(
                         asr_data,
-                        subtitle_config,
-                        coverage_report_path=coverage_report_path,
-                        validation_status="failed",
-                        validation_summary=validation_summary,
-                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                        # Every backend now reaches the same frozen-ledger final
+                        # timeline. Later passes may alter Chinese only.
+                        preserve_aligned_timing=True,
+                        # A structurally blocked result needs only a frozen local
+                        # timeline for editing.
+                        allow_chinese_compression=not pre_timeline_blocked,
                     )
-                    raise
-                if self._timeline_alignment_backend() != "whisperx-time-only":
-                    asr_data = screen_editor.rebuild_final_cue_timeline(
-                        asr_data,
-                        frozen_word_ledger,
-                        alignment_backend=self._timeline_alignment_backend(),
+                    self._write_article_asr_review_artifact(
+                        coverage_report_path,
+                        article_asr_review_artifact,
                     )
-                asr_data = screen_editor.repair_after_final_time_alignment(
-                    asr_data,
-                    # Every backend now reaches the same frozen-ledger final
-                    # timeline.  Later passes may alter Chinese only; they
-                    # must not write a second cue timing authority.
-                    preserve_aligned_timing=True,
-                    # A structurally blocked result needs only a frozen local
-                    # timeline for editing. Do not spend another LLM request
-                    # trying to compress Chinese that cannot be published yet.
-                    allow_chinese_compression=not pre_timeline_blocked,
-                )
-                self._write_article_asr_review_artifact(
-                    coverage_report_path,
-                    article_asr_review_artifact,
-                )
                 try:
                     self._require_valid_final_timeline_before_display_pages(
                         screen_editor
@@ -2482,6 +2636,31 @@ class SubtitleThread(QThread):
                         manifest_meta=self._screen_manifest_metadata(screen_editor),
                     )
                     raise
+                checkpoint_stage_started = self._begin_stage(
+                    "frozen_parent_timeline",
+                    "复用已冻结父字幕与时间轴"
+                    if parent_checkpoint_resumed
+                    else "保存已冻结父字幕与时间轴",
+                )
+                checkpoint_paths = self._frozen_parent_checkpoint_paths(
+                    coverage_report_path,
+                    artifact_dir=resumed_artifact_dir,
+                )
+                self._complete_stage(
+                    "frozen_parent_timeline",
+                    "已复用父字幕检查点"
+                    if parent_checkpoint_resumed
+                    else "父字幕检查点已保存",
+                    checkpoint_stage_started,
+                    artifact_paths=checkpoint_paths,
+                    details={
+                        "resumed": parent_checkpoint_resumed,
+                        "subtitle_count": len(asr_data.segments),
+                        "artifact_dir": str(checkpoint_paths[0].parent),
+                    },
+                )
+                self._active_stage = "screen_subtitle_edit"
+                self._active_stage_started_at = stage_started
                 if pre_timeline_blocked:
                     message = screen_editor.blocking_validation_message()
                     self._save_stable_subtitle_outputs(

@@ -937,6 +937,481 @@ class ScreenSubtitleEditor:
         edited_data.segments = self._apply_display_timing_padding(edited_data.segments)
         return edited_data
 
+    @staticmethod
+    def _read_frozen_parent_checkpoint_json(
+        artifact_dir: Path,
+        name: str,
+    ) -> Any:
+        path = artifact_dir / name
+        try:
+            return json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"frozen_parent_checkpoint_invalid: cannot read {name}"
+            ) from exc
+
+    @staticmethod
+    def _checkpoint_english_tokens(text: object) -> List[str]:
+        return [
+            token.lower()
+            for token in re.findall(
+                r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*",
+                str(text or ""),
+            )
+        ]
+
+    def restore_frozen_parent_checkpoint(
+        self,
+        artifact_dir: str | Path,
+    ) -> ASRData:
+        """Restore the immutable parent/timeline stage without rerunning it.
+
+        The checkpoint is accepted only when the independently serialized word
+        ledger, fixed subtitle spans, translations, semantic groups, boundary
+        evidence, and final cue timeline still describe one identical ID-bound
+        state. Display-page output is deliberately excluded because it is the
+        downstream stage being retried.
+        """
+        if not self.enable_stable_mode:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: stable mode is required"
+            )
+        root = Path(artifact_dir).resolve()
+        if not root.is_dir():
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: artifact directory is missing"
+            )
+
+        run_manifest = self._read_frozen_parent_checkpoint_json(
+            root, "run-manifest.json"
+        )
+        ledger_payload = self._read_frozen_parent_checkpoint_json(
+            root, "word-ledger.json"
+        )
+        spans = self._read_frozen_parent_checkpoint_json(
+            root, "subtitle-spans.json"
+        )
+        translations = self._read_frozen_parent_checkpoint_json(
+            root, "translations.json"
+        )
+        semantic_payload = self._read_frozen_parent_checkpoint_json(
+            root, "semantic-groups.json"
+        )
+        transcript_payload = self._read_frozen_parent_checkpoint_json(
+            root, "transcript.json"
+        )
+        timeline = self._read_frozen_parent_checkpoint_json(
+            root, "final-cue-timeline.json"
+        )
+        parent_authority = self._read_frozen_parent_checkpoint_json(
+            root, "authoritative-parent-chinese.json"
+        )
+        boundary_evidence = self._read_frozen_parent_checkpoint_json(
+            root, "display-boundary-evidence.json"
+        )
+        boundary_snapshots = self._read_frozen_parent_checkpoint_json(
+            root, "stable-boundary-snapshots.json"
+        )
+
+        expected_runtime = {
+            "pipeline": "screen_subtitle_stable",
+            "prompt_version": SCREEN_SUBTITLE_PROMPT_VERSION,
+            "full_translation_model": self._full_translation_model_name(),
+            "allocation_review_model": self._allocation_review_model_name(),
+            "target_language": self.target_language,
+            "max_cjk_chars": int(self.max_cjk_chars),
+            "max_english_words": int(self.max_english_words),
+        }
+        for key, expected in expected_runtime.items():
+            if run_manifest.get(key) != expected:
+                raise RuntimeError(
+                    "frozen_parent_checkpoint_invalid: runtime contract changed "
+                    f"at {key}"
+                )
+
+        words = list(ledger_payload.get("words") or [])
+        declared_ledger_hash = str(ledger_payload.get("hash") or "")
+        if not words or not declared_ledger_hash:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: word ledger is incomplete"
+            )
+        if [int(word.get("word_id", -1)) for word in words] != list(
+            range(len(words))
+        ):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: word IDs are not continuous"
+            )
+        if canonical_word_ledger_hash(words) != declared_ledger_hash:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: word ledger hash changed"
+            )
+
+        self._active_word_entries = [
+            {
+                "surface": str(word.get("surface") or ""),
+                "token": str(
+                    word.get("normalized")
+                    or self._clean_boundary_token(word.get("surface") or "")
+                ),
+                "start_time": int(word.get("start_ms") or 0),
+                "end_time": int(word.get("end_ms") or 0),
+                "alignment_source": str(
+                    word.get("alignment_source") or "stable-ts"
+                ),
+            }
+            for word in words
+        ]
+        if self._word_ledger_hash() != declared_ledger_hash:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: restored word ledger drifted"
+            )
+
+        expected_ids = [str(value) for value in run_manifest.get("frozen_subtitle_ids") or []]
+        if not expected_ids or expected_ids != [
+            f"S{index:04d}" for index in range(1, len(expected_ids) + 1)
+        ]:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: fixed subtitle IDs are incomplete"
+            )
+        if not isinstance(spans, list) or len(spans) != len(expected_ids):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: subtitle spans are incomplete"
+            )
+        if not isinstance(translations, list) or len(translations) != len(
+            expected_ids
+        ):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: translations are incomplete"
+            )
+        timeline_records = list(timeline.get("records") or [])
+        timeline_validation = dict(timeline.get("validation") or {})
+        if (
+            timeline_validation.get("status") != "PASS"
+            or list(timeline_validation.get("errors") or [])
+            or len(timeline_records) != len(expected_ids)
+            or list(timeline.get("expected_subtitle_ids") or []) != expected_ids
+        ):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: final cue timeline is invalid"
+            )
+
+        translations_by_id = {
+            str(record.get("subtitle_id") or ""): dict(record)
+            for record in translations
+            if isinstance(record, Mapping)
+        }
+        timeline_by_id = {
+            str(record.get("subtitle_id") or ""): dict(record)
+            for record in timeline_records
+            if isinstance(record, Mapping)
+        }
+        authority_by_id = parent_chinese_records_by_id(parent_authority)
+        if set(translations_by_id) != set(expected_ids) or set(timeline_by_id) != set(
+            expected_ids
+        ) or set(authority_by_id) != set(expected_ids):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: fixed ID coverage changed"
+            )
+
+        subtitle_items: List[ScreenSubtitleItem] = []
+        final_segments: List[ASRDataSeg] = []
+        previous_word_end = -1
+        for index, (subtitle_id, raw_span) in enumerate(
+            zip(expected_ids, spans),
+            1,
+        ):
+            span = dict(raw_span)
+            translation = translations_by_id[subtitle_id]
+            record = timeline_by_id[subtitle_id]
+            authority = authority_by_id[subtitle_id]
+            try:
+                word_start = int(span.get("word_start"))
+                word_end = int(span.get("word_end"))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "frozen_parent_checkpoint_invalid: subtitle word span is invalid"
+                ) from exc
+            if (
+                str(span.get("subtitle_id") or "") != subtitle_id
+                or word_start != previous_word_end + 1
+                or word_end < word_start
+                or word_end >= len(words)
+                or int(record.get("word_start", -1)) != word_start
+                or int(record.get("word_end", -1)) != word_end
+            ):
+                raise RuntimeError(
+                    "frozen_parent_checkpoint_invalid: final timeline word span drifted"
+                )
+            original = str(span.get("original") or "")
+            translated = str(span.get("translated") or "")
+            ledger_tokens = [
+                token
+                for word in words[word_start : word_end + 1]
+                for token in self._checkpoint_english_tokens(word.get("surface"))
+            ]
+            if (
+                str(translation.get("text") or "") != original
+                or str(translation.get("translated_text") or "") != translated
+                or str(authority.get("english") or "") != original
+                or str(authority.get("chinese") or "") != translated
+                or self._checkpoint_english_tokens(original) != ledger_tokens
+                or int(record.get("word_envelope_start_ms", -1))
+                != int(words[word_start].get("start_ms") or 0)
+                or int(record.get("word_envelope_end_ms", -1))
+                != int(words[word_end].get("end_ms") or 0)
+            ):
+                raise RuntimeError(
+                    "frozen_parent_checkpoint_invalid: subtitle text or word envelope drifted"
+                )
+            start_ms = int(record.get("start_ms") or 0)
+            end_ms = int(record.get("end_ms") or 0)
+            if (
+                int(translation.get("start_ms") or 0) != start_ms
+                or int(translation.get("end_ms") or 0) != end_ms
+                or start_ms > int(words[word_start].get("start_ms") or 0)
+                or end_ms < int(words[word_end].get("end_ms") or 0)
+                or end_ms <= start_ms
+            ):
+                raise RuntimeError(
+                    "frozen_parent_checkpoint_invalid: final cue timing drifted"
+                )
+            item = ScreenSubtitleItem(
+                source_ids=[int(value) for value in span.get("source_ids") or []],
+                original=original,
+                translated=translated,
+                word_start=word_start,
+                word_end=word_end,
+                subtitle_id=subtitle_id,
+            )
+            segment = ASRDataSeg(
+                text=original,
+                translated_text=translated,
+                start_time=start_ms,
+                end_time=end_ms,
+            )
+            segment.subtitle_id = subtitle_id
+            segment.word_start = word_start
+            segment.word_end = word_end
+            segment.stable_word_start_ms = int(
+                record.get("word_envelope_start_ms") or 0
+            )
+            segment.stable_word_end_ms = int(
+                record.get("word_envelope_end_ms") or 0
+            )
+            segment.timing_backend = str(
+                (timeline.get("alignment") or {}).get("applied_backend")
+                or "stable-ts"
+            )
+            subtitle_items.append(item)
+            final_segments.append(segment)
+            previous_word_end = word_end
+        if previous_word_end != len(words) - 1:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: word ledger coverage is incomplete"
+            )
+
+        items_by_id = {str(item.subtitle_id): item for item in subtitle_items}
+        semantic_groups: List[Dict[str, Any]] = []
+        grouped_ids: List[str] = []
+        for raw_group in semantic_payload if isinstance(semantic_payload, list) else []:
+            group_id = int(raw_group.get("group_id") or 0)
+            group_ids = [
+                str(value)
+                for value in raw_group.get("expected_subtitle_ids") or []
+            ]
+            if group_id <= 0 or not group_ids or any(
+                subtitle_id not in items_by_id for subtitle_id in group_ids
+            ):
+                raise RuntimeError(
+                    "frozen_parent_checkpoint_invalid: semantic group identity drifted"
+                )
+            semantic_groups.append(
+                {
+                    "id": group_id,
+                    "start_index": int(raw_group.get("start_index") or 0),
+                    "items": [items_by_id[subtitle_id] for subtitle_id in group_ids],
+                }
+            )
+            grouped_ids.extend(group_ids)
+        if grouped_ids != expected_ids:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: semantic groups do not cover fixed IDs"
+            )
+
+        if (
+            str(boundary_evidence.get("word_ledger_hash") or "")
+            != declared_ledger_hash
+            or len(boundary_evidence.get("boundaries") or {})
+            != max(0, len(words) - 1)
+        ):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: boundary evidence drifted"
+            )
+        if (
+            not isinstance(boundary_snapshots, Mapping)
+            or str(boundary_snapshots.get("word_ledger_hash") or "")
+            != declared_ledger_hash
+            or int(boundary_snapshots.get("max_english_words") or 0)
+            != int(self.max_english_words)
+            or not isinstance(boundary_snapshots.get("stages"), list)
+            or not isinstance(boundary_snapshots.get("changes"), list)
+            or not isinstance(boundary_snapshots.get("pre_id_boundary_repairs"), list)
+        ):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: boundary snapshots drifted"
+            )
+
+        source_spans: Dict[int, tuple[int, int]] = {}
+        for word_id, word in enumerate(words):
+            for raw_source_id in word.get("source_segment_ids") or []:
+                source_id = int(raw_source_id)
+                prior = source_spans.get(source_id)
+                source_spans[source_id] = (
+                    word_id if prior is None else min(prior[0], word_id),
+                    word_id if prior is None else max(prior[1], word_id),
+                )
+        source_segments: Dict[int, ASRDataSeg] = {}
+        for raw_segment in transcript_payload if isinstance(transcript_payload, list) else []:
+            source_id = int(raw_segment.get("id") or 0)
+            if source_id <= 0 or source_id in source_segments:
+                raise RuntimeError(
+                    "frozen_parent_checkpoint_invalid: source transcript IDs drifted"
+                )
+            source_segments[source_id] = ASRDataSeg(
+                text=str(raw_segment.get("text") or ""),
+                translated_text=str(raw_segment.get("translated_text") or ""),
+                start_time=int(raw_segment.get("start_ms") or 0),
+                end_time=int(raw_segment.get("end_ms") or 0),
+            )
+        if list(source_segments) != list(range(1, len(source_segments) + 1)):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: source transcript order drifted"
+            )
+        if set(source_spans) != set(source_segments):
+            raise RuntimeError(
+                "frozen_parent_checkpoint_invalid: source transcript coverage drifted"
+            )
+
+        def optional_list(name: str) -> List[Dict[str, Any]]:
+            path = root / name
+            if not path.is_file():
+                return []
+            payload = self._read_frozen_parent_checkpoint_json(root, name)
+            return [dict(value) for value in payload if isinstance(value, Mapping)]
+
+        def optional_dict(name: str) -> Dict[str, Any]:
+            path = root / name
+            if not path.is_file():
+                return {}
+            payload = self._read_frozen_parent_checkpoint_json(root, name)
+            return dict(payload) if isinstance(payload, Mapping) else {}
+
+        self._active_source_word_spans = source_spans
+        self._active_source_segments_by_id = source_segments
+        self._frozen_subtitle_ids = expected_ids
+        self._last_subtitle_items = subtitle_items
+        self._last_semantic_groups = semantic_groups
+        self._last_semantic_group_id_by_subtitle_id = {
+            str(item.subtitle_id): f"G{int(group['id']):04d}"
+            for group in semantic_groups
+            for item in group.get("items") or []
+        }
+        self._last_semantic_group_audit_contexts = {}
+        self._last_semantic_full_translations = {}
+        self._boundary_snapshots = [
+            dict(value)
+            for value in boundary_snapshots.get("stages") or []
+            if isinstance(value, Mapping)
+        ]
+        self._boundary_snapshot_changes = [
+            dict(value)
+            for value in boundary_snapshots.get("changes") or []
+            if isinstance(value, Mapping)
+        ]
+        self._pre_id_boundary_repairs = [
+            dict(value)
+            for value in boundary_snapshots.get("pre_id_boundary_repairs") or []
+            if isinstance(value, Mapping)
+        ]
+        self._boundary_snapshot_item_sets = {}
+        self._final_cue_timeline = dict(timeline)
+        self._final_cue_timeline_seed_errors = []
+        self._final_timeline_alignment = dict(timeline.get("alignment") or {})
+        self._final_word_timing_reconciliations = list(
+            timeline.get("word_timing_reconciliations") or []
+        )
+        self._display_boundary_evidence_artifact = dict(boundary_evidence)
+        self._parent_chinese_authority_artifact = dict(parent_authority)
+        self._display_page_translation_artifact = {}
+        self._display_page_degradation = {
+            "degraded_page_count": 0,
+            "total_parent_count": 0,
+            "degraded_parent_ratio": 0.0,
+            "degraded_page_threshold": 0,
+            "degraded_parents": [],
+        }
+        self._display_page_translation_reviews = []
+        self._display_page_external_request_count = 0
+        self._translation_structure_errors = [
+            item
+            for item in optional_list("translation-structure-errors.json")
+            if not str(item.get("code") or "").startswith("display_page_")
+        ]
+        self._last_llm_raw_returns = optional_list("llm-raw-returns.json")
+        self._llm_request_ledger = optional_list("llm-request-ledger.json")
+        self._last_allocation_inputs = optional_list("allocation-inputs.json")
+        self._last_allocation_raw_returns = optional_list(
+            "allocation-raw-returns.json"
+        )
+        self._last_allocation_validation = optional_list(
+            "allocation-validation.json"
+        )
+        self._last_allocation_retry_log = optional_list("allocation-retry-log.json")
+        self._last_allocation_final = optional_list("allocation-final.json")
+        self._last_allocation_unresolved = optional_list(
+            "allocation-unresolved.json"
+        )
+        self._last_full_translation_style_retry_log = optional_list(
+            "full-translation-style-retry-log.json"
+        )
+        self._last_semantic_group_debug = optional_list("semantic-group-debug.json")
+        self._allocation_isolation_report = optional_dict(
+            "allocation-isolation-report.json"
+        )
+        self._llm_cache_stats = dict(run_manifest.get("llm_cache_stats") or {})
+        self._allocation_runtime_stats = dict(
+            run_manifest.get("allocation_runtime_stats") or {}
+        )
+        self._chinese_cache_contract = dict(
+            run_manifest.get("stable_chinese_cache_contract") or {}
+        )
+        self._llm_cache_used = bool(run_manifest.get("cache_used"))
+        self._safe_auto_repair_log = []
+        self._safe_auto_repair_candidates = []
+        self._display_coverage_repairs = optional_list(
+            "display-coverage-repairs.json"
+        )
+        self._display_coverage_unresolved = optional_list(
+            "display-coverage-unresolved.json"
+        )
+        self._chinese_polish_log = []
+        self._final_cue_timeline_path = str(root / "final-cue-timeline.json")
+        self._parent_chinese_authority_path = str(
+            root / "authoritative-parent-chinese.json"
+        )
+        self._display_boundary_evidence_path = str(
+            root / "display-boundary-evidence.json"
+        )
+        self._parent_chinese_authority_sha256 = hashlib.sha256(
+            (root / "authoritative-parent-chinese.json").read_bytes()
+        ).hexdigest()
+        self._display_boundary_evidence_sha256 = hashlib.sha256(
+            (root / "display-boundary-evidence.json").read_bytes()
+        ).hexdigest()
+        self.last_validation_summary = None
+        self._checkpoint_resume_source = str(root)
+        return ASRData(final_segments)
+
     def _edit_stable_word_timed(self, asr_data: ASRData) -> ASRData:
         logger.info("Screen subtitle stable mode: local English cutting, LLM Chinese only")
         self._translation_structure_errors = []
@@ -2312,10 +2787,22 @@ class ScreenSubtitleEditor:
     @staticmethod
     def _display_page_translation_batch_contracts(
         contract: Mapping[str, Any],
+        *,
+        one_parent_per_batch: bool = False,
     ) -> List[Mapping[str, Any]]:
         parents = list(contract.get("parents") or [])
         if not parents:
             return [contract]
+
+        if one_parent_per_batch:
+            return [
+                ScreenSubtitleEditor._display_page_contract_for_parent_ids(
+                    contract,
+                    [str(parent.get("parent_subtitle_id") or "")],
+                )
+                for parent in parents
+                if str(parent.get("parent_subtitle_id") or "").strip()
+            ]
 
         parent_batches: List[List[str]] = []
         current_parent_ids: List[str] = []
@@ -2560,7 +3047,10 @@ class ScreenSubtitleEditor:
         retry_errors: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> tuple[object, bool]:
         self._display_page_translation_batch_errors = []
-        batch_contracts = self._display_page_translation_batch_contracts(contract)
+        batch_contracts = self._display_page_translation_batch_contracts(
+            contract,
+            one_parent_per_batch=bool(retry_errors),
+        )
         total_batches = len(batch_contracts)
         request_started = time.perf_counter()
 
@@ -2640,7 +3130,8 @@ class ScreenSubtitleEditor:
             )
         )
         batch_contracts = self._display_page_translation_batch_contracts(
-            pending_contract
+            pending_contract,
+            one_parent_per_batch=bool(retry_errors),
         )
         total_batches = len(batch_contracts)
 
@@ -3098,6 +3589,31 @@ class ScreenSubtitleEditor:
                     f"{json.dumps(split_token, ensure_ascii=False)} entirely on "
                     "one page; move the page boundary without changing its wording."
                 )
+            if str(error.get("code") or "") == "display_page_semantic_validation_failed":
+                for issue in error.get("issues") or []:
+                    if not isinstance(issue, Mapping):
+                        continue
+                    anchor = str(issue.get("anchor") or "").strip()
+                    expected_page_id = str(
+                        issue.get("expected_subtitle_id") or ""
+                    ).strip()
+                    actual_page_ids = [
+                        str(page_id or "").strip()
+                        for page_id in issue.get("actual_subtitle_ids") or []
+                        if str(page_id or "").strip()
+                    ]
+                    if not anchor or not expected_page_id:
+                        continue
+                    actual_scope = (
+                        ", ".join(actual_page_ids)
+                        if actual_page_ids
+                        else "any other page"
+                    )
+                    corrections.append(
+                        f"{scope}: keep the semantic anchor "
+                        f"{json.dumps(anchor, ensure_ascii=False)} on page "
+                        f"{expected_page_id}; do not place it on {actual_scope}."
+                    )
             missing_ids = [
                 str(page_id).strip()
                 for page_id in error.get("ids") or []
