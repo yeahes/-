@@ -1055,7 +1055,7 @@ class SubtitleInterface(QWidget):
         if available:
             button.setText(self.tr("重试"))
             button.setToolTip(
-                self.tr("重新运行当前字幕任务；已完成的翻译会按缓存复用。")
+                self.tr("从失败阶段继续；已验证完成的阶段不会重新运行。")
             )
         else:
             button.setText(self.tr("开始"))
@@ -2446,7 +2446,7 @@ class SubtitleInterface(QWidget):
             )
             return
         self.start_button.setEnabled(False)
-        self.progress_bar.reset()
+        self._reset_progress_bar_for_run()
         self.cancel_button.show()
 
         if need_create_task:
@@ -2474,6 +2474,11 @@ class SubtitleInterface(QWidget):
         InfoBar.info(
             self.tr("开始优化"), self.tr("开始优化字幕"), duration=3000, parent=self
         )
+
+    def _reset_progress_bar_for_run(self) -> None:
+        """Clear both the value and qfluentwidgets error-state animation."""
+        self.progress_bar.reset()
+        self.progress_bar.resume()
 
     def process(self):
         """主处理函数"""

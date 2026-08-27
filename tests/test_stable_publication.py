@@ -3400,6 +3400,7 @@ class StablePublicationTests(unittest.TestCase):
 
         self.assertFalse(interface.start_button.isHidden())
         self.assertEqual(interface.start_button.text(), "重试")
+        self.assertIn("已验证完成的阶段不会重新运行", interface.start_button.toolTip())
 
         interface._set_failed_checkpoint_retry_available(False)
         app.processEvents()
@@ -3417,6 +3418,15 @@ class StablePublicationTests(unittest.TestCase):
                 interface.import_subtitle_action,
             ],
         )
+
+    def test_retry_resets_and_resumes_progress_bar_after_error_state(self):
+        progress_bar = MagicMock()
+        interface = SimpleNamespace(progress_bar=progress_bar)
+
+        SubtitleInterface._reset_progress_bar_for_run(interface)
+
+        progress_bar.reset.assert_called_once_with()
+        progress_bar.resume.assert_called_once_with()
 
     def test_recent_restore_can_identify_matching_failed_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp_dir:
