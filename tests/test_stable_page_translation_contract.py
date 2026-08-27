@@ -1772,6 +1772,134 @@ def test_page_translation_requests_use_flash_then_pro_for_quality_retry():
     assert calls == ["deepseek-v4-flash", "deepseek-v4-pro"]
 
 
+def test_retry_page_translation_batches_are_one_parent_scoped():
+    parents = []
+    for index in range(1, 3):
+        parent_id = f"S{index:04d}"
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": f"Alpha {index}.",
+                "chinese": f"第{index}段内容。",
+                "word_start": (index - 1) * 2,
+                "word_end": (index - 1) * 2 + 1,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": (index - 1) * 2,
+                        "word_end": (index - 1) * 2,
+                        "english": "Alpha",
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": (index - 1) * 2 + 1,
+                        "word_end": (index - 1) * 2 + 1,
+                        "english": f"{index}.",
+                    },
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        planner_version="one-parent-retry-regression-v1",
+    )
+
+    class Cache:
+        def get_llm_result(self, *args, **kwargs):
+            return None
+
+        def set_llm_result(self, *args, **kwargs):
+            return None
+
+    calls = []
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        calls.append([item["parent_subtitle_id"] for item in payload])
+        rows = [
+            {
+                "display_page_id": page["display_page_id"],
+                "source_english": page["english"],
+                "zh": "第{}段".format(int(item["parent_subtitle_id"][1:]))
+                if page["display_page_id"].endswith(".P01")
+                else "内容。",
+            }
+            for item in payload
+            for page in item["pages"]
+        ]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.translation_request_max_attempts = 1
+    editor.allocation_max_concurrency = 1
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor._display_page_translation_quality_errors = lambda *args: []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    response, cache_hit = editor._request_display_page_translations(
+        contract,
+        retry_errors=[
+            {
+                "code": "page_translation_id_missing",
+                "ids": ["S0001.P01", "S0001.P02", "S0002.P01", "S0002.P02"],
+            }
+        ],
+    )
+
+    assert cache_hit is False
+    assert calls == [["S0001"], ["S0002"]]
+    assert [row["display_page_id"] for row in response["pages"]] == [
+        "S0001.P01",
+        "S0001.P02",
+        "S0002.P01",
+        "S0002.P02",
+    ]
+
+
+def test_page_translation_retry_prompt_binds_semantic_anchor_to_expected_page():
+    prompt = ScreenSubtitleEditor._display_page_retry_correction_instructions(
+        [
+            {
+                "code": "display_page_semantic_validation_failed",
+                "parent_subtitle_id": "S0260",
+                "issues": [
+                    {
+                        "anchor": "negation",
+                        "expected_subtitle_id": "S0260.P01",
+                        "actual_subtitle_ids": ["S0260.P02"],
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert "semantic anchor \"negation\" on page S0260.P01" in prompt
+    assert "do not place it on S0260.P02" in prompt
+
+
 def test_residual_page_retry_shrinks_scope_until_all_parents_are_valid():
     parents = []
     for index in range(1, 4):
@@ -3505,13 +3633,15 @@ def test_display_page_semantics_use_authoritative_parent_chinese_not_english_sca
 
 
 def test_display_page_prompt_makes_parent_chinese_the_semantic_ceiling():
-    assert DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION == "display-page-translation-v9"
+    assert DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION == "display-page-translation-v10"
     assert DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION == "fixed-parent-page-allocation-v9"
     assert "semantic ceiling" in DISPLAY_PAGE_TRANSLATION_PROMPT
     assert "Never restore a concept from the English" in DISPLAY_PAGE_TRANSLATION_PROMPT
     assert "Do not introduce a new multi-character content word" in DISPLAY_PAGE_TRANSLATION_PROMPT
     assert "a natural Chinese continuation across adjacent pages is allowed" in DISPLAY_PAGE_TRANSLATION_PROMPT
     assert "merely to make a fragment page stand alone" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "Read the projected pages aloud in order" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "bare “的/在/从/对/把/将”" in DISPLAY_PAGE_TRANSLATION_PROMPT
 
 
 def test_display_page_retry_prompt_constrains_arbitrary_validator_tokens():

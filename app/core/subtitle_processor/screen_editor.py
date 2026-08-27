@@ -453,7 +453,7 @@ DISPLAY_PAGE_TRANSLATION_PROMPT = """
 You are assigning a display-only Simplified Chinese projection to fixed visual
 pages below one frozen parent subtitle ID.
 
-Version: display-page-translation-v9
+Version: display-page-translation-v10
 
 The English page IDs, English text, order, word ownership, and timing are
 immutable. Re-express the supplied full_translation as one concise Chinese
@@ -472,6 +472,12 @@ explicitly. Distribute or minimally reorder only the meaning already present
 in full_translation.
 
 Rules:
+- Read the projected pages aloud in order before returning them. Optimize the
+  sequence as a compact, natural Chinese subtitle passage: avoid a page that
+  ends with a bare “的/在/从/对/把/将” or an isolated modifier when the same
+  meaning can be reordered across the fixed page boundary. A continuation is
+  acceptable only when the English page is itself incomplete and no legal
+  reordering keeps the page's facts on the correct side of the boundary.
 - Return exactly one object for every display_page_id and no other IDs.
 - Keep facts, names, numbers, negation, contrast, causality, modality, and
   speaker stance from full_translation.
