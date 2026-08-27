@@ -37,3 +37,6 @@ Thumbs.db
 
 # Generated test reports
 tests/caption_audit/out/
+
+# Local regression evidence and visual previews
+/output/
