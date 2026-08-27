@@ -251,19 +251,35 @@ They are patterns to adapt, not code to copy into the Python/Qt architecture.
   and recommendation evidence. Parent-scoped undo/redo survives recovery and
   does not overwrite later edits to unrelated parents.
 
-## Delivery Order
+## Delivery Order (2026-08-27 triage)
 
-1. Reproduce and fix authoritative-Chinese/manual-final synchronization.
-2. Add context-only neighbor envelopes and hit-only terminology injection.
-3. Add exact-ID source echo and local per-entry repair where missing. (Source
-   echo and per-group retry are now implemented for full translations.)
-4. Add selective semantic review and the editor risk queue. (The deterministic
-   semantic-review artifact queue is implemented; model-backed replacement
-   suggestions and focused editor navigation remain.)
-5. Add delta journal, autosave/recovery, and exact preview workflow.
-6. Add optional verbatim boundary alternatives only after the above is stable.
-7. Run cached regressions, then blind unseen-audio E2E before raising the
-   quality claim.
+Only the following work remains active:
+
+1. Resolve the current unreviewed page blocker (`S0136.P01/P02` missing and
+   `S0260` negation on the wrong page) using a manual bypass or a targeted page
+   retry. Do not rerun frozen upstream stages.
+2. Verify one real GUI restart-and-retry flow, then run one fresh, unreviewed
+   audio package and measure manual edits, page failures, Chinese issues, and
+   review time.
+3. Optionally run the already-committed read-only parent translation audit on the current failed
+   checkpoint after explicitly selecting the official DeepSeek service. It may
+   add review evidence, but it must not rewrite subtitles or unblock rendering.
+4. Only if that measurement shows a repeated defect, add one narrowly scoped
+   owning-layer fix with a regression test.
+
+The following are explicitly deferred and are not active delivery work:
+
+- Full Chinese-character-to-English-word alignment.
+- Broad five-class semantic-anchor production integration.
+- Additional pagination heuristics or further G7 expansion.
+- Evaluation or repair of the isolated `S9522` fixture.
+- Whole-file translation rewrites, provider proliferation, and unbounded
+  quality-audit expansion.
+- Editor redesign, large history refactors, and visual polish unrelated to a
+  demonstrated publication blocker.
+
+These deferred items remain in the historical roadmap for context; they are not
+commit targets until new evidence reopens them.
 
 Each delivery step requires a root-cause regression at its owning layer plus
 the unified regression. Translation-only work must not change English, the

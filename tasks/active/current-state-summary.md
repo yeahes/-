@@ -1,13 +1,13 @@
 # Current Task State
 
-Last verified: 2026-08-27 14:22 Asia/Shanghai
+Last verified: 2026-08-27 15:24:08 Asia/Shanghai
 Branch: main
-Verified HEAD: 220cd2c
+Verified HEAD: 4d1c78d
 
 ## Current Goal
 
-Resolve the current unreviewed page blocker without touching the source
-checkpoint, then separate the mixed working tree into reviewable groups.
+Keep only low-risk, high-payoff work: use the committed local retry for the
+current page blocker and preserve independent parent translation auditing.
 
 ## Confirmed
 
@@ -19,7 +19,9 @@ checkpoint, then separate the mixed working tree into reviewable groups.
   `tasks/archive/stable-subtitle-production-v1-log/`.
 - The latest unreviewed run has 53/55 pages: S0136 is missing two IDs and S0260
   has a misplaced negation. An offline 55-page candidate passes renderer
-  application but remains outside the checkpoint; focused retry tests pass 10/10.
+  application but remains outside the checkpoint; focused retry tests pass 11/11.
+- Mixed page batches now cache valid parents independently; the committed retry
+  only requests the failed parent and merges successful pages unchanged.
 
 ## Cleanup
 
@@ -27,14 +29,20 @@ checkpoint, then separate the mixed working tree into reviewable groups.
   translation, display-page translation, retry UI, offline measurement tools,
   and their focused tests.
 - Article readability remains 109 passed / 1 failed (S9522 `into` vs `in`);
-  page-selection experiment and synthesis-enable path remain uncommitted.
+  the unverified page-selection experiment was removed and synthesis recovery is
+  already committed.
 
 ## Next Action
 
-Resolve the S9522 planner regression before committing any page-selection code;
-keep historical audit and generated evidence separate from source commits.
+Use the committed local retry on the current unreviewed checkpoint; successful
+pages stay frozen and the parent translation audit remains independent.
 
 ## Unknowns
 
-- G7 before/after page quality has not yet been classified.
+- S9522 matches HEAD baseline but differs from the old fixture expectation; it is
+  not a production regression and is out of the current scope.
 - A fresh unreviewed audio is still required for current end-to-end quality.
+
+## Deferred
+- No full Chinese-character alignment, broad semantic-anchor integration, or
+  additional pagination heuristics until fresh-run data shows repeated benefit.

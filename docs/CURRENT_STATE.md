@@ -1,14 +1,14 @@
 # Current State
 
-Last verified: 2026-08-27 14:22 Asia/Shanghai
+Last verified: 2026-08-27 15:24 Asia/Shanghai
 
 ## Current Goal
 
-Complete the current unreviewed pagination blocker assessment, then keep the
-working tree separated into reviewable source, test, documentation, and
-evidence groups. A retry must resume from the failed display-page stage without
-rebuilding frozen English, parent Chinese, fixed IDs, the word ledger,
-WhisperX alignment, or the final cue timeline.
+Keep only low-risk, high-payoff work: use the committed local retry for the
+current page blocker, settle the S9522 fixture separately, then measure one
+fresh unreviewed audio run. A retry must resume from the failed display-page
+stage without rebuilding frozen English, parent Chinese, fixed IDs, the word
+ledger, WhisperX alignment, or the final cue timeline.
 
 ## Current Production Contracts
 
@@ -72,7 +72,9 @@ WhisperX alignment, or the final cue timeline.
   hidden by an older work-dir draft. A draft still wins when it is genuinely
   newer. The real White House package loaded 199 cues directly without ASR,
   translation, pagination, or writes to the package.
-- Focused page-retry verification passes 10 tests. The current unreviewed
+- Focused page-retry verification passes 11 tests. The committed local retry
+  caches each valid parent independently, so a later retry requests only the
+  failed parent and merges the successful pages unchanged. The current unreviewed
   `中国企业正把供应链铺满全球` checkpoint remains `ERROR` at 53/55 pages:
   `S0136.P01/P02` are missing and `S0260` places the negation on P02. Four
   OpenCode retries were rejected by existing semantic/lexical validators. A
@@ -109,10 +111,9 @@ WhisperX alignment, or the final cue timeline.
   Chinese explanations remain one line when they fit; when they overflow and a
   comma/semicolon boundary is available, that punctuation boundary is preferred
   before other legal lexical breaks.
-- The mixed working tree has been split into mechanism-scoped commits through
-  `9e43927`; remaining uncommitted changes are limited to the unresolved
-  article page-selection experiment, an untested synthesis-button enable path,
-  historical audit updates, and generated evidence.
+- The production changes are split into mechanism-scoped commits through
+  `4d1c78d`; the unverified page-selection experiment was removed. Remaining
+  uncommitted changes are historical audit/state updates and generated evidence.
 
 ## Known Risks And Unknowns
 
@@ -131,8 +132,9 @@ WhisperX alignment, or the final cue timeline.
   recorded above; Chinese fluency and long-caption quality still require a
   fresh unreviewed run after the blocker is handled.
 - The current article readability contract remains 109 passed / 1 failed:
-  S9522's existing assertion expects `into` while the uncommitted planner
-  experiment selects `in`; this change is not part of the committed baseline.
+  S9522's existing assertion expects `into` while the current planner selects
+  `in`; this is a separate fixture-quality item, not a regression from the
+  local retry.
 - G1 failure localization is implemented. A renderable review fallback is now
   recorded as `degraded_page_count` instead of an episode-level error; a real
   non-renderable parent or an exceeded degraded threshold still blocks.
@@ -204,6 +206,7 @@ newest round and the short current-state summary.
 
 ## Next Action
 
-Finish the documentation/task-log cleanup, then split only verified source and
-test changes into mechanism-scoped groups. Keep the 55-page candidate outside
-the checkpoint and do not rerun manually reviewed audio packages.
+Use the committed local retry to handle S0136/S0260 in the current unreviewed
+run without rerunning upstream stages; keep the 55-page candidate outside the
+checkpoint, then run one fresh quality measurement. Do not rerun manually
+reviewed audio packages.

@@ -1,14 +1,15 @@
 # Project State
 
 Status: in_progress
-Last verified: 2026-08-27 14:22:18 Asia/Shanghai
+Last verified: 2026-08-27 15:24:08 Asia/Shanghai
 Branch: main
-Verified HEAD: 220cd2c
-Working tree: modified (95 entries: 11 tracked source/test/docs files and 84 untracked evidence/report files remain intentionally isolated)
+Verified HEAD: 4d1c78d
+Working tree: modified (94 entries: 8 tracked docs/evidence files and 86 untracked evidence/report files remain intentionally isolated)
 
 ## Current Goal
-Resolve the current unreviewed pagination blocker, then separate the mixed
-working tree into reviewable source, test, documentation, and evidence groups.
+Keep only low-risk, high-payoff work: use the committed local retry for the
+current page blocker, preserve independent parent translation auditing, then
+measure one fresh unreviewed run.
 
 ## Confirmed Facts
 - A completed `frozen_parent_timeline` stage is reusable only under the same input fingerprint and valid file digests.
@@ -22,8 +23,10 @@ working tree into reviewable source, test, documentation, and evidence groups.
   misplaced negation. Four OpenCode Go retries did not pass lexical/semantic
   validation. A separate offline candidate restores 55 pages and passes the
   renderer apply check, but has not been written back to the checkpoint.
-- Focused page-retry tests pass 10/10; the offline candidate remains a review
-  aid only because S0260 still needs a human semantic confirmation.
+- Focused page-retry tests pass 11/11. The committed local retry freezes each
+  valid parent in a mixed batch as an independent cache unit, so a later retry
+  requests only the failed parent. The offline candidate remains a review aid
+  only because S0260 still needs a human semantic confirmation.
 - Committed mechanism groups are independently verified: frozen-parent resume
   (111 tests), selected-service translation audit (14), parent translation and
   backchannel rules (561), display-page translation (76), retry progress UI
@@ -53,8 +56,8 @@ working tree into reviewable source, test, documentation, and evidence groups.
   application `True` without changing the source checkpoint.
 
 ## Next Action
-Keep the uncommitted page-selection changes out of the stable baseline; decide
-the S9522 planner regression before touching that layer.
+Use the committed local retry on the current unreviewed run; keep successful
+pages and the independent parent audit intact, then measure one fresh run.
 
 ## Do Not Regress
 - Preserve frozen English/IDs/word ownership/final timing, reject inconsistent checkpoints, keep successful page-batch caches, and never write `D:\\软件缓存\\VideoCaptioner`.
@@ -62,6 +65,5 @@ the S9522 planner regression before touching that layer.
 ## Unknowns
 - Live GUI retry after application restart has not yet confirmed the new 96%-stage resume display; the offline checkpoint replay is complete.
 - It is not yet decided whether the two current page failures will be handled
-  by manual final-editor bypass or by a general production fallback.
-- The remaining tracked synthesis-enable change has no dedicated focused
-  regression test and is intentionally not committed.
+  by manual final-editor bypass or by a targeted provider retry.
+- The 90-95% automation target still has no fresh blind-run measurement.
