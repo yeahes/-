@@ -1,6 +1,6 @@
 # Current State
 
-Last verified: 2026-08-27 12:54 Asia/Shanghai
+Last verified: 2026-08-27 14:10 Asia/Shanghai
 
 ## Current Goal
 
@@ -39,9 +39,10 @@ WhisperX alignment, or the final cue timeline.
 - ASR trust contract: `tests/test_asr_trust_contract.py` passed 45 tests.
 - Stable publication contract: `tests/test_stable_publication.py` passed 101
   tests. Final cue timeline tests pass.
-- Full regression currently reports 31/32 checks passing. The remaining
-  article-readability fixture failure is unrelated to recent recovery and
-  manual-editor changes.
+- Focused mechanism verification is green: frozen-parent resume/publication 111
+  tests, selected-service translation audit 14 tests, parent translation rules
+  561 tests, display-page translation 76 tests, and offline measurements 3
+  tests. Full regression is intentionally not rerun during this cleanup.
 - Direct CUDA Faster-Whisper probe of the current desktop audio completed with
   return code 0 and produced an SRT. The same SRT produced zero unresolved
   internal-gap candidates under the current gap detector.
@@ -108,6 +109,10 @@ WhisperX alignment, or the final cue timeline.
   Chinese explanations remain one line when they fit; when they overflow and a
   comma/semicolon boundary is available, that punctuation boundary is preferred
   before other legal lexical breaks.
+- The mixed working tree has been split into mechanism-scoped commits through
+  `12b1e50`; remaining uncommitted changes are limited to the unresolved
+  article page-selection experiment, an untested synthesis-button enable path,
+  historical audit updates, and generated evidence.
 
 ## Known Risks And Unknowns
 
@@ -125,6 +130,9 @@ WhisperX alignment, or the final cue timeline.
   unreviewed checkpoint has 55 expected pages and the two page-local issues
   recorded above; Chinese fluency and long-caption quality still require a
   fresh unreviewed run after the blocker is handled.
+- The current article readability contract remains 109 passed / 1 failed:
+  S9522's existing assertion expects `into` while the uncommitted planner
+  experiment selects `in`; this change is not part of the committed baseline.
 - G1 failure localization is implemented. A renderable review fallback is now
   recorded as `degraded_page_count` instead of an episode-level error; a real
   non-renderable parent or an exceeded degraded threshold still blocks.

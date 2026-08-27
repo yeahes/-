@@ -1,8 +1,8 @@
 # Current Task State
 
-Last verified: 2026-08-27 12:54 Asia/Shanghai
+Last verified: 2026-08-27 14:10 Asia/Shanghai
 Branch: main
-Verified HEAD: 11398c6
+Verified HEAD: 12b1e50
 
 ## Current Goal
 
@@ -21,10 +21,18 @@ checkpoint, then separate the mixed working tree into reviewable groups.
   has a misplaced negation. An offline 55-page candidate passes renderer
   application but remains outside the checkpoint; focused retry tests pass 10/10.
 
+## Cleanup
+
+- Committed mechanism groups: frozen resume, selected-service audit, parent
+  translation, display-page translation, retry UI, offline measurement tools,
+  and their focused tests.
+- Article readability remains 109 passed / 1 failed (S9522 `into` vs `in`);
+  page-selection experiment and synthesis-enable path remain uncommitted.
+
 ## Next Action
 
-Inventory and isolate the mixed source/test/document/evidence changes; do not
-start a new pagination mechanism.
+Resolve the S9522 planner regression before committing any page-selection code;
+keep historical audit and generated evidence separate from source commits.
 
 ## Unknowns
 

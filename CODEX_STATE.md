@@ -1,10 +1,10 @@
 # Project State
 
 Status: in_progress
-Last verified: 2026-08-27 12:54:20 Asia/Shanghai
+Last verified: 2026-08-27 14:10:45 Asia/Shanghai
 Branch: main
-Verified HEAD: 11398c6
-Working tree: modified (151 entries; source, tests, docs, scripts, and generated evidence remain mixed)
+Verified HEAD: 12b1e50
+Working tree: modified (95 entries: 11 tracked source/test/docs files and 84 untracked evidence/report files remain intentionally isolated)
 
 ## Current Goal
 Resolve the current unreviewed pagination blocker, then separate the mixed
@@ -24,6 +24,10 @@ working tree into reviewable source, test, documentation, and evidence groups.
   renderer apply check, but has not been written back to the checkpoint.
 - Focused page-retry tests pass 10/10; the offline candidate remains a review
   aid only because S0260 still needs a human semantic confirmation.
+- Committed mechanism groups are independently verified: frozen-parent resume
+  (111 tests), selected-service translation audit (14), parent translation and
+  backchannel rules (561), display-page translation (76), retry progress UI
+  (102), and offline measurements (3 plus script self-test).
 
 ## Approved Decisions
 - Do not rerun or mutate manually reviewed audio packages for retry verification.
@@ -36,16 +40,21 @@ working tree into reviewable source, test, documentation, and evidence groups.
 
 ## Last Verification
 - Real checkpoint restore: 271 IDs, 2855 words, source coverage equal, final timeline PASS, 44/44 files unchanged.
-- `runtime\\python.exe -m pytest tests\\test_stable_run_state.py -q`: 9 passed.
+- `runtime\\python.exe -m pytest tests\\test_stable_run_state.py tests\\test_stable_publication.py -q`: 111 passed.
+- `runtime\\python.exe -m pytest tests\\test_translation_quality_audit.py -q`: 14 passed.
+- `runtime\\python.exe -m pytest tests\\test_stable_caption_rules.py -q`: 561 passed.
+- `runtime\\python.exe -m pytest tests\\test_stable_page_translation_contract.py -q`: 76 passed.
 - `runtime\\python.exe -m pytest tests\\test_stable_publication.py -q`: 102 passed.
+- `runtime\\python.exe -m pytest tests\\test_measure_g6_manual_diff.py tests\\test_measure_page_number_anchors.py -q`: 3 passed; number-anchor script self-test PASS.
+- Article readability contract: 109 passed, 1 failed (`test_three_line_fallback_promotes_complete_two_page_alternative`, S9522 expects `into` but current uncommitted planner selects `in`).
 - G1 checkpoint replay: PASS, degraded=1 (S0089), 306 pages total, 0 page-signature changes outside S0089, page-translation cache validation PASS, QA queue=76, semantic queue=9.
 - Latest page-blocker probe: OpenCode Go retries rejected; offline candidate
   validated `status=PASS`, 55 pages, 27 multi-page parents, and renderer
   application `True` without changing the source checkpoint.
 
 ## Next Action
-Keep the validated page candidate out of source commits; finish the documentation
-archive and prepare small, mechanism-scoped source/test commit groups.
+Keep the uncommitted page-selection changes out of the stable baseline; decide
+the S9522 planner regression before touching that layer.
 
 ## Do Not Regress
 - Preserve frozen English/IDs/word ownership/final timing, reject inconsistent checkpoints, keep successful page-batch caches, and never write `D:\\软件缓存\\VideoCaptioner`.
@@ -54,3 +63,5 @@ archive and prepare small, mechanism-scoped source/test commit groups.
 - Live GUI retry after application restart has not yet confirmed the new 96%-stage resume display; the offline checkpoint replay is complete.
 - It is not yet decided whether the two current page failures will be handled
   by manual final-editor bypass or by a general production fallback.
+- The remaining tracked synthesis-enable change has no dedicated focused
+  regression test and is intentionally not committed.
