@@ -1,12 +1,14 @@
 # Current State
 
-Last verified: 2026-08-25 22:05 Asia/Shanghai
+Last verified: 2026-08-27 12:54 Asia/Shanghai
 
 ## Current Goal
 
-Keep the stable subtitle pipeline from publishing incomplete English when ASR
-misses an active speech span, while preserving frozen English IDs, word spans,
-timing, page contracts, translation cache identity, and recoverable checkpoints.
+Complete the current unreviewed pagination blocker assessment, then keep the
+working tree separated into reviewable source, test, documentation, and
+evidence groups. A retry must resume from the failed display-page stage without
+rebuilding frozen English, parent Chinese, fixed IDs, the word ledger,
+WhisperX alignment, or the final cue timeline.
 
 ## Current Production Contracts
 
@@ -22,6 +24,11 @@ timing, page contracts, translation cache identity, and recoverable checkpoints.
   checkpoint. Incomplete output is not publishable.
 - Manual-final packages and immutable stable runs are isolated. A new run must
   not inherit review queues, caches, or manual edits by numeric subtitle ID.
+- Automatic pagination may reject a relative-clause entrance when frozen syntax
+  evidence shows a later finite predicate still depends on the previous-page
+  noun. Complete relative clauses such as `professors | who have ...` remain
+  reviewable and selectable; English text, IDs, word timing, and parent Chinese
+  are unchanged.
 
 ## Verified Results
 
@@ -32,9 +39,9 @@ timing, page contracts, translation cache identity, and recoverable checkpoints.
 - ASR trust contract: `tests/test_asr_trust_contract.py` passed 45 tests.
 - Stable publication contract: `tests/test_stable_publication.py` passed 101
   tests. Final cue timeline tests pass.
-- Full regression currently reports 30/32 checks passing. The remaining two
-  failures are known legacy expectation mismatches in article readability and
-  manual-editor blocking behavior; neither reproduces the ASR repair path.
+- Full regression currently reports 31/32 checks passing. The remaining
+  article-readability fixture failure is unrelated to recent recovery and
+  manual-editor changes.
 - Direct CUDA Faster-Whisper probe of the current desktop audio completed with
   return code 0 and produced an SRT. The same SRT produced zero unresolved
   internal-gap candidates under the current gap detector.
@@ -46,9 +53,61 @@ timing, page contracts, translation cache identity, and recoverable checkpoints.
   not silently reused under these identities.
 - Failed stable checkpoints retain a visible retry entry. Retry restores the
   original input/context and preserves completed cache entries.
+- Stable retry now records a hash-verified `frozen_parent_timeline` checkpoint
+  immediately before display-page translation. A compatible retry validates
+  the frozen English, IDs, word spans, word ledger, parent Chinese, semantic
+  groups, source-segment coverage, boundary evidence, and final timeline before
+  skipping stable editing and WhisperX. Display-page artifacts are deliberately
+  excluded so only the failed downstream stage is retried.
+- The existing unreviewed `中国职场女性为何悄然掉队？` failure was restored
+  read-only from its editable checkpoint: 271 fixed IDs, 2855 words, 245
+  semantic groups, 2845 source segments, and 271 PASS timeline records. All 44
+  checkpoint file hashes were unchanged after restore.
+- Retry UI reset now clears both the progress value and the qfluentwidgets error
+  state. The frozen-checkpoint stage remains at 96% so downstream page and audit
+  progress can still advance normally.
+- `恢复最近字幕` now follows hash-verified subtitle paths from a stable run to
+  the owning `*-处理结果/人工终稿字幕包`, so a newer saved manual final is not
+  hidden by an older work-dir draft. A draft still wins when it is genuinely
+  newer. The real White House package loaded 199 cues directly without ASR,
+  translation, pagination, or writes to the package.
+- Focused page-retry verification passes 10 tests. The current unreviewed
+  `中国企业正把供应链铺满全球` checkpoint remains `ERROR` at 53/55 pages:
+  `S0136.P01/P02` are missing and `S0260` places the negation on P02. Four
+  OpenCode retries were rejected by existing semantic/lexical validators. A
+  read-only 55-page candidate passes renderer application but leaves the
+  S0260 page meaning for manual confirmation; the checkpoint is unchanged.
 - Manual-final save handles proven orphan display plans after parent merges;
   unexplained orphan plans remain hard failures.
-- OpenCode Zen/Go and TokenRhythm now use the shared reasoning-gateway request adapter with bounded completions.
+- Offline readability verification: 108/109 article display contract tests pass.
+  The remaining S9522 fixture still expects `into` while the current planner
+  selects `in`; this predates the relative-clause boundary fix and remains a
+  separate pagination-quality item.
+- Vocabulary card production update: prompt version is 17, the per-episode
+  concept-detail cap is 6, candidate normalization records rejection reasons,
+  and article cards use semantic two-line detail wrapping plus the title-card
+  blue vertical accent. Focused vocabulary tests pass; old prompt-version 16
+  caches are intentionally invalidated.
+- Vocabulary card visual follow-up: the accent is now 6px wide, sits farther
+  from the content, and is vertically inset from the text block. Mixed Chinese
+  explanations rank balanced lines with a slightly longer second line before
+  semantic tie-breakers. Focused card/layout tests pass; a 1920x1080 sample is
+  `output/current-production-vocab-render-20260826/fixed-accent-and-detail-wrap-card.png`.
+- The next accent pass uses a 45px container-to-line gap, a 9px rendered line,
+  and a 45px line-to-content gap at 1080p. The line is square-ended and its
+  vertical span follows visible glyph bounds rather than layout-group bounds.
+  Sample: `output/current-production-vocab-render-20260826/fixed-accent-45px-glyph-aligned-card.png`.
+- Opening title cards now use the same accent geometry and visible-glyph height
+  rule. Chinese detail wrapping keeps deterministic lexical boundaries; visual
+  balance is optimized only among legal breaks, so a word such as `造成` is not
+  split merely to make two lines equal. Samples:
+  `output/current-production-vocab-render-20260826/fixed-title-accent-45px-glyph-aligned.png`
+  and `output/current-production-vocab-render-20260826/fixed-accent-45px-glyph-aligned-card.png`.
+- The active article card content width now uses the same actual `45px` inset
+  on both the left-side content rule and the right container edge at 1080p.
+  Chinese explanations remain one line when they fit; when they overflow and a
+  comma/semicolon boundary is available, that punctuation boundary is preferred
+  before other legal lexical breaks.
 
 ## Known Risks And Unknowns
 
@@ -62,14 +121,81 @@ timing, page contracts, translation cache identity, and recoverable checkpoints.
   generated-artifact modifications. Do not restore or clean them blindly.
 - The 90–95% automation target is not verified by the existing stressed runs;
   old manually corrected packages are evidence for offline comparison only.
+- The latest 73-page replay remains historical evidence only. The active
+  unreviewed checkpoint has 55 expected pages and the two page-local issues
+  recorded above; Chinese fluency and long-caption quality still require a
+  fresh unreviewed run after the blocker is handled.
+- G1 failure localization is implemented. A renderable review fallback is now
+  recorded as `degraded_page_count` instead of an episode-level error; a real
+  non-renderable parent or an exceeded degraded threshold still blocks.
+- The G1 blueprint now reports `total_parent_count`,
+  `degraded_parent_ratio`, and a named 2% threshold on both PASS and ERROR
+  artifacts. The threshold uses `floor(total_parent_count * 0.02)` with a
+  minimum of one reviewable degraded parent for small unit inputs.
+- Before synthesis, each degraded parent is written as one JSONL row under the
+  stable artifact directory at `degraded-review-checklist.jsonl`, including
+  page IDs, page English/Chinese, and the degradation reason.
+- Read-only replay of checkpoint
+  `20260826T040659.244182-79951e43` produced `status=PASS`,
+  `degraded_page_count=1`, and only `S0089` degraded. It preserved all 306
+  page plans outside S0089 byte-for-byte at the page-signature level. The
+  translated page cache validated `PASS` with 0 errors; a temporary QA replay
+  produced 76 review items and 9 semantic-review items.
+- Translation quality audit now follows the selected LLM service configuration
+  instead of always using OpenCode Go. Audit cache entries are stored under a
+  service-scoped namespace, and the audit manifest records the service/model
+  used. The audit remains read-only and does not change subtitles, IDs, or
+  timing. When display-page projection fails, the production failure path now
+  explicitly opts into auditing the fixed parent English/Chinese rows instead
+  of silently skipping the audit; the page failure remains a render blocker.
+- OpenCode Zen/Go and TokenRhythm requests now pass through
+  `app/core/llm_client.py`. The adapter disables their default hidden
+  reasoning (`reasoning_effort=none` for OpenCode,
+  `thinking.type=disabled` for TokenRhythm) and supplies a reliable
+  `max_completion_tokens=8192` when a stage omitted an output budget or used
+  legacy `max_tokens`. DeepSeek and other providers keep their original request
+  parameters. Live replays of the 6,717-character humanoid-robot article
+  returned valid analysis JSON in about 10 seconds (OpenCode) and 19 seconds
+  (TokenRhythm); the same request previously timed out or returned an empty
+  length-limited completion on those gateways.
+
+## Merged Status And Handoff
+
+The former `docs/CURRENT_STATUS.md` and `docs/CODEX_HANDOFF.md` are preserved
+under `docs/archive/2026-08-26/d1-merged/`; their current, non-conflicting
+conclusions are merged here.
+
+- Stable production flows from ASR word timestamps through deterministic English
+  cuts, frozen IDs and word spans, ID-addressed Chinese translation/allocation,
+  local validation, final cue timing, SRT/ASS export, and synthesis.
+- Stable English, subtitle IDs, order, word ownership, and final timing remain
+  immutable after freezing. Chinese may use an LLM only within fixed IDs.
+- ERROR blocks publishable stable output; WARNING/INFO remain diagnostic. Manual
+  finals and immutable stable runs remain isolated from one another.
+- Current state is the newer 2026-08-26 retry/replay state above. Historical
+  handoff decisions remain evidence, not authority over current code or output.
+
+## Superseded Archived Conclusions
+
+- `docs/CURRENT_STATUS.md` reported only 2026-07-26 smoke/syntax results and
+  unresolved validation questions; the newer 2026-08-26 state supersedes them.
+- `docs/CODEX_HANDOFF.md` recorded verified HEAD `bafd5d72...` and an older
+  regression baseline; the current root state records `f00edc4` and supersedes
+  that identity and baseline.
+- `docs/CODEX_STATE.md` was only a compatibility pointer to the root state; the
+  root `CODEX_STATE.md` remains the single retained same-name entry.
 
 ## Historical Archive
 
 The former append-only state log is preserved at
 `docs/archive/2026-08-25/CURRENT_STATE-history.md`. Superseded unreferenced
 planning/baseline notes from the same cleanup are in that directory as well.
+Historical task rounds are preserved one per file under
+`tasks/archive/stable-subtitle-production-v1-log/`; `tasks/active/` keeps the
+newest round and the short current-state summary.
 
 ## Next Action
 
-Return to the mainline subtitle-quality work. Do not rerun manually reviewed
-audio packages; use a new, unreviewed audio for any production experiment.
+Finish the documentation/task-log cleanup, then split only verified source and
+test changes into mechanism-scoped groups. Keep the 55-page candidate outside
+the checkpoint and do not rerun manually reviewed audio packages.
