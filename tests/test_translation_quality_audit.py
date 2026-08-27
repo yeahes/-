@@ -1,6 +1,8 @@
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,10 +10,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.core.bk_asr.asr_data import ASRDataSeg
+from app.core.entities import LLMServiceEnum
+from app.core.llm_service_config import LLMRuntimeConfig
 from app.core.subtitle_processor.translation_quality_audit import (
     audit_fixed_id_translation_quality,
     build_translation_audit_rows,
 )
+from app.thread.subtitle_thread import SubtitleThread
 
 
 def _segment(subtitle_id: str, english: str, chinese: str) -> ASRDataSeg:
@@ -602,6 +607,112 @@ def test_model_audit_filters_ordinary_cross_row_continuation_but_keeps_dangling_
     ]
 
 
+def test_subtitle_thread_audit_uses_selected_deepseek_runtime_and_cache_namespace():
+    segment = _segment("S0001", "A fixed English cue.", "固定中文。")
+    editor = SimpleNamespace(
+        _display_page_translation_artifact={
+            "status": "PASS",
+            "parents": [
+                {
+                    "parent_subtitle_id": "S0001",
+                    "pages": [
+                        {
+                            "display_page_id": "S0001.P01",
+                            "english": "A fixed English cue.",
+                            "zh": "固定中文。",
+                            "start_ms": 0,
+                            "end_ms": 3000,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    runtime = LLMRuntimeConfig(
+        service=LLMServiceEnum.DEEPSEEK,
+        base_url="https://api.deepseek.com/v1",
+        api_key="deepseek-key",
+        model="deepseek-chat",
+        full_translation_model="deepseek-v4-pro",
+    )
+    audit_payload = {
+        "status": "PASS",
+        "source_subtitle_count": 1,
+        "audited_subtitle_count": 1,
+        "items": [],
+        "batch_errors": [],
+    }
+
+    with tempfile.TemporaryDirectory() as temp_dir, patch(
+        "app.thread.subtitle_thread.resolve_llm_service_config",
+        return_value=runtime,
+    ), patch("app.thread.subtitle_thread.OpenAI") as openai_factory, patch(
+        "app.thread.subtitle_thread.audit_fixed_id_translation_quality",
+        return_value=audit_payload,
+    ) as audit, patch("app.thread.subtitle_thread.write_subtitle_review_ledger"):
+        payload = SubtitleThread._run_translation_quality_audit(
+            editor,
+            SimpleNamespace(segments=[segment]),
+            str(Path(temp_dir) / "coverage-report.txt"),
+        )
+
+    openai_factory.assert_called_once_with(
+        base_url="https://api.deepseek.com/v1",
+        api_key="deepseek-key",
+        max_retries=0,
+        timeout=90,
+    )
+    assert audit.call_args.kwargs["model"] == "deepseek-chat"
+    assert Path(audit.call_args.kwargs["cache_dir"]).name == "deepseek"
+    assert payload["service"] == "DeepSeek"
+    assert payload["cache_namespace"] == "deepseek"
+
+
+def test_subtitle_thread_audit_can_run_after_page_projection_failure_when_opted_in():
+    segment = _segment("S0001", "A fixed English cue.", "固定中文。")
+    editor = SimpleNamespace(
+        _display_page_translation_artifact={
+            "status": "ERROR",
+            "errors": [{"code": "display_page_translation_request_failed"}],
+        }
+    )
+    runtime = LLMRuntimeConfig(
+        service=LLMServiceEnum.DEEPSEEK,
+        base_url="https://api.deepseek.com/v1",
+        api_key="deepseek-key",
+        model="deepseek-chat",
+        full_translation_model="deepseek-chat",
+    )
+    audit_payload = {
+        "status": "PASS",
+        "source_subtitle_count": 1,
+        "audited_subtitle_count": 1,
+        "items": [],
+        "batch_errors": [],
+    }
+
+    with tempfile.TemporaryDirectory() as temp_dir, patch(
+        "app.thread.subtitle_thread.resolve_llm_service_config",
+        return_value=runtime,
+    ), patch("app.thread.subtitle_thread.OpenAI") as openai_factory, patch(
+        "app.thread.subtitle_thread.audit_fixed_id_translation_quality",
+        return_value=audit_payload,
+    ) as audit, patch("app.thread.subtitle_thread.write_json_artifact"), patch(
+        "app.thread.subtitle_thread.write_subtitle_review_ledger"
+    ):
+        payload = SubtitleThread._run_translation_quality_audit(
+            editor,
+            SimpleNamespace(segments=[segment]),
+            str(Path(temp_dir) / "coverage-report.txt"),
+            allow_page_projection_failure=True,
+        )
+
+    openai_factory.assert_called_once()
+    audit.assert_called_once()
+    assert payload["status"] == "PASS"
+    assert payload["audited_subtitle_count"] == 1
+
+
 if __name__ == "__main__":
     test_model_audit_is_id_bound_and_filters_false_parent_length_warning()
     test_model_audit_fails_closed_when_batch_ids_are_incomplete()
@@ -614,4 +725,5 @@ if __name__ == "__main__":
     test_adjacent_issue_requires_two_ids_and_can_use_context_neighbor()
     test_model_audit_deduplicates_same_owned_problem_and_filters_marker_phrase()
     test_model_audit_filters_ordinary_cross_row_continuation_but_keeps_dangling_chinese()
+    test_subtitle_thread_audit_uses_selected_deepseek_runtime_and_cache_namespace()
     print("translation quality audit tests passed")

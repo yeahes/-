@@ -38,6 +38,7 @@ from app.core.article_context import (
     save_article_artifacts,
 )
 from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
+from app.core.llm_service_config import resolve_llm_service_config
 from app.core.subtitle_processor.review_evidence_identity import (
     load_bound_semantic_review_queue,
 )
@@ -620,6 +621,8 @@ class SubtitleThread(QThread):
         if isinstance(translation_audit, dict):
             metadata["translation_quality_audit"] = {
                 "status": str(translation_audit.get("status") or "UNKNOWN"),
+                "service": str(translation_audit.get("service") or ""),
+                "model": str(translation_audit.get("model") or ""),
                 "source_subtitle_count": int(
                     translation_audit.get("source_subtitle_count") or 0
                 ),
@@ -1057,8 +1060,9 @@ class SubtitleThread(QThread):
         coverage_report_path: str | None,
         *,
         progress_callback: Callable[[Dict], None] | None = None,
+        allow_page_projection_failure: bool = False,
     ) -> dict:
-        """Run the dedicated OpenCode audit after actual pages are frozen."""
+        """Run the read-only quality audit with the selected LLM service."""
         if not coverage_report_path:
             return {}
         artifact_dir = stable_artifact_dir(Path(coverage_report_path))
@@ -1069,11 +1073,31 @@ class SubtitleThread(QThread):
         page_artifact = dict(
             getattr(screen_editor, "_display_page_translation_artifact", {}) or {}
         )
-        model = str(cfg.opencode_go_model.value or "deepseek-v4-flash").strip()
-        if str(page_artifact.get("status") or "") != "PASS":
+        try:
+            llm_runtime = resolve_llm_service_config()
+            service_name = str(llm_runtime.service.value or "").strip()
+            model = str(llm_runtime.model or "").strip()
+            api_key = str(llm_runtime.api_key or "").strip()
+            base_url = str(llm_runtime.base_url or "").strip()
+        except Exception as exc:
+            llm_runtime = None
+            service_name = ""
+            model = ""
+            api_key = ""
+            base_url = ""
+            logger.warning("Translation quality audit service config unavailable: %s", exc)
+
+        cache_namespace = "".join(
+            character.lower() if character.isalnum() else "_"
+            for character in service_name
+        ).strip("_") or "unknown"
+        page_projection_passed = str(page_artifact.get("status") or "") == "PASS"
+        audit_enabled = page_projection_passed or allow_page_projection_failure
+        if not audit_enabled:
             payload = {
                 "schema_version": 1,
                 "status": "SKIPPED",
+                "service": service_name,
                 "model": model,
                 "source_subtitle_count": len(rows),
                 "audited_subtitle_count": 0,
@@ -1089,24 +1113,37 @@ class SubtitleThread(QThread):
                 ],
             }
         else:
-            api_key = str(cfg.opencode_go_api_key.value or "").strip()
-            base_url = str(cfg.opencode_go_api_base.value or "").strip()
-        if str(page_artifact.get("status") or "") == "PASS" and (
-            not api_key or not base_url or not model
+            if llm_runtime is None:
+                payload = {
+                    "schema_version": 1,
+                    "status": "UNAVAILABLE",
+                    "service": service_name,
+                    "model": model,
+                    "source_subtitle_count": len(rows),
+                    "audited_subtitle_count": 0,
+                    "issue_count": 0,
+                    "items": [],
+                    "batch_errors": [
+                        {"code": "translation_quality_audit_service_unavailable"}
+                    ],
+                }
+        if audit_enabled and (
+            llm_runtime is not None and (not api_key or not base_url or not model)
         ):
             payload = {
                 "schema_version": 1,
                 "status": "UNAVAILABLE",
+                "service": service_name,
                 "model": model,
                 "source_subtitle_count": len(rows),
                 "audited_subtitle_count": 0,
                 "issue_count": 0,
                 "items": [],
                 "batch_errors": [
-                    {"code": "opencode_translation_audit_not_configured"}
+                    {"code": "translation_quality_audit_not_configured"}
                 ],
             }
-        elif str(page_artifact.get("status") or "") == "PASS":
+        elif audit_enabled and llm_runtime is not None:
             client = OpenAI(
                 base_url=base_url,
                 api_key=api_key,
@@ -1164,9 +1201,15 @@ class SubtitleThread(QThread):
                 rows,
                 completion,
                 model=model,
-                cache_dir=artifact_dir / "translation-quality-audit-cache",
+                cache_dir=(
+                    artifact_dir
+                    / "translation-quality-audit-cache"
+                    / cache_namespace
+                ),
                 progress_callback=progress_callback,
             )
+            payload["service"] = service_name
+            payload["cache_namespace"] = cache_namespace
         write_json_artifact(
             artifact_dir / "translation-quality-audit.json",
             payload,
@@ -2702,10 +2745,22 @@ class SubtitleThread(QThread):
                         # Parent Chinese and fixed IDs are already authoritative
                         # here.  A renderer-page failure must not suppress the
                         # higher-value English/Chinese review queue.
-                        self._run_translation_quality_audit(
+                        audit_payload = self._run_translation_quality_audit(
                             screen_editor,
                             asr_data,
                             coverage_report_path,
+                            allow_page_projection_failure=True,
+                        )
+                        self.__dict__["_translation_quality_audit"] = dict(
+                            audit_payload or {}
+                        )
+                        self.__dict__["_translation_quality_audit_path"] = (
+                            str(
+                                stable_artifact_dir(Path(coverage_report_path))
+                                / "translation-quality-audit.json"
+                            )
+                            if coverage_report_path
+                            else ""
                         )
                     except Exception as audit_exc:
                         logger.warning(
