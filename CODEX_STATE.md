@@ -1,10 +1,10 @@
 # Project State
 
 Status: in_progress
-Last verified: 2026-08-27 15:24:08 Asia/Shanghai
+Last verified: 2026-08-27 15:27:08 Asia/Shanghai
 Branch: main
-Verified HEAD: 4d1c78d
-Working tree: modified (94 entries: 8 tracked docs/evidence files and 86 untracked evidence/report files remain intentionally isolated)
+Verified HEAD: b1ae687
+Working tree: modified (16 entries: 7 tracked evidence files and 9 untracked audit/report files remain intentionally isolated)
 
 ## Current Goal
 Keep only low-risk, high-payoff work: use the committed local retry for the

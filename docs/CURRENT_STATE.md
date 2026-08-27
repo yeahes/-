@@ -1,6 +1,6 @@
 # Current State
 
-Last verified: 2026-08-27 15:24 Asia/Shanghai
+Last verified: 2026-08-27 15:27 Asia/Shanghai
 
 ## Current Goal
 
@@ -112,7 +112,7 @@ ledger, WhisperX alignment, or the final cue timeline.
   comma/semicolon boundary is available, that punctuation boundary is preferred
   before other legal lexical breaks.
 - The production changes are split into mechanism-scoped commits through
-  `4d1c78d`; the unverified page-selection experiment was removed. Remaining
+  `b1ae687`; the unverified page-selection experiment was removed. Remaining
   uncommitted changes are historical audit/state updates and generated evidence.
 
 ## Known Risks And Unknowns
