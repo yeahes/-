@@ -24,13 +24,15 @@ import time
 from collections import Counter
 from pathlib import Path
 
-PROJ = Path("/sessions/magical-zen-dijkstra/mnt/VideoCaptioner-screen-subtitle")
-OUT = Path("/sessions/magical-zen-dijkstra/mnt/outputs")
+# Repo root and script dir are derived from this file's location so the
+# script runs unmodified on Windows or Linux. Override with VC_REPO if moved.
+_HERE = Path(__file__).resolve().parent
+PROJ = Path(os.environ.get("VC_REPO") or _HERE.parents[3])
+OUT = _HERE
 MODEL = PROJ / "runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0"
 os.environ.setdefault("OPENAI_API_KEY", "x")
 sys.path.insert(0, str(PROJ))
-sys.path.insert(0, str(OUT))
-
+sys.path.insert(0, str(_HERE))
 import spacy  # noqa: E402
 from app.core.subtitle_processor import screen_editor as se_mod  # noqa: E402
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor as E  # noqa: E402

@@ -27,8 +27,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-PROJ = Path("/sessions/magical-zen-dijkstra/mnt/VideoCaptioner-screen-subtitle")
-OUT = Path("/sessions/magical-zen-dijkstra/mnt/outputs")
+# Repo root and script dir are derived from this file's location so the
+# script runs unmodified on Windows or Linux. Override with VC_REPO if moved.
+_HERE = Path(__file__).resolve().parent
+PROJ = Path(os.environ.get("VC_REPO") or _HERE.parents[3])
+OUT = _HERE
 os.environ.setdefault("OPENAI_API_KEY", "x")
 sys.path.insert(0, str(PROJ))
 

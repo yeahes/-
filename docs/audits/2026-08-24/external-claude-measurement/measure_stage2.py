@@ -16,7 +16,10 @@ from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
-PROJ = Path("/sessions/magical-zen-dijkstra/mnt/VideoCaptioner-screen-subtitle")
+# Repo root and script dir are derived from this file's location so the
+# script runs unmodified on Windows or Linux. Override with VC_REPO if moved.
+_HERE = Path(__file__).resolve().parent
+PROJ = Path(os.environ.get("VC_REPO") or _HERE.parents[3])
 MODEL = PROJ / "runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0"
 os.environ.setdefault("OPENAI_API_KEY", "x")
 sys.path.insert(0, str(PROJ))
@@ -30,7 +33,7 @@ se_mod.logger.disabled = True
 TARGET = {"relative_clause_entrance_split", "dependent_clause_entrance_split"}
 _NLP = spacy.load(str(MODEL), disable=["ner", "textcat"])
 
-sys.path.insert(0, "/sessions/magical-zen-dijkstra/mnt/outputs")
+sys.path.insert(0, str(_HERE))
 from measure_boundary_flips import build_editor, find_episodes  # noqa: E402
 
 
@@ -79,8 +82,7 @@ def main():
         per_ep[name] = {"accepted_boundaries": a_tot, "now_illegal": a_bad}
         print(f"[A2] {name}: {a_bad}/{a_tot} 生产已接受但现规则判非法", file=sys.stderr)
 
-    prev = json.loads(Path("/sessions/magical-zen-dijkstra/mnt/outputs/"
-                           "boundary_flip_measurement.json").read_text("utf-8"))
+    prev = json.loads((_HERE / "boundary_flip_measurement.json").read_text("utf-8"))
     opened = prev["opened_boundaries"]
 
     by_parent_len = Counter()
@@ -123,7 +125,7 @@ def main():
             "samples": opened[:30],
         },
     }
-    Path("/sessions/magical-zen-dijkstra/mnt/outputs/boundary_flip_stage2.json").write_text(
+    (_HERE / "boundary_flip_stage2.json").write_text(
         json.dumps(out, ensure_ascii=False, indent=1), "utf-8")
     print(json.dumps(out["stage_a2_falsification"], ensure_ascii=False, indent=1)[:2600])
     print(json.dumps(out["stage_c_opened_analysis"], ensure_ascii=False, indent=1)[:1800])

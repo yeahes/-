@@ -51,17 +51,23 @@
 - §11.4 的"去重后 98"= 64 + 34 相加得出，不是直接读数；`newly_illegal_*` 键在
   `open_subordinate_new_candidates_EF.json` 中**缺失即为真 0**（`measure_open_subordinate_v4.py:139` 用 Counter 计数）。
 
-## 运行前需要改一处
+## 怎么跑（无需改任何路径）
 
-全部脚本（共 8 个）顶部的 `PROJ` 是 Linux 容器内的绝对路径：
+全部 10 个脚本的 `PROJ` 现在**由脚本自身位置自动推导**
+（`Path(__file__).resolve().parents[3]`），产物写回**脚本所在目录**，
+跨脚本 import 也走 `_HERE`。所以在 Windows 上直接：
 
-```python
-PROJ = Path("/sessions/.../mnt/VideoCaptioner-screen-subtitle")
+```
+python docs\audits\2026-08-24\external-claude-measurement\measure_stage2.py
 ```
 
-在 Windows 上复现请改为仓库根目录，例如
-`PROJ = Path(r"E:\VideoCaptioner-screen-subtitle")`；
-`MODEL` 指向 `runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0`，无需改动。
+从任意工作目录运行都可以，不必 `cd` 进来。仓库若被移动或改名，
+可用环境变量 `VC_REPO` 覆盖仓库根。
+已验证：从与仓库无关的目录运行 `measure_stage2.py`，
+复现 **5,180 边界 / 516 非法 / open_sub 110**（= GPT 当前工作树的状态）。
+
+`MODEL` 指向 `runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0`，
+随 `PROJ` 自动定位，无需改动。
 `measure_stage2.py` / `measure_finite_counterfactual.py` 会从
 `measure_boundary_flips.py` 导入 `build_editor` / `find_episodes`，四个文件需放在同一目录。
 

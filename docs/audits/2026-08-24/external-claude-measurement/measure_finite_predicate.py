@@ -19,7 +19,10 @@ import logging
 from collections import Counter
 from pathlib import Path
 
-PROJ = Path("/sessions/magical-zen-dijkstra/mnt/VideoCaptioner-screen-subtitle")
+# Repo root and script dir are derived from this file's location so the
+# script runs unmodified on Windows or Linux. Override with VC_REPO if moved.
+_HERE = Path(__file__).resolve().parent
+PROJ = Path(os.environ.get("VC_REPO") or _HERE.parents[3])
 MODEL = PROJ / "runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0"
 os.environ.setdefault("OPENAI_API_KEY", "x")
 sys.path.insert(0, str(PROJ))
@@ -48,7 +51,7 @@ def spacy_has_finite(doc):
 
 
 def main():
-    sys.path.insert(0, "/sessions/magical-zen-dijkstra/mnt/outputs")
+    sys.path.insert(0, str(_HERE))
     from measure_boundary_flips import find_episodes
 
     texts, meta = [], []
@@ -104,7 +107,7 @@ def main():
         "over_strict_samples": fn_samples,
         "helper_yes_spacy_no_samples": fp_samples,
     }
-    Path("/sessions/magical-zen-dijkstra/mnt/outputs/finite_predicate_audit.json").write_text(
+    (_HERE / "finite_predicate_audit.json").write_text(
         json.dumps(out, ensure_ascii=False, indent=1), "utf-8")
     o = dict(out)
     o["missed_verbs_top40"] = out["missed_verbs_top40"][:18]

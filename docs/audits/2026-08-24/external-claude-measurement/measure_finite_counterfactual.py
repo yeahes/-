@@ -16,12 +16,14 @@ from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
-PROJ = Path("/sessions/magical-zen-dijkstra/mnt/VideoCaptioner-screen-subtitle")
+# Repo root and script dir are derived from this file's location so the
+# script runs unmodified on Windows or Linux. Override with VC_REPO if moved.
+_HERE = Path(__file__).resolve().parent
+PROJ = Path(os.environ.get("VC_REPO") or _HERE.parents[3])
 MODEL = PROJ / "runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0"
 os.environ.setdefault("OPENAI_API_KEY", "x")
 sys.path.insert(0, str(PROJ))
-sys.path.insert(0, "/sessions/magical-zen-dijkstra/mnt/outputs")
-
+sys.path.insert(0, str(_HERE))
 import spacy  # noqa: E402
 from app.core.subtitle_processor import screen_editor as se_mod  # noqa: E402
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor as E  # noqa: E402
@@ -105,7 +107,7 @@ def main():
         "boundaries_fixed_not_in_after_set": len(k0 - k1),
         "boundaries_newly_illegal_after": len(k1 - k0),
     }
-    Path("/sessions/magical-zen-dijkstra/mnt/outputs/finite_predicate_counterfactual.json"
+    (_HERE / "finite_predicate_counterfactual.json"
          ).write_text(json.dumps(out, ensure_ascii=False, indent=1), "utf-8")
     o = dict(out); o["per_code"] = [p for p in per_code if p["resolved"]][:14]
     print(json.dumps(o, ensure_ascii=False, indent=1))

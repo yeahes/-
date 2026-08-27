@@ -17,7 +17,10 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
-PROJ = Path("/sessions/magical-zen-dijkstra/mnt/VideoCaptioner-screen-subtitle")
+# Repo root and script dir are derived from this file's location so the
+# script runs unmodified on Windows or Linux. Override with VC_REPO if moved.
+_HERE = Path(__file__).resolve().parent
+PROJ = Path(os.environ.get("VC_REPO") or _HERE.parents[3])
 MODEL = PROJ / "runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0"
 
 os.environ.setdefault("OPENAI_API_KEY", "not-used-offline")
@@ -225,7 +228,7 @@ def main():
         } if grand else {},
         "opened_boundaries": all_opened,
     }
-    Path("/sessions/magical-zen-dijkstra/mnt/outputs/boundary_flip_measurement.json").write_text(
+    (_HERE / "boundary_flip_measurement.json").write_text(
         json.dumps(out, ensure_ascii=False, indent=1), "utf-8")
     print(json.dumps(out["harness_validation"], ensure_ascii=False, indent=1)[:2000])
     print(json.dumps(out["totals"], ensure_ascii=False, indent=1))
