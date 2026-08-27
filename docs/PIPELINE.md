@@ -278,6 +278,20 @@ Run-state rules:
   model/prompt values, and selected timing backend.
 - A stage artifact is reusable only when its recorded digest and full input
   fingerprint match; otherwise the normal stage executes.
+- After fixed parent Chinese and the final cue timeline pass, the pipeline
+  records a `frozen_parent_timeline` checkpoint before display-page work. It
+  binds the run manifest, source transcript, word ledger, subtitle spans,
+  fixed-ID translations, semantic groups, parent-Chinese authority, boundary
+  evidence, and final cue timeline by file digest.
+- A compatible page-stage retry reconstructs the in-memory parent state only
+  after those artifacts agree on English, fixed IDs, continuous word coverage,
+  source-segment coverage, Chinese, semantic-group order, and final timing. It
+  then skips stable English editing, parent translation/allocation, and
+  WhisperX. The failed display-page artifact is not restored as authority.
+- A page-only editable checkpoint created before this stage record existed has
+  one compatibility path. It must belong to the same source subtitle, declare
+  only `display_page_*` failures, and pass the same complete structural restore
+  checks. A different failure or any drift falls back to the normal pipeline.
 - Existing LLM batch caches may be reused under their current cache keys, but
   completion order never controls translation or subtitle writeback order.
 - Display-page Chinese requests are bounded to at most six parent subtitles
@@ -760,6 +774,10 @@ Rule:
   relaxed atomic evidence are selected first. If no normal-font candidate is
   renderable, the failed parent remains visible to the editor as an editable
   seed; it is not hidden or silently forced into an emergency three-line page.
+  A renderable review fallback is isolated to its parent and recorded as
+  `degraded_page_count`; it does not enter the episode `errors` list. The
+  episode blocks only for a non-renderable parent or when the degraded count
+  exceeds its recorded threshold.
   Page Chinese uses `fixed-parent-page-allocation-v9`. Its aggregate projection
   is checked against the authoritative parent Chinese for repeated meaning and
   significant expansion before the existing parent-local retry is accepted.

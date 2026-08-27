@@ -3,6 +3,23 @@
 Status: in_progress
 Last reviewed: 2026-08-19 07:14:07 Asia/Shanghai
 
+## 2026-08-25 Manual-final save after timeline deletion
+
+- Reproduced the White House manual package failure offline. The package had
+  a deleted interval `50604..80767ms`; frozen pages after that interval were
+  validated against source-media times and became non-monotonic on the
+  compacted audio timeline.
+- The save path now maps page cues and word timing to the presentation clock,
+  then recomputes only page display boundaries from the frozen word ranges.
+  English text, page IDs, parent spans, and the authoritative word ledger are
+  unchanged. A valid output timestamp of `0` is handled explicitly.
+- Regression fixture covers deleting the first parent and checks every frozen
+  page has `end_ms > start_ms`; focused deletion/save and 76 page-contract
+  tests pass. White House offline render-contract replay reports 186/186
+  valid plans and `render_blocked=false`.
+- Remaining acceptance: run the normal project regression and confirm one GUI
+  save/synthesis after restarting from the current working copy.
+
 ## 2026-08-24 Complete-parent media deletion
 
 - Added a parent-scoped, reversible context-menu operation that marks one or
@@ -335,3 +352,17 @@ research. This task remains limited to the manual long-caption workspace.
 - https://github.com/SubtitleEdit/subtitleedit/blob/main/docs/features/split-break-long-lines.md
 - https://github.com/SubtitleEdit/subtitleedit/blob/main/src/ui/Features/Edit/ShowHistory/ShowHistoryViewModel.cs
 - https://github.com/SubtitleEdit/subtitleedit/blob/main/src/ui/Features/Files/RestoreAutoBackup/RestoreAutoBackupViewModel.cs
+
+## 2026-08-26 Recent Manual-Final Recovery
+
+- Discovery now follows hash-verified subtitle paths declared by stable
+  manifests to the owning media result directory and its manual-final package.
+- Episode identity comes from the result directory. Selection uses actual
+  update time before draft/package rank, so stale drafts cannot mask newer
+  finals and genuinely newer drafts remain recoverable.
+- Read-only verification found and loaded the real `拆解白宫所谓的中国转运骗局`
+  manual-final package with 199 cues, without rerunning the processing pipeline
+  or modifying user-owned artifacts.
+- `tests/test_manual_final_subtitle_editor.py` passes 136/136. The full
+  regression passes 31/32; the remaining article-readability fixture failure
+  is outside this recovery change.
