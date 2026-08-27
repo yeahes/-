@@ -322,6 +322,7 @@ def _write_display_page_preview_artifact(session: ManualFinalSubtitleSession) ->
                             "start_ms": 900,
                             "end_ms": 1200,
                             "english_font_size": 54,
+                            "english_width": 1260,
                         }
                     ],
                 },
@@ -2369,6 +2370,51 @@ def test_legacy_blank_page_edits_recover_visible_stale_chinese_drafts():
         )
 
 
+def test_blank_page_edits_reuse_exact_visible_projection_for_save():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session, _, _ = _session_fixture(Path(temp_dir))
+        _write_display_page_preview_artifact(session)
+        artifact = json.loads(
+            (session.artifact_dir / "display-page-translations.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        rows = session.to_model_data(prefer_display_pages=True)
+        session.display_page_edits = [
+            {
+                "display_page_id": str(row["display_page_id"]),
+                "parent_subtitle_id": str(row["manual_cue_id"]),
+                "word_start": int(row["word_start"]),
+                "word_end": int(row["word_end"]),
+                "english": str(row["original_subtitle"]),
+                "chinese": "",
+                "chinese_stale_unconfirmed": True,
+            }
+            for row in rows.values()
+            if row.get("display_page_id")
+        ]
+
+        response = session._display_page_edit_translation_response(
+            artifact["parents"],
+            artifact["render_plans"],
+        )
+
+        assert response == {
+            "pages": [
+                {"display_page_id": "S0001.P01", "zh": "中"},
+                {"display_page_id": "S0001.P02", "zh": "文一"},
+            ]
+        }
+        assert all(
+            str(item.get("chinese") or "").strip()
+            for item in session.display_page_edits
+        )
+        assert all(
+            not item.get("chinese_stale_unconfirmed")
+            for item in session.display_page_edits
+        )
+
+
 def test_blank_intermediate_page_edits_cannot_hide_recovered_stale_drafts():
     with tempfile.TemporaryDirectory() as temp_dir:
         session, _, _ = _session_fixture(Path(temp_dir))
@@ -3587,6 +3633,41 @@ def test_timeline_delete_save_round_trip_projects_srt_and_binds_v3_media():
         assert Path(resolved_media).resolve() == Path(
             derivation["derived_media_path"]
         ).resolve()
+
+
+def test_timeline_delete_reconciles_frozen_display_page_times_to_presentation_clock():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, _source_srt, _manifest_path = _session_fixture(root)
+        _write_display_page_preview_artifact(session)
+        session.set_cues_timeline_deleted(["S0001"], True)
+
+        timeline = session._rebuild_authoritative_cue_timeline()
+        presentation = timeline["presentation_timeline"]
+        presentation_records = {
+            str(record["subtitle_id"]): record
+            for record in presentation["records"]
+        }
+        blueprint = session._blueprint_from_frozen_display_page_edits(
+            presentation_records_by_id=presentation_records,
+            deleted_intervals=presentation["deleted_intervals"],
+        )
+
+        s0002 = next(
+            plan
+            for plan in blueprint["render_plans"]
+            if plan["parent_subtitle_id"] == "S0002"
+        )
+        assert s0002["pages"][0]["start_ms"] == 0
+        s0002_presentation = presentation_records["S0002"]
+        assert s0002["pages"][0]["end_ms"] == s0002_presentation[
+            "output_end_ms"
+        ]
+        assert all(
+            int(page["end_ms"]) > int(page["start_ms"])
+            for plan in blueprint["render_plans"]
+            for page in plan["pages"]
+        )
 
 
 def test_materialized_timeline_delete_removes_audio_and_compacts_duration():
@@ -5036,6 +5117,9 @@ def test_save_persists_manual_override_and_synthesis_uses_it():
             str(source_srt.with_suffix(".m4a")),
             paths["manifest_path"],
         )
+        # The renderer must receive the parent SRT so it can validate the
+        # frozen word ledger.  It loads the reviewed display-page projection
+        # from the manifest artifact separately.
         assert Path(package_resolved) == latest_override
 
 

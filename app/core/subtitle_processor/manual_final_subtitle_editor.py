@@ -2259,6 +2259,9 @@ class ManualFinalSubtitleSession:
         self,
         cue_index: int,
         boundary_items: Mapping[str, Mapping[str, Any]],
+        *,
+        presentation_records_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+        deleted_intervals: Sequence[Mapping[str, Any]] = (),
     ):
         from app.core.utils.podcast_learning_video import (
             Cue,
@@ -2271,20 +2274,32 @@ class ManualFinalSubtitleSession:
         display_word_spans = tuple(
             self._display_word_spans(word_start, word_end)
         )
-        raw_word_timing = tuple(
-            {
-                "word_id": word_id,
-                "surface": str(
-                    self.word_ledger[word_id].get(
-                        "surface",
-                        self.word_ledger[word_id].get("token", ""),
-                    )
-                ),
-                "start": self._word_start_time(word_id) / 1000.0,
-                "end": self._word_end_time(word_id) / 1000.0,
-            }
-            for word_id in range(word_start, word_end + 1)
-        )
+        raw_word_timing = []
+        for word_id in range(word_start, word_end + 1):
+            word_start_ms = self._word_start_time(word_id)
+            word_end_ms = self._word_end_time(word_id)
+            if deleted_intervals:
+                word_start_ms = map_source_time_ms(
+                    word_start_ms,
+                    deleted_intervals,
+                )
+                word_end_ms = map_source_time_ms(
+                    word_end_ms,
+                    deleted_intervals,
+                )
+            raw_word_timing.append(
+                {
+                    "word_id": word_id,
+                    "surface": str(
+                        self.word_ledger[word_id].get(
+                            "surface",
+                            self.word_ledger[word_id].get("token", ""),
+                        )
+                    ),
+                    "start": word_start_ms / 1000.0,
+                    "end": word_end_ms / 1000.0,
+                }
+            )
         projected_timing = _project_article_display_word_timing(
             raw_word_timing,
             display_word_spans,
@@ -2293,10 +2308,26 @@ class ManualFinalSubtitleSession:
             raise ManualFinalSubtitleEditError(
                 "英文显示词面无法映射回冻结词时间。"
             )
+        presentation_record = (
+            (presentation_records_by_id or {}).get(str(cue.get("cue_id") or ""))
+            or {}
+        )
+        presentation_start_ms = presentation_record.get("output_start_ms")
+        presentation_end_ms = presentation_record.get("output_end_ms")
+        cue_start_ms = int(
+            cue["start_time"]
+            if presentation_start_ms is None
+            else presentation_start_ms
+        )
+        cue_end_ms = int(
+            cue["end_time"]
+            if presentation_end_ms is None
+            else presentation_end_ms
+        )
         return Cue(
             index=cue_index + 1,
-            start=int(cue["start_time"]) / 1000.0,
-            end=int(cue["end_time"]) / 1000.0,
+            start=cue_start_ms / 1000.0,
+            end=cue_end_ms / 1000.0,
             en=str(cue["original_subtitle"]),
             zh=str(cue.get("translated_subtitle") or ""),
             speaker="manual",
@@ -2308,6 +2339,89 @@ class ManualFinalSubtitleSession:
                 for right_word in range(word_start + 1, word_end + 1)
             },
         )
+
+    @staticmethod
+    def _reconcile_frozen_display_page_timing(
+        plan: Mapping[str, Any],
+        render_cue: Any,
+    ) -> Dict[str, Any]:
+        """Derive frozen page times from the current presentation word clock.
+
+        A stable artifact can carry source-media page times while a manual
+        final package renders a compacted presentation timeline after deleting
+        subtitle intervals. Page spans remain frozen, but their display
+        boundaries must be recomputed from the same mapped word timing used by
+        the renderer. This keeps the page contract monotonic without changing
+        English text, IDs, or word ownership.
+        """
+        from app.core.utils.podcast_learning_video import (
+            RenderStructuralOverflowError,
+            _schedule_article_page_boundaries,
+        )
+
+        pages = [
+            dict(page)
+            for page in plan.get("pages") or []
+            if isinstance(page, Mapping)
+        ]
+        timing = list(getattr(render_cue, "word_timing", ()) or ())
+        if not pages or not timing:
+            raise RenderStructuralOverflowError(
+                [{
+                    "cue_index": getattr(render_cue, "index", 0),
+                    "reason": "frozen_page_timing_invalid",
+                }]
+            )
+        try:
+            first_word_id = int(timing[0]["word_id"])
+            last_word_id = int(timing[-1]["word_id"])
+            ranges = []
+            expected_start = first_word_id
+            for page in pages:
+                global_start = int(page["word_start"])
+                global_end = int(page["word_end"])
+                if (
+                    global_start != expected_start
+                    or global_end < global_start
+                    or global_end > last_word_id
+                ):
+                    raise ValueError("non-contiguous frozen page word ranges")
+                ranges.append(
+                    (
+                        global_start - first_word_id,
+                        global_end - first_word_id + 1,
+                    )
+                )
+                expected_start = global_end + 1
+            if expected_start - 1 != last_word_id:
+                raise ValueError("frozen pages do not cover the cue word span")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RenderStructuralOverflowError(
+                [{
+                    "cue_index": getattr(render_cue, "index", 0),
+                    "reason": "frozen_page_timing_invalid",
+                }]
+            ) from exc
+
+        schedule, schedule_error = _schedule_article_page_boundaries(
+            render_cue,
+            ranges,
+            minimum_page_duration_ms=0,
+        )
+        if schedule is None:
+            raise RenderStructuralOverflowError(
+                [{
+                    "cue_index": getattr(render_cue, "index", 0),
+                    "reason": schedule_error or "frozen_page_timing_invalid",
+                }]
+            )
+        reconciled = copy.deepcopy(dict(plan))
+        reconciled_pages = list(reconciled.get("pages") or [])
+        for page, start, end in zip(reconciled_pages, schedule, schedule[1:]):
+            page["start_ms"] = int(round(float(start) * 1000))
+            page["end_ms"] = int(round(float(end) * 1000))
+        reconciled["pages"] = reconciled_pages
+        return reconciled
 
     def build_display_page_candidate_workspace(
         self,
@@ -8683,6 +8797,96 @@ class ManualFinalSubtitleSession:
             if isinstance(page, Mapping)
             and str(page.get("display_page_id") or "")
         }
+
+        # A boundary confirmation can clear page-level Chinese even when the
+        # resulting page identity is unchanged. Recover only an exact visible
+        # projection; changed ranges, English text, or parent Chinese still
+        # require an explicit manual translation.
+        try:
+            visible_translations = self._visible_display_page_translations()
+        except (ManualFinalSubtitleEditError, OSError, TypeError, ValueError):
+            visible_translations = {}
+
+        def same_page_identity(
+            candidate: Mapping[str, Any] | None,
+            page_id: str,
+            parent_id: str,
+            page: Mapping[str, Any],
+        ) -> bool:
+            if not candidate:
+                return False
+            try:
+                return bool(
+                    str(candidate.get("display_page_id") or "") == page_id
+                    and str(candidate.get("parent_subtitle_id") or "")
+                    == parent_id
+                    and int(candidate.get("word_start", -1))
+                    == int(page.get("word_start", -2))
+                    and int(candidate.get("word_end", -1))
+                    == int(page.get("word_end", -2))
+                    and self._normalised_tokens(candidate.get("english"))
+                    == self._normalised_tokens(page.get("english"))
+                )
+            except (TypeError, ValueError):
+                return False
+
+        cue_chinese_by_id = {
+            str(cue.get("cue_id") or ""): re.sub(
+                r"\s+", "", str(cue.get("translated_subtitle") or "")
+            )
+            for cue in self.cues
+            if isinstance(cue, Mapping)
+        }
+        pages_by_parent: Dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
+        for page_id, (parent_id, page) in expected_pages.items():
+            pages_by_parent.setdefault(parent_id, []).append((page_id, page))
+
+        for parent_id, parent_pages in pages_by_parent.items():
+            recovered: Dict[str, str] = {}
+            aggregate: list[str] = []
+            recoverable = True
+            for page_id, page in parent_pages:
+                edited = edits.get(page_id)
+                # A visible stale proposal is not an approved translation.
+                # When a manual boundary override exists, recovery is only
+                # allowed after the user acknowledged this exact page
+                # boundary; otherwise saving would silently turn a review
+                # checkpoint into a renderable final package. For an unchanged
+                # source projection there is no new boundary decision to ack.
+                if (
+                    edited is None
+                    or (
+                        parent_id in self.display_page_boundary_overrides
+                        and not bool(edited.get("boundary_review_acknowledged"))
+                    )
+                ):
+                    recoverable = False
+                    break
+                chinese = str(edited.get("chinese") or "").strip()
+                if not chinese:
+                    candidate = visible_translations.get(page_id)
+                    if not same_page_identity(candidate, page_id, parent_id, page):
+                        recoverable = False
+                        break
+                    chinese = str(candidate.get("chinese") or "").strip()
+                    if not chinese:
+                        recoverable = False
+                        break
+                    recovered[page_id] = chinese
+                aggregate.append(re.sub(r"\s+", "", chinese))
+            if (
+                not recoverable
+                or not recovered
+                or "".join(aggregate) != cue_chinese_by_id.get(parent_id, "")
+            ):
+                continue
+            for page_id, chinese in recovered.items():
+                edited = edits[page_id]
+                edited["chinese"] = chinese
+                edited["chinese_stale_unconfirmed"] = False
+                edited.pop("stale_chinese_draft", None)
+                edited.pop("chinese_draft_kind", None)
+
         if set(edits) != set(expected_pages):
             raise ManualFinalSubtitleEditError(
                 "manual_page_translation_required: "
@@ -8801,6 +9005,9 @@ class ManualFinalSubtitleSession:
 
     def _blueprint_from_frozen_display_page_edits(
         self,
+        *,
+        presentation_records_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+        deleted_intervals: Sequence[Mapping[str, Any]] = (),
     ) -> Dict[str, Any] | None:
         from app.core.utils.podcast_learning_video import (
             RenderStructuralOverflowError,
@@ -8924,6 +9131,8 @@ class ManualFinalSubtitleSession:
                 render_cue = self._article_render_cue(
                     self.cues.index(cue),
                     dict(boundary_payload.get("boundaries") or {}),
+                    presentation_records_by_id=presentation_records_by_id,
+                    deleted_intervals=deleted_intervals,
                 )
                 source_pages = [
                     dict(page)
@@ -8991,6 +9200,8 @@ class ManualFinalSubtitleSession:
                     render_cue = self._article_render_cue(
                         self.cues.index(cue),
                         dict(boundary_payload.get("boundaries") or {}),
+                        presentation_records_by_id=presentation_records_by_id,
+                        deleted_intervals=deleted_intervals,
                     )
                 try:
                     plan = reflow_article_frozen_page_plan_same_screen(
@@ -9001,13 +9212,23 @@ class ManualFinalSubtitleSession:
                     raise ManualFinalSubtitleEditError(
                         "manual_page_translation_required: 冻结分页的页内排版无法升级。"
                     ) from exc
+                if deleted_intervals:
+                    try:
+                        plan = self._reconcile_frozen_display_page_timing(
+                            plan,
+                            render_cue,
+                        )
+                    except RenderStructuralOverflowError as exc:
+                        raise ManualFinalSubtitleEditError(
+                            "manual_page_translation_required: 删除区间后的分页时间无法重建。"
+                        ) from exc
                 # A tail trim (or another parent-local timing edit) can change
                 # the cue envelope while the frozen page spans remain valid.
                 # Keep the page IDs, word ranges, and interior boundaries
                 # frozen, but reconcile only the two outer display edges with
                 # the current authoritative parent cue.
                 frozen_pages = list(plan.get("pages") or [])
-                if self.tail_trim and frozen_pages:
+                if self.tail_trim and frozen_pages and not deleted_intervals:
                     frozen_pages[0]["start_ms"] = int(cue["start_time"])
                     frozen_pages[-1]["end_ms"] = int(cue["end_time"])
                     plan["pages"] = frozen_pages
@@ -9288,20 +9509,13 @@ class ManualFinalSubtitleSession:
         render_block_reason = ""
         blueprint: Dict[str, Any] = {}
         try:
-            frozen_blueprint = self._blueprint_from_frozen_display_page_edits()
+            frozen_blueprint = self._blueprint_from_frozen_display_page_edits(
+                presentation_records_by_id=presentation_records_by_id,
+                deleted_intervals=deleted_intervals,
+            )
             blueprint = frozen_blueprint or build_article_display_page_blueprint(
                 render_cues
             )
-            if frozen_blueprint and deleted_intervals:
-                for plan in blueprint.get("render_plans") or []:
-                    for page in plan.get("pages") or []:
-                        projected = project_retained_interval(
-                            int(page["start_ms"]),
-                            int(page["end_ms"]),
-                            deleted_intervals,
-                        )
-                        page["start_ms"] = projected["start_ms"]
-                        page["end_ms"] = projected["end_ms"]
             multipage_parents = list(blueprint.get("parents") or [])
             page_response = self._display_page_edit_translation_response(
                 multipage_parents,
