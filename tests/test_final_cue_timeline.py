@@ -145,8 +145,8 @@ def test_short_parent_gap_caps_the_next_cue_lead_in():
     assert timeline["validation"]["status"] == "PASS"
 
 
-def test_one_second_parent_pause_is_not_chained():
-    words = _words((1000, 2000), (3000, 3800))
+def test_one_and_a_half_second_parent_pause_is_not_chained():
+    words = _words((1000, 2000), (3500, 4300))
     timeline = derive_final_cue_timeline(
         [
             {"subtitle_id": "S0001", "word_start": 0, "word_end": 0},
@@ -160,11 +160,36 @@ def test_one_second_parent_pause_is_not_chained():
 
     left, right = timeline["records"]
     assert left["end_ms"] == 2260
-    assert right["start_ms"] == 2960
-    assert right["start_ms"] - left["end_ms"] == 700
+    assert right["start_ms"] == 3460
+    assert right["start_ms"] - left["end_ms"] == 1200
     assert timeline["validation"]["status"] == "PASS"
     assert not any(
         item["code"] == "final_timeline_short_gap_chained"
+        for item in timeline["boundary_reconciliations"]
+    )
+
+
+def test_one_second_parent_pause_is_chained():
+    words = _words((1000, 2000), (3000, 3800))
+    timeline = derive_final_cue_timeline(
+        [
+            {"subtitle_id": "S0001", "word_start": 0, "word_end": 0},
+            {"subtitle_id": "S0002", "word_start": 1, "word_end": 1},
+        ],
+        words,
+        expected_subtitle_ids=["S0001", "S0002"],
+        lead_in_ms=40,
+        tail_padding_ms=260,
+    )
+
+    left, right = timeline["records"]
+    assert left["end_ms"] == right["start_ms"] == 2800
+    assert right["word_envelope_start_ms"] - right["start_ms"] == 200
+    assert timeline["validation"]["status"] == "PASS"
+    assert any(
+        item["code"] == "final_timeline_short_gap_chained"
+        and item["word_gap_ms"] == 1000
+        and item["old_display_gap_ms"] == 700
         for item in timeline["boundary_reconciliations"]
     )
 
@@ -464,7 +489,8 @@ if __name__ == "__main__":
     test_padding_overlap_is_reconciled_without_cutting_either_word_envelope()
     test_short_parent_gap_is_chained_at_the_original_three_quarter_boundary()
     test_short_parent_gap_caps_the_next_cue_lead_in()
-    test_one_second_parent_pause_is_not_chained()
+    test_one_and_a_half_second_parent_pause_is_not_chained()
+    test_one_second_parent_pause_is_chained()
     test_existing_timeline_artifact_preserves_boundary_reconciliation_evidence()
     test_short_response_uses_available_silence_for_target_display_duration()
     test_short_response_keeps_best_safe_duration_when_target_is_impossible()
