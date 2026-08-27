@@ -110,7 +110,7 @@ WhisperX alignment, or the final cue timeline.
   comma/semicolon boundary is available, that punctuation boundary is preferred
   before other legal lexical breaks.
 - The mixed working tree has been split into mechanism-scoped commits through
-  `12b1e50`; remaining uncommitted changes are limited to the unresolved
+  `9e43927`; remaining uncommitted changes are limited to the unresolved
   article page-selection experiment, an untested synthesis-button enable path,
   historical audit updates, and generated evidence.
 
