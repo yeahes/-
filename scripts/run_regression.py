@@ -1,4 +1,7 @@
 import argparse
+import atexit
+import datetime as _datetime
+import os
 import re
 import subprocess
 import sys
@@ -10,23 +13,102 @@ ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / "runtime" / "python.exe"
 if not PYTHON.exists():
     PYTHON = Path(sys.executable)
+REGRESSION_LOG_DIR = ROOT / "output" / "regression-logs"
+REGRESSION_SITE_CUSTOMIZE = ROOT / "sitecustomize.py"
+_FAILURE_MARKERS = re.compile(r"AssertionError|Error:|FAILED|Traceback")
+_LOG_NOISE = re.compile(r"logging|WinError 32", re.IGNORECASE)
+_SITE_CUSTOMIZE_INSTALLED = False
 
 
-def run_step(name: str, args: list[str], allow_warning_exit: bool = False) -> tuple[int, float]:
+def _regression_environment() -> dict[str, str]:
+    """Keep test-only logging behavior out of the production logger config."""
+    global _SITE_CUSTOMIZE_INSTALLED
+    environment = os.environ.copy()
+    environment["VC_REGRESSION_DISABLE_LOG_ROTATION"] = "1"
+    owns_sitecustomize = environment.get("VC_REGRESSION_SITE_OWNER") != "1"
+    if owns_sitecustomize:
+        environment["VC_REGRESSION_SITE_OWNER"] = "1"
+    if owns_sitecustomize and not _SITE_CUSTOMIZE_INSTALLED:
+        REGRESSION_SITE_CUSTOMIZE.write_text(
+            """import logging.handlers\nimport os\n\n\nif os.environ.get(\"VC_REGRESSION_DISABLE_LOG_ROTATION\") == \"1\":\n\n    class _RegressionFileHandler(logging.FileHandler):\n        def __init__(self, filename, mode=\"a\", encoding=None, delay=False, errors=None, **_):\n            super().__init__(filename, mode=mode, encoding=encoding, delay=delay, errors=errors)\n\n    logging.handlers.RotatingFileHandler = _RegressionFileHandler\n""",
+            encoding="utf-8",
+        )
+        _SITE_CUSTOMIZE_INSTALLED = True
+        atexit.register(_remove_test_sitecustomize)
+    return environment
+
+
+def _remove_test_sitecustomize() -> None:
+    if _SITE_CUSTOMIZE_INSTALLED and REGRESSION_SITE_CUSTOMIZE.exists():
+        REGRESSION_SITE_CUSTOMIZE.unlink()
+
+
+def _write_step_log(name: str, output: str) -> Path:
+    REGRESSION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = _datetime.datetime.now().strftime("%Y%m%dT%H%M%S.%f")
+    path = REGRESSION_LOG_DIR / f"{_slug(name)}-{timestamp}.log"
+    path.write_text(output, encoding="utf-8")
+    return path
+
+
+def _failure_excerpt(output: str) -> list[str]:
+    lines = [line for line in output.splitlines() if not _LOG_NOISE.search(line)]
+    tail = lines[-30:]
+    markers = [line for line in lines if _FAILURE_MARKERS.search(line)]
+    return tail + [line for line in markers if line not in tail]
+
+
+def run_step(
+    name: str,
+    args: list[str],
+    allow_warning_exit: bool = False,
+    *,
+    verbose: bool = False,
+) -> tuple[int, float]:
     print(f"\n== {name} ==")
     started = time.perf_counter()
-    result = subprocess.run(
-        [str(PYTHON), *args],
-        cwd=str(ROOT),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    command = [str(PYTHON), *args]
+    if verbose:
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=_regression_environment(),
+        )
+        output_parts: list[str] = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            output_parts.append(line)
+        result_code = process.wait()
+        output = "".join(output_parts)
+    else:
+        result = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_regression_environment(),
+        )
+        result_code = result.returncode
+        output = result.stdout or ""
     elapsed = time.perf_counter() - started
-    if result.returncode != 0 and not allow_warning_exit:
-        print(f"FAILED: {name} exited with {result.returncode}")
-    print(f"{name}: {('PASS' if result.returncode == 0 else 'WARN' if allow_warning_exit else 'FAIL')} ({elapsed:.2f}s)")
-    return result.returncode, elapsed
+    log_path = _write_step_log(name, output)
+    if result_code != 0 and not allow_warning_exit:
+        print(f"FAILED: {name} exited with {result_code}")
+        for line in _failure_excerpt(output):
+            print(line)
+        print(f"Full log: {log_path}")
+    print(f"{name}: {('PASS' if result_code == 0 else 'WARN' if allow_warning_exit else 'FAIL')} ({elapsed:.2f}s)")
+    return result_code, elapsed
 
 
 def _slug(value: str) -> str:
@@ -56,6 +138,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--list",
         action="store_true",
         help="list check slugs and exit",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="stream each check's captured output to the terminal",
     )
     return parser.parse_args(argv)
 
@@ -362,7 +449,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     started_all = time.perf_counter()
     for name, args, allow_warning_exit in selected_checks:
-        code, _elapsed = run_step(name, args, allow_warning_exit=allow_warning_exit)
+        code, _elapsed = run_step(
+            name,
+            args,
+            allow_warning_exit=allow_warning_exit,
+            verbose=options.verbose,
+        )
         if code != 0 and not allow_warning_exit:
             failures.append(name)
             if options.fail_fast:
