@@ -108,8 +108,8 @@ SUBTITLE_DURATION_INVALID_MS = 150
 SUBTITLE_DURATION_ERROR_MS = 250
 SUBTITLE_DURATION_WARNING_MS = 500
 SCREEN_SUBTITLE_PROMPT_VERSION = "global-subtitle-id-v2"
-SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v4"
-SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v7"
+SEMANTIC_ALLOCATION_PROMPT_VERSION = "semantic-allocation-v5"
+SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION = "semantic-full-translation-v8"
 SEMANTIC_FULL_TRANSLATION_CONTEXT_VERSION = "semantic-full-translation-context-v1"
 SEMANTIC_FULL_TRANSLATION_SOURCE_ECHO_VERSION = "semantic-full-translation-source-echo-v1"
 SEMANTIC_FULL_TRANSLATION_STYLE_RETRY_PROMPT_VERSION = "semantic-full-translation-style-retry-v1"
@@ -128,7 +128,7 @@ LEGACY_FULL_TRANSLATION_CACHE_ALLOCATION_CONTRACTS = (
         "fixed_id_allocation_algorithm_version": "fixed-id-allocation-v4",
     },
 )
-SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v7"
+SEMANTIC_FULL_TRANSLATION_CACHE_TASK = "screen_subtitle_semantic_full_translation_v8"
 LEGACY_SEMANTIC_FULL_TRANSLATION_UNIT_CACHE_TASK = (
     "screen_subtitle_semantic_full_translation_unit_v1"
 )
@@ -327,6 +327,12 @@ Write a fresh compact translation from `full_english`, using the reference only
 to avoid losing an established name, number, or domain term.
 
 Rules:
+- Before drafting, make a compact meaning checklist from the English: actor,
+  action, object, entity/name, number or unit, time, negation, comparison,
+  condition/cause, conclusion, and speaker stance. Every fact-bearing item
+  must survive in Chinese. Omit only empty conversational padding, never a
+  logical relation that changes why, when, whether, or under what condition
+  something is true.
 - Translate the complete meaning, not the English word order.
 - Use polished magazine/documentary/finance explainer narration.
 - Write for a one-glance video subtitle, not for a transcript or written essay.
@@ -361,6 +367,10 @@ Rules:
 - Do not remove a reaction, hedge, or stance when it is independently spoken
   meaning. Concision may remove verbal padding, never facts or speaker intent.
 - Keep facts, numbers, names, negation, contrast, conditions, modality, and speaker stance.
+- Preserve logical markers such as because, so, but, although, if, unless,
+  rather than, instead of, only when, and not just. They may become natural
+  Chinese constructions such as “要……得……”, “并非……而是……”, or
+  “只有……才……”, but the relation itself must remain explicit.
 - Avoid stiff translationese and overly literal English sentence shape.
 - Default to Chinese commas, full stops, colons, semicolons, or parentheses to organize a sentence.
 - Do not use em dashes for ordinary explanations, examples, appositives, causes, or results.
@@ -395,6 +405,10 @@ Task:
 Given a full English sense group, its completed Chinese translation, and fixed subtitle parts, write one concise Chinese subtitle for each part.
 
 Rules:
+- Read the complete group as one Chinese sentence before assigning parts. The
+  concatenated subtitles must be a fluent read-through, not a character slice
+  of full_translation. Keep a short connective or pronoun when it is needed
+  for continuity; do not trade away a fact to satisfy one short duration.
 - Return one translation object for every subtitle_parts item.
 - Keep exactly the same subtitle_id set as subtitle_parts.
 - Do not change, omit, summarize, or reorder the English parts.
@@ -411,6 +425,11 @@ Rules:
 - If a part is an incomplete English fragment, make the Chinese fragment natural in context.
 - When an English subject receives its predicate in a later part, keep the Chinese subject-predicate relation readable across those parts. Add a minimal pronoun or connective when needed; do not copy English modifier order.
 - When a part begins with an explicit causal, conditional, or concessive relation, keep the preceding main-clause action on its earlier subtitle_id and begin this part with the matching Chinese relation rather than a displaced main clause.
+- If a boundary would leave a page/part ending in a bare “的/在/从/对/把/将”
+  or a similarly governed head, first rephrase within the supplied meaning so
+  the two subtitles read naturally in order. Leave a fragment only when the
+  frozen English itself is an unavoidable continuation and no legal Chinese
+  reordering exists.
 - Do not use a subtitle_id only as a dangling Chinese syntactic scaffold. A non-final part may continue into the next ID, but it must not end on a bare preposition or other head that has no governed phrase in the same part.
 - Every subtitle_parts item includes target_zh_chars and absolute_max_zh_chars derived from its display duration. Treat target_zh_chars as a preferred reading budget, not a reason to omit meaning. If one part is too short, distribute the same completed Chinese meaning naturally across adjacent IDs in the same group.
 - For comparisons, lists, and source attributions, rebuild the Chinese sentence first. Do not leave the final subtitle part as a bare list of publications, dates, or nouns without the comparison/action that governs it.
@@ -18067,6 +18086,23 @@ class ScreenSubtitleEditor:
                 merged,
             )
         )
+        # English often uses "because to ... we have/need to ..." as a
+        # purpose construction. Concise Chinese naturally renders that as
+        # "要……得/需……"; requiring the literal 因为 would create a false
+        # semantic-loss finding and an unnecessary retry/review.
+        because_to_purpose = bool(
+            re.search(
+                r"\bbecause\s+to\b.*\b(?:have|has|need|needs|must)\s+to\b",
+                full_en,
+                re.IGNORECASE,
+            )
+        )
+        chinese_purpose_construction = bool(
+            re.search(
+                r"(?:要|为了)[^。！？]{1,60}(?:得|需|需要|必须|就得|就要)",
+                merged,
+            )
+        )
 
         # Chinese negation can be written as “并非”; account for it before
         # treating an otherwise complete allocation as a semantic-loss risk.
@@ -18083,6 +18119,12 @@ class ScreenSubtitleEditor:
                 english_marker == "because"
                 and just_because_non_entailment
                 and chinese_non_entailment
+            ):
+                continue
+            if (
+                english_marker == "because"
+                and because_to_purpose
+                and chinese_purpose_construction
             ):
                 continue
             if english_marker in full_en and not any(option in merged for option in zh_options):
@@ -20413,6 +20455,7 @@ class ScreenSubtitleEditor:
             payload_by_id=payload_by_id,
             full_translations=result,
         )
+        result = self._repair_attached_backchannel_full_translations(groups, result)
         self._store_semantic_full_translation_units(payload_by_id, result)
 
         final_missing_ids = [int(entry["id"]) for entry in payload if int(entry["id"]) not in result]
@@ -23743,27 +23786,74 @@ class ScreenSubtitleEditor:
 
     @staticmethod
     def _compact_attached_backchannel_translation(english: str, chinese: str) -> str:
-        """Drop only a mechanical Chinese acknowledgement before real content."""
+        """Keep a spoken acknowledgement in the shortest useful Chinese form.
+
+        Older code removed ``对/没错/是的`` whenever the English cue began with
+        ``Yeah/Yes/Right/Exactly``.  That treated a spoken stance marker as
+        disposable scaffolding and caused the manual-final samples to restore
+        meaning that the automatic result had dropped.  A one- or two-character
+        marker is cheap on screen, so preserve it or add the compact marker when
+        the source explicitly contains an attached acknowledgement.
+        """
         source = " ".join(str(english or "").split())
         translation = str(chinese or "").strip()
         if not source or not translation:
+            standalone_match = re.fullmatch(
+                r"(yeah|yes|right|exactly)[.!?]?",
+                source,
+                flags=re.IGNORECASE,
+            )
+            if standalone_match and not translation:
+                return {
+                    "yeah": "嗯。",
+                    "yes": "是的。",
+                    "right": "对。",
+                    "exactly": "没错。",
+                }[standalone_match.group(1).lower()]
             return translation
-        if not re.match(
-            r"^(?:yeah|yes|right|exactly)(?:[,.])\s+\S",
+        marker_match = re.match(
+            r"^(yeah|yes|right|exactly)(?:[,.!?])\s+\S",
             source,
             flags=re.IGNORECASE,
+        )
+        if not marker_match:
+            return translation
+        if re.match(
+            r"^(?:嗯|啊|哦|对|对的|没错|是|是的|正是如此|确实(?:如此)?)(?:[，,。.!！?？\s]|$)",
+            translation,
         ):
             return translation
-        compact = re.sub(
-            r"^(?:对|对的|没错|是的|正是如此|确实如此)"
-            r"(?:[，,。.!！]+\s*)+",
-            "",
-            translation,
-            count=1,
-        ).strip()
-        if not compact or not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", compact):
-            return translation
-        return compact
+        compact_marker = {
+            "yeah": "嗯",
+            "yes": "是的",
+            "right": "对",
+            "exactly": "没错",
+        }[marker_match.group(1).lower()]
+        return f"{compact_marker}，{translation}"
+
+    @classmethod
+    def _repair_attached_backchannel_full_translations(
+        cls,
+        groups: Sequence[Dict],
+        translations: Mapping[int, str],
+    ) -> Dict[int, str]:
+        """Apply the same compact backchannel repair to every full-translation path."""
+        result = {
+            int(group_id): str(text or "").strip()
+            for group_id, text in translations.items()
+        }
+        for group in groups:
+            group_id = int(group.get("id") or 0)
+            if group_id not in result:
+                continue
+            full_english = " ".join(
+                str(item.original or "") for item in group.get("items") or []
+            )
+            result[group_id] = cls._compact_attached_backchannel_translation(
+                full_english,
+                result[group_id],
+            )
+        return result
 
     def _translate_semantic_subtitle_groups_single_stage(
         self, items: List[ScreenSubtitleItem], groups: Sequence[Dict]
@@ -23848,6 +23938,10 @@ class ScreenSubtitleEditor:
         single_stage_full_translations = self._semantic_full_translations_from_groups_data(
             groups_data if isinstance(groups_data, list) else []
         )
+        single_stage_full_translations = self._repair_attached_backchannel_full_translations(
+            groups,
+            single_stage_full_translations,
+        )
         self._last_semantic_full_translations = dict(single_stage_full_translations)
         self._last_semantic_group_audit_contexts = self._semantic_group_audit_contexts(
             groups,
@@ -23872,6 +23966,10 @@ class ScreenSubtitleEditor:
             for offset, item in enumerate(group_items):
                 subtitle_id = expected_ids[offset]
                 translated = str(translations.get(subtitle_id, "")).strip()
+                translated = self._compact_attached_backchannel_translation(
+                    item.original,
+                    translated,
+                )
                 result.append(
                     ScreenSubtitleItem(
                         source_ids=item.source_ids,

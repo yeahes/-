@@ -10435,6 +10435,17 @@ def test_just_because_non_entailment_translation_is_not_semantic_loss():
     assert "semantic_loss" not in {finding["code"] for finding in findings}
 
 
+def test_because_to_purpose_translation_is_not_semantic_loss():
+    editor = _id_editor()
+    english = (
+        "Because to understand how we arrived here, we have to look at the "
+        "structural foundation."
+    )
+    chinese = "要理解我们如何走到这一步，就得看看结构根基。"
+
+    assert not editor._has_core_semantic_loss(chinese, chinese, english)
+
+
 def test_invalid_single_cue_quality_preserves_authoritative_translation_for_review():
     editor = _id_editor()
     items = editor._assign_global_subtitle_ids(_id_items(2))
@@ -10542,9 +10553,9 @@ def test_full_translation_requests_are_chunked_and_retry_missing_groups():
         full_translations = editor._translate_semantic_group_full_translations(groups)
 
     assert calls == [
-        ("screen_subtitle_semantic_full_translation_v7", list(range(1, 9))),
-        ("screen_subtitle_semantic_full_translation_v7", [9, 10, 11, 12]),
-        ("screen_subtitle_semantic_full_translation_v7_retry", list(range(2, 9))),
+        ("screen_subtitle_semantic_full_translation_v8", list(range(1, 9))),
+        ("screen_subtitle_semantic_full_translation_v8", [9, 10, 11, 12]),
+        ("screen_subtitle_semantic_full_translation_v8_retry", list(range(2, 9))),
     ]
     assert full_translations == {
         group_id: f"full-{group_id}" for group_id in range(1, 13)
@@ -10723,19 +10734,47 @@ def test_full_translation_prompt_restrains_ordinary_chinese_em_dashes():
     assert "translation_budget" in SEMANTIC_FULL_TRANSLATION_PROMPT
     assert "soft reading target" in SEMANTIC_FULL_TRANSLATION_PROMPT
     assert "The main takeaway is that X" in SEMANTIC_FULL_TRANSLATION_PROMPT
-    assert SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION == "semantic-full-translation-v7"
-    assert SEMANTIC_FULL_TRANSLATION_CACHE_TASK == "screen_subtitle_semantic_full_translation_v7"
+    assert "compact meaning checklist" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert "要……得……" in SEMANTIC_FULL_TRANSLATION_PROMPT
+    assert SEMANTIC_FULL_TRANSLATION_PROMPT_VERSION == "semantic-full-translation-v8"
+    assert SEMANTIC_FULL_TRANSLATION_CACHE_TASK == "screen_subtitle_semantic_full_translation_v8"
 
 
-def test_attached_backchannel_chinese_is_compacted_without_erasing_responses():
+def test_attached_backchannel_chinese_stays_compact_without_being_dropped():
     compact = ScreenSubtitleEditor._compact_attached_backchannel_translation
 
-    assert compact("Yeah. This pattern spread quickly.", "对，这种模式迅速传播。") == "这种模式迅速传播。"
-    assert compact("Right, the numbers changed.", "没错，数字发生了变化。") == "数字发生了变化。"
-    assert compact("Exactly. That is the point.", "正是如此。这就是关键。") == "这就是关键。"
+    assert compact("Yeah. This pattern spread quickly.", "这种模式迅速传播。") == "嗯，这种模式迅速传播。"
+    assert compact("Right, the numbers changed.", "数字发生了变化。") == "对，数字发生了变化。"
+    assert compact("Exactly. That is the point.", "正是如此。这就是关键。") == "正是如此。这就是关键。"
     assert compact("Yeah.", "对。") == "对。"
     assert compact("No. That is not true.", "不。事实并非如此。") == "不。事实并非如此。"
     assert compact("Wow. That changed everything.", "哇，这改变了一切。") == "哇，这改变了一切。"
+
+
+def test_standalone_backchannel_missing_translation_is_restored_compactly():
+    compact = ScreenSubtitleEditor._compact_attached_backchannel_translation
+
+    assert compact("Yeah.", "") == "嗯。"
+    assert compact("Yes.", "") == "是的。"
+    assert compact("Right.", "") == "对。"
+    assert compact("Exactly.", "") == "没错。"
+    assert compact("No.", "") == ""
+
+
+def test_full_translation_reinstates_compact_attached_backchannel_from_cached_text():
+    editor = _id_editor()
+    items = editor._assign_global_subtitle_ids(
+        [ScreenSubtitleItem(source_ids=[1], original="Yeah. This pattern spread quickly.", translated="")]
+    )
+    groups = [_id_group(1, 0, [items[0]])]
+    with patch.object(
+        editor,
+        "_load_semantic_full_translation_unit",
+        return_value="这种模式迅速传播。",
+    ), patch.object(editor, "_store_semantic_full_translation_units"):
+        translations = editor._translate_semantic_group_full_translations(groups)
+
+    assert translations == {1: "嗯，这种模式迅速传播。"}
 
 
 def test_full_translation_em_dash_style_detector_ignores_lexical_hyphen():
@@ -10755,7 +10794,7 @@ def test_full_translation_style_retry_only_retries_flagged_group_and_accepts_imp
 
     def request(prompt, payload, cache_task, **kwargs):
         calls.append((cache_task, [entry["id"] for entry in payload]))
-        if cache_task == "screen_subtitle_semantic_full_translation_v7":
+        if cache_task == "screen_subtitle_semantic_full_translation_v8":
             return {
                 "groups": [
                     {
@@ -10786,7 +10825,7 @@ def test_full_translation_style_retry_only_retries_flagged_group_and_accepts_imp
         full_translations = editor._translate_semantic_group_full_translations(groups)
 
     assert calls == [
-        ("screen_subtitle_semantic_full_translation_v7", [1, 2]),
+        ("screen_subtitle_semantic_full_translation_v8", [1, 2]),
         ("screen_subtitle_semantic_full_translation_style_retry_v1", [2]),
     ]
     assert full_translations == {1: "这是一句普通陈述。", 2: "这项研究得出了明确结论。"}
@@ -15820,7 +15859,9 @@ if __name__ == "__main__":
     test_full_translation_missing_group_repair_has_a_hard_request_budget()
     test_full_translation_payload_includes_fixed_id_soft_reading_budgets()
     test_full_translation_prompt_restrains_ordinary_chinese_em_dashes()
-    test_attached_backchannel_chinese_is_compacted_without_erasing_responses()
+    test_attached_backchannel_chinese_stays_compact_without_being_dropped()
+    test_standalone_backchannel_missing_translation_is_restored_compactly()
+    test_full_translation_reinstates_compact_attached_backchannel_from_cached_text()
     test_full_translation_em_dash_style_detector_ignores_lexical_hyphen()
     test_full_translation_style_retry_only_retries_flagged_group_and_accepts_improvement()
     test_full_translation_style_retry_keeps_original_when_candidate_loses_number_or_negation()
