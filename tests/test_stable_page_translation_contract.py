@@ -2278,6 +2278,158 @@ def test_page_translation_unit_cache_rebinds_shifted_ids_with_same_semantics():
     )
 
 
+def test_mixed_page_batch_freezes_valid_parent_for_scoped_retry():
+    cases = [
+        _cases()["s0078_reordered_chinese"],
+        _cases()["s0252_monotonic_chinese"],
+    ]
+    parents = [
+        {
+            "parent_subtitle_id": case["subtitle_id"],
+            "english": case["english"],
+            "chinese": case["parent_chinese"],
+            "word_start": case["word_start"],
+            "word_end": case["word_end"],
+            "pages": [
+                {
+                    "display_page_id": display_page_id(case["subtitle_id"], index),
+                    "word_start": page["word_start"],
+                    "word_end": page["word_end"],
+                    "english": page["english"],
+                }
+                for index, page in enumerate(case["pages"], 1)
+            ],
+        }
+        for case in cases
+    ]
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        planner_version="mixed-batch-scoped-retry-v1",
+    )
+
+    class Cache:
+        def __init__(self):
+            self.values = {}
+            self.unit_writes = []
+
+        def get_llm_result(self, cache_key, *args, **kwargs):
+            return self.values.get(cache_key)
+
+        def set_llm_result(self, cache_key, value, *args, **kwargs):
+            self.values[cache_key] = value
+            if str(kwargs.get("task") or "").endswith("_unit_v1"):
+                self.unit_writes.append(cache_key)
+
+    cache = Cache()
+    request_scopes = []
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.target_language = "简体中文"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.cache_manager = cache
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_translation_reviews = []
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_quality_errors = lambda *args: []
+
+    def split_into_parent_batches(batch_contract, *, one_parent_per_batch=False):
+        return [
+            ScreenSubtitleEditor._display_page_contract_for_parent_ids(
+                batch_contract,
+                [parent["parent_subtitle_id"]],
+            )
+            for parent in batch_contract.get("parents") or []
+        ]
+
+    editor._display_page_translation_batch_contracts = split_into_parent_batches
+
+    def request_batch(batch_contract, *, retry_errors=None, cache_only=False):
+        if cache_only:
+            return None, False
+        request_scopes.append(
+            [
+                parent["parent_subtitle_id"]
+                for parent in batch_contract.get("parents") or []
+            ]
+        )
+        assert request_scopes[-1] == [cases[1]["subtitle_id"]]
+        return _response(cases[1]), False
+
+    editor._request_display_page_translation_batch = request_batch
+
+    def request_api(batch_contract, *, retry_errors=None):
+        request_scopes.append(
+            [
+                parent["parent_subtitle_id"]
+                for parent in batch_contract.get("parents") or []
+            ]
+        )
+        if len(request_scopes) == 1:
+            # The first parent is valid; the second parent is missing entirely.
+            return {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": cases[0]["pages"][index - 1]["chinese"],
+                    }
+                    for index, page in enumerate(parents[0]["pages"], 1)
+                ]
+            }, "", [{
+                "attempt": 1,
+                "elapsed_seconds": 0.0,
+                "response": None,
+                "error": None,
+            }]
+        if len(request_scopes) == 2:
+            assert request_scopes[-1] == [cases[1]["subtitle_id"]]
+            return {"pages": []}, "", [{
+                "attempt": 1,
+                "elapsed_seconds": 0.0,
+                "response": None,
+                "error": None,
+            }]
+        assert request_scopes[-1] == [cases[1]["subtitle_id"]]
+        return _response(cases[1]), "", [{
+            "attempt": 1,
+            "elapsed_seconds": 0.0,
+            "response": None,
+            "error": None,
+        }]
+
+    editor._request_display_page_translation_api_only = request_api
+    editor._record_llm_request = lambda *args, **kwargs: None
+    editor._record_llm_cache_stat = lambda *args, **kwargs: None
+    editor._emit_progress_event = lambda *args, **kwargs: None
+
+    first, first_hit = editor._request_display_page_translations(contract)
+    assert first_hit is False
+    assert [row["display_page_id"] for row in first["pages"]] == [
+        page["display_page_id"] for page in parents[0]["pages"]
+    ]
+    first_valid_rows = [dict(row) for row in first["pages"]]
+    assert len(cache.unit_writes) == 1
+
+    second, second_hit = editor._request_display_page_translations(contract)
+    assert second_hit is False
+    assert request_scopes == [
+        [cases[0]["subtitle_id"]],
+        [cases[1]["subtitle_id"]],
+        [cases[1]["subtitle_id"]],
+    ]
+    assert [row["display_page_id"] for row in second["pages"]] == [
+        page["display_page_id"]
+        for parent in parents
+        for page in parent["pages"]
+    ]
+    assert second["pages"][: len(first_valid_rows)] == first_valid_rows
+
+
 def test_page_translation_terminal_failure_does_not_start_later_batches():
     parents = []
     for index in range(1, 14):

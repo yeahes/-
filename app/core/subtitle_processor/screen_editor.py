@@ -3001,8 +3001,6 @@ class ScreenSubtitleEditor:
             response,
             require_source_echo=True,
         )
-        if artifact.get("status") != "PASS":
-            return
         artifact_by_parent = {
             str(parent.get("parent_subtitle_id") or ""): parent
             for parent in artifact.get("parents") or []
@@ -3024,6 +3022,16 @@ class ScreenSubtitleEditor:
                 }
                 for page in artifact_parent.get("pages") or []
             ]
+            try:
+                single_artifact = validate_page_translation_response(
+                    single_contract,
+                    {"pages": single_rows},
+                    require_source_echo=True,
+                )
+            except (TypeError, ValueError):
+                continue
+            if single_artifact.get("status") != "PASS":
+                continue
             prior_reviews = list(
                 getattr(self, "_display_page_translation_reviews", []) or []
             )
@@ -3306,11 +3314,14 @@ class ScreenSubtitleEditor:
                     response,
                     retry_errors=batch_retry_errors,
                 )
-                if not batch_retry_errors:
-                    self._store_display_page_translation_units(
-                        batch_contract,
-                        response,
-                    )
+            if not batch_retry_errors:
+                # A mixed batch can contain valid and invalid parents. Store
+                # only the valid parent units so a later retry does not repeat
+                # successful requests from the same batch.
+                self._store_display_page_translation_units(
+                    batch_contract,
+                    response,
+                )
 
         if pending_batches:
             workers = min(
