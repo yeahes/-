@@ -5232,7 +5232,6 @@ def _partition_article_english_pages(
     allow_forced_continuation: bool = False,
     allow_review_boundary: bool = False,
     allow_manual_override: bool = False,
-    prefer_punctuation_for_manual_review: bool = False,
     span_layout: Callable[[int, int, int, bool], Sequence[str]] | None = None,
     span_balance: Callable[[int, int, int, int], float] | None = None,
     max_candidates: int = 1,
@@ -5328,11 +5327,7 @@ def _partition_article_english_pages(
         ),
         "span_is_readable": span_is_readable,
         "break_score": lambda end, target: (
-            (
-                _article_manual_review_break_rank
-                if prefer_punctuation_for_manual_review
-                else _article_manual_override_break_rank
-            )(
+            _article_manual_override_break_rank(
                 cue,
                 words,
                 end,
@@ -6306,7 +6301,6 @@ def _build_article_english_page_plan(
                         font_size,
                         diagnostics=attempt_diagnostics,
                         allow_manual_override=True,
-                        prefer_punctuation_for_manual_review=True,
                         span_layout=span_layout,
                         span_balance=span_balance,
                         max_candidates=ARTICLE_PAGE_CANDIDATE_FRONTIER_LIMIT,
@@ -8345,6 +8339,7 @@ def _article_manual_degraded_render_plan(
             }
         )
         return rebuilt
+
     return None
 
 
