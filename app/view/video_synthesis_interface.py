@@ -716,6 +716,12 @@ class VideoSynthesisInterface(QWidget):
             self.subtitle_input.setText(str(selected))
         if media_path:
             self.video_input.setText(str(media_path))
+        # Loading a saved manual-final package may reuse this page after a
+        # previous synthesis attempt left the action disabled.  Inputs have
+        # already passed package resolution above, so expose the action again;
+        # the synthesis thread still performs the authoritative gate checks.
+        if self.subtitle_input.text().strip() and self.video_input.text().strip():
+            self.synthesize_button.setEnabled(True)
 
     def _clear_manual_draft_mode(self, *_args) -> None:
         self._manual_draft_mode = False
