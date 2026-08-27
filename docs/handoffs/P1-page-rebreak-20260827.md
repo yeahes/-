@@ -68,3 +68,80 @@
 - 未调用 API、模型、ASR、视频合成或界面。
 - 未运行整集回归、未提交、未 push。
 - 未执行 §46.40 的自动重断验证 1/2/3；A2 已失败，继续运行会把启发式结果误当作可验证结果。
+
+## 给 Claude 的下一步建议：语义锚点分页审计（只读低风险版）
+
+### 目标
+
+在不改变字幕生成结果的前提下，发现分页中文把否定、数字、实体、单位、条件或关键动作分配到错误页面的问题。第一阶段只做离线审计，不改字幕、不改分页、不改时间轴、不调用 API。
+
+### 明确不做
+
+- 不做“每个中文字符对应英文单词”的完整对齐；中英文是多对多片段关系，且允许自然语序调整。
+- 不让 LLM 改写父级中文、分页中文、英文、字幕 ID 或时间轴。
+- 不调整页面边界、不重新切分页、不自动修复中文。
+- 不把新检查直接设为 `BLOCKER`。
+- 不读取或修改人工终稿和 `stable-runs` 产物。
+
+### 输入与现有能力
+
+只读取自动 checkpoint 中的 `authoritative-parent-chinese.json`、`display-page-translations.json`、`word-ledger.json` 和 `final-cue-timeline.json`。
+
+复用 `E:\VideoCaptioner-screen-subtitle\app\core\subtitle_processor\chinese_token_boundaries.py` 的中文词边界能力；它只能判断中文能否安全切开，不能单独证明中文片段属于哪个英文页面。
+
+### 第一阶段只检查高置信度语义锚点
+
+1. 否定：`not`、`no`、`never`、`doesn't`、`didn't`、`cannot` 等。
+2. 数字和单位：金额、百分比、年份、距离、数量、重量和货币。
+3. 实体：人名、公司名、国家、城市、产品名。
+4. 条件和转折：`if`、`unless`、`but`、`however`、`only`。
+5. 关键动作和对象：只处理能够从权威父级中文中明确找到的短语。
+
+英文锚点的归属页由固定英文词范围决定；中文锚点从权威父级中文和现有分页中文中提取。只接受高置信度匹配，不要求中英文词序完全一致，也不把普通语气词、连接词和可省略主语当作错误。
+
+### 输出
+
+新增只读离线脚本，例如 `E:\VideoCaptioner-screen-subtitle\scripts\measure_page_semantic_anchors.py`，输出写到 `output/`，不得写入 checkpoint：
+
+```json
+{
+  "status": "PASS",
+  "source_run": "...",
+  "anchor_count": 0,
+  "review_count": 0,
+  "items": [
+    {
+      "parent_subtitle_id": "S0260",
+      "anchor_type": "negation",
+      "english_anchor": "does not matter",
+      "expected_page_id": "S0260.P01",
+      "actual_page_ids": ["S0260.P02"],
+      "severity": "REVIEW",
+      "reason": "否定含义被分配到错误页面"
+    }
+  ]
+}
+```
+
+### 必须覆盖的离线测试
+
+- 锚点在正确页面：不报错。
+- 锚点在错误页面：产生 `REVIEW`。
+- 锚点缺失或重复：产生 `REVIEW`。
+- 中文自然调整语序但语义仍在正确页面：不误报。
+- 无法确定对应关系：标记 `uncertain`，不报错。
+- `S0260` 必须被识别：`does not matter` 属于 P01，但“并不重要”在 P02。
+- `S0136` 的缺少页面 ID 仍由现有结构校验负责，语义锚点脚本不代替结构校验。
+
+### 验收条件
+
+- 全程零网络、零模型调用、零 API 费用，运行时间少于 1 分钟。
+- `S0260` 被标记为 `REVIEW`，不新增 `BLOCKER`。
+- 现有字幕、分页、ID、时间轴和 checkpoint 字节内容不变。
+- 不修改既有测试断言；报告真实召回、误报和无法判断数量，不先编造总体自动化成功率。
+
+### 后续边界
+
+只有第一阶段在现有自动结果和已知缺陷上证明误报可控后，才考虑把结果并入翻译审计清单。即使并入，也只能产生 `REVIEW`，不能自动改中文或自动重排页面。
+
+核心原则：先发现“关键意思去了错误页面”，再决定是否人工处理；不要先造一个看似完整、实际不可靠的逐字符中英对齐系统。
