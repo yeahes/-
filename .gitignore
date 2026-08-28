@@ -40,3 +40,4 @@ tests/caption_audit/out/
 
 # Local regression evidence and visual previews
 /output/
+tmp/

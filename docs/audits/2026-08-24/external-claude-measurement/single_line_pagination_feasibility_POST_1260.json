@@ -2,7 +2,7 @@
  "artifact_sets": 22,
  "parents": 4656,
  "font_size": 56,
- "font_file": "E:\\VideoCaptioner-screen-subtitle\\resource\\podcast_template\\fonts\\RobotoSlab-SemiBold.ttf",
+ "font_file": "/sessions/magical-zen-dijkstra/mnt/VideoCaptioner-screen-subtitle/resource/podcast_template/fonts/RobotoSlab-SemiBold.ttf",
  "caps_render_px": {
   "1100_current_gate": 1512,
   "1260_comfortable": 1512,
@@ -26,96 +26,96 @@
  },
  "A_one_line_fit_by_threshold": {
   "1100_current_gate": {
-   "fits_total": 2123,
+   "fits_total": 2116,
    "of_production_1line_fits": 1813,
-   "of_production_2line_fits": 310,
+   "of_production_2line_fits": 303,
    "of_production_2line_total": 3343
   },
   "1260_comfortable": {
-   "fits_total": 2123,
+   "fits_total": 2116,
    "of_production_1line_fits": 1813,
-   "of_production_2line_fits": 310,
+   "of_production_2line_fits": 303,
    "of_production_2line_total": 3343
   },
   "1455_english": {
-   "fits_total": 2704,
-   "of_production_1line_fits": 1912,
-   "of_production_2line_fits": 792,
+   "fits_total": 2695,
+   "of_production_1line_fits": 1910,
+   "of_production_2line_fits": 785,
    "of_production_2line_total": 3343
   },
   "1498_wide_safe": {
-   "fits_total": 2846,
-   "of_production_1line_fits": 1929,
-   "of_production_2line_fits": 917,
+   "fits_total": 2828,
+   "of_production_1line_fits": 1925,
+   "of_production_2line_fits": 903,
    "of_production_2line_total": 3343
   }
  },
  "B_min_single_line_pages_per_parent": {
   "1100_current_gate": {
-   "1": 1598,
-   "2": 2211,
-   "3": 695,
-   "4": 106,
-   "5": 36,
-   "6": 8,
+   "1": 1597,
+   "2": 2206,
+   "3": 699,
+   "4": 109,
+   "5": 34,
+   "6": 9,
    "7": 2
   },
   "1260_comfortable": {
-   "1": 1598,
-   "2": 2211,
-   "3": 695,
-   "4": 106,
-   "5": 36,
-   "6": 8,
+   "1": 1597,
+   "2": 2206,
+   "3": 699,
+   "4": 109,
+   "5": 34,
+   "6": 9,
    "7": 2
   },
   "1455_english": {
-   "1": 1995,
-   "2": 2202,
+   "1": 1990,
+   "2": 2207,
    "3": 368,
    "4": 71,
    "5": 17,
    "6": 3
   },
   "1498_wide_safe": {
-   "1": 2085,
-   "2": 2179,
-   "3": 315,
-   "4": 62,
+   "1": 2076,
+   "2": 2185,
+   "3": 320,
+   "4": 60,
    "5": 13,
    "6": 2
   }
  },
  "B_constraint_violations": {
   "1100_current_gate": {
-   "pages_total": 8771,
-   "parent_over_max_pages": 46,
-   "page_under_min_words": 2059,
+   "pages_total": 8780,
+   "parent_over_max_pages": 45,
+   "page_under_min_words": 2062,
    "page_under_min_duration": 1648
   },
   "1260_comfortable": {
-   "pages_total": 8771,
-   "parent_over_max_pages": 46,
-   "page_under_min_words": 2059,
+   "pages_total": 8780,
+   "parent_over_max_pages": 45,
+   "page_under_min_words": 2062,
    "page_under_min_duration": 1648
   },
   "1455_english": {
-   "pages_total": 7890,
-   "page_under_min_words": 1789,
+   "pages_total": 7895,
+   "page_under_min_words": 1785,
    "page_under_min_duration": 1487,
    "parent_over_max_pages": 20
   },
   "1498_wide_safe": {
-   "pages_total": 7713,
+   "pages_total": 7723,
    "page_under_min_words": 1713,
-   "page_under_min_duration": 1434,
+   "page_under_min_duration": 1439,
    "parent_over_max_pages": 15
   }
  },
  "B_control_min_two_line_pages_at_1260": {
-  "1": 3809,
-  "2": 801,
-  "3": 44,
+  "1": 3803,
+  "2": 808,
+  "3": 43,
   "4": 2
  },
  "declared_vs_actual_per_planner_version": {
@@ -174,12 +174,12 @@
   }
  },
  "page_one_line_px": {
-  "min": 90,
-  "p25": 1189,
-  "median": 1738,
-  "p75": 2300,
-  "p90": 2818,
-  "p99": 3695,
-  "max": 5567
+  "min": 91,
+  "p25": 1190,
+  "median": 1741,
+  "p75": 2301,
+  "p90": 2821,
+  "p99": 3712,
+  "max": 5571
  }
 }

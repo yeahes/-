@@ -1,15 +1,14 @@
 # Project State
 
 Status: in_progress
-Last verified: 2026-08-27 15:27:08 Asia/Shanghai
-Branch: main
-Verified HEAD: b1ae687
-Working tree: modified (16 entries: 7 tracked evidence files and 9 untracked audit/report files remain intentionally isolated)
+Last verified: 2026-08-28 21:06:22 Asia/Shanghai
+Branch: codex/backup-20260828
+Verified HEAD: 4959be4
+Working tree: staged backup candidate; local generated media remains ignored
 
 ## Current Goal
-Keep only low-risk, high-payoff work: use the committed local retry for the
-current page blocker, preserve independent parent translation auditing, then
-measure one fresh unreviewed run.
+Prepare a recoverable GitHub backup branch containing source, tests, state,
+handoffs, and reproducible audit material without generated media.
 
 ## Confirmed Facts
 - A completed `frozen_parent_timeline` stage is reusable only under the same input fingerprint and valid file digests.
@@ -31,6 +30,34 @@ measure one fresh unreviewed run.
   (111 tests), selected-service translation audit (14), parent translation and
   backchannel rules (561), display-page translation (76), retry progress UI
   (102), and offline measurements (3 plus script self-test).
+- §46.48 is wired as a default-off article-renderer display flag. With it off,
+  page-local Chinese is unchanged; with it on, the 17 machine multi-page
+  parents display their complete parent Chinese on each frozen English page.
+- Fresh unreviewed run `人工智能会产生自我意识吗？`
+  (`20260828T124923.879908-6e68f0d2`) is bound to the current `06df6585`
+  commit and word ledger, but is `ERROR`/`render_blocked=true`: S0098 and
+  S0116 have no complete normal-font page partition, and S0100 is missing
+  `S0100.P01/P02` page translations. Its stressed audit covers 43 parents and
+  75 pages; 32 parents are multi-page and 24 page boundaries are REVIEW.
+  The run used `deepseek-v4-flash`, with 6 external attempts and 201 cache hits.
+- Same-screen wrapping now rejects a measured shorter/longer line pixel ratio
+  below `0.48`; regression coverage for the three originating cases passes.
+  Offline v33 re-planning removes the three severe imbalance pages from the
+  tested inputs, but the saved manual artifact and fresh checkpoint are not
+  rewritten.
+- Explicit manual-final synthesis now invokes frozen-page reflow for both PASS
+  display artifacts and REVIEW draft artifacts. It changes only page-local
+  English typography and preserves all frozen structural fields.
+- Manual-final reload now retries same-screen typography reflow when an
+  unchanged user-owned page range is rejected only by the legacy imbalance
+  guard. The fallback preserves page IDs, word ranges, page Chinese, and
+  timing; the desktop package now exposes S0006.P01/P02 and saves a render
+  contract successfully.
+- The latest manual-final package was synthesized locally with the committed
+  reflow code and article template at 1920x1080. The MP4 is 11:46.10 with both
+  H.264 video and AAC audio; representative frames for S0006, S0013, S0063,
+  and S0088 show balanced two-line English layouts. The formal package path now
+  detects this hash-bound manual final automatically.
 
 ## Approved Decisions
 - Do not rerun or mutate manually reviewed audio packages for retry verification.
@@ -54,16 +81,27 @@ measure one fresh unreviewed run.
 - Latest page-blocker probe: OpenCode Go retries rejected; offline candidate
   validated `status=PASS`, 55 pages, 27 multi-page parents, and renderer
   application `True` without changing the source checkpoint.
+- §46.48 read-only stable check: 17 multi-page parents, 37 pages, all complete
+  parent Chinese returned under the enabled flag; default flag is `False`.
+- Same-screen focused verification (`same_screen or severe or line_wrap`):
+  18 passed, 94 deselected; `git diff --check` passed with only known
+  LF/CRLF conversion warnings.
+- Manual/display reflow verification: article display `20 passed, 94
+  deselected`; full manual editor `137 passed`; the new affected-case test
+  passes and the render contract remains unblocked.
+- Local synthesis verification: MP4 decode completed at 1920x1080 / 11:46.10;
+  four representative subtitle-page frames were visually inspected and were
+  nonblank with the expected reflowed lines.
 
 ## Next Action
-Use the committed local retry on the current unreviewed run; keep successful
-pages and the independent parent audit intact, then measure one fresh run.
+Run the focused probe test and `git diff --check`, then create the local backup
+checkpoint commit. User will review and push this branch to GitHub.
 
 ## Do Not Regress
 - Preserve frozen English/IDs/word ownership/final timing, reject inconsistent checkpoints, keep successful page-batch caches, and never write `D:\\软件缓存\\VideoCaptioner`.
 
 ## Unknowns
 - Live GUI retry after application restart has not yet confirmed the new 96%-stage resume display; the offline checkpoint replay is complete.
-- It is not yet decided whether the two current page failures will be handled
-  by manual final-editor bypass or by a targeted provider retry.
+- It is not yet decided whether the three fresh-run blocking parents will be
+  handled by manual final-editor bypass or by a targeted display-stage retry.
 - The 90-95% automation target still has no fresh blind-run measurement.

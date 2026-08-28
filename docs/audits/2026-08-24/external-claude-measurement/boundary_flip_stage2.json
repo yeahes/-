@@ -1,13 +1,9 @@
 {
  "stage_a2_falsification": {
   "production_accepted_boundaries_checked": 5180,
-  "now_judged_illegal_by_harness": 516,
-  "illegal_pct": 9.96,
+  "now_judged_illegal_by_harness": 452,
+  "illegal_pct": 8.73,
   "illegal_code_histogram": [
-   [
-    "open_subordinate_prefix_fragment",
-    110
-   ],
    [
     "dependency_phrase_entrance_split",
     64
@@ -31,6 +27,10 @@
    [
     "relative_clause_entrance_split",
     40
+   ],
+   [
+    "open_subordinate_prefix_fragment",
+    37
    ],
    [
     "weak_subject_fragment",
@@ -92,11 +92,11 @@
   "per_episode": {
    "AI竞赛：中美殊途": {
     "accepted_boundaries": 225,
-    "now_illegal": 20
+    "now_illegal": 18
    },
    "中国AI为何更省钱？": {
     "accepted_boundaries": 187,
-    "now_illegal": 19
+    "now_illegal": 16
    },
    "中国人会爱上巧克力吗？": {
     "accepted_boundaries": 216,
@@ -108,39 +108,39 @@
    },
    "中国已成为世界石油强国": {
     "accepted_boundaries": 169,
-    "now_illegal": 23
+    "now_illegal": 18
    },
    "中国年轻人为何不爱留学了？": {
     "accepted_boundaries": 259,
-    "now_illegal": 25
+    "now_illegal": 22
    },
    "中式梦核：千禧一代的怀旧密码": {
     "accepted_boundaries": 201,
-    "now_illegal": 13
+    "now_illegal": 12
    },
    "创业者的天堂": {
     "accepted_boundaries": 337,
-    "now_illegal": 59
+    "now_illegal": 56
    },
    "好莱坞最新热潮：姐弟恋": {
     "accepted_boundaries": 264,
-    "now_illegal": 14
+    "now_illegal": 12
    },
    "如何停止拖延": {
     "accepted_boundaries": 286,
-    "now_illegal": 34
+    "now_illegal": 28
    },
    "如何识别人工智能写作": {
     "accepted_boundaries": 285,
-    "now_illegal": 57
+    "now_illegal": 53
    },
    "心理治疗，中国社会的奢侈品": {
     "accepted_boundaries": 194,
-    "now_illegal": 24
+    "now_illegal": 17
    },
    "无论怎么衡量，就业市场都很疲软": {
     "accepted_boundaries": 259,
-    "now_illegal": 19
+    "now_illegal": 17
    },
    "日本X世代的困境：被反复诅咒的一代人": {
     "accepted_boundaries": 240,
@@ -148,11 +148,11 @@
    },
    "烂到爆红：一部动画的逆袭": {
     "accepted_boundaries": 184,
-    "now_illegal": 17
+    "now_illegal": 15
    },
    "牛来": {
     "accepted_boundaries": 223,
-    "now_illegal": 23
+    "now_illegal": 19
    },
    "白宫对中国转运骗局的荒谬指控": {
     "accepted_boundaries": 216,
@@ -160,27 +160,27 @@
    },
    "石油市场，现在中国说了算？": {
     "accepted_boundaries": 139,
-    "now_illegal": 10
+    "now_illegal": 7
    },
    "美国已成为创业者的天堂": {
     "accepted_boundaries": 321,
-    "now_illegal": 54
+    "now_illegal": 48
    },
    "肠道菌群，能人为操控吗？": {
     "accepted_boundaries": 216,
-    "now_illegal": 17
+    "now_illegal": 15
    },
    "英伟达的硅基大决战": {
     "accepted_boundaries": 253,
-    "now_illegal": 25
+    "now_illegal": 23
    },
    "蜜雪冰城为何卖起了啤酒": {
     "accepted_boundaries": 212,
-    "now_illegal": 20
+    "now_illegal": 16
    },
    "识别": {
     "accepted_boundaries": 78,
-    "now_illegal": 12
+    "now_illegal": 9
    }
   },
   "examples": [
@@ -222,19 +222,6 @@
     "left_tail": "But they are making undeniable, steady progress,",
     "right_head": "reaching a level of miniaturization that many",
     "pause_ms": 80
-   },
-   {
-    "episode": "AI竞赛：中美殊途",
-    "ids": [
-     "S0070",
-     "S0071"
-    ],
-    "hard": [
-     "open_subordinate_prefix_fragment"
-    ],
-    "left_tail": "access to the underlying architecture, the weights,",
-    "right_head": "they can custom-tailor the model to distribute",
-    "pause_ms": 420
    },
    {
     "episode": "AI竞赛：中美殊途",
@@ -412,7 +399,6 @@
      "S0206"
     ],
     "hard": [
-     "open_subordinate_prefix_fragment",
      "short_open_prefix_fragment"
     ],
     "left_tail": "If the disruption gets too severe,",
@@ -433,17 +419,30 @@
     "pause_ms": 400
    },
    {
-    "episode": "AI竞赛：中美殊途",
+    "episode": "中国AI为何更省钱？",
     "ids": [
-     "S0225",
-     "S0226"
+     "S0021",
+     "S0022"
     ],
     "hard": [
-     "open_subordinate_prefix_fragment"
+     "right_orphaned_finite_predicate"
     ],
-    "left_tail": "is no longer to do the work,",
-    "right_head": "but simply to serve as the training",
-    "pause_ms": 381
+    "left_tail": "collective spend and just hitting a wall.",
+    "right_head": "I mean, historically, sure, massive capital expenditure",
+    "pause_ms": 400
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "ids": [
+     "S0036",
+     "S0037"
+    ],
+    "hard": [
+     "incomplete_interrogative_fragment"
+    ],
+    "left_tail": "Why the sudden panic?",
+    "right_head": "Well, the market narrative has shifted.",
+    "pause_ms": 320
    }
   ]
  },

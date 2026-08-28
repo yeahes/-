@@ -1,6 +1,6 @@
 # Current State
 
-Last verified: 2026-08-27 15:27 Asia/Shanghai
+Last verified: 2026-08-28 19:17:31 Asia/Shanghai
 
 ## Current Goal
 
@@ -175,6 +175,51 @@ ledger, WhisperX alignment, or the final cue timeline.
   returned valid analysis JSON in about 10 seconds (OpenCode) and 19 seconds
   (TokenRhythm); the same request previously timed out or returned an empty
   length-limited completion on those gateways.
+- §46.48 whole-parent-Chinese display flag is wired at the article renderer's
+  page-text selection point. `PODCAST_ARTICLE_WHOLE_PARENT_CHINESE` defaults to
+  `False`, so stable output remains unchanged unless explicitly enabled. With
+  the flag enabled, only multi-page parents display their complete parent
+  Chinese on each frozen English page; English, IDs, word spans, timing,
+  page plans, and subtitle artifacts remain unchanged. Read-only validation
+  against stable run `20260828T032249.733500-9602f073` covered 17 multi-page
+  parents and 37 pages; focused tests passed.
+- Same-screen line wrapping now rejects a severe two-line width imbalance when
+  the measured shorter/longer line pixel ratio is below `0.48`. The caller
+  receives no layout so the frozen-page planner can select another
+  already-enumerated projection or emit an explicit structural-overflow review
+  seed. This preserves parent English, IDs, word spans, timing, and page
+  Chinese. Regression coverage for the originating cases `S0006`, `S0063`, and
+  `S0088` passes; the same-layer focused set passes 18 tests.
+- A read-only stressed audit of the fresh checkpoint
+  `work-dir/人工智能会产生自我意识吗？/subtitle/stable-checkpoints/20260828T124923.879908-6e68f0d2`
+  is identity-bound (`content=PASS`) but formally `ERROR` and not publishable:
+  187 parents, 219 actual pages, 32 multipage parents, and 43 selected stressed
+  parents covering 75 pages. `S0098` and `S0116` have no complete normal-font
+  page partition; `S0100` is missing `S0100.P01/P02` page translations. These
+  are display-stage blockers, not evidence to change the frozen timeline.
+- Offline re-planning of the current v33 word ledger removes the three severe
+  imbalance pages observed in the prior manual package (`S0006.P01`,
+  `S0088.P02`, `S0063.P02`) for the tested inputs. The old artifact itself was
+  not rewritten: it remains 219 pages with 3 severe pages, 24 pages below the
+  `0.60` ratio, and 58 below `0.72`. Historical v19 automatic results show the
+  same class of defect (16 and 21 severe pages in two episodes), so this is a
+  general display-layer issue rather than an ID-specific exception. The
+  evidence is targeted/offline and does not establish a new end-to-end rate.
+- Manual-final synthesis now applies the frozen-page same-screen reflow to both
+  `PASS` display-page artifacts and `REVIEW` manual-draft artifacts when
+  `allow_manual_draft=True`. It can update only page-local English lines,
+  rendered font size, and measured width; page word ranges, page IDs, page
+  Chinese, parent English/Chinese, and page timing remain unchanged. The
+  default stable path keeps the reflow opt-in.
+- A local synthesis of the latest manual-final package completed after the
+  `ea226cc` source checkpoint. The 1920x1080 MP4 is 11:46.10 and four sampled
+  pages (`S0006`, `S0013`, `S0063`, `S0088`) show the expected balanced English
+  wraps; AI vocabulary cards were disabled, so no API call was made.
+- Manual-final reload now falls back to the existing same-screen typography
+  reflow when an unchanged user-owned page range is rejected only by the newer
+  imbalance guard. The fallback preserves page IDs, word ranges, page Chinese,
+  and timing. The desktop package reloads `S0006.P01/P02` as usable pages and
+  its render contract saves successfully; focused editor tests pass.
 
 ## Merged Status And Handoff
 
@@ -213,7 +258,9 @@ newest round and the short current-state summary.
 
 ## Next Action
 
-Use the committed local retry to handle S0136/S0260 in the current unreviewed
-run without rerunning upstream stages; keep the 55-page candidate outside the
-checkpoint, then run one fresh quality measurement. Do not rerun manually
-reviewed audio packages.
+Keep the new same-screen imbalance guard and the whole-parent-Chinese flag
+disabled by default. Do not publish checkpoint
+`20260828T124923.879908-6e68f0d2`; the next action is to reopen the current
+desktop manual package, verify the corrected page-mode editor visually, and
+save or synthesize from that package if the UI is clean. No audio rerun or API
+call is needed for this fix.

@@ -1,0 +1,82 @@
+{
+  "thresholds_design_px": {
+    "1100": 1100,
+    "1260": 1260,
+    "1455": 1455
+  },
+  "thresholds_render_px": {
+    "1100": 1320,
+    "1260": 1512,
+    "1455": 1746
+  },
+  "production_two_line_pages": 3343,
+  "fits_one_line_by_threshold": {
+    "1260": 310,
+    "1455": 792,
+    "1100": 19
+  },
+  "delta_1100_to_1260": 291,
+  "delta_1260_to_1455": 482,
+  "selected": {
+    "1100": {
+      "artifact": "work-dir\\牛来\\subtitle\\【样式字幕】牛来-FasterWhisper ✨-英语-LLM 大模型翻译-artifacts",
+      "parent_subtitle_id": "S0090",
+      "display_page_id": "S0090.P01",
+      "english": "A friend who did try to stop it, to be fair.",
+      "measured_px": 1259,
+      "word_count": 11,
+      "layouts": {
+        "1100": [
+          "A friend who did try to stop it, to be fair."
+        ],
+        "1260": [
+          "A friend who did try to stop it, to be fair."
+        ],
+        "1455": [
+          "A friend who did try to stop it, to be fair."
+        ]
+      }
+    },
+    "1260": {
+      "artifact": "work-dir\\心理治疗，中国社会的奢侈品\\subtitle\\【样式字幕】心理治疗，中国社会的奢侈品-FasterWhisper ✨-英语-LLM 大模型翻译-artifacts",
+      "parent_subtitle_id": "S0149",
+      "display_page_id": "S0149.P01",
+      "english": "We go back to that 500 yuan or 75 session fee.",
+      "measured_px": 1445,
+      "word_count": 11,
+      "layouts": {
+        "1100": [
+          "We go back to that 500 yuan or 75 session",
+          "fee."
+        ],
+        "1260": [
+          "We go back to that 500 yuan or 75 session fee."
+        ],
+        "1455": [
+          "We go back to that 500 yuan or 75 session fee."
+        ]
+      }
+    },
+    "1455": {
+      "artifact": "work-dir\\好莱坞最新热潮：姐弟恋\\subtitle\\【样式字幕】好莱坞最新热潮：姐弟恋-FasterWhisper ✨-英语-LLM 大模型翻译-artifacts",
+      "parent_subtitle_id": "S0172",
+      "display_page_id": "S0172.P01",
+      "english": "It's not just that they are scared to make a move.",
+      "measured_px": 1533,
+      "word_count": 11,
+      "layouts": {
+        "1100": [
+          "It's not just that they are scared to make",
+          "a move."
+        ],
+        "1260": [
+          "It's not just that they are scared to make a",
+          "move."
+        ],
+        "1455": [
+          "It's not just that they are scared to make a move."
+        ]
+      }
+    }
+  }
+}

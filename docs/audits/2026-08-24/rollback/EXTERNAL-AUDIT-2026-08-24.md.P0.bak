@@ -1,0 +1,3037 @@
+# 外部只读审计报告 — 2026-08-24
+
+审计者：Claude（Opus 5），以**只读**方式介入。
+分支：`main`，审计时 HEAD = `db46f68`（2026-08-24, "Improve manual subtitle editor responsiveness"）。
+
+## 0. 给接手模型的阅读说明（请先读这一节）
+
+**本次审计没有修改本仓库任何一个既有文件。**本报告与 `docs/audits/2026-08-24/external-claude-measurement/`
+下的脚本、原始 JSON 是本次唯一新增内容。所有反事实实验都是在**仓库外的独立进程内**用
+monkeypatch 完成的，磁盘上的代码始终是 `db46f68` 的原样。
+
+本报告刻意把结论分成三种，请勿混用：
+
+| 标记 | 含义 |
+| --- | --- |
+| **【实测】** | 有脚本、有原始 JSON、可复现的数字 |
+| **【已核实】** | 一手读代码确认的事实（含 file:line） |
+| **【推断】** | 由前两类推出的判断，未直接测量 |
+| **【已推翻】** | 审计者自己先前的假设，被自己的数据否掉，保留以防重复踩坑 |
+
+> **⚠ 2026-08-24 第二轮追加（发布后新增）**
+> 本文档发布后又做了一轮只读核实，结果全部集中在 **§10**，其中包含对
+> **§3.3 与 §4.1 的更正**，以及一条**新发现**（§10.2：占矛盾最大头的
+> `open_subordinate_prefix_fragment` 病灶不在有限谓语词表，而在一条正则）。
+> **前文若与 §10 冲突，以 §10 为准。**
+> 第二轮同样没有修改本仓库任何既有文件。
+>
+> **⚠ 2026-08-24 第三轮追加：§11（有实测数字，且推翻了 §10.2 的处方）**
+> §11 把上面那条"新发现"从**推断**做成了**实测**：七个 arm、5,180 条已发布边界、
+> 49,678 个候选切点全枚举，并逐条人工复核了被放宽出来的新切点。
+> 结果有三件事必须先看：
+> **(a)** §10.2 我提的"依存祖先判据"处方**只值 15 条且靠 spaCy 标注偏差碰对**，已作废；
+> **(b)** 正确判据是"从句自身有没有有限谓语"，配上"须以逗号结尾"这道闸
+> （§11 的 arm F），可消掉 64 条矛盾、新增非法 0 条、只多开 69 个候选切点且质量良好；
+> **(c)** 数字最漂亮的 arm 不是最该采纳的 arm ——
+> "消掉的矛盾条数"不能当优化目标，理由见 §11.5。
+> **§10 与 §11 冲突处一律以 §11 为准。**
+>
+> **⚠ 2026-08-24 第四轮追加：§13（针对你已落地的实现，有实测）**
+> 你报的"8 个回归"方向判断正确，但根因不在判据、在接线：
+> **arm F 被接到了共享 helper `_fragment_has_finite_predicate` 上（6595-6600）**，
+> 于是"修 helper"和"上 arm F"成了同一次编辑，二者的影响在代码上无法分离。
+> 该 helper 的返回值有 **35.9%（1,837/5,123）会翻转**，而它有 11 个消费点，
+> 显示层五条 `visual_*` 全部门控在 `not has_finite_predicate` 上 ——
+> 测试成批失败是算术必然。**处置见 §13.2：给 arm F 一个私有判据，本轮别动共享 helper。**
+> 另有一条**阻塞项**：`@classmethod` 改成实例方法后，三个基线脚本的 `.__func__`
+> 解包会抛 `AttributeError`，当前工作树上跑不出回归基线（§13.4.1）。
+>
+> **⚠ 2026-08-24 第五轮追加：§15（S2 门禁）+ §16（脚本可独立运行 / 预期收益分层）**
+> 你的拆分方向正确，且恢复 `@classmethod` 比我的建议更好（我的基线脚本因此免改即可跑）。
+> 但 **`measure_stage2.py` 在你当前工作树上返回 5,180 / 516 / `open_sub` 110 ——
+> 与改动前基线逐位相同，收益为 0**：该 code 有**两处发射源**，你只豁免了一处
+> （6292 用新判据 ✓，6440 经 `_evaluate_final_display_fragment` 仍读原判据 ✗）。
+> 把 arm F 接到两处即复现 **452 / 37**，与 §11 预测精确一致 → 规则是对的，接线只做了一半。
+> 因第二处宿主函数有 11 个调用者（含 3 个显示层），**处置用 §15.4 的方案 B**：
+> 在 6241 与 6246 之间的**单一边界消费点**后置过滤该 code，`_evaluate_final_display_fragment` 一行不改。
+> **S2 放行条件：452 / 37，且新增合法候选切点 ≤ 69，且显示层测试未改而全绿。**
+>
+> §16 两件事，请在动手前读：**(1)** 那 10 个测量脚本现在路径无关，
+> Windows 上 `python docs\audits\...\measure_stage2.py` 直接可跑，你能自查（§16.1）；
+> **(2) 不要把 516 → 452 当成效果指标**——它衡量的是规则自相矛盾，不是切得更好；
+> 代价函数从未被测量，2,122 个"合法但未被选中"的切点就是证据（§16.3）。
+> 另有一条实测到的落地成本：**重跑会触发中文重翻，人工校过的段落会回到未校状态（§16.4）。**
+>
+> **⚠ 2026-08-24 第六轮追加：§17（对你"本轮已完成"那条报告的复核，有实测）**
+> 在你 08:49 那棵树（+61/−1）上重跑：**规则和实现都对，但生产收益仍然是 0。**
+> `measure_stage2.py` 输出 **5180 / 516 / open_sub=110**，与改动前基线一字未变（§17.2）。
+> 原因是同一个 code 有**两个发射源**，你只豁免了 6291 那个，**6440 那个还在报**，
+> 两者在 6246 合并 → 结果照旧非法。**缺的只是一处接线，代码见 §17.3。**
+> 好消息有两条：**(1)** 你的实现与审计规格**语义等价已被证明**——两套独立实现在两个
+> 测量面上给出同一组数（452/37 与 newly_legal=69 / newly_illegal=0，§17.4）；
+> **(2)** §13.4 那三处硬伤现在都不影响 arm F 了（§17.5），其中"恢复 classmethod"
+> 比审计者原先的建议更好，已采纳你的判断。
+> 另发现一条非阻塞项：spaCy 回退路径让切分结果与环境相关，但**失败朝保守侧倒**，
+> 建议把模型可用性写进证据文件以免静默漂移（§17.6）。
+> **S2 放行条件（已预登记，你可自验）：452 / 5180，open_sub=37，且 newly_illegal 仍为 0。**
+>
+> **⚠ 2026-08-24 第七轮追加：§19（优先级被推翻，请务必读；有实测）**
+> **补完 S2 之后不要按 §18.3/18.4 走。** 实测发现真正的瓶颈不在切分质量，
+> 而在**审校清单根本不工作**：`qa-review-points.json` 在 47 个产物集上
+> **中位数 0 条、最大 2 条**，因为 `_editor_review_points`（12746-12814）
+> **只遍历 `_last_allocation_unresolved`**（中文分配失败），
+> 结构上不消费边界合法性、父字幕长度、分页结果、时长/词数地板、字号回退、行数异常。
+> 用户列出的三类担忧（长句切坏害翻译 / 分页差 / 短字幕）**没有一类被覆盖** ——
+> 所以他必须逐条看 230 条字幕，这不是习惯问题，是清单没在替他筛。
+> **用户目标"自动化 90-95%"是审校覆盖率指标，不是切分质量指标**：
+> 就算把 516 刷到 0，他仍然要逐条看。
+> **新 #1 = 一份只读审校清单（recall 优先）**，所需信号全部已冻结在产物里且本报告已量化
+> （§19.3 的表），零生产改动、零重跑、不触发中文重翻。
+> **项目终止条件见 §19.5：在一集上测出"我改了但清单没标"的召回缺口。
+> 那个数出来之前，任何进一步的切分/分页工程都是在无目标函数的空间里搜索。**
+>
+> **⚠ 2026-08-24 第八轮追加：§20 无人值守工单 —— 用户已离开，这是你现在的执行依据**
+> **请直接跳到 §20 并按 A→B→C→D→E→F 顺序执行。** 你自己提的四步计划结构正确，
+> 但有三处会出事，§20 已修正：**(1)** "固定成基线"必须在接线补完**之后**做，
+> 否则会把 516 焊成基线、收益永久丢失；**(2)** 1260px 的取舍**你不得自行决定**，
+> 它是可读性权衡，且候选值有 1260 和 1455 两个，必须都出对照图交用户挑；
+> **(3)** 真实音频回归**不得对已人工校对的产物集重跑**，否则用户的中文校对成果被冲掉。
+> 另外你的计划整体仍在"让规则自洽"这条线上，缺了 §19 认定的真瓶颈（审校清单不工作），
+> 已补为 §20 的 C 项，**它是本工单最高价值项**。
+> **每一步的验收数字都在你动手之前写好，你可自验但不得修改目标值；
+> 对不上就停下写明原因，不要改断言迁就实现。**
+> 用户回来只看 `执行进展-给用户.md`，需要他决定的事集中列在该文件末尾。
+>
+> **🛑 2026-08-24 第九轮自我纠错：§21 推翻了 §19 和 §20-C，先读 §21 再动手。**
+> 产品里**已经有**真正的审校清单 `editor-review-ledger.json`
+> （`subtitle_review_marks.py:32`），标出率 12–27%，已落在预登记门禁内；
+> 我此前测的 `qa-review-points.json` 是死路径，`§19` 关于"结构性不覆盖"的结论**作废**。
+> **C 不要重写清单**，改成 §21.3 的 C1：用 6 份 `人工终稿字幕-edits.json`
+> （用户真实修改记录，且产生于 ledger 存在之前 → 无偏 ground truth）
+> 离线算出清单的**漏标条数与漏标 ID 列表**。这可能让用户零投入拿到终止条件那个数。
+
+> **🛑🛑 2026-08-24 第十轮：§26 是当前最高优先级，先读 §26 再读任何其他章节。**
+> 用户点名了他真正认真校对并合成视频的四集，**§25 用的样本不在其中**。
+> 在其中一集（就业市场，P=237，清单先写于 14:53、用户 15:09 才开始改 → 前瞻性预测）实测：
+> **清单标出率 9.3%、召回率 39%**。**§25 的两条处方被推翻**
+> （「父总词数≤5」提升 0.00×，「每页≥13词」召回 47% 而非 69%）。
+> 更关键：**用户 101 步操作里 60% 是逐页改中文，而清单对中文改动的召回只有 11%**（版式是 29%）——
+> **你正在做的 A/B/D/E/F 全在版式与边界层，不覆盖用户六成的操作。**
+> 新增最高优先级项 **G**（查中文检测器为何只召回 11%），见 §26.10。
+> 并且：**「自动化 90-95%、只动 5-10%」用现有冻结信号达不到**，天花板约「读一半、漏一到两成」，
+> 这句必须原样传达，不许软化。
+
+> **🛑🛑 2026-08-24 第十一轮：§27 是最新结论，覆盖 §26 的两个数字，先读 §27。**
+> 另两集的人工终稿包在 **`D:\经济学人\2026-08-15\其他媒体`**（不在 E:\work-dir 下，
+> §26.2「草稿已清除」是错的）。三集跨集验证已完成：
+> **中文主导复现（中文操作步数占比 60% / 74% / 65%），这是已证实的事实**；
+> **用户改动率 11.8% / 29.9% / 17.3%，合并 19.3%** —— 离「只动 5-10%」差 2 到 6 倍。
+> **`父总词数≤5` 三集全灭（0.00× / 0.15× / 0.00×），彻底作废；`每页≥13词` 逐集衰减，不得单独接线。**
+> 天花板更正：**读 45.7% / 召回 77%（三集合并）**，不是 §26 的 48%/86%；
+> 要 90% 召回需读 60–65%。**接线基线随之改为 77%，且必须三集分别达标。**
+> 清单召回率 39% 仍只有就业集一个样本（另两集编辑于 ledger 机制上线前）。
+
+> **🛑🛑🛑 2026-08-24 第十二轮：从现在起唯一的执行依据是 §28，先读 §28，再回头看 §27/§26 取事实。**
+> 用户已离开且短期不会复核，明确要求「直接给一个完整的往 90-95 做的方案」。
+> §20 的 A–F **作废为已完成的清理项，不再是路线**。
+> §28 把目标拆成三个必须同时达标的数：**改动率 E ≤10%（现 19.3%）、
+> 清单召回 Rec ≥95%（现 39%）、读取率 R ≤50%（现 ~100%）**，
+> 并给出 **P0→P5 六步、每步预登记门禁**的顺序执行工单。
+> **P0（把目标函数做成能跑的脚本，复现 §28.1 表格全部数字）未通过前不许碰 P1。**
+> 降 E 只能靠生成质量、降 R 只能靠清单变准，两条线并行，缺一条到不了目标（§28.0）。
+> **Rec ≥95% 用现存冻结信号做不到**——这是实测结论，P3 是唯一升级路径；
+> 若 P3 也不达标，§28.7 要求你如实报天花板，**不许调低门禁**。
+
+> **⚠ 关于"未修改既有文件"这句话，请配合 `git status` 一起读（免得你以为我在撒谎）**
+> 你在工作树里会看到 **119 个 M**。经 `git diff --ignore-cr-at-eol --numstat` 剥离后，
+> **其中 113 个是 CRLF 假阳性**（仓库 `core.autocrlf` 未设置；`app/_vendor/jieba/dict.txt`
+> 一个文件就 109,749 增 / 109,749 删）。**真实内容改动只有 6 个文件**：
+> `app/components/article_context_panel.py`、`app/core/subtitle_processor/manual_final_subtitle_editor.py`、
+> 对应两个测试、`CODEX_STATE.md`、`docs/CURRENT_STATE.md` ——
+> 这一簇是**并发的 Codex 会话**在做"frozen-page refresh reuse / article-analysis dialog isolation"，
+> 与本报告的切分/分页议题无交集。
+> **本报告涉及的两个文件都没被我碰过**：`screen_editor.py` 完全不在 M 列表里；
+> `podcast_learning_video.py` 是 M 但 `--ignore-cr-at-eol` 下真实改动为 0（纯 CRLF）。
+> 我的全部反事实都是**仓库外独立进程内的 monkeypatch**，新增文件只有
+> `EXTERNAL-AUDIT-2026-08-24.md` 与 `docs/audits/2026-08-24/`。
+
+复现方式：脚本在 `docs/audits/2026-08-24/external-claude-measurement/`，依赖 `spacy>=3.8` 与
+`en_core_web_sm`（仓库已自带于 `runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0`）。
+数据源是 `work-dir/*/subtitle/*artifacts/` 下已冻结的 `word-ledger.json` +
+`final-cue-timeline.json` + `english-boundary-audit.json`，覆盖 23 个产物集。
+脚本只读，不写入仓库。
+
+---
+
+## 1.【已推翻】"放宽两条 HARD 判定即可解锁切点"——此处方作废
+
+审计者最初的假设是：`_cross_item_structural_boundary_issues`
+（`app/core/subtitle_processor/screen_editor.py:6259-6346`）里唯一两条 HARD 判定过严，
+补上同函数其它三条已有的证据检查即可解锁一批切点。该函数确实存在不对称
+（见 §4.3），但**收益假设被实测否掉**：
+
+| 指标 | 值 |
+| --- | --- |
+| 覆盖 | 15 集 / 5,219 条冻结父字幕 / 54,897 词 |
+| 枚举的内部候选切点 | 49,678 |
+| 现规则下已合法但未被选中（纯代价决策） | 2,122 |
+| 现规则下被判非法 | 47,471 |
+| **仅**因 `relative_clause_entrance_split` 或 `dependent_clause_entrance_split` 被判非法 | **98** |
+| ↳ 仅 relative / 仅 dependent / 两者兼有 | 41 / 57 / 0 |
+| 这两条 + 其它 code 共同判非法 | 1,079 |
+| 98 条涉及的不同父字幕 | 97 |
+| ↳ 其中 ≥17 词的父字幕 | 17 |
+| 98 条命中 S0123 / S0132 / S0192 | **0** |
+
+【实测】`boundary_flip_measurement.json` / `boundary_flip_stage2.json`。
+
+更重要的是**逐条人工检视这 98 条，多数本来就应当被挡**，属限定性关系从句：
+
+```
+…they're going to buy the mine            ┃ that extracts the silicon.
+…their chocolate with Chinese flavors     ┃ that the mass-market foreign brands just…
+…a nation of 1.4 billion people           ┃ who historically ate only 1% of…
+…And well, what it means                  ┃ when these high level models break loose…
+```
+
+**结论：给这两条加笼统豁免会让输出变差。不要按此方向改。**
+若要改，只能针对 §4.3 与 §4.4 两个精确缺陷，不能整体放宽。
+
+---
+
+## 2.【实测】生产自证矛盾：9.96%
+
+把每一对**相邻且词号连续**的冻结父字幕（即生产当初实际做出的切分决策，且已经通过
+校验、已经参与合成）重新喂回今天的 `_evaluate_item_pair_for_final_boundary`：
+
+| 指标 | 值 |
+| --- | --- |
+| 生产已接受的父间边界 | 5,180 |
+| 被今天的规则判为非法 | **516** |
+| 占比 | **9.96%** |
+| 分布 | 23 个产物集**全部**命中，2.5% – 20.0% |
+
+按 rule code（可多重命中）：
+
+| code | 条数 |
+| --- | --- |
+| `open_subordinate_prefix_fragment` | 110 |
+| `dependency_phrase_entrance_split` | 64 |
+| `right_orphaned_finite_predicate` | 64 |
+| `predicate_attached_continuation_split` | 62 |
+| `coordinated_constituent_split` | 52 |
+| `short_open_prefix_fragment` | 47 |
+| `relative_clause_entrance_split` | 40 |
+| `weak_subject_fragment` | 37 |
+| `dependent_clause_entrance_split` | 32 |
+| `incomplete_short_fragment` | 23 |
+| `post_noun_participial_modifier_split` | 14 |
+| `subject_finite_verb_split` | 12 |
+| `incomplete_interrogative_fragment` / `unfinished_wh_complement_fragment` / `object_attached_modifier_split` | 各 10 |
+| 其余 5 个 code | 共 23 |
+
+**这 516 条是混合体，必须分开看，不要整体解读：**
+
+一类是规则确实过严，边界本身没问题。典型：
+
+```
+…Yeah. Let's unpack that divergence  ┃  because the US and China are playing…   pause=200ms
+…The quality is globally recognized, ┃  which proves this domestic wave is…      pause=80ms
+```
+
+左侧都是完整主句，右侧另起从句，且这类切点**已经在成品中播出**。
+
+另一类是当年确实切错了、规则变严后才抓到。典型：
+
+```
+…Because instead of hiring traditional film crews, ┃ production companies started…  pause=441ms
+```
+
+左侧无主句，`open_subordinate_prefix_fragment` 命中正确。
+
+**【推断】真正的问题不在某一条规则，而在回归防线：**
+仓库中不存在任何"现规则必须仍然接受历史已发布输出"的不变量测试。
+规则一路收紧，但从未回头验证收紧是否否掉了过去做对的判断。
+同一病灶的另一个表现：S9522 在 30 项回归中失败已持续 8 天，仓库无 xfail/skip 机制，
+`29/30` 被事实上当作通过。
+
+**建议（低风险、可先做）**：把这 5,180 个边界固化为快照测试。任何"收紧"改动若使
+非法数从 516 上升，即为回归信号；若下降，即为收益证据。这条不依赖本报告其余任何结论。
+
+---
+
+## 3.【实测】地基缺陷：`_fragment_has_finite_predicate` 单向漏判 42%
+
+`screen_editor.py:6697-6715`。实现是**一张硬编码词表**：45 个助动词/情态词
++ 10 个实义动词（`changed / worked / reported / started / ended / matters / matter /
+happened / became / felt / seemed`）+ `endswith("n't")`。无形态分析，**未使用 spaCy**
+——尽管同一个类在 `_load_syntax_nlp`（12233-12262）中已经加载了 `en_core_web_sm`。
+
+在本仓库自己的 5,219 条冻结父字幕上，与 spaCy 的有限动词标注对比：
+
+| 指标 | 值 |
+| --- | --- |
+| 双方都判"有谓语" | 2,509 |
+| 双方都判"无谓语" | 869 |
+| **词表判"无"、spaCy 判"有"（过严方向）** | **1,827** |
+| ↳ 占全部父字幕 | **35.01%** |
+| ↳ 占"确实含有限动词"的父字幕 | **42.14%** |
+| 词表判"有"、spaCy 判"无"（过宽方向） | **14** |
+
+即：**几乎纯单向过严**。那 14 条经检视均为词表命中 `be`/`being` 而实际是非限定形式
+（`being built in America`、`only to be forced to use it`），属可接受噪声。
+
+漏判最多的动词（lemma/tag）：
+
+| 漏判 | 次数 | 说明 |
+| --- | --- | --- |
+| `be/VBZ` | 230 | **`'s`** |
+| `be/VBP` | 98 | **`'re` / `'m`** |
+| `know/VBP` | 44 | |
+| `mean/VBP` | 42 | |
+| `make/VBZ` | 34 | |
+| `see/VBP` | 29 | |
+| `look/VBP` | 22 | |
+| `get/VBP` | 18 | |
+| `bring/VBZ` | 17 | |
+| `can/MD` | 17 | 情态词漏判 |
+
+**头号成因是缩写未入表**：词表写了 `is / are / am`，没写 `'s / 're / 'm / 've / 'll / 'd`
+（`_word_tokens` 的正则 `[A-Za-z]+(?:'[A-Za-z]+)?` 会把 `it's` 保留为单 token）。
+播客口语中缩写高频，于是：
+
+```
+It's really about how distinct market environments        →  判为"无谓语碎片"
+They're optimizing the trade-offs between the cost…      →  判为"无谓语碎片"
+I'm just stuck on the physical reality of this.          →  判为"无谓语碎片"
+And that fear gets magnified tenfold                     →  判为"无谓语碎片"
+Let's track that panic                                   →  判为"无谓语碎片"
+```
+
+**需要覆盖的动词 lemma 共 649 个，补丁表里只有 10 个。**这 10 个词的构成
+（`changed / worked / reported / …`）本身就是"撞到误判就贴一个词"的证据，
+该路径不可能通过继续补表收敛。
+
+### 3.1 正确实现已经在仓库里，只是没被生产链路使用
+
+`scripts/audit_visual_temporal_splits.py:45-67`：
+
+```python
+def _has_finite_predicate(text: str) -> bool:
+    tokens = _tokens(text)
+    if any(token in FINITE_AUXILIARIES for token in tokens):
+        return True
+    ...  # 惰性加载 en_core_web_sm，缓存在函数属性上
+    return any(
+        token.pos_ in {"VERB", "AUX"}
+        and token.tag_ not in {"VB", "VBG", "VBN"}
+        for token in nlp(text)
+    )
+```
+
+**词表优先 + spaCy 回落**，23 行，语义正确（排除 VB/VBG/VBN 即排除不定式、动名词、
+过去分词，剩下的就是有限形式）。生产链路走的是 6697 那份。
+
+### 3.2 影响面
+
+直接调用点：`6318` / `6319`（WH 分支）、`6366`（存入 fragment 字典的
+`has_finite_predicate` 键）、`6646`、`6759`、`14468`。
+
+经 `6366` 的字典键间接门控（`not has_finite_predicate` 即触发）：
+`5963` `visual_preposition_led_fragment`、`5965-5971` `visual_open_phrase_fragment` /
+`visual_short_subject_or_connector_fragment` / `visual_open_clause_fragment`、
+`5977-5983` `visual_connector_led_noun_phrase_fragment`、`6383` / `6430` / `6445`，
+以及 `6466` 的派生标志 `has_independent_meaning = has_finite_predicate and word_count >= 4`。
+
+### 3.3【实测】把它换成 §3.1 那份之后的反事实
+
+在独立进程内 monkeypatch（**磁盘代码未改**），对 §2 的 5,180 个生产已接受边界重测：
+
+| 指标 | 值 |
+| --- | --- |
+| 修复前判非法 | 516 |
+| 修复后判非法 | 484 |
+| **消解的矛盾** | **32** |
+| **新增非法** | **0** |
+| 非法率 | 9.96% → 9.34% |
+
+分 code：`weak_subject_fragment` 37→20（−17）、`short_open_prefix_fragment` 47→31（−16）、
+`unfinished_wh_complement_fragment` 10→7（−3）。
+
+**诚实说明收益边界**：`open_subordinate_prefix_fragment`(110) 与
+`right_orphaned_finite_predicate`(64) 在此次反事实中**完全没有变化**，说明它们不经过这个
+helper，各有独立实现。因此"修这一个函数"在**父间边界这一个闸门**上只值 32 条。
+
+**未测部分（不夸大）**：§3.2 列出的 5 条 `visual_*` 判定走显示层路径，不在
+`_evaluate_item_pair_for_final_boundary` 内，本次未测量。该 helper 的真实作用面很可能
+显著大于 32，但**目前没有数字支撑，请勿引用为已证事实**。
+
+**风险评级：极低。**函数是 `@classmethod`，签名纯净 `(words) -> bool`，
+反事实中新增非法为 0，且替换目标是仓库内已存在、已在审计脚本中运行的实现。
+
+---
+
+## 4.【已核实】其余具体缺陷（一手读代码，含 file:line）
+
+### 4.1 `_auditable_atomic_boundary_issues` 可静默全失效
+
+`screen_editor.py:9570-9586`。9573-9574 只取 `entries[left].get("token")`，
+缺少 `or surface` 回退；对比 `9045-9050` 的同类取值**有**回退。
+若 `_active_word_entries` 条目缺 `token` 键，该函数 5 条判定**全部静默变成 no-op**，
+不报错、不告警。
+
+### 4.2 8 份互相竞争的坏切点判定，且同名 rule code 语义冲突
+
+| 位置 | 说明 |
+| --- | --- |
+| `6259` `_cross_item_structural_boundary_issues` | 唯一持 cue 对级子句状态，**不应合并** |
+| `7894` `_boundary_bad_cut_reasons` | 纯透传，零逻辑，**可删** |
+| `9038` `_hard_stable_cut_issues` | 唯一基于词账本 + spaCy 的真闸门，**应作唯一真源**；`9126` 有 `pause_ms >= 450` 安全阀 |
+| `9570` `_auditable_atomic_boundary_issues` | 是 `9038` 的真子集，**应改为 `atomic=True` 过滤视图** |
+| `9974` `_is_bad_boundary_pair` | 53 个硬编码词对，仅 +160 软代价 |
+| `14053` `_bad_cut_issues` | |
+| `14472` `_syntax_boundary_reasons` | 保留为 `word_continuity == False` 降级路径，但规则体须与 `9038` 同源 |
+| `14596` `_bad_cut_reasons` | 返回**中文句子**而非稳定 rule code；`bad_end` 58 项无标点上下文 |
+
+**同名 code 语义冲突（已确认 2 处）：**
+
+- `auxiliary_predicate_split`：`9589` 判 `predicate_starts` / `-ed` / `-ing`；`14527` 只判 `-ing`。
+- `possessive_head_split`：`9691-9694` 豁免右侧并列连词；`14545` 无此豁免。
+
+另有第三份独立副本在仓库外的测试侧：`tests/caption_audit/metrics.py:769`，
+已腐化至 15 个 reason code 只剩 13，**缺失的正好是新测试覆盖的那 2 个**
+——即应用侧改动无法被该路径捕获。
+
+### 4.3 `_cross_item_structural_boundary_issues` 内部判据不对称
+
+同函数 5 条判定，唯二 HARD 的恰是唯二**不带证据检查**的：
+
+- `6297-6298` `relative_clause_entrance_split`：右侧首词 ∈ `{that, which, who, whom, whose}`
+  → **无条件 HARD**。不看前置逗号、不看停顿、不看左侧是否已构成完整主句。
+- `6304-6305` `dependent_clause_entrance_split`：右侧首词 ∈ 9 个从属连词且 `len(left_words) <= 10`
+  → HARD。**不调用** `_fragment_has_finite_predicate(left_words)`，而同函数
+  `6316-6321` 的 WH 分支两侧都验。
+
+对比同函数另三条：WH 补语（`6316-6321`）两侧验有限谓语；
+`leading_prepositional_fragment`（`6327-6332`）有 2 个豁免且仅 REVIEW；
+`coordinated_continuation_fragment`（`6334-6338`）验左侧标点且仅 REVIEW。
+
+**该函数全域无停顿豁免**（`6259-6346` 内 `pause_ms` 零出现），
+对比 `_hard_stable_cut_issues` 在 `9126` 有 `pause_ms >= 450` 安全阀。
+`_is_unambiguous_sentence_terminal`（`9265-9304`）只认 `.!?`，逗号不豁免。
+
+**自相矛盾**：`_cut_boundary_score`（`8926`）在 `8973` 对 `which/who/that` 的处理是
+"前面**没有**逗号才 +20"，且 `8977-8979` 的 `_dangerous_segment_start_tokens`
+明确对"逗号 + which/who/that"开洞——作者在打分层写明逗号后的关系从句合法，
+但 `6297` 的无条件 HARD 在 cue 对层把它覆盖了。
+
+**这不是审计标记，是真在删候选**（调用链已核实）：
+`_stable_global_ranges.edge_cost`（`10004`）→ `10024` `_stable_candidate_display_safe`（`10060`）
+→ `10070` `_evaluate_item_pair_for_final_boundary`（`6198`）→ `6222-6226` 合并 HARD
+→ `6256` `legal=False` → `edge_cost` 返回 `None` → **该边从 DP 搜索图消失**。
+
+### 4.4 `relative_clause_entrance_split` 不做词性判别
+
+对 `that` 一律视为关系代词，把指示限定词与指示代词也一并否决：
+
+```
+…shifting its economy away from basic manufacturing, ┃ that historical overinvestment in…   ← that = DET
+…if people are watching their wallets,               ┃ that just doesn't seem like enough.  ← that = 指示代词
+```
+
+同一个类已加载 spaCy，DET vs PRON/relativizer 判别成本近乎为零。
+**这是纯精度 bug，与 §1 的"放宽"是两件事**：修它不会放开限定性关系从句。
+
+---
+
+## 5.【已核实 + 推断】架构缺口：切分层对分页可行性完全盲
+
+**【已核实】** `screen_editor.py` 全文 grep `font_size|pixel|chars_per_line|max_lines|line_width`
+→ **0 命中**；import 区无 `stable_display_planner`。
+切分层唯一的下游代理量是硬编码的 16 词上限
+（`_stable_word_ranges_for_span` `8916` 行 `min(..., 16)`；`emergency = 19` 同样硬编码，配置改不动）。
+
+**【已核实】** 分页层的真实约束是**像素**：每页须在 ≤2 行 × 四档宽度 profile
+（1100 / 1260 / 1455 / 1498 设计像素）内排下，且每页 ≥900ms
+（`ARTICLE_PAGE_MIN_DURATION_MS`）、每页 ≥4 词（`ARTICLE_VISUAL_PAGE_MIN_WORDS`）、
+总页数 ≤4（`ARTICLE_VISUAL_PAGE_MAX_PAGES`）；字号档位仅 56/54/52（50 为 legacy 只读校验）。
+
+**【推断】** 这就是"语法合法但无法分页"父字幕的产生机制：切分层在一个对真实约束
+不可见的空间里做决策，分页层只能事后枚举、枚举到失败。**机制不堵，每一集都会新生成
+这类父字幕**，人工标黄量不会随时间下降。
+
+### 5.1 另一处未对齐：平局裁决策略不一致
+
+**【已核实】** `stable_english_optimizer.plan_english_cue_ranges` 的 `_path_key`
+= `(cost, tuple(ends))`，代价相同时按切点索引字典序 → **更靠左的切点胜出**，
+这是元组比较的副作用而非显式设计。全仓 grep `equal_risk|tie_break|prefer_pause`
+在 `screen_editor.py` **0 命中**。
+对比分页层 `stable_display_planner.py:68-71` 有显式 `(risk_tier, score)` 二元组分层排序。
+切分层的 `boundary_score` 是单一 float，停顿只是 −28 / −12 的连续分量，
+被其它加分抵平后即失效。
+
+### 5.2【推断】对 2026-08-23 17:12 那次结论的补充
+
+先前结论为："固定父字幕优化有效但只改善 4 条；局部移动英文切点净改善 0 条；
+改变相邻父字幕数量 18,457 个候选中可行结果为 0。"
+
+**审计者认同这三个实验的数据，但认为其解释需要修正。**
+三个实验的搜索空间**全部位于切分层内部**，而 §5 表明真实可行性约束位于**像素层**，
+且切分层对该约束完全不可见。在对目标函数不可见的空间内做局部搜索，
+18,457 个候选产出 0 个可行是**结构性必然，而非实验运气**。
+
+因此这批数据支持的结论是"**沿切分层内部局部搜索这个方向没有收益**"，
+而不足以支持"当前架构下无法进一步自动化"。二者不等价。
+
+### 5.3【已核实】S0123 / S0132 / S0192 维持"放弃、标黄"判断
+
+三条同属白宫集，checkpoint `20260823T063436.783343-e950e557`：
+
+| ID | 词号 | 词数 | 时长 | 文本 |
+| --- | --- | --- | --- | --- |
+| S0123 | 1433-1454 | 22 | ≈10.2s | `Now, the source notes that 303 billion would represent an improbable 56% of all of America's imports from China back in 2018.` |
+| S0132 | 1530-1543 | 14 | ≈7.1s | `They argue Navarro is deliberately conflating legal, rules-compliant supply chain restructuring with outright smuggling.` |
+| S0192 | 2185-2203 | 19 | ≈7.9s | `They point out that what Navarro just described is literally just the normal, everyday infrastructure of modern global trade.` |
+
+三条 reason 完全相同：`no_complete_normal_font_page_partition`；
+attempted 含 `fixed_font_span_unreadable` / `hard_page_boundary` /
+`page_boundary_timing_invalid` / `no_complete_legal_page_partition`。
+
+**`cue_duration_below_page_minimum` 三条均缺席 → 不是时间受限。**
+真因是原子链不可切：`303 billion` 数字量级、
+`legal, rules-compliant supply chain restructuring` 修饰-中心链、
+`of all of America's imports` / `of modern global trade` of-补语。
+S0132 枚举 61 个 partition 全灭。§1 那 98 个新增切点命中这三条 = 0。
+
+**同意维持"放弃、标黄给人工"。**但这是对**这三条**的处置，不是对§5 机制问题的处置。
+
+**文档冲突提示**：`docs/audits/2026-08-23/recent-actual-page-quality-audit.md:83`
+写作 S0123/S0133/S0193，与同文件 `:258` 及全部产物冲突，`:258` 与产物一致。
+
+---
+
+## 6.【已核实】上下文成本：哪些冗余在拖累模型
+
+按"误导代价"排序，不按体积排序。
+
+**最贵：完整的假闭环（检测 → 上报 → 无人消费）。**
+模型读到检测逻辑存在，就会假设该检测生效，从而在错误前提上继续推理。
+`_detect_cross_id_anchor_misplacement`（16 个死键）、
+`_validation_review_reason`（12 个死键）是完整链条。
+全仓合计 **238 个死键 / 323 个写入点**。
+
+**其次：能打开但指向错误位置的引用**，比断链更危险。
+`docs/audits/core-workflow-audit-2026-08-16.md` 的 **7/7** 个符号级行号
+全部指向无关函数（该文档引用的 P2-2 实际对应 `_bad_cut_reasons` `14596`，
+文中所标 12091 已过期，且编号误作 P2-3）。
+
+**文档层：**
+- `docs/CURRENT_STATUS.md` 与必读的 `docs/CURRENT_STATE.md` **仅一字母之差**，
+  内容冲突，且违反 `AGENTS.md:41`。
+- `docs/CURRENT_STATE.md` 在 160 个相邻小节转换中有 **16 处日期倒序**
+  → 读头部或读尾部都不可靠（审计者先前认为它严格新在前，此判断已推翻）。
+- 该孤儿文档中一个 4 周前的开放问题，其答案就在 `screen_editor.py:12819`。
+
+**规则层：** `AGENTS.md:96` 正在保护一个死函数 `_quality_check_candidate_segments`；
+`AGENTS.md:97` 被一个 158 行的死 backchannel 簇直接违反。
+死方法合计 11 个 / 188 行。
+
+**版本漂移：** 必读文档中存在 v31 / v32 并存
+（代码真值为 `article-fixed-font-pages-v32`）；测试 fixture 中残留 v27 / v28
+——后者使回归保持绿色但不再反映实际契约。
+
+**测量：** 必读量 **370,744 B**（含任务日志 **592,355 B**）→ 可压至 **138,088 B**，
+降幅 **63% / 77%**。
+
+---
+
+## 7.【已推翻】审计者自己被数据否掉的假设（保留以防重复踩坑）
+
+| 假设 | 实际 |
+| --- | --- |
+| 存在零引用的模块级常量 | **0 个** |
+| 交接文档之间存在逐字复制粘贴 | **0 对**，是独立撰写 |
+| `_allocate_semantic_group_translations_concurrent` 是死码 | **不是**。`screen_editor.py:20511-20517` 在 `allocation_max_concurrency > 1 and len(payload_chunks) > 1` 时条件调用 |
+| `tests/` 有被 skip/xfail 掩盖的失败 | **0 个** skip / **0 个** xfail / **0 处**注释掉的断言 |
+| 测试体积构成上下文税 | 测试冗余 **< 250 行（0.5%）**，**不构成**上下文税 |
+| `docs/CURRENT_STATE.md` 严格新在前 | 有 **16 处**日期倒序 |
+| 放宽 §4.3 两条 HARD 即可解锁切点 | 见 §1，仅 98 条且多数应当被挡 |
+
+---
+
+## 8. 建议的下手顺序（仅为判断，审计者未执行任何改动）
+
+按"风险 / 收益确定性"排序，前三项互不依赖，可独立进行。
+
+**第 1 步｜风险：极低。收益：确定（防回归）。**
+把 §2 的 5,180 个生产已接受边界固化为快照测试，并给 S9522 建立
+xfail/skip 机制以使 `29/30` 不再被当作通过。此步不改变任何行为，只建立度量。
+没有它，后续任何"收紧"或"放宽"都无法判断是收益还是回归。
+
+**第 2 步｜风险：极低。收益：已测 32 条 + 未测的显示层作用面。**
+让 `screen_editor.py:6697` 改用 `scripts/audit_visual_temporal_splits.py:45-67`
+已有的"词表优先 + spaCy 回落"实现（建议提取为单一真源供两处共用）。
+反事实新增非法为 0。做完应重测 §3.2 列出的 5 条 `visual_*` 判定以补上未测部分。
+
+**第 3 步｜风险：低。收益：精度修正，不放开限定性从句。**
+给 `6297` 的 `relative_clause_entrance_split` 加 spaCy 词性判别，
+区分 `that` 作 DET / 指示代词 / 关系化标记；并修 §4.1 的
+`or surface` 回退缺失。同时消解 §4.2 的两处同名 code 语义冲突，
+并清理 `tests/caption_audit/metrics.py:769` 的第三份副本。
+
+**第 4 步｜风险：高。收益：唯一能触达 90-95% 的方向。**
+把分页可行性反馈进切分层——最小形式不是重构，而是给切分层的
+`edge_cost` 增加一个"该候选跨度在 56/54/52 三档字号下是否存在可行分页"的
+可行性探针，替代当前硬编码的 16 词代理量。
+这一步必须在第 1 步的度量基线建立之后进行。
+
+---
+
+## 9. 本次审计的偏差与置信度声明
+
+- **样本**：23 个产物集、每集单次运行的冻结产物。未覆盖不同 ASR 质量、
+  不同说话人数、非播客素材。
+- **测量哈钦构造**：为规避 `__init__`（`698` 行 `CacheManager` 写 AppData、
+  `699` 行 `_init_client()`）的副作用，脚本用 `ScreenSubtitleEditor.__new__`
+  + 显式属性设置构造实例，复制 `scripts/audit_pre_id_joint_page_feasibility.py`
+  `_make_editor`（`173+`）的既有做法。构造保真度的上界由 §2 的 9.96% 界定
+  ——其中含哈钦误差与真实规则漂移，二者未分离。
+- **旧版哈钦校验**：对 `english-boundary-audit.json` 的 `rule_codes` 逐条比对，
+  2,438 / 2,585 = **94.31%** 一致。不一致主要来自该 JSON 的 `rule_codes`
+  混入了其它 predicate 的 code，非哈钦缺陷；§2 已改用与反事实同一个函数以消除此偏差。
+- **spaCy 一致性**：模型直接从 `runtime/Lib/site-packages/en_core_web_sm/en_core_web_sm-3.8.0`
+  按绝对路径加载，与仓库自带版本完全相同；注入方式为 `ed._syntax_nlp = nlp`
+  （`_load_syntax_nlp` `12234` 行对非 None 短路返回），故不存在
+  "spaCy 缺失导致 hint 缺失、进而少判"的方向性偏差。
+- **spaCy 不是外部标尺**：§3 用 spaCy 作对照，是因为本仓库已经依赖并已在
+  `_load_syntax_nlp` 与 `audit_visual_temporal_splits.py` 中使用它。
+  这是"与项目自己已信任的信号对照"，不是引入新标准。
+- **§3 的显示层作用面未测**，§5 的机制结论为推断，二者请勿当作已证事实引用。
+
+---
+
+## 10. 第二轮只读核实（2026-08-24 追加，动手前的前置检查）
+
+本节缘起：接手模型已依据本报告 §8 给出四步计划——①建立历史边界回归基线
+②修有限谓语检测 ③修 `that` 词性与重复规则 ④做切分层与分页层联合可行性实验，
+并正确地把第 4 步标为"最值得验证"而非"已证结果"。
+审计者认同该计划与其顺序。本节是**动手前**补做的核实，包含两处对前文的更正
+和一条新发现。**本节同样未修改任何既有文件。**
+
+### 10.1【已更正】§4.1 的严重性被说重了——它是潜伏缺陷，不是现行缺陷
+
+前文 §4.1 称 `_auditable_atomic_boundary_issues`（`screen_editor.py:9570-9586`）
+因缺少 `or surface` 回退而"可静默全失效"。二次核实后必须收窄这个说法：
+
+- `_word_time_entries`（`17912-17941`）是生产链路**唯一**的 `_active_word_entries`
+  构造入口（赋值点仅 `851` / `861` / `866`），它在 `17935` 行**无条件**写入 `"token"` 键。
+- 两个审计哈钦也都写：`scripts/audit_pre_id_joint_page_feasibility.py:182`、
+  `scripts/run_allocation_only_replay.py:66`。
+- `8097-8099` 只是就地补写 `start_time` / `end_time` / `alignment_source`，不新建条目。
+
+**结论：今天不存在任何使 `token` 缺失的代码路径，那 5 条原子判定并没有在静默失效。**
+补上 `or surface`（与 `9045-9050` 对齐）今天**零行为变化**——
+所以它是零风险的一致性修补，**既不要算作收益，也不要担心它会一次性点亮 5 条休眠规则**。
+前文措辞暗示过后者，此处撤回。
+
+### 10.2【已核实·新发现】矛盾最大头 `open_subordinate_prefix_fragment` 的病灶是一条正则，与有限谓语词表无关
+
+§2 的 516 条自证矛盾里，`open_subordinate_prefix_fragment` 占 **110 条，为最大单一 code**。
+它的判定源是 `_is_open_subordinate_prefix`（`screen_editor.py:6575-6591`），实现如下：
+
+```python
+def _is_open_subordinate_prefix(self, item: ScreenSubtitleItem) -> bool:
+    """Detect a non-terminal dependent introduction awaiting a main clause."""
+    text = self._normalize_text(item.original)
+    if re.search(r"[.!?][\"')\]]*\s*$", text):
+        return False
+    normalized = text.casefold()
+    normalized = re.sub(r"^(?:(?:yes|yeah|right|exactly|absolutely|definitely|sure|okay|ok)[.!?]\s*)+", "", normalized)
+    return bool(re.match(
+        r"^(?:because\s+)?(?:because|if|when|while|although|though|unless|until|once|whereas)\b",
+        normalized))
+```
+
+**三点已核实的事实：**
+
+1. **它从不检查主句是否已经出现。**判据只有两条：开头是否为 10 个从属连词之一、
+   结尾是否有终止标点。唯一的逃生口是句末 `.!?`。因此像
+   `When the US did that, China responded immediately`
+   这种**主句已在同一条 cue 内出现、只是整句尚未结束**的情形，一律被判 HARD。
+2. **它压根不调用 `_fragment_has_finite_predicate`。**这正是 §3.3 反事实中这 110 条
+   "完全没有变化"的原因——第 2 步无论怎么修有限谓语检测，都碰不到这一块。
+3. **同名 code 有两个发射源**：`6291`（经本函数）与 `6439`（经 `_fragment_issues`
+   路径的 `open_subordinate_prefix` 局部变量）。§4.2 的"同名 code 语义冲突"清单应补上这一条。
+   此外正则里的 `^(?:because\s+)?` 前缀在后续分支已包含 `because`，属冗余（可匹配 "because because"），
+   疑为残留。
+4. 本函数全域**无停顿豁免**（`6575-6591` 内 `pause_ms` 零出现），与 §4.3 记录的
+   `_cross_item_structural_boundary_issues` 同病。
+
+**同一文件内已有正确工具，但不能直接替换。**
+`_visual_temporal_clause_shape`（`5568-5644`）是基于 spaCy 依存树的"完整主句"判定器：
+取 `dep_ == "ROOT"`，判 `root_is_finite`（`5583-5586`：`pos_ in {VERB,AUX}` 且
+`tag_ not in {VB,VBG,VBN}`）、`root_has_finite_auxiliary`（`5587-5595`）、
+`root_is_imperative`（`5607-5623`），并在 `5638-5644` 返回 `complete_main_clause`。
+**但它的定义是：**
+
+```python
+"complete_main_clause": bool(
+    (root_is_finite or root_has_finite_auxiliary or root_is_imperative)
+    and not leading_subordinator          # ← 5641
+),
+```
+
+而 `leading_subordinator`（`5596-5600`）用的是**位置代理**：
+
+```python
+leading_subordinator = any(
+    token.i < root.i and (token.dep_ == "mark" or token.pos_ == "SCONJ")
+    for token in doc
+)
+```
+
+任何"前置从句 + 主句"的句子都满足"ROOT 之前存在 mark/SCONJ"，
+所以 `complete_main_clause` 对 `When the US did that, China responded immediately`
+**同样返回 False**。直接拿它替换正则不会解决问题。
+
+**【推断】正确判据应是依存祖先关系，而非词序位置：**
+"从属连词是否支配 ROOT"，而不是"从属连词是否出现在 ROOT 之前"。即
+
+- ROOT 为有限形式（沿用 `5583-5595` 的既有定义），**且**
+- 该从属连词不是 ROOT 祖先链上的 `mark`（等价地：它所标记的从句是 ROOT 的
+  `advcl` / `ccomp` 等**子节点**，而非 ROOT 本身所在的从句）。
+
+对照两个例子：
+`When the US did that, China responded immediately` → `When` 是 `did` 的 `mark`，
+`did` 是 ROOT `responded` 的 `advcl` 子节点 → 从句已闭合，主句在，**应放行**；
+`Because instead of hiring traditional film crews,` → 从句之外不存在有限 ROOT
+→ 确实悬空，**应继续挡**（此例正是 §2 中"规则抓对了"的那一类）。
+
+**这是 §2 那 516 条里最大的单点可救空间，但收益尚未测量，请勿当作已证事实。**
+测量方案见 §11。
+
+### 10.3【已核实】§3.3 中"那 64 条不动"的机制已确认
+
+§3.3 曾指出 `right_orphaned_finite_predicate`（64 条）在有限谓语反事实中完全没有变化，
+但未给出原因。现已确认：该 code 发射于 `5826`，所属函数为
+`_right_orphaned_finite_predicate_issues`（`5746-5830`），
+其 `5760` 行走 `self._load_syntax_nlp()`、`5823` 行遍历 `doc` ——
+**它本来就在用 spaCy，不经过那张硬编码词表**。
+
+因此第 2 步（修有限谓语检测）的收益边界现在是完整的：
+516 条里最大的两块——`open_subordinate_prefix_fragment` 110 条（§10.2，走正则）
+与 `right_orphaned_finite_predicate` 64 条（走 spaCy）——**合计 174 条都不在其作用面内**。
+第 2 步的盘子 = 已测的 32 条 + §3.2 列出的 5 条 `visual_*` 显示层判定（仍未测）。
+
+### 10.4【已核实】第 2 步的性能约束，以及仓库内已有的正确缓存写法
+
+**约束**：`screen_editor.py` 全文 grep `lru_cache|functools.cache|@cache`
+→ **0 命中**。而 `_fragment_has_finite_predicate` 位于 DP 的
+`edge_cost` 调用链上（`10004` → `10060` → `6198` → `6259` → `6318`/`6319`），
+接入 spaCy 等价于"每评估一条候选边即 parse 一次"。
+审计者自己的反事实脚本必须挂 `lru_cache(maxsize=200_000)` 才能在可接受时间内跑完。
+
+**仓库已有正确写法可直接沿用** —— `_right_orphaned_finite_predicate_issues`
+（`5752-5759`）：
+
+```python
+cache = getattr(self, "_orphaned_finite_predicate_cache", None)
+if cache is None:
+    cache = {}
+    self._orphaned_finite_predicate_cache = cache
+cache_key = (item.word_start, item.word_end, text)
+cached = cache.get(cache_key)
+if cached is not None:
+    return list(cached)
+nlp = self._load_syntax_nlp()
+if not nlp:
+    return []            # ← 优雅降级，spaCy 缺失时不报错
+```
+
+配套：缓存属性在 `__init__:706` 声明，在 `_prepare_syntax_cut_hints`
+（`10094-10098`）每轮开头清空。**建议照此实现，不要引入 `lru_cache`**
+（`lru_cache` 挂在类方法上会跨 run 泄漏，与 `10094-10098` 的每轮清空语义冲突）。
+
+**一处改进**：上述缓存键为 `(word_start, word_end, text)`，含词号。
+新 helper 建议**只用拼接后的 token 串作键**——DP 中同一段文字会在不同跨度上反复出现，
+去掉词号可显著提高命中率。
+
+### 10.5 第 1 步（回归基线）的两个做废风险
+
+**风险一：哈钦不可中途更换。**§2 的 9.96% 是用 `ScreenSubtitleEditor.__new__`
+构造的哈钦测得，构造保真度误差与真实规则漂移**未分离**（见 §9）。
+这不妨碍它作为基线——只要"改前"与"改后"使用**同一个哈钦**，该误差即可对消。
+但因此有两条硬要求：基线须在第 2 步之前冻结为 golden 文件，且须记录
+**每条边界的 rule code 集合**而非仅总数；中途更换构造方式将使前后数字不可比。
+
+**风险二：不要把"516 下降"当作唯一的好信号。**§2 已说明这 516 条是混合体：
+一部分是规则过严而边界本身正确（`Let's unpack that divergence ┃ because…`，
+左侧为完整主句且已合成播出），另一部分是当年确实切错、规则收紧后才抓到
+（`Because instead of hiring traditional film crews, ┃ …`，左侧无主句）。
+若把"总数下降"当作优化目标，将系统性地把规则推向放松——
+**那正是 §1 已被自身数据推翻的方向**。
+建议：测试输出**变化清单（delta）**，人工只复核发生变化的那几条，而不追踪总数。
+
+### 10.6 第 4 步（分页可行性探针）的两条方向性要求
+
+**要求一：探针必须是软代价，不得返回 `None`。**
+当前病根正是 `edge_cost`（`10004-10028`）返回 `None` 会把该边从 DP 搜索图中删除
+（调用链见 §4.3 末段）。探针若同样删边，一旦判错即不可恢复。
+应先实现为代价项，使 DP 仍能选择"略差但排得下"的切点；
+取得数据后再讨论是否收紧为硬闸门。
+
+**要求二：探针误差必须偏向"可行"。**
+误判为"不可行"会删掉好边——与现有过严缺陷同病；
+误判为"可行"最坏只是分页层照旧枚举失败，**不比今天更差**。故宁可放过，不可错杀。
+
+**实现提示（已核实）**：不要用 `app/core/utils/ass_auto_wrap.py:70` 的
+`estimate_text_width`（CJK 计 `font_size`、其余一律 `font_size * 0.5`）作为英文探针——
+英文字符步进宽度差异极大，该估计器对英文不可用。
+真实渲染路径是 `podcast_learning_video.py:916` 的
+`text_w(draw, text, fnt) = draw.textbbox(...)`，字体为
+`article_subtitle_en_font`（`855-862`）→ `RobotoSlab-SemiBold.ttf`，字号经 `acx()` 缩放。
+建议一次性导出 56/54/52 三档的字符步进宽度表并落盘，探针查表，
+再在全部 5,219 条父字幕上验证"探针判不可行 ⇒ 渲染器同意"的单边保守性，然后才接线。
+
+**落点建议**：`app/core/subtitle_processor/text_metrics.py`
+（52 行、零重依赖、已被 `screen_editor.py:70` 与 `app/core/article_context.py:16` 引用，
+且 `HARD_ENGLISH_WORD_LIMIT = 16` 本就定义于此）。
+即这一步是**把容量模型搬到已有的共享叶子接缝**，不是重建。
+
+### 10.7 本节的未测项（请勿引用为已证）
+
+- §10.2 的依存祖先判据能救回 110 条中的多少、是否产生新增非法 —— **已于 §11 实测，
+  且结论是该处方作废（只值 15 条）。本条已解除未测状态，请直接读 §11。**
+- 单行页 vs 现行双行页的可行率对比 —— **仍未测**，见 §12（尚未产出）。
+- §3.2 列出的 5 条 `visual_*` 显示层判定作用面 —— 仍**未测**（与第一轮相同）。
+
+
+---
+
+## 11. 第三轮：`open_subordinate_prefix_fragment` 反事实实测（2026-08-24 追加）
+
+> **本节结论优先于 §10.2。** §10.2 提出的"依存祖先判据是 516 条里最大单点可救空间"
+> 这句话**已被我自己的测量推翻**，正确判据是另一条（见 11.2）。
+> 本轮仍未修改本仓库任何既有文件；全部改动都是进程内 monkeypatch。
+>
+> **给动手的模型的一句话摘要**：请采用 **arm F**（不是我上一轮暗示的方向，
+> 也不是本轮数字最漂亮的 arm E）。理由是 11.5 的双向权衡，不是 11.1 的单向计数。
+
+### 11.1 七个 arm 的实测结果
+
+同一测量面：**23 个 work-dir，每个取 1 个产物集，覆盖约 15 个不同源集**
+（改名重跑的同一集会被算两次，比例不受影响但那几集被双倍加权）/
+**5,180 个"生产已接受并已合成"的父间边界**，
+全部重新喂回 `_evaluate_item_pair_for_final_boundary`。
+
+| arm | 改了什么 | 判非法 | 占比 | 相对现网**消掉** | 相对现网**新增非法** | `open_sub` 码命中 |
+|---|---|---|---|---|---|---|
+| **A** | 现网代码（基线） | 516 | 9.96% | 0 | 0 | 110 |
+| **B** | 只修有限谓语词表（§3.3） | 484 | 9.34% | 32 | **0** | 110【推导】 |
+| **C** | 只换依存祖先判据（§10.2 的处方） | 501 | 9.67% | 15 | **0** | 92 |
+| **D** | B + C | 469 | 9.05% | 47 | **0** | 92 |
+| **E** | 只在"从句自身无有限谓语"时才发火 | 440 | 8.49% | 76 | **0** | 12 |
+| **F** | E + 追加要求"以逗号结尾"才豁免 | 452 | 8.73% | 64 | **0** | 37 |
+| **G** | E + 有限谓语词表修复 | **405** | **7.82%** | **111** | **0** | 12 |
+
+注：arm B 的 `open_sub` 命中 110 **是推导值，不在任何 JSON 里**（v1 的 per-code 表只有 A/C/D 列）。
+依据是 E=12 且 G(E+词表修复)=12，即词表修复不改变该 code 的命中，故 B=A=110。
+其余每一格都可在归档 JSON 中直接读到。
+
+三点可直接使用的事实：
+
+**（1）两个修复互不干扰、效果可加。** B 消 32、E 消 76、G 消 111 ≈ 32+76+3。
+说明 §3.3 的词表修复和本节的 `open_sub` 修复落在几乎不重叠的边界集合上，
+可以分两个 PR 独立上，不必担心相互抵消或叠加爆炸。
+
+**（2）七个 arm 全部"新增非法 = 0"。** 在"生产已发布边界"这个面上，
+这些改动是纯单向放宽，没有任何一条已发布边界因此变得非法。
+**但这条性质本身不足以下结论**——§1 的处方就是死在这里，见 11.4。
+
+**（3）F 比 E 差 12 条，但这 12 条不是损失。** 见 11.5。
+
+### 11.2 【已推翻·我自己的假设】依存祖先判据只值 15 条，而且它"对得很偶然"
+
+§10.2 我写的处方是：`ROOT 有限 且 从属连词不在 ROOT 的 mark 子节点上`
+（即"从句已闭合 ⇒ 不该判碎片"）。arm C 实测**只消掉 15 条**，
+远不如单纯修词表的 32 条，更谈不上"最大单点可救空间"。**这句话请从 §10.2 划掉。**
+
+用 spaCy 直接探针查原因，发现一个必须写进项目笔记的事实：
+
+> **spaCy 把作从属连词的 `when` 标成 `advmod` / `WRB`，而不是 `mark`。**
+> `while` / `if` / `because` 才稳定标 `mark`。
+
+所以"ROOT 的子节点里有 `mark`"这个测试对**每一条 `when` 开头的句子都无条件放行**——
+不管结构是否真的闭合。arm C 消掉的那 15 条里绝大多数是 `when` 开头，
+**它是靠一个词性标注的偏差碰对的，不是靠语法判据对的。**
+任何后续基于 `dep_ == "mark"` 的判据都会继承这个坑；
+若要走依存路线，从属连词集合必须同时接受 `mark` 与 `advmod/WRB`，并显式列举 `when/where/whenever`。
+
+顺带更正一处措辞：§10.2 说 `_visual_temporal_clause_shape`（5568-5644）
+"用位置代理 `token.i < root.i`"是对的，但我当时把它描述成主要缺陷；
+真正更致命的是它和 arm C 共用的 `mark` 假设。两者都别直接搬。
+
+### 11.3 【已核实】真正的判据是"从句自身有没有谓语"，不是"主句来了没有"
+
+读 arm C 消掉的 15 条时诊断被改正了。它们**全部**是同一形状：
+前置从句 + 逗号 + 主句落在下一条。例如
+
+```
+When you refine a barrel of crude, ┃ you only get a tiny percentage of jet fuel
+If you look at all the chocolate eaten worldwide, ┃ only a microscopic 2% of it ...
+While balancing safety and innovation is a global challenge, ┃ Chinese leaders are willing ...
+```
+
+这是英语里最安全的断点之一，而且生产**已经这么切并合成了**。
+对照现网规则唯一抓对的那类：
+
+```
+Because instead of hiring traditional film crews, ┃ production companies started ...
+Because for the last hundred years, ┃ the momentum of the workforce was ...
+If a neocloud company ┃ defaults on a billion dollar loan in year three,
+```
+
+左半**根本没有有限动词**——`Because` / `If` 什么都没管住，是真碎片。
+
+**所以过严的不是"主句是否已出现"，而是"这个从句自身是否成句"。**
+arm E 就是这一条：`从句无有限谓语 → 判碎片；有 → 放行`。
+它把 `open_sub` 码命中从 110 压到 12，剩下的 12 条抽查全部是真碎片
+（另有 2 条属于 spaCy 把 `help` 标成 `VB` 之类的标注误差，量级可忽略）。
+
+判据只需 3 行，且**复用仓库已有写法**：
+`pos_ in {VERB, AUX} and tag_ not in {VB, VBG, VBN}`
+（与 `scripts/audit_visual_temporal_splits.py:45-67` 和 `screen_editor.py:5583-5586` 完全一致，
+不引入新概念）。缓存请照 §10.4 的 5752-5759 模式，键用拼接后的 token 串。
+
+### 11.4 补测：只看"已发布边界"会重犯 §1 的错，所以做了互补枚举
+
+"新增非法 = 0"只证明**已经切过的地方**没变坏，
+不能证明**没切过的地方**不会因为放宽而多出坏切点。§1 的处方正是死在这一步：
+那 98 条被解锁的边界逐条看下来多数**本来就该挡**。所以对 arm E / F 补了反方向的一次枚举：
+
+> 遍历 5,219 条冻结父字幕的**全部内部候选切点**，
+> 找出"现网判非法、放宽后判合法"的切点，逐条人工看。
+
+| 指标 | 数值 |
+|---|---|
+| 枚举候选切点总数 | 49,678 |
+| 其中左半命中现网 gate 入口条件（唯一可能产生差异的子集） | 3,537 |
+| **arm E 新增合法** | **105**（去重后 98 = 64 + 34，由两个互斥样本池相加得出，非直接读数） |
+| **arm F 新增合法** | **69**（去重后 64） |
+| arm E / arm F 新增非法 | **0 / 0**（`measure_open_subordinate_v4.py:139` 用 Counter 计数，键在 JSON 中缺失即从未自增 = 真 0；v3 的 JSON 另有显式 `newly_illegal_under_arm_E: 0`） |
+
+（重复共 7 对，**全部来自"巧克力"那一集在两个 work-dir 下的重跑副本**——
+同一位置被两个产物集各计一次。我最初解释成"一处在一个集里是父间边界、在另一个里是父内候选点"，
+**那个机制是错的**：本节两个数出自同一次枚举，重复纯粹来自跨 work-dir 的同集重跑。）
+
+### 11.5 【决定性】逐条看这 105 条 → 推荐 F，不推荐 E
+
+**arm F 新增的那 69 条（去重 64 条）几乎全是教科书级好切点。** 全量看过，摘录：
+
+```
+While balancing safety and innovation is a global challenge, ┃ Chinese leaders are willing ...
+If you scroll through these videos on social media, ┃ there is a recurring title that keeps ...
+When you wake up the next day, ┃ your executive function is running on fumes.
+Once you miss the entrance at the top, ┃ you can't just jump in halfway down.
+Because their pensions are microscopic, ┃ they can't afford to buy property, so they are forced to rent.
+Right. If the audience controls what's valuable, ┃ the gatekeepers have no power.
+```
+
+64 条里判为"平庸/略差"的约 5-6 条，且集中在一种形状：右半是极短尾巴
+（`┃ right?`、`┃ maybe`、`┃ you...`）。这类应由"两侧最少词数"约束兜住，
+**而不是靠 `open_sub` 这条语法规则兜**——用语法规则兜长度问题正是现网这堆缺陷的成因。
+（现网切分层是否已有最小词数下限、下限是多少 —— **本轮未测**。）
+
+**arm E 比 F 多开的那 36 条（去重 34 条）多数是本来就不该断的地方。** 全量列出后判定，
+约 20-24 条明确有害，典型形状是把不可分的短语劈开：
+
+```
+Because buyers are usually just way ┃ too fragmented.
+because the scale of this is hard ┃ to wrap my head around.
+if they don't know what the final picture is supposed ┃ to look like?
+Because the hyperscalers are no longer content ┃ just buying Adidas chips,
+When she dates a man ┃ her own age or older,
+If you feed a machine ┃ a massive diet of New York Times reporting ...
+... store on Main Street 50 years ┃ ago,
+... stuck at like one bar ┃ a year, ...
+... and then ┃ everyone else just learns how to do it.
+... in an anti-American scam, then ┃ America isn't just fighting a trade war ...
+When a downturn hits, irregular workers are the first ones ┃ let go because ...
+... a franchising model that only costs 8 300 ┃ to buy into, ...
+```
+
+**这就是 §1 的坑，位置一模一样。** 差别只在这次先看了才下结论。
+
+**那么 F 相对 E "少消掉的 12 条"是不是损失？** 抽查这 12 条对应的生产已发布边界
+（左半有有限谓语但不以逗号结尾），**约一半本身就是坏切点，生产切错了**：
+
+```
+because her visa status made it ┃ almost impossible for her to switch employers   ← 劈开 made it | impossible
+If you are a company and a single client ┃ makes up nearly half of your premium   ← 主谓分离
+... drains that battery, maybe ┃ the real trick is designing ...                  ← 断在 maybe 后
+Because every two years, oil field depletion physically costs the world ┃ one Saudi Arabia's worth  ← 动宾分离
+```
+
+另一半（`... willing to pay millions of dollars ┃ just to experience something ...`）确实还行。
+**所以 F 放弃的 12 条里有一半是"本该挡住的"，代价远小于 E 多开的 34 条坏切点。**
+
+**这也顺带更正 §2 的一个隐含框架**：`生产已接受` 不等于 `切得好`。
+既然已发布边界里 9.96% 自证非法、且抽查中确有真错切，
+那么"消掉的矛盾条数"就**不能当作优化目标**——
+最大化这个数会把规则一路放宽到把生产的错切也一并合法化。
+§10.5 已经写过"不要把 516 下降当目标"，本节给出了它的具体反例。
+
+### 11.6 给动手模型的落地形状
+
+```
+在 _is_open_subordinate_prefix (screen_editor.py:6575-6591) 现有正则全部命中之后，
+追加一道豁免：若该 cue 自身含有限谓语（spaCy: pos_ ∈ {VERB,AUX} 且 tag_ ∉ {VB,VBG,VBN}）
+           且 该 cue 以逗号结尾
+   → 不再判 open_subordinate_prefix_fragment。
+其余一切不变（终止标点逃生口、backchannel 前缀剥离、正则词表都别动）。
+```
+
+三条工程约束（均已核实，理由见 §10.4 / §10.6）：
+
+1. **必须缓存**，键用拼接 token 串，照 5752-5759 的实例字典 + `getattr` 防御初始化写法；
+   本文件全文 0 个 `lru_cache`，而这个 helper 在 DP 的 `edge_cost` 路径上
+   （10004→10060→6198→6259→6291）。
+2. **spaCy 不可用时必须降级为"按现网行为"**（`if not nlp: 走原正则`），不能降级成"放行"。
+3. **同名 code 有两个发射点**：6291 与 6439（后者走 `_fragment_issues`）。
+   只改 helper 两处同时生效；若只想改一处，请先确认另一处的语义是否也需要同步。
+
+回归基线要求：把 arm A 的 516 条（含每条边界的 rule-code 集合）写成 golden 文件，
+改动后断言 **新增非法 = 0**、且 **新增合法候选点数 ≤ 69**。
+第二条断言比第一条重要——它才是防止重蹈 §1 的那道闸。
+
+### 11.7 本节的证据分级与未测项
+
+**【已实测】** 表 11.1 全部数字；11.4 的枚举全部数字；11.5 引用的所有例句
+（均来自 `word-ledger.json` + `final-cue-timeline.json` 冻结产物，非构造）。
+
+**【已推翻】** §10.2 的"依存祖先判据是最大单点可救空间"；`dep_ == "mark"` 可用于识别从属连词。
+
+**【人工判断】** 11.5 里"好切点 / 坏切点"的分类是我逐条读英文下的判断，
+不是任何指标算出来的。34 条与 64 条我都全量列出在测量产物里，
+**请自行复核后再采纳结论**，不要只引用比例。
+
+**【未测】**
+
+- arm **F + 有限谓语词表修复** 的联合值。按 11.1 的可加性外推约为消掉 96 条
+  （64+32），但**这是推断，未实测**。
+- 改动对**最终选中的切点**的影响。本节全部结论都停在"候选点合法性"层面；
+  合法 ≠ 会被 DP 选中（软代价仍在）。真实输出差异需要重跑切分才知道。
+- 切分层是否已有"两侧最少词数"下限（关系到 11.5 那 5-6 条短尾巴是否已被兜住）。
+- 单行页 vs 现行双行页的可行率对比 —— 仍未测，见 §12（下一节，尚未产出）。
+- §3.2 那 5 条 `visual_*` 显示层判定的作用面 —— 三轮均未测。
+
+**测量脚本**（在仓库外，未落盘到本项目源码树）：
+`measure_open_subordinate.py`（arms A-D）、`_v2.py`（arms A/E/F/G）、
+`_v3.py`（互补枚举）、`_v4.py`（E/F 双臂互补枚举），
+产物 `open_subordinate_counterfactual*.json`、`open_subordinate_new_candidates*.json`。
+已随本文件一并归档到 `docs/audits/2026-08-24/external-claude-measurement/`。
+
+---
+
+## 12. 第三轮：单行页 vs 现行双行页可行性实测（2026-08-24 追加）
+
+> 这一节回答 GPT 第 4 步（"切分层与分页层联合可行性实验"）里关于**分页层**的那一半，
+> 也回答"单行分页是不是更好"。**结论与我先前的口头倾向不同**：
+> 不要改成单行分页；真正该动的是 `podcast_learning_video.py:3591` 的**一个常数**。
+> 全部数字用项目自己的字体度量（`article_subtitle_en_font` + `text_w` + `acx`，
+> 即真实 PIL RobotoSlab-SemiBold 步进宽度），未修改本仓库任何既有文件。
+
+### 12.1 测量面与保真度
+
+数据源：22 个产物集的 `display-page-translations.json` 的 `render_plans`
+（**这是冻结的生产分页结果本身**，不是我复算的）+ 同目录 `word-ledger.json` 的逐词时间戳。
+**4,656 条父字幕 / 5,352 个显示页。**
+
+**测量面披露**：这 22 个产物集只覆盖 **20 个 work-dir** —— `中式梦核`（202+202 父）与
+`无论怎么衡量，就业市场都很疲软`（260+260 父）各有 `【字幕】` 与 `【样式字幕】` 两份产物，
+即 **462/4,656 = 9.9% 的测量面是这 2 集的重复计数**，它们被双倍加权（比例结论基本不受影响，
+但 §12.3 的 `hard_examples` 里 S0062/S0064/S0218 各出现两次就是这个原因）。
+
+保真度检查：把词账本 `surface` 用空格拼接后与 `render_plans[i].english` 逐条比对 ——
+**4,656 / 4,656 完全相同，0 条不一致**。所以本节的分词与词-时间对齐是精确的，
+不像 §9 那样带哈钦误差。
+
+先记录一组描述性事实（直接读冻结产物，无推断）：
+
+| 事实 | 数值 |
+|---|---|
+| 每父页数分布 | 1 页 **4,024（86.4%）**、2 页 575、3 页 50、4 页 7 |
+| 每页行数分布 | 1 行 1,950（36.4%）、**2 行 3,343（62.5%）**、3 行 44、0 行 15 |
+| 实际用到的宽度档 | 1260 → 82.1%、1455 → 13.4%、1498 → 4.5% |
+| 父级选用字号 | 56 → 4,369、54 → 69、52 → 113、50 → 105；触发回退 272（5.8%） |
+| 单行渲染宽度（渲染 px，上限 1798） | 中位 1,741、p75 2,301、p90 2,821、max 5,571 |
+
+**第一个可用结论：多页机制只服务 13.6% 的父字幕，而双行机制服务 62.5% 的页。**
+真正天天在用的是"行内换行"，不是"多页"。
+
+### 12.2 【已核实】单行路径被一个 1100 的常数卡住，而面板宽 1260/1455/1498
+
+`podcast_learning_video.py:3591` 的早退条件用的是
+`ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH = 1100`（194 行），
+而同文件 `_article_english_layout_width`（3703-3717）挑选面板宽度的阶梯是
+**1260 / 1455 / 1498**——1100 **不在**阶梯里，它只是单行早退的门槛。
+换句话说：**一段文字明明能在 1455 的面板上一行放下，但因为超过 1100，就被强行拆成两行。**
+
+把 5,352 个生产页的文本按**单行**在 56 号字下量一遍：
+
+| 单行门槛 | 全部页能单行装下 | **现网 3,343 个双行页里能改成单行的** |
+|---|---|---|
+| **1100（现状）** | 1,621（30.3%） | **17（0.5%）** |
+| 1260 | 2,116（39.5%） | 303（9.1%） |
+| **1455** | 2,695（50.4%） | **785（23.5%）** |
+| 1498 | 2,828（52.8%） | 903（27.0%） |
+
+**把 3591 的门槛从 1100 抬到 1455，有 785 个页（占全部页 14.7%、占双行页 23.5%）
+从两行变一行**——**页数不变、切分不变、翻译不变、约束压力不变**，
+因为这一层只决定"同一页内怎么折行"。这是本次审计里性价比最高的单点改动。
+
+**代价必须一起说**：行会变长（最长可到 1746 渲染 px），
+一行扫视距离变大；这是可读性取舍，不是免费收益。
+建议先只抬到 1260（+303 页）观察，再决定是否到 1455。
+另外此表按 56 号字统一测量，对那 272 个用了更小字号的父字幕**偏保守**
+（字号更小 → 更容易单行装下），所以真实收益不低于上表。
+
+### 12.3 【已实测】改成"只用单行页"在联合约束下会破功
+
+问题必须连着三条约束一起问，单看页数会得出错误结论。
+用可行性 DP 逐父穷举分页方案，要求每页同时满足：
+**① 在 56 号字下单行装进给定宽度 ② ≥ `ARTICLE_VISUAL_PAGE_MIN_WORDS`(4) 词
+③ ≥ `ARTICLE_PAGE_MIN_DURATION_MS`(900ms) ④ 总页数 ≤ `ARTICLE_VISUAL_PAGE_MAX_PAGES`(4)**。
+
+先剔除"本身就够不到地板"的父字幕：整条不足 4 词或不足 900ms 的有
+**457 条（占 4,656 的 9.8%）**——这些无论怎么排版都违约，不该记在单行头上。
+剩余 **4,199 条**为计算面。
+
+| 单行门槛 | **可行（≤4 页且全页合规）** | 需要 >4 页 | **完全无可行方案** |
+|---|---|---|---|
+| 1100（现状门槛） | 3,613（86.04%） | 95 | 491 |
+| 1260 | 3,990（95.02%） | 45 | 164 |
+| 1455 | 4,145（98.71%） | 20 | 34 |
+| 1498 | 4,162（99.12%） | 15 | 22 |
+| **对照：现行双行页（任一宽度）** | **4,199（100.00%）** | **0** | **0** |
+
+**双行设计在四档宽度下全部 100% 可行；单行设计即使用最宽的 1498 也有 37 条（0.88%）做不到。**
+
+**卡点不是页数上限。** 只有 15-20 条父字幕需要超过 4 页 ——
+这条**推翻了我先前的口头担忧**（我说过单行"可能需要放宽 `ARTICLE_VISUAL_PAGE_MAX_PAGES`"，
+实测不需要）。真正的卡点是 **≥4 词与 ≥900ms 这两条地板**：
+单行页装的词少 → 页变多 → 每页停留时间变短 → 撞 900ms 地板。
+无可行方案的样本正是这个形状：
+
+```
+S0190  11词 5664ms  →  无解
+  The overarching policy stance still heavily emphasizes high-quality employment and self-reliance.
+    （词都长，11 词无论 4+7 / 5+6 / 6+5 / 7+4 都有一半超宽）
+S0102   8词 3242ms  →  无解
+  Right. But when you're constrained, every single parameter,
+    （只能 4+4，但前 4 词语速太快，不足 900ms）
+S0215  39词 13168ms →  需 5 页
+```
+
+### 12.4 结论：抬门槛，不要换成单行分页
+
+| 方案 | 收益 | 代价 | 判断 |
+|---|---|---|---|
+| **抬高 3591 的单行门槛（1100 → 1260 或 1455）** | 303 / 785 个双行页变单行 | 行更长；无结构风险 | **推荐，先到 1260** |
+| 改成只用单行页 | 版面最干净 | 4,199 条里 37-586 条无解（取决于宽度）；页数翻约 1.6 倍（1260 档 8,780/5,352 = 1.64×；1455 档 1.48×；1100 档 1.83×）；需重做页级中文分配 | **不推荐** |
+| 保持现状 | — | 双行页停在 62.5% | — |
+
+单行的干净版面，**八成可以靠抬门槛拿到，而不必承担换布局的可行性风险**。
+
+### 12.5 【新发现】三条声明约束在冻结产物里的实际成立情况
+
+顺手把 `layout_profile` 声明的约束与产物实际内容逐版本对齐，
+这是 §2"缺不变量测试"在**分页层**的同类证据。按 `planner_version` 分组：
+
+| planner | 页数 | `>2 行` | `0 行` | `<900ms` | `<4 词` |
+|---|---|---|---|---|---|
+| v18 | 306 | 8 | 0 | 15 | 24 |
+| v19 | 1,755 | 23 | 0 | 59 | 95 |
+| v23 | 409 | 6 | 0 | 19 | 26 |
+| v24 | 251 | 2 | 0 | 17 | 24 |
+| v26 | 485 | 5 | 0 | 19 | 33 |
+| v27 | 492 | **0** | 0 | 20 | 43 |
+| v28 | 574 | **0** | **8** | 22 | 40 |
+| v29 | 813 | **0** | **4** | 47 | 70 |
+| **v32（最新）** | **267** | **0** | **3** | **16** | **27** |
+
+三种不同性质，请分开处理：
+
+1. **`>2 行` 已经修好了。** v18-v26 每集都有几条，**v27 起为 0**。
+   `layout_profile.max_lines = 2` 现在成立。**不要再把它当待修缺陷**
+   （我如果只看全量 44 条就会误报，这是分版本看才拿到的结论）。
+2. **`0 行` 是 v28 引入的新回归，且 v32 仍在。** v18-v27 全为 0，
+   v28=8、v29=4、v32=3，共 15 页 `english_lines == []`。
+   页有 `english` 文本但 `english_lines` 是空数组 → **建议优先查这条**，
+   它是三条里唯一"越新越有、且此前没有"的。
+3. **`<900ms`(4.4%) 与 `<4 词`(7.1%) 每个版本都有，v32 也有（6.0% / 10.1%）。**
+   但**这两条不宜直接判为 bug**：§12.3 测出有 457 条父字幕（9.8%）
+   整条就不足 4 词或 900ms，地板对它们物理上不可达。
+   **这不是分页层的错，是切分层交下来的东西已经低于地板**——
+   正是 §5"切分层对分页可行性完全盲"的直接后果。
+   真正该做的是让切分层知道这两条地板，而不是在分页层放宽它们。
+
+### 12.6 本节的证据分级与未测项
+
+**【已实测】** 12.1 全部描述性数字（读冻结产物）；12.2 的四档命中数；
+12.3 的 DP 可行率与对照；12.5 的逐版本计数。
+保真度 4,656/4,656 精确匹配，本节不含 §9 那类哈钦误差。
+
+**【已推翻】** 我先前说单行分页"可能需要放宽 `ARTICLE_VISUAL_PAGE_MAX_PAGES`"——
+实测只有 15-20 条父字幕需要 >4 页，页数上限不是卡点；卡点是 ≥4 词与 ≥900ms。
+
+**【方向性偏差，必须知道】**
+
+- 12.3 的**双行对照偏乐观**：我只建模了"页内贪心折行 ≤2 行"，
+  **没有**建模项目实际的每行 ≥3 词、行间平衡、`ARTICLE_AVOID_LINE_START_WORDS`（264 行起）
+  等规则。所以"100% 可行"是双行可行性的**上界**。
+  不过冻结产物本身最多只用到 4 页、无一超限，与该上界一致。
+- 12.3 的**单行可行率也偏乐观**：DP 只管宽度/词数/时长，
+  **不管断点是否语法合法**（即 §11 那一整套 HARD 判定）。接上合法性后只会更低，
+  所以"单行不推荐"这个方向的结论是**保守安全**的。
+- 12.2 按 56 号字统一测量，对 272 个用了更小字号的父字幕偏保守，收益是下界。
+
+**【未测】**
+
+- 抬高 3591 门槛后，**页级中文分配**是否还能对齐（`display-page-translation-v9` 合同）。
+  英文行数变化不改页边界，理论上不影响分配，但**未验证**。
+- 那 15 条 `0 行` 页的成因（v28 的哪次改动引入）—— 未查。
+- 单行页方案下的页级中文重分配成本 —— 未测。
+- 把 §11 的边界合法性接入本节 DP 的联合可行率 —— 未测，这才是 GPT 第 4 步的完整形态。
+
+**测量脚本**：`measure_single_line_pages.py`（描述性 + 门槛命中）、
+`measure_single_line_feasibility_dp.py`（联合约束可行性 DP），
+产物 `single_line_pagination_feasibility.json`、`single_line_feasibility_dp.json`，
+已归档到 `docs/audits/2026-08-24/external-claude-measurement/`。
+
+---
+
+## 13. 第四轮：对 GPT 已落地实现的只读复核（2026-08-24 追加）
+
+> 触发：GPT 报告"有限谓语改动的第一轮聚焦测试暴露 8 个回归",并判断
+> "不能把 spaCy 结果无条件替换到所有显示层判定"。
+> **它这个判断是对的**,本节给出让它不必逐条猜的量化依据,以及一条它没点出的机械原因。
+> 我仍未修改任何既有文件；本节全部结论读自 `git diff` 与新增测试。
+
+### 13.1 8 个回归的量级解释：那个值有 35.9% 会翻转
+
+在本仓库 5,123 条去重父字幕上实测 GPT 的新实现（词表快路 → spaCy 兜底）：
+
+| 项 | 条数 | 占比 |
+|---|---|---|
+| **词表漏判、被 spaCy 兜住 → `has_finite_predicate` 由 False 翻 True** | **1,837** | **35.9%** |
+| 词表短路成 True 但 spaCy 说 False（假阳性，spaCy 无机会纠正） | 18 | 0.4% |
+| 全小写送入 spaCy 导致结论翻转 | 49 | 1.0% |
+
+（1,837 与 §3 独立测得的 1,827 相互印证。）
+
+**`has_finite_predicate` 有 35.9% 的样本改变取值,而它有 11 个消费点**
+（4904、5952→5964/5966/5980、6319/6320、6367、6384/6431/6446、6467、6597、6655、6809、14519）。
+显示层五条 `visual_*` 判定全部门控在 `not has_finite_predicate` 上 ——
+该值翻 True 后这些判定**发火变少**,即显示层整体**变宽松**。
+所以"断言某处是碎片"的测试成批失败是**必然的算术结果**,不是实现写错。
+**GPT 的方向判断成立：作用面必须收窄。**
+
+### 13.2 【机械原因，GPT 未点出】arm F 被接在了共享 helper 上
+
+`screen_editor.py:6595-6600`（改后）：
+
+```python
+if (
+    normalized.rstrip().endswith(",")
+    and self._fragment_has_finite_predicate(self._word_tokens(normalized))
+):
+    return False
+```
+
+arm F 的豁免走的是**那个共享 helper**,于是"修 helper"与"上 arm F"变成同一次编辑,
+**这正是它无法区分"哪些是 arm F 预期变化、哪些是显示层误判"的原因** —— 二者在代码上不可分。
+
+**§11.6 的落地形态本意是给 arm F 一个自己的私有判据,不是复用共享 helper。**
+建议：arm F 内联一个独立的有限动词测试（同样的 spaCy 条件、同样缓存），
+`_fragment_has_finite_predicate` 本轮**完全不动**。这样：
+
+- arm F 的 PR 里显示层零变化 → 那 8 个回归**直接消失**,可用 §11.6 的两条断言单独验；
+- 修词表另开一个 PR,其 35.9% 的爆炸半径可以逐个消费点分别评估。
+
+两者效果本来就是可加的（§11.2：32 + 76 ≈ 111）,分开落地不损失收益。
+
+### 13.3 "正确的作用面"不必靠判断，我只测过一处
+
+§3.3 的反事实（516 → 484、新增非法 0）虽然是全局 monkeypatch,
+但**只测了 `_evaluate_item_pair_for_final_boundary` 这一条路径的边界合法性**。
+→ **有实测背书的安全作用面 = 边界评估路径；显示层五条 `visual_*` 与 6467
+`has_independent_meaning` 的实测背书为零**（§3 末尾"显示层未测"即指此处）。
+结论：先把 spaCy 兜底限制在边界路径,显示层继续用旧词表,直到有人测过为止。
+
+### 13.4 三处具体缺陷（按重要性）
+
+1. **【阻塞】`@classmethod` 改成实例方法,打断了回归基线脚本。**
+   `measure_finite_counterfactual.py:34`、`measure_open_subordinate.py:61`、
+   `measure_open_subordinate_v2.py:67` 都用 `E._fragment_has_finite_predicate.__func__`
+   解包 classmethod,普通函数没有 `__func__` → `AttributeError`。
+   **当前工作树上跑不出基线。** 改 `getattr(f, "__func__", f)` 即可,或在干净检出上跑基线。
+2. **`be`/`been`/`being` 在 `finite_or_aux` 里是错的**,且**在 spaCy 之前短路**,
+   于是永远得不到纠正。这三个是非有限形式。实测 18 条（0.4%）受此影响,
+   14 条只因这三个词而误判：`being built in America right now?`、
+   `only to be forced to use it for DoorDash,`、`So let me be perfectly clear right up front.`
+   → 从快路名单里移除这三个,交给 spaCy 判。量小但方向明确是错的。
+3. **送入 spaCy 的是 `.casefold()` 后的文本**（`cache_key` 即小写串）。
+   `en_core_web_sm` 在有大小写文本上训练,全小写会掉准,受影响 49 条（1.0%）,
+   集中在祈使句（`Set the parameters carefully` 有大小写判 False、全小写判 True）。
+   → 缓存键可以用小写,但**送进 `nlp()` 的应是原始大小写文本**。§3 的测量用的是原文。
+
+### 13.5 对"不改测试来掩盖行为变化"这条原则的一点补充
+
+这个原则**大体正确,请保持**。但有一个例外必须留出口：**测试本身可能编码了 bug**。
+§3 实测：旧词表在真含有限动词的字幕上**漏判 42%**,反方向只错 14 条 —— 纯单向过严。
+任何断言 `It's really about…` / `They're optimizing…` 无有限谓语的测试,
+断言的是**关于英语的错误事实**,不是关于本项目的约定。
+
+判定规则：**看那条 cue 的原文,问"这里有没有一个在做时态/人称变化的动词"**,
+让英语裁决,不让测试裁决。若测试错,改测试并在注释里写清为什么错、依据哪条实测。
+若 cue 确实无有限动词而 spaCy 说有,那是 spaCy 误判 → 走 13.3 的收窄作用面,别放宽判据。
+
+**新增的三个测试（`..._falls_back_to_spacy_and_caches_by_token_text`、
+`..._spacy_unavailable_keeps_legacy_conservative_result`、
+`..._allows_finite_comma_clause_only`）写法是合规的**,缓存命中、
+spaCy 缺失降级、arm F 只在"逗号 + 有限谓语"时豁免三条都覆盖到了,建议保留。
+
+### 13.6 本节未测
+
+- 11 个消费点**各自**因 35.9% 翻转而改变多少判定 —— 未测。
+  这是让 GPT 从数据而非逐条猜测中选定作用面所缺的最后一块,可以补。
+- arm F 改用私有判据后,§11.6 那两条断言的实际数值 —— 未测（需先修 13.4.1 的阻塞）。
+
+---
+
+## 14. 执行计划（2026-08-24，双方共用；含分工与放行条件）
+
+> 本节是给**两个执行者**看的：`[GPT]` 与 `[审计者]`。
+> 每步都写了**放行条件**——不满足就不许进下一步，也不许合并。
+> 排序原则：**先恢复量具，再拆耦合，最后才碰作用面。**顺序错了后面全是猜。
+
+### 14.0 先承认一件事：谁更缜密，取决于谁在交付
+
+`[审计者]` 本轮抓到 `[GPT]` 四处问题（arm F 耦合、`be/been/being`、casefold、基线被打断），
+但**这不证明审计者更缜密**，只证明**没有交付压力的第二读者天然能看见作者看不见的东西**。
+反向也成立：`[GPT]` 的实现里，缓存写法、spaCy 降级、三个新测试都合规，
+而审计者本轮自己犯的错有：违反自己写进记忆的禁令去 grep `runtime/`（超时）、
+样本桶命名张冠李戴（`F_still_blocked` 实为 E）、
+差点用推导代替实测（arm F 的 69）、§12 测量面 9.9% 重复计数未察（靠 subagent 逮到）、
+以及写给 GPT 的"其余先别动"一句**差点让对方停掉正确的活**。
+
+→ **结论不是"谁更强"，而是"任何一方都不得自证"。** 本计划因此把交叉复核写成硬性放行条件。
+
+### 14.1 步骤表
+
+| # | 归属 | 动作 | 放行条件（不满足则停） |
+|---|---|---|---|
+| **S0** | `[GPT]` | **恢复量具**（阻塞全局）。把 `measure_finite_counterfactual.py:34`、`measure_open_subordinate.py:61`、`measure_open_subordinate_v2.py:67` 的 `.__func__` 改成 `getattr(f, "__func__", f)` | 在**当前工作树**上跑出基线并复现 **5,180 条边界 / 516 条非法（9.96%）**。数字对不上就先查装置，不要往下走 |
+| **S1** | `[审计者]` | 测 `has_finite_predicate` 那 35.9% 翻转在**11 个消费点各自**造成多少判定变化 | 产出逐消费点的翻转计数表，并标出哪些消费点**零变化**（那些是免费安全区） |
+| **S2** | `[GPT]` | **拆耦合**：arm F 改用私有有限动词判据（同条件、同缓存），`_fragment_has_finite_predicate` **本轮完全不动** | ①**显示层测试全绿且一行测试都没改**；② 新增非法 = 0；③ **新增合法候选切点 ≤ 69**。③ 比 ① 重要 |
+| **S3** | `[GPT]` | 共享 helper 的三处硬伤：`be`/`been`/`being` 移出快路；送 `nlp()` 的用**原始大小写**（缓存键仍可小写）；快路顺序不变 | 复跑 §13.1 那张表：假阳性 **18 → 0**、casefold 翻转 **49 → 0**、正收益 **1,837 不降** |
+| **S4** | `[GPT]`，**依赖 S1** | 按 S1 的数据把 spaCy 兜底**收窄到有实测背书的作用面**（边界评估路径），显示层继续走旧词表 | ① 516 → 484、新增非法 0；② 显示层测试全绿**且未改测试**；③ 收窄边界在注释里写明依据 S1 的哪一行 |
+| **S5** | `[GPT]`，**无依赖，可并行先做** | 分页单常数：`podcast_learning_video.py:3591` 的门槛 1100 → 1260 | ① 页数、页边界、`word_start/word_end` **逐页不变**；② 页级中文分配（`display-page-translation-v9` 合同）仍对齐；③ 抽 10 页人眼看行长可接受。满足后再议 1455 |
+| **S6** | `[GPT]`，无依赖 | 查 15 页 `english_lines == []`（v28 引入、v32 仍在） | 定位到引入它的那次改动；修完 v28/v29/v32 三组产物复算为 0 |
+| **S7** | 暂不动 | 457 条父字幕（9.8%）整条低于 ≥4 词 / ≥900ms 地板；2,122 个"合法但未被选中"的切点背后的代价函数 | **这才是真瓶颈**，属设计问题不是补丁问题。S0–S6 全绿后单开一轮 |
+
+### 14.2 两条贯穿全程的硬规则
+
+1. **谁写的谁不许判定通过。** 每个 PR 合并前由另一方读 diff。
+   `[GPT]` 的 diff 由 `[审计者]` 在只读模式复核；`[审计者]` 的测量结论由 `[GPT]`
+   或独立 subagent 对账（本报告 §11/§12 已按此办过一次，逮出 8 处标注错误）。
+2. **改测试必须附理由，但"不改测试"不是原则性禁令。** 判定归英语，不归测试：
+   看 cue 原文问"有没有一个在做时态/人称变化的动词"。测试若编码了旧 bug，
+   改它并在注释里写清依据（§13.5）。**唯一禁止的是为了让红变绿而改**。
+
+### 14.3 排序的理由（别自作聪明调顺序）
+
+- **S0 必须最先。** 没有"改之前是什么样"的对照，8 个红点只能靠猜归因，
+  这正是 `[GPT]` 当前卡住的位置。恢复量具 10 分钟，省下来的是几小时。
+- **S2 必须在 S4 之前。** 两件事焊在一起时，任何一方的效果都无法归因（§13.2）。
+  拆开后 S2 的显示层变化为零，8 个回归自然消失——**不是被掩盖，是本来就不该发生**。
+- **S1 必须在 S4 之前。** 否则"正确作用面"是判断，不是数据。有了逐消费点的表，
+  收窄到哪一行是**读出来的**。
+- **S5/S6 可以插到最前面。** 它们与上面完全无依赖，而 S5 是本次审计里唯一
+  "肉眼可见、零结构风险"的收益（每集约 14 页从两行变一行）。
+  想先要一个能看见的进展就先做 S5。
+
+---
+
+## 15. S2 放行复核：拆分结构正确，但作用面窄了一个发射源（2026-08-24 实测）
+
+> 这是 §14 里 S2 的放行判定。**结论：不放行**，但差的只有一处，且改法已实测出来。
+> 全部数字在 `[GPT]` 当前工作树上跑出，审计者仍未修改任何既有文件。
+
+### 15.1 先记两件做对的事
+
+1. **恢复 `@classmethod` 是比我的建议更好的选择。** §13.4.1 我提的是改我那三个脚本，
+   `[GPT]` 选择恢复方法绑定类型，于是**基线脚本原样可跑**，量具立刻恢复。这个判断优于我的。
+2. **拆耦合的结构是对的。** 新增 `_is_open_subordinate_prefix_for_structural_boundary`
+   （6594-6606）+ 私有 `_structural_fragment_has_finite_predicate`（6608-），
+   共享 helper 恢复 classmethod 与旧词表语义、spaCy 尾巴移除 →
+   **显示层五条 `visual_*` 与 6467 完全不再受影响**，§13.1 那 35.9% 的爆炸半径被隔离掉了。
+   新判据还顺手避开了 §13.4.3 的 casefold 问题（送 `nlp()` 的是 `str(word).strip()`，未小写）。
+
+### 15.2 【实测】但 arm F 目前零收益：516 未降，`open_sub` 仍是 110
+
+在当前工作树上跑 `measure_stage2.py`：
+
+| 版本 | 非法 / 5,180 | `open_sub` 命中 |
+|---|---|---|
+| §11 实测基线（改动前） | 516 | 110 |
+| **当前工作树（arm F 只在 6292 一处）** | **516** | **110** |
+| 把 arm F 提到 `_is_open_subordinate_prefix`（两个发射源都吃） | **452** | **37** |
+| **推荐方案 B（见 15.4）** | **452** | **37** |
+
+**一条都没降。** 原因是 §11.6 里那句"两个发射源（6292 和 6440），两处都要覆盖"
+没有落地：
+
+- **6292** 在 `_cross_item_structural_boundary_issues`（6260）→ 已换成 arm F 判据 ✅
+- **6440** 在 `_evaluate_final_display_fragment`（6349），它在 6387 读的是
+  **原版** `_is_open_subordinate_prefix` → 仍无条件发火 ❌
+
+而 `_evaluate_item_pair_for_final_boundary`（6199）**两条都吃**：
+6219 调 `_cross_item_structural_boundary_issues`，6241 调 `_evaluate_final_display_fragment`，
+后者的 `hard_fragment_issues` 在 6246-6248 被合并进 `hard_issues`。
+→ **同一条边界被同名 code 重复发射，抹掉一个不改变 `legal` 的结果。**
+
+### 15.3 【关键】不要直接去改 6387 —— 那会重演上一轮的踩坑
+
+`_evaluate_final_display_fragment` 有 **11 个调用者**，其中**三个在显示层**：
+
+| 调用行 | 所在函数 | 层 |
+|---|---|---|
+| 6241 | `_evaluate_item_pair_for_final_boundary` | **边界（有实测背书）** |
+| 4893 / 5171 / 5176 / 5679 / 7082 / 7623 | pre-ID 再平衡与修复 | 结构（未测） |
+| 6545 | `_weak_fragment_issues` | 未测 |
+| **5938** | **`_visual_split_display_unit_issues`** | **显示层** |
+| **6034** | **`_validate_final_display_fragments`** | **显示层** |
+| **10127** | **`_stable_candidate_display_safe`** | **显示层** |
+
+把 6387 换成 arm F 判据 = 一次改动同时影响这 11 个消费点，
+**与上一轮"改共享 helper"是同一个错误形状**，只是换了个函数。别做。
+
+### 15.4 【已实测】推荐方案 B：只在边界那一个消费点后置过滤
+
+在 `_evaluate_item_pair_for_final_boundary` 里，6241 拿到 `fragment_evaluation`
+之后、6246 合并之前，按 arm F 抹掉这个 code：
+
+```python
+fragment_hard = list(fragment_evaluation["hard_fragment_issues"])
+if ("open_subordinate_prefix_fragment" in fragment_hard
+        and not self._is_open_subordinate_prefix_for_structural_boundary(left)):
+    fragment_hard = [c for c in fragment_hard
+                     if c != "open_subordinate_prefix_fragment"]
+for issue in fragment_hard:            # 原 6246-6248
+    if issue not in hard_issues:
+        hard_issues.append(issue)
+...
+result["hard_fragment_issues"] = fragment_hard   # 原 6253，保持一致
+```
+
+**实测复现 452 / 5,180、`open_sub` 37**，与 §11 的 arm F 预测值精确一致。
+`_evaluate_final_display_fragment` 一行不改 → **其余 10 个调用者、含 3 个显示层的，零变化**。
+这是"作用面收窄到有实测背书的那一处"的字面落地。
+
+方案 A（给 `_evaluate_final_display_fragment` 加 `structural_boundary: bool = False`
+参数，仅 6241 传 True）在语义上更干净，但改的是 11 个调用者共用的签名；
+若选 A，放行条件同样是 **452 / 37 且显示层测试未改而全绿**。
+
+### 15.5 S2 放行条件的当前状态
+
+| 条件 | 状态 |
+|---|---|
+| 显示层测试全绿且一行未改 | ✅ 已满足（共享 helper 已复原，显示层不再读 spaCy 判定） |
+| 新增非法 = 0 | ✅ 满足但**无意义**：因为收益也是 0，等于没改 |
+| **消掉 64 条（516 → 452）** | ❌ **未满足，当前 516**。补上 15.4 即可 |
+| **新增合法候选切点 ≤ 69** | ⏸ 未测。需在补完 15.4 后跑 `measure_open_subordinate_v4.py` 的枚举 |
+
+→ **S2 不放行。** 补 15.4 后重跑本节两张表，再验第四条。
+
+---
+
+## §16 脚本已可独立运行 + 预期收益分层（不要把 516→452 当效果指标）
+
+### 16.1 `docs/audits/2026-08-24/external-claude-measurement/` 的 10 个脚本现在路径无关
+
+原先每个脚本写死了外部审计方的 Linux 绝对路径，在 Windows 上会直接失败；
+其中 `sys.path.insert` 还指向一个 Windows 上不存在的目录，
+**即使手改 `PROJ` 也会在跨脚本 import 处再挂一次**。已全部改为：
+
+```python
+_HERE = Path(__file__).resolve().parent
+PROJ = Path(os.environ.get("VC_REPO") or _HERE.parents[3])
+OUT = _HERE
+sys.path.insert(0, str(_HERE))
+```
+
+另修掉 5 处残留的写死输出路径（`measure_boundary_flips.py:231`、
+`measure_finite_counterfactual.py:110`、`measure_finite_predicate.py:110`、
+`measure_stage2.py:85,129`）。`MODEL` 随 `PROJ` 自动定位。
+
+已验证：无残留 `/sessions/` 字面量；10 个脚本全部 `py_compile` 通过；
+**从一个与仓库无关的工作目录运行 `measure_stage2.py`，复现 5,180 / 516 / `open_sub` 110。**
+
+含义：**S2/S3/S5/S6 的验收数字全部在本报告 §14/§15 里预先登记，
+且脚本现在可由改动方自己跑。** 自查在这种条件下是有效的——
+危险的是事后挑一个自己已经达成的标准当成功，而这里标准早于动手时间钉死。
+仍然适用的红线见 §14.2：**谁写的谁不许判定通过**，
+所以"跑出目标数"是必要条件，不是充分条件。
+
+### 16.2 预期收益分层（改完之后到底哪里会变好）
+
+| 改动 | 数量级 | 肉眼可见？ | 说明 |
+|---|---|---|---|
+| S5 分页门槛 1100 → 1260 | 303 页 / 5,352（5.7%） | **是** | 现网双行页改为单行，页数与切分不变 |
+| S5 分页门槛 1100 → 1455 | 785 页 / 5,352（14.7%） | **是，但需目视** | 已接近面板满宽，"塞得进去"已实测，"好不好看"**未测** |
+| S2 arm F 补完（516 → 452） | 64 条 | **不一定** | 见 16.3 |
+| S3 `be/been/being` 快速路径 | 18 例 / 5,123（0.4%），其中 14 例单由这三个词造成 | 否 | 正确性修复 |
+| S3 casefold 喂 spaCy | 49 例 / 5,123（1.0%），集中在祈使句 | 否 | 新判据已用 `str(word).strip()`，此项可能已自然消解，需复测确认 |
+| S7 低于地板的父字幕 | 457 条 | — | **本轮完全未动**，且无预登记验收条件 |
+
+分页两行的基数 5,352 页 / 4,656 父来自 22 个产物集，其中约 9.9% 的父字幕
+是 2 集被算了两遍（见目录 README），比例结论不受实质影响。
+
+### 16.3 为什么 516 → 452 不是效果指标
+
+9.96% 那个数衡量的是**规则自相矛盾**：生产已接受并已合成出去的父间边界，
+拿现规则回头判会判成非法。消掉它是账目一致性变好，**不等于切得更好**——
+这条方法论已在 §11.5 写过，此处重申是因为它极易被当成优化目标。
+
+具体理由：arm F 只是把 64 个原本被 `open_subordinate_prefix_fragment`
+**硬挡住**的候选切点放开；最终切在哪儿由全局 DP 的代价函数决定。
+**该代价函数从未被测量**，而已知存在 2,122 个"合法但未被选中"的切点，
+直接说明**合法 ≠ 会被选中**。因此 arm F 的预期效果是：
+少数 `when/if/because/although` 类从句开头处切到应切的位置，其余无感。
+
+风险方向也要记住：**放宽规则本身可以让效果变差。**
+现有证据把风险限定在有界范围内——`newly_illegal = 0` 是实测（不是推断），
+64 条新增合法切点已在 §11.5 逐条目视复核——但不是零风险。
+
+### 16.4 一条实测到的落地成本：改完不会让已导出的视频变好，重跑会触发中文重翻
+
+- `word-ledger.json` / `final-cue-timeline.json` / `english-boundary-audit.json`
+  等产物在 `screen_editor.py:13544-13594` 处**只写不读**，是证据文件而非缓存。
+  故规则改动不会追溯改写任何已冻结产物或已导出视频，必须重跑才体现。
+- `stable_pipeline_contracts.py` 的 `FrozenPipelineSnapshot` 是**单次运行内**的
+  哈希护栏（禁止中文阶段回改英文/时间/语义组），**不是跨运行的复用缓存**。
+- LLM 结果按文本哈希缓存（`split_by_llm.py:30-56` 的 `get_cache_key(text, model)`）。
+  **切分一改 → 父字幕文本改 → 缓存键改 → 中文重新调用。**
+  已人工校对过的中文，在被重切的段落上会回到未校状态。
+
+→ 建议：**先在一集新素材上验证，不要对着已人工校好的老集直接重跑。**
+
+---
+
+## §17. S2 二次放行复核：规则已验证正确，收益仍为 0，缺口只剩一处接线（2026-08-24 实测）
+
+复核对象：GPT 报告"本轮已完成（恢复 classmethod / 拆出私有结构边界判据 / 保留
+spaCy 缓存与回退 / 视觉层不受影响 / 新增四类测试）"。
+被复核树：`screen_editor.py` mtime `2026-08-24 08:49:30`，
+`git diff --ignore-cr-at-eol --numstat` = **+61 / −1**。
+本节所有数字为审计者在该树上重新实跑所得，**未修改任何项目文件**。
+
+### 17.1 结论（一句话）
+
+**规则和实现都对，但生产可见收益依然是 0——因为同一个 code 有两个发射源，只豁免了一个。**
+这不是判断分歧，是可复现的数字：见 17.2。
+
+### 17.2 生产面复测：三个数一个字没变
+
+`python docs/audits/2026-08-24/external-claude-measurement/measure_stage2.py`
+
+| 指标 | 改动前基线 | GPT 本轮完成后 | 变化 |
+|---|---|---|---|
+| 生产已接受边界 | 5180 | **5180** | — |
+| 被判非法 | 516（9.96%） | **516（9.96%）** | **0** |
+| 其中 `open_subordinate_prefix_fragment` | 110 | **110** | **0** |
+
+原因（一手读代码，非推测）：该 code 有两个发射源。
+
+| 行号 | 所在函数 | 用哪个判据 | 状态 |
+|---|---|---|---|
+| 6291→6292 | `_cross_item_structural_boundary_issues` | `_is_open_subordinate_prefix_for_structural_boundary` | 已豁免 ✅ |
+| 6387→6440 | `_evaluate_final_display_fragment` | `_is_open_subordinate_prefix`（原版） | **未豁免 ❌** |
+
+两者都被 `_evaluate_item_pair_for_final_boundary`（def 6199）消费并在 6246-6248
+合并（6219 走前者、6241 走后者），所以**只要 6440 还在报，合并结果就照旧非法**。
+
+### 17.3 缺口确认只是接线：方案B 复现 452 / 37
+
+在 GPT 当前树上，**不改任何函数**，只在 6241 与 6246 之间那一个消费点后置过滤该
+code（调用 GPT 自己的新私有判据），实测：
+
+```
+方案B 后置过滤        非法 452 / 5180   open_sub=37     （预登记目标 452 / 37）
+```
+
+与 §11 预登记目标完全一致 → **规则无误，只差把第二个发射源接上。**
+不采用"直接改 6387"的原因见 §15：`_evaluate_final_display_fragment` 有 11 个调用点，
+其中 3 个在显示层（`_visual_split_display_unit_issues` 5938、
+`_validate_final_display_fragments` 6034、`_stable_candidate_display_safe` 10127），
+在那里动手等于换个函数把 8 个回归再犯一遍。
+
+**建议落地代码（方案B，作用面 = 唯一的边界消费点）：**
+
+```python
+# _evaluate_item_pair_for_final_boundary 内，6246 合并之前
+if "open_subordinate_prefix_fragment" in fragment_evaluation.get("hard_fragment_issues", ()) \
+        and not self._is_open_subordinate_prefix_for_structural_boundary(left):
+    fragment_evaluation = dict(fragment_evaluation)
+    fragment_evaluation["hard_fragment_issues"] = [
+        c for c in fragment_evaluation["hard_fragment_issues"]
+        if c != "open_subordinate_prefix_fragment"
+    ]
+```
+
+### 17.4 安全侧反向枚举：69 / 0，且两套独立实现互相印证（本轮新增证据）
+
+比"非法数下降"更该看的是**放宽后新开了多少切点**。全量枚举 49,678 个内部候选切口
+（门内 3,537 个），基线 vs 方案B：
+
+| 指标 | 预登记目标 | 实测 | 判定 |
+|---|---|---|---|
+| 新变合法的切点 `newly_legal` | ≤ 69 | **69** | PASS |
+| 新变非法的切点 `newly_illegal` | 0 | **0** | PASS |
+| 去重后的不同左右对 | — | 64 | — |
+
+**关键交叉验证：** `measure_open_subordinate_v4.py` 里的 arm F 是审计者**自己重写**的；
+本轮脚本调用的是 GPT **实际落地**的
+`_is_open_subordinate_prefix_for_structural_boundary`。
+两套独立实现在两个不同测量面上给出同一组数（69/0 与 452/37）
+→ **GPT 的实现与审计规格语义等价**，此项不再需要复核。
+
+脚本：`/tmp/optb_reverse.py`（审计者临时件，未入库；如需入库请让审计者归档）。
+
+### 17.5 §13.4 三处硬伤的当前状态：全部不再影响 arm F
+
+一手读 6594-6650 确认：
+
+| §13.4 缺陷 | 影响量 | 当前状态 |
+|---|---|---|
+| classmethod→实例方法，打断外部脚本 `.__func__` | blocker | **已修**：`_fragment_has_finite_predicate` 恢复 `@classmethod`（6652 附近同款写法），审计脚本**原封不动跑通**（17.2 即为证据） |
+| `be`/`been`/`being` 被当有限式短路 | 18 例 / 0.4% | **不再影响 arm F**：`_structural_fragment_has_finite_predicate` 的 spaCy 路径**没有词表快捷路径**，直接送 `nlp()` |
+| 送进 `nlp()` 的文本被 casefold，降低标注质量 | 49 例 / 1.0% | **已修**：6613 用 `str(word).strip()`，未 casefold |
+
+GPT 选择"恢复 classmethod"而不是审计者建议的"改脚本适配"，是**更优解**——
+它让 before/after 仪器保持可用，代价为零。此处采纳 GPT 判断。
+
+### 17.6 本轮新发现的一处（非阻塞）：回退路径导致切分结果与环境相关
+
+6642-6648 的回退分支在 spaCy 不可用时改走旧词表（且 casefold）。方向是**安全的**——
+旧词表把 `be/been/being` 当有限式 → `has_finite_predicate` 为真 → arm F 返回 False
+→ 仍然拦住 → 退回改动前行为，**失败朝保守侧倒**，不会产生新的激进切分。
+
+但对"冻结可复现"的稳定模式来说，这意味着**同一份输入在装/不装模型的机器上会切出不同结果**，
+而产物里没有任何字段能事后区分。建议（低成本、不改逻辑）：
+把 spaCy 是否可用 + 模型版本写进 `english-boundary-audit.json` 一类证据文件，
+让重跑差异可被发现，而不是静默漂移。
+
+### 17.7 放行判定
+
+- **arm F 规则与实现：放行 ✅**（69/0 与 452/37 双面印证，语义等价已确认）
+- **S2 整体：仍不放行 ❌**，唯一未完成项 = 17.3 那一处接线。
+  放行条件：`measure_stage2.py` 输出 **452 / 5180，open_sub=37**；
+  且 `newly_illegal == 0` 保持不变。两个数都已预登记，GPT 可自验。
+
+### 17.8 复核者声明
+
+- 本节未修改任何项目文件；改动仅限本报告与 `/tmp` 下的临时脚本。
+- 未运行 `git checkout .` / `git restore .`。
+- 未跑 pytest：GPT 报告的"新增四类测试"是否通过，由 GPT 自行确认；
+  §13.5 的警告仍然有效——**测试断言可以把当前行为固化成"正确"**，
+  所以测试通过不能替代 17.7 的两个数字。
+
+---
+
+## §18. S2 通过之后干什么：优先级排序（2026-08-24 追加）
+
+前置：`measure_stage2.py` = **452 / 5180, open_sub=37** 且 `newly_illegal == 0`。
+未达到就别往下走，缺口见 §17.3。
+
+**先明确一件事：到这里"规则自洽"的活基本干完了，不要再刷这个指标。**
+516→452 衡量的是规则自相矛盾，不是切得更好（§16.2）。继续压这个数会把生产的错切
+一并合法化（§1 的坑）。下面按"用户能看见的改善 / 单位风险"排序。
+
+### 18.1 立刻做：把收益锁死成不变量测试（低风险，防倒退）
+
+§2 的根因是**没有任何测试保证"现规则仍接受历史已发布输出"**。S2 通过后应新增一条
+回归测试：喂 5,180 条生产已接受边界，断言被判非法 **≤ 452**（棘轮，只许降不许升）。
+这比新增的四类单元测试重要——后者验的是新判据自身行为，前者防的是**下一次改动
+悄悄把 452 顶回 516**。注意 §13.5：单元测试可以把当前行为固化成"正确"，
+所以断言要挂在**生产历史数据**上，不是挂在手写样例上。
+
+**顺带（5 行、零逻辑改动）**：把 spaCy 可用性 + 模型版本写进
+`english-boundary-audit.json`，理由见 §17.6（否则装/不装模型切出来不一样且事后无法分辨）。
+
+### 18.2 然后做：S6 —— v28 起的空行回归（真 bug，用户能看见）
+
+`english_lines == []` 的页共 **15 个**，**v28 才出现、v29/v32 仍在**（§8）。
+这是屏幕上真的出现空白英文行，比任何规则整洁度都更该修，且属"新引入回归"，
+按 v27→v28 的 diff 定位应该很快。**分版本看，不要看全量 44 条**（会误报已修好的 >2 行）。
+
+### 18.3 然后做：S5 —— 分页常数 1100（最便宜的可见改善，但需要人眼定档）
+
+`podcast_learning_video.py:3591` 用 `ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH=1100`
+早退，而面板阶梯是 1260/1455/1498，**1100 不在其中**（§8）。抬到 1260 → **303** 个双行页
+变单行；抬到 1455 → **785** 个（占双行页 23.5%）。页数/切分/翻译/约束压力全不变。
+
+**这一步不该由模型拍板**：代价是行更长，属可读性取舍。
+GPT 应当**产出 1100 / 1260 / 1455 三档的同页真实渲染对比图**交用户选，而不是自己定。
+
+### 18.4 再然后：S1 —— 共享 helper 的爆炸半径表（只测量，不改代码）
+
+`_fragment_has_finite_predicate` 单向漏判 42%、返回值在 5,123 条父字幕上翻转 35.9%，
+是切分层最大的地基缺陷（§3）——**但它有 11 个消费点，其中 3 个在显示层**。
+两次回归都出在这儿。所以下一步**不是修它，是先出一张表**：
+11 个消费点各自有多少条判定会翻转、翻转方向、显示层受影响页数。
+有了表才能决定作用面；没表就动 = 第三次重犯。**本项审计者也未跑过，是双方共同空白。**
+
+### 18.5 落地验证（贯穿以上每一步）
+
+规则改动**不会**追溯改写任何已冻结产物或已导出视频，必须重跑才体现（§16.4）。
+而重跑会改父字幕文本 → LLM 缓存键改 → **中文重新翻译，已人工校对的段落回到未校状态**。
+→ **一律先在一集新素材上端到端验证，不要对着已人工校好的老集直接重跑。**
+判断标准是"看着是不是更好"，不是矛盾条数。
+
+### 18.6 暂缓：S7 —— 真正的瓶颈（没有预登记门禁，先设计测量）
+
+切分层对分页可行性完全盲（§5）、代价函数从未被测量（2,122 个"合法但未被选中"的切点
+就是证据）、457 个父整条低于 ≥4词/≥900ms 地板（§8）。这三件才是 90-95% 自动化的真障碍，
+但**本报告没有为它们预写任何验收数字**。进入这一块之前应先补测量设计，
+否则又会重演"在对目标函数盲的空间里搜索"（§7）。
+
+---
+
+## §19. 【实测·最高优先级】真正的瓶颈是"审校清单不工作"，不是切分质量
+
+本节推翻 §18 的优先级排序。§18.1/18.2 保留，18.3/18.4 让位于本节。
+
+### 19.1 用户的真实工作流（本节的起因）
+
+用户反馈原话：**"现在基本上跑的结果我要逐条看，不止是标黄的字幕，因为我不知道没标的
+哪一条长字幕没切好导致翻译不好，还有就是分页也分的差，还有一些短字幕也可能有问题。"**
+目标是"自动化完成 90-95%，我补 5-10%"。
+
+**注意这个目标的字面含义：它是"我只需要动 5-10% 的条目"，是一个审校覆盖率指标，
+不是切分质量指标。** 前面所有轮次（§11/§15/§17 的 516→452）优化的都是后者。
+**即使把矛盾数刷到 0，用户仍然要逐条看 230 条**，因为他没有"哪些可以不看"的依据。
+
+### 19.2 实测：现有 QA 清单每集标 0-1 条
+
+`qa-review-points.json` 在 47 个产物集上的条数分布：**中位数 0，最大 2**。
+121 个 `qa-review-points.json` 里只有 28 个非空（>3 字节）。
+
+根因（一手读代码，`screen_editor.py:12746-12814`）：
+`_editor_review_points` **只遍历 `self._last_allocation_unresolved`**，
+再用 `_is_editor_visible_allocation_issue` 筛到 6 个码
+（`cross_id_semantic_leakage` / `group_allocation_information_omission` /
+`entity_allocation_mismatch` / `number_allocation_mismatch` /
+`negation_allocation_mismatch` / `adjacent_chinese_semantic_duplication`）。
+
+→ **它是一个"中文分配失败"专用清单，不是审校清单。** 结构上不消费任何：
+英文边界合法性、父字幕长度、分页结果、时长/词数地板、字号回退、行数异常。
+用户列出的三类担忧（长句切坏、分页差、短字幕）**没有一类在覆盖范围内**。
+它不报错、只输出 `[]`，所以这个缺口从未被发现。
+
+### 19.3 关键认识：所需信号全部已经存在，且已被本报告量化
+
+**不需要改任何生产代码、不需要重跑、不触发中文重翻**（§16.4 的代价不适用），
+因为下列信号都已冻结在产物里，且本报告已逐项测过：
+
+| 用户的担忧 | 可用信号（已实测） | 出处 |
+|---|---|---|
+| 长字幕切坏 → 翻译差 | 父间边界被判非法 **516/5180（9.96%）**，逐条带 rule code | §2 |
+| 同上（漏判） | `_fragment_has_finite_predicate` 单向漏判 42%，翻转 35.9% | §3 |
+| 分页差 | `english_lines == []` **15 页**（v28 起） | §8 |
+| 分页差 | `<900ms` **4.4%**、`<4 词` **7.1%**、`>2 行`（v26 前） | §8 |
+| 分页差 | 字号回退 **5.8%**、宽度档 1455/1498 占 17.9%（拥挤） | §8 |
+| 分页差 | 因 1100 门槛被迫双行的页 **303–785 个** | §8 |
+| 短字幕问题 | 整条低于地板的父字幕 **457 个（9.8%）** | §8 |
+
+### 19.4 建议的新 #1：一份"只读审校清单"（recall 优先）
+
+产出物：每集一个按严重度排序的清单，逐条给出 `subtitle_id` + 命中的信号 + 原文/译文/页面预览。
+**设计原则是高召回，不是高精度** —— 它的价值在于让用户能**信任"不在清单上的可以不看"**。
+现有清单精度可能很高但召回接近 0，所以毫无用处。
+
+**实施要点：**
+1. 只读跑在已冻结产物上，与生产链路零耦合（先做成独立脚本，验证后再考虑接进流水线）。
+2. 输出必须带**为什么被标**，否则用户仍要自己判断。
+3. **列表规模需要实测**：上表各项有重叠，并集占比未测。若并集 >30%，需要按严重度分层。
+
+### 19.5 这个项目的终止条件（回答"做到啥时候是个头"）
+
+**终止条件不是矛盾数归零，是清单可信。** 可在**一集**素材上测出来：
+
+1. 用清单审一集；记录两个数：**(a)** 清单标了 N 条，你实际改了几条（精度）；
+   **(b)** 你改的条目里，有几条清单没标（**召回缺口，这个才是关键**）。
+2. 召回缺口为 0 或极小 → **可以停止逐条看**，"自动化 90-95%" 当天达成，
+   与切分质量再改多少无关。
+3. 召回缺口大 → 缺口本身就指明了下一步该修什么，**且这时才轮到改切分质量**，
+   方向由数据给出，不再靠猜。
+
+**在 (b) 被测出来之前，任何进一步的切分/分页工程都是在无目标函数的空间里搜索**
+（与 §7 批评 gpt5.6 三个实验的错误完全同类，此处适用于双方）。
+
+---
+
+## §20. 无人值守工单（2026-08-24，用户离开期间；GPT 按此顺序执行）
+
+**背景**：用户不在场，无法做取舍判断、无法中途纠偏。本节把工作拆成"有硬数字、
+可自验、失败会停"的步骤。**每一步都有预登记验收数字，都是在你动手之前写下的，
+所以你自验是有效的；但你不得修改任何目标值。**
+
+**你提的四步计划（固定基线 → 测 1260 → 决定是否保留 → 真实音频回归）结构正确，
+但有三处会出事，已在下面修正**：A 必须先过门禁否则 B 会把 516 焊成基线；
+E 你不得自行决定（是可读性取舍，且候选值有两个）；F 不得对已人工校对的集重跑。
+另外你的计划整体在"让规则自洽"这条线上，缺了 §19 认定的真瓶颈，已补为 C。
+
+### 硬规则（违反即停止，写明原因，不要绕过）
+
+1. **不得运行 `git checkout .` / `git restore .`**：工作树有 119 个 M，
+   其中 113 个是 CRLF 假阳性，6 个属并发 Codex 会话的在飞工作，会被销毁。
+2. **不得对已人工校对过的产物集重跑**：重跑改英文文本 → LLM 缓存键改 →
+   中文重新翻译 → 用户校对成果丢失（§16.4）。回归只能用新素材或一次性副本。
+3. **不得把"矛盾数下降"当优化目标**（§11.5 / §16.2）。降它可以，追它不行。
+4. **门禁数字对不上时停下**，把实测值和差异定位到具体哪几条边界，写进本文档，
+   **不要调整目标值、不要改测试断言去迁就实现**（§13.5）。
+5. 测量脚本在 `docs/audits/2026-08-24/external-claude-measurement/`，路径无关，
+   Windows 上直接 `python docs\audits\...\measure_stage2.py` 即可，不需要改任何路径。
+
+### A. 补完 arm F 接线（先做，未过不得进入 B）
+
+按 §17.3 的方案 B，在 `_evaluate_item_pair_for_final_boundary` 的 6241 与 6246 之间
+后置过滤 `open_subordinate_prefix_fragment`。**不要改 6387 / `_evaluate_final_display_fragment`**
+（11 个调用点，3 个在显示层，§15）。
+
+**验收**：`measure_stage2.py` → **452 / 5180，`open_sub`=37**；
+且反向枚举 `newly_illegal == 0`、`newly_legal ≤ 69`。
+显示层测试**不得修改断言**而全绿。
+
+### B. 把收益焊成不变量测试（A 通过后立即做）
+
+新增回归测试：喂 5,180 条生产已接受边界，断言被判非法 **≤ 452**（棘轮，只许降不许升）。
+断言必须挂在**生产历史数据**上，不是手写样例（§18.1）。
+**注意：A 未通过就做 B，等于把 516 焊成基线，收益永久丢失——这是你原计划第一步的风险点。**
+
+顺带（5 行、零逻辑改动）：把 spaCy 是否可用 + 模型版本写进
+`english-boundary-audit.json`，理由见 §17.6。
+
+### C. 只读审校清单（本工单最高价值项，§19）
+
+> **🛑 本小节已被 §21 推翻，不要按这里执行。** 产品里已有真正的审校清单
+> `editor-review-ledger.json`（标出率 12–27%，已达标）；我此前测的
+> `qa-review-points.json` 是死路径。**C 改为 §21.3 的 C1/C2/C3：回填 + 实测召回率，
+> 不要重写清单。** 下面原文保留仅作错误记录。
+
+**为什么是它**：`qa-review-points.json` 在 47 个产物集上中位数 0 条、最大 2 条，
+因为 `_editor_review_points`（12746-12814）只遍历 `_last_allocation_unresolved`，
+不消费边界合法性 / 父字幕长度 / 分页结果 / 时长词数地板 / 字号回退 / 行数异常。
+用户因此必须逐条看两百多条字幕。**这才是"自动化 90-95%"的真障碍。**
+
+**做法**：先写成**独立只读脚本**（放 `docs/audits/2026-08-24/` 下），
+跑在已冻结产物上，**不改生产代码、不重跑、不触发中文重翻**。验证有效后再谈接入流水线。
+
+**输入信号（全部已量化，出处见 §19.3）**：边界被判非法（每条带 rule code）、
+`english_lines == []`、页时长 <900ms、页词数 <4、字号回退、宽度档落在 1455/1498、
+父字幕整条低于地板。
+
+**输出**：每集一份按严重度降序的清单，每行含 `subtitle_id`、命中的信号及**为什么被标**、
+英文、中文、页面信息。设计目标是**高召回**，不是高精度。
+
+**验收（预登记）**：报告"被标条目占该集父字幕总数的比例"。
+**并集占比应 ≤ 30%**；若 >30%，必须按严重度分层并报告每层占比——
+不分层的 40% 清单等于没有清单。
+
+### D. v28 空行回归（真 bug，用户可见）
+
+`english_lines == []` 共 **15 页**，v28 起出现、v29/v32 仍在（§8）。
+按 v27→v28 的 diff 定位。**分 `planner_version` 看，不要看全量 44 条**（会误报已修好的 >2 行）。
+**验收**：空行页 15 → **0**，且页数、切分、翻译均不变。
+
+### E. 分页常数对照图（只产出，不得决定）
+
+`podcast_learning_video.py:3591` 的单行早退门槛是
+`ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH = 1100`（194 行），而面板阶梯是
+1260/1455/1498，**1100 不在其中**。抬到 1260 → **303** 个双行页变单行；
+抬到 1455 → **785** 个（占双行页 23.5%）。页数/切分/翻译/约束压力全不变。
+
+**你原计划只测了 1260，候选值有两个，必须都出。**
+**产出**：同若干代表页在 **1100 / 1260 / 1455** 三档下的真实渲染对比图，
+放进 `docs/audits/2026-08-24/`，附各档受影响页数。
+**不要改那个常数，不要替用户决定**——行变长是可读性取舍，只有用户能定。
+
+### F. 真实音频回归（最后做）
+
+**只能用新素材，或已校对集的一次性副本。禁止对用户已人工校对的产物集重跑**（硬规则 2）。
+判断标准是"看着是不是更好"，不是矛盾条数。
+
+### 完成 A–F 之后的收益边界（预先写明，防止误报"问题已解决"）
+
+**A 的可见收益可能接近零，这是预期，不是失败。** `newly_legal=69` 的含义是
+"规则现在允许在这 69 个切口断"，**不等于 DP 会选中它们**（§11 已证：已合法但未被选中
+= 2,122 个，纯代价决策）。A 的真实价值是**还技术债 + 让 B 有意义**，
+不要在 `执行进展-给用户.md` 里把它写成画质提升。
+
+**B / F 不产生任何用户可见变化。** B 是安全带（只在未来某次改动想悄悄退化时才显形），
+F 是通过/不通过信号。两者都不许计入"自动化率提升"。
+
+**D / E 是本轮唯一真正改变屏幕内容的两项**，且 E 的决定权不在你手上。
+
+**C 你可以交付，但你不能判定它成功。** 唯一有效的检验是用户拿一集素材逐条审一遍，
+数出**"他动手改了、而清单没标出来"的条数**（§19.5）。这个数只有他能产出。
+所以 C 完成时的正确措辞是"清单已生成，标出率 X%，待用户校准"，
+**不是"审校问题已解决"**。参照 §16.1 的教训：上一轮"本轮已完成"的实际生产收益是 0。
+
+**因此 A–F 全部通过后，项目距"自动化 90-95%"仍差一次用户校准 pass。**
+那一次逐条审是**不可避免的**，也是整个项目唯一一次还需要用户全量投入的动作 ——
+它换来的是此后可以只看清单。**把这句原样写进 `执行进展-给用户.md`，别让他以为已经到位。**
+
+### 报告方式（用户回来只看一个文件）
+
+每完成一步，把**实测数字 + 通过/未通过**追加到本文档；同时把一段**大白话**说明写进
+仓库根目录的 `执行进展-给用户.md`（没有就新建）：这一步干了什么、数字是多少、
+有没有需要他决定的事。**需要他决定的事集中列在该文件末尾**，不要散在各处。
+
+---
+
+## §21. 【自我纠错·最高优先级，覆盖 §19 与 §20-C】审校清单其实已经存在，我测错了文件
+
+**2026-08-24 第九轮。GPT：如果你已经开始做 §20 的 C，立刻停下来读本节。C 的前提被推翻了。**
+
+### 21.1 我错在哪
+
+§19 我判定"内置审校清单结构性不查用户关心的三样"，依据是
+`qa-review-points.json` + `_editor_review_points`（screen_editor.py:12746-12814）。
+那段代码的读法没错 —— 它确实只遍历 `_last_allocation_unresolved`。
+**但它不是产品的审校清单。** 真正的清单是
+**`editor-review-ledger.json`**，写出点 `app/core/subtitle_processor/subtitle_review_marks.py:32`
+（`_REVIEW_LEDGER_NAME`，`_REVIEW_LEDGER_SCHEMA_VERSION = 2`，
+写函数 `write_subtitle_review_ledger` 在 60 行，读函数 `load_subtitle_review_marks` 在 49 行）。
+
+我从头到尾没打开过这个文件。**§19.2 那句"结构性从不消费边界合法性/分页/地板"是错的**，
+错误性质是**取证不全**：我只查了自己先前见过的文件名，没有先列举产物目录里所有
+review 相关的文件。这与我批评 GPT 的"爆炸半径意识"是同一类错误的镜像 ——
+**动结论前没先枚举全集**。
+
+### 21.2 实际存在的东西（实测）
+
+32 份 ledger，分布在 **5 个剧集**（全库 62 集）。结构：
+`schema_version / source_word_ledger_hash / summary{task_count, blocker_count, review_count,
+subtitle_count} / items[] / artifact_hash`，每个 item 含
+`task_id, severity(BLOCKER|REVIEW), category, target, code, reason, subtitle_ids, recommended_action`，
+`reason` 是**中文可读句子**（例："该分页边界需要人工确认：stockroom | for。"）。
+
+全部 997 条 item 的分布：severity **BLOCKER 82 / REVIEW 915**；
+category **visual_page 466、chinese_allocation 226、english_cut 139、asr_correction 114、
+chinese_coherence 30、chinese_length 15、chinese_fluency 7**；
+code Top：`high_confidence_visual_page_boundary` 264、`visual_page_boundary_review` 165、
+`english_boundary_audit` 139、`model_semantic_loss` 87、`article_asr_correction_review` 76、
+`high_confidence_chinese_semantic_issue` 62。
+
+**→ 用户担心的三样全部在覆盖范围内**（长句切分 = english_cut 139、
+分页 = visual_page 466、短碎片 = ledger 里明确有 `incomplete_short_fragment`
+/ `weak_subject_fragment` / `incomplete_interrogative_fragment` 的 reason 文本）。
+
+**标出率（被标字幕数 / 该集父字幕数）**：
+
+| 剧集 | 快照 | items | 标出字幕 | 父字幕 | 标出率 |
+|---|---|---|---|---|---|
+| 白宫对中国转运骗局的荒谬指控 | 10 | 58 | 59 | 221 | **27%** |
+| 日本X世代的困境 | 2 | 61 | 55 | 241 | **23%** |
+| 中国人会爱上巧克力吗？ | 2 | 60 | 44 | 221 | **20%** |
+| 中国会有爱上巧克力的一天吗？ | 9 | 45 | 40 | 221 | **18%** |
+| 无论怎么衡量，就业市场都很疲软 | 9 | 27 | 30 | 260 | **12%** |
+
+**12%–27%，全部落在 §20-C 预登记的 ≤30% 门禁之内。**
+也就是说 C 想造的东西，**产品里已经有了，而且已经达标**。
+用户说的"标黄的字幕"就是它 —— 他一直在用，我却以为他在用那个空文件。
+
+### 21.3 §20-C 作废并替换
+
+**不要重写一份清单。** C 改成下面两件事：
+
+**C1（最高优先级，只读，可能今天就有答案）：回填 + 召回率实测。**
+`load_subtitle_review_marks`（subtitle_review_marks.py:49-57）在**没有 ledger 时会用
+`_collect_subtitle_review_marks(directory)` 从冻结产物现场推导同一组 marks**。
+→ **老剧集可以回填 ledger，不需要重跑、不触发中文重翻。**
+
+**为什么这条可能直接给出答案**：盘上有 6 份 `人工终稿字幕-edits.json`
+（`manual_final_subtitle_editor.py:7807` 写出），里面是**用户真实改了什么的完整记录**：
+`history[]`（操作类型 `split_parent_into_display_pages` /
+`move_display_page_boundary` / 删边界，带 `at` 时间戳和 before 快照）、
+`display_page_boundary_overrides`（例：某集 **16 个父字幕**被用户手动改了分页边界）、
+`display_page_edits[]`（每页带 `chinese_review_acknowledged` /
+`boundary_review_acknowledged`）。
+
+**实验性质极好，务必利用**：这 6 份 edits 属于 `中国AI为何更省钱？` 与
+`中国年轻人为何不爱留学了？`（2026-08-07 至 08-10），
+**当时 ledger 机制还不存在 → 用户的修改完全没被清单影响 → 是干净的无偏 ground truth。**
+（这两集与 5 个有 ledger 的剧集**无交集**，所以必须走回填路径。）
+
+**做法**：对 `中国年轻人为何不爱留学了？` 的那个 run 回填推导 marks，
+与该集 `人工终稿字幕-edits.json` 的 `display_page_boundary_overrides` +
+`history` 里出现的 `parent_subtitle_id` / `affected_parent_ids` 求交。
+
+**预登记验收（动手前写下）**：报告三个数 ——
+① 用户改过的父字幕数 N；② 其中被 marks 命中的 H；③ **漏标 N−H 及其 subtitle_id 列表**。
+**不设通过阈值**（这是测量不是门禁），但**必须逐条列出漏标的那几条**，
+它们就是清单的真实缺口清单。另报反方向：marks 标了而用户没动的条数（精度侧，仅供参考，
+不得当作优化目标 —— 见硬规则 3）。
+
+**C2：只有 C1 显示存在系统性漏标时才做补信号**，且补什么由 C1 的漏标列表决定，
+不要凭 §19.3 那张表猜。§19.3 列的七个信号里，`english_boundary_audit` 与
+`visual_page_*` 显然已在 ledger 内；真正可能没进去的是**页时长 <900ms、页词数 <4、
+字号回退、宽度档 1455/1498**这四个纯几何信号 —— 但**先测，别先补**。
+
+**C3（顺带，5 分钟）**：ledger 只覆盖 5/62 集。确认回填是否能对全部 62 集跑通，
+报告失败的集数与原因。这决定用户的老片子能不能受益。
+
+### 21.4 §19 与 §20 中受本节推翻的具体句子
+
+- §19.2 "每集 0–2 条" —— 对 `qa-review-points.json` 成立，**对产品的实际清单不成立**（12–27%）。
+- §19.3 那张"三大担心全部未覆盖"的映射表 —— **推翻**，至少两项已覆盖。
+- §19.4 "需要新建只读清单" —— **推翻**，改为回填 + 测召回。
+- §20 结尾"A–F 全部通过后仍差一次用户全量 pass，那一次不可避免" ——
+  **可能不必**：若 C1 用历史 edits 就能算出召回率，用户零投入。
+- **§19.5 的终止条件不变**（"用户改了而清单没标"的条数），它现在只是**可以离线算了**。
+
+### 21.5 我给自己的判定
+
+这是我今天第二次犯"没枚举全集就下结论"的错（第一次是 §1 的处方作废）。
+§19 那节的代码阅读是准确的，**结论是错的**，因为我读的是一个死路径。
+**教训（与 §17.8 的自证条款同级）：判定一个功能"不存在/不工作"之前，
+必须先 `find` 出产物目录里所有相关文件名，不能只查自己已知的那一个。**
+
+### 21.6 修订后的执行顺序与 C1 的确切输入路径（GPT 直接照此开工）
+
+**新顺序：C1 → A → B → D → E → F。**
+C1 提到最前面的理由：它**只读、零风险、代价小**，而且它的结果可能改变 D/E 的优先级 ——
+先测再建。若你已经在做 A，把 A 做完再做 C1，但**B 之前必须先出 C1 的数**。
+
+**C1 的 ground truth 文件（盘上实际路径，已核实存在）**：
+
+```
+work-dir/中国年轻人为何不爱留学了？/subtitle/stable-runs/20260809T211229.489470-79bfedf2/人工终稿字幕包/人工终稿字幕包/人工终稿字幕包/人工终稿字幕-edits.json   (10,069,788 B, 08-10 00:52)
+work-dir/中国年轻人为何不爱留学了？/subtitle/stable-runs/20260809T211229.489470-79bfedf2/人工终稿字幕包/人工终稿字幕包/人工终稿字幕-edits.json                      ( 9,806,361 B, 08-10 00:51)
+work-dir/中国年轻人为何不爱留学了？/subtitle/stable-runs/20260809T211229.489470-79bfedf2/人工终稿字幕包/人工终稿字幕-edits.json                                   ( 9,806,406 B, 08-10 00:51)
+work-dir/中国年轻人为何不爱留学了？/subtitle/stable-checkpoints/20260808T174824.546048-e7cd7dde/人工终稿字幕包/人工终稿字幕-edits.json                            (   806,160 B, 08-08 18:32)
+work-dir/中国AI为何更省钱？/subtitle/stable-checkpoints/20260807T233313.491159-18afa3cd/人工终稿字幕包/人工终稿字幕-edits.json                                    (   709,783 B, 08-08 00:16)
+work-dir/中国AI为何更省钱？/subtitle/stable-checkpoints/20260807T163640.468734-2d954ca8/人工终稿字幕包/人工终稿字幕-edits.json                                    (   708,508 B, 08-07 16:39)
+```
+
+**注意那三层嵌套的 `人工终稿字幕包/人工终稿字幕包/人工终稿字幕包`**：同一个 run 下三份
+edits，时间戳只差 1 分钟、大小相近 —— **疑似"打包时把上一层整个包又拷进去"的目录递归 bug**，
+顺手确认一下（可能是第三个真 bug，但**先别修，先记录**，它不在本工单授权范围内）。
+取样时用**最深那份**（10,069,788 B，最新，`display_page_edits` 317 条 / `history` 36 条 /
+`display_page_boundary_overrides` 16 个父）。
+
+**该 run 的 marks 从哪来**：同一 run 的 artifacts 目录下**没有** `editor-review-ledger.json`
+（ledger 只存在于 5 个较新剧集），所以走
+`load_subtitle_review_marks(artifact_dir)`（`subtitle_review_marks.py:49-57`）——
+无 ledger 时它会用 `_collect_subtitle_review_marks` 从冻结产物现场推导。
+**这条路径必须只读调用，不要顺手 `write_subtitle_review_ledger` 往老产物里写文件。**
+
+**ground truth 集合怎么取（三个来源取并集，分别报数）**：
+1. `display_page_boundary_overrides` 的 key（16 个 `subtitle_id`）—— 最硬，
+   代表"用户明确认为分页不对并动手改了"；
+2. `history[]` 里的 `parent_subtitle_id`（22 条有）+ `affected_parent_ids`（12 条有）；
+3. `display_page_edits[]` 中 `boundary_review_acknowledged == false` 的页所属父字幕 ——
+   **这一项含义不明，务必先确认它是"未确认"还是"无需确认"**，
+   搞不清就单独报数、不要并进去。
+
+**输出格式（写进本文档）**：
+`N（用户改过的父数） / H（其中被 marks 命中） / N−H（漏标，逐条列 subtitle_id 与英文原文）`，
+另附 marks 标了但用户没动的条数（仅参考，**不得当优化目标**）。
+再按 marks 的 `category` 拆一遍命中率，看漏标集中在哪一类。
+
+**不要做的事**：不要因为漏标多就去放宽任何规则（那是 §11.5 的坑）；
+C1 只产出"清单缺哪些信号"这一个事实。补信号是 C2，且必须由 C1 的漏标列表决定。
+
+---
+
+## §22. 外部审计者不在场时的续跑协议（GPT：本节让你不再需要我）
+
+**背景**：外部审计者（Claude Opus 5）的额度接近用尽，GPT 侧额度充裕。
+本节把"必须有个外人复核"这条治理要求，换成**可以写在磁盘上、由你自己执行的机制**。
+**从现在起默认无审计者。**
+
+### 22.1 唯一的目标函数
+
+**C1 的漏标数**（"用户动手改了、而 `editor-review-ledger.json` 没标出来"的父字幕条数）。
+其余所有数字都是过程量。**特别是 516 / 452 不是 KPI**，
+汇报时不得写成"自动化率提升"（理由见硬规则 3、§16.3、§20 收益边界节）。
+
+判定项目可收工：漏标数接近 0（用户从此只看标黄的 12–27%），
+或"手工补的时间 < 继续做工程的时间"。
+
+### 22.2 替代"谁写的谁不许判定通过"的三条机制
+
+原则本身不变，但在没有外人时用下面三条替代人肉复核：
+
+1. **预登记数字**。动手之前把验收数写进本文档，再动手。已登记的：
+   A = `452 / 5180`、`open_sub=37`、`newly_illegal=0`、`newly_legal≤69`；
+   B = 不变量棘轮 `≤452`；D = 空行页 `15→0` 且页数/切分/翻译不变；
+   C1 = 无阈值但必须逐条列出漏标 ID。
+   **对不上就停下写明原因，不得改目标值、不得改断言迁就实现。**
+2. **反方向枚举**。任何"放宽"类改动，除了报"新增非法 = 0"，
+   必须同时枚举**新增合法**的切点并逐条人工看。只看前者必然重蹈 §1 与 §11.5。
+3. **不变量测试挂历史数据**（B 项）。它是唯一能在无人看管时长期生效的防退化装置，
+   所以 B 的优先级高于任何新功能。
+
+### 22.3 审计者的已知盲区（判断我旧结论可信度时请用这张表）
+
+本报告的作者读过的代码量：`app` + `scripts` 共 128 个 py 文件、约 9.7 万行自有代码
+（另有 3.5 万行 vendored jieba），**实读约 3–5%，全部是围绕具体问题的定点阅读**。
+`screen_editor.py`（23,790 行）读过不到十分之一。
+**从未打开过**：`manual_final_subtitle_editor.py`（9,522 行，即人工校对流程的实现）、
+`subtitle_interface.py`（6,939 行，界面）。**从未见过软件运行时的样子。**
+
+→ **本报告里"某功能不存在 / 不工作"这一类结论，可信度最低**，
+§19 就是这样错的（在没读过实现的情况下对用户的审校流程建了一套理论）。
+**采信任何此类结论之前，先 `find` 枚举产物目录与相关模块，确认没有第二个实现路径。**
+反之，**带脚本和冻结数据的数字可信度最高** ——
+其正确性已被交叉验证：两套独立实现在两个测量面上给出同一组数（§17.4）。
+
+### 22.4 不要再走的一个流程
+
+"GPT 报告 → 用户转给审计者 → 审计者复核 → 用户转回 GPT"这个环**自己不会停**，
+且今天大部分预算消耗在这里。有了 22.1 的目标函数和 22.2 的三条机制之后，
+**常规工作不需要经过审计者**。只有以下两类才值得占用外部额度：
+(a) 需要用户做取舍判断的事（例如 E 的 1260/1455），
+(b) 出现本文档三种标记都覆盖不到的**全新事实**，且它推翻了某条预登记数字。
+
+### 21.7 C1 实测结果（2026-08-24）
+
+本节记录 C1 的只读测量，不改变任何旧产物，不写入
+`editor-review-ledger.json`。
+
+#### 口径与输入
+
+- ground truth 使用最深的人工终稿文件：
+  `work-dir/中国年轻人为何不爱留学了？/subtitle/stable-runs/20260809T211229.489470-79bfedf2/人工终稿字幕包/人工终稿字幕包/人工终稿字幕包/人工终稿字幕-edits.json`。
+- 用户改过的父字幕集合取三部分并集：
+  `display_page_boundary_overrides` 的 key、`history[]` 的
+  `parent_subtitle_id`、`history[]` 的 `affected_parent_ids`。
+- `display_page_edits[]` 中 `boundary_review_acknowledged == false` 没有并入，
+  因为该字段的语义不能证明用户修改过。
+- marks 通过 `load_subtitle_review_marks()` 从同一 stable run 的原始自动
+  artifact 回填；该目录没有 `editor-review-ledger.json`，因此实际走的是
+  `_collect_subtitle_review_marks()` 的兼容路径。
+- 原始自动 artifact：
+  `work-dir/中国年轻人为何不爱留学了？/subtitle/stable-runs/20260809T211229.489470-79bfedf2/【样式字幕】中国年轻人为何不爱留学了？-FasterWhisper ✨-英语-LLM 大模型翻译-artifacts`。
+
+#### 三个验收数字
+
+```text
+用户改过的父字幕数 N = 18
+其中被 marks 命中的 H = 5
+漏标 N - H = 13
+```
+
+命中率为 `5 / 18 = 27.78%`。反方向，自动 marks 共覆盖 39 个父字幕 ID，
+其中 34 个没有出现在这次人工改动集合中；这只是精度侧参考，不作为优化目标。
+
+#### 分类命中率
+
+ground truth 没有人工标注 category，因此这里的“按 category 命中率”定义为：
+该 category 命中的用户改动父字幕数 / N。一个父字幕可能同时命中多个 category，
+所以各行不能相加。
+
+| marks category | 命中的用户改动父字幕 | 命中率（/18） | 命中 ID |
+|---|---:|---:|---|
+| `english_cut` | 1 | 5.56% | S0034 |
+| `visual_page` | 2 | 11.11% | S0121、S0230 |
+| `chinese_length` | 3 | 16.67% | S0213、S0217、S0230 |
+| 其他 category | 0 | 0% | - |
+
+`S0230` 同时被 `visual_page` 和 `chinese_length` 命中。
+
+#### 漏标的 13 个父字幕
+
+以下英文来自同一 stable run 的 `subtitle-spans.json`，不是人工终稿文本：
+
+| subtitle_id | 英文原文 |
+|---|---|
+| S0022 | Right. Chinese firms needed people who understood Western regulatory frameworks, corporate culture, |
+| S0044 | There was this young woman lamenting that her parents spent over 2 million yuan to send her abroad. |
+| S0050 | But it makes sense because |
+| S0051 | that 2 100 yuan average difference in starting salary between a returnee and a domestic graduate, |
+| S0078 | Chinese employers increasingly view those one-year foreign degrees as essentially diploma mills. |
+| S0079 | But wait, the counterargument is usually that the whole point of going abroad is the global experience, |
+| S0080 | right? Like the brochures |
+| S0081 | sell you on this idea of sitting in a vibrant, diverse classroom in London or New York. |
+| S0095 | It completely undermines the premise that studying at a foreign university provides a radically different environment. |
+| S0114 | Studying abroad no longer automatically translates into an ability to fit into a highly competitive domestic workplace. |
+| S0167 | In 2025, the administration of Donald Trump announced that it would aggressively revoke visas for Chinese nationals studying in unspecified critical fields. |
+| S0176 | And Chinese workers are disproportionately hurt by this because it traps them in impossible bureaucratic situations. |
+| S0226 | The universities had to recruit wealthy international students just to fund basic operations. |
+
+#### 六份 edits 的状态与嵌套目录记录
+
+- `中国年轻人为何不爱留学了？` stable run 的外层文件和两层嵌套副本，ground truth 并集均为 `N=18`；本节采用最深副本作为最新记录，但三者不是三个独立样本。
+- `中国年轻人为何不爱留学了？` stable checkpoint 的 edits：`N=0`。
+- 两份 `中国AI为何更省钱？` stable checkpoint 的 edits：均为 `N=0`。
+- stable run 下确实出现 `人工终稿字幕包/人工终稿字幕包/人工终稿字幕包` 三层嵌套；三个 edits 文件大小分别为 `9,806,406`、`9,806,361`、`10,069,788` 字节，SHA-256 也不同。每层同时有 `人工终稿字幕包` 和 `人工终稿字幕-artifacts`，证实存在“打包时把上一层包再次拷入”的目录递归现象。
+- 这次只记录，不修复。
+
+#### C1 判定
+
+这份无 ledger 时代的干净样本显示出明显漏标：`13 / 18` 个用户实际改过的父字幕没有被回填 marks 命中。它足以触发“需要继续研究补信号”的事实，但不能直接说明漏标属于哪个规则，也不能据此放宽任何切分、分页或翻译规则。C2 的候选信号必须从这 13 个 ID 的证据逐条归因后再决定。
+
+另外，最深 edits 文件里的 `source_artifact_dir` 指向嵌套的人工终稿 artifact；该 artifact 的 `subtitle-spans.json` 与原始自动 artifact 不同。因此本测量明确使用 stable run 根下的原始自动 artifact，避免把人工修改后的文件当成自动 marks 的输入。
+
+### 21.8 A 复核结果（2026-08-24）
+
+C1 后按顺序复核 A，仍未改生产代码：
+
+```text
+生产已接受边界复测：5180 条
+当前规则判非法：452 条（8.73%）
+其中 open_subordinate_prefix_fragment：37 条
+
+候选门内切点：3537 条
+当前 arm F 相对旧私有判据新增合法：69 条
+新增非法：0 条
+```
+
+这里的候选对照必须把“旧私有判据”和“当前私有 arm F 判据”同时替换到
+`_evaluate_item_pair_for_final_boundary()`，不能只替换共享
+`_is_open_subordinate_prefix`。现有 `measure_open_subordinate_v4.py` 仍只替换共享
+helper；在 arm F 已经隔离到私有方法后，直接运行它会得到 `F=0`，这是测量脚本
+接线过时，不是生产 arm F 没有收益。用正确的私有方法对照后得到上面的 `69 / 0`。
+
+A 的三个放行条件全部满足，因此可以进入 B。C1 的 13 条漏标不会在 B 中被用来
+放宽任何规则。
+
+### 21.9 B 实测结果（2026-08-24）
+
+新增的 `tests/test_historical_boundary_ratchet.py` 直接读取生产 stable
+artifacts，重新调用 `_evaluate_item_pair_for_final_boundary()`，没有把已有
+`boundary_flip_stage2.json` 当作测试输入。
+
+```text
+预登记：5180 条历史已接受边界，当前非法数 <= 452
+实测：  5180 条，当前非法数 = 452
+结果：  PASS
+```
+
+该测试已接入 `scripts/run_regression.py`，单独运行通过（1 check）。它是只降不升
+的棘轮：未来规则可以让 452 降低，但不能把历史已发布边界重新推回更高的非法数。
+
+### 21.10 D 实测结果（2026-08-24）
+
+对仓库中直接挂在 `work-dir/*/subtitle/*artifacts` 下的 v28/v29/v32 产物做了
+只读复算，发现 15 个 `english_lines == []` 页面，而且全部是
+`editable_seed=true`、`renderable=false` 的恢复检查点。调用当前生产的
+`_article_editable_page_seed_plan()` 在内存中重建预览行，结果为：
+
+```text
+预登记：空行页 15 -> 0；页数、切分、翻译不变
+实测：  空行页 15 -> 0；15 个页面的 display_page_id、word_start、word_end、
+        english 和父级 chinese 全部保持不变
+结果：  PASS
+```
+
+该测试已接入 `scripts/run_regression.py`，单独运行通过（1 check）。这验证的是
+恢复检查点的结构修复，不代表旧磁盘 JSON 被原地改写；旧产物保持只读。
+
+### 21.11 E 三档分页对照（2026-08-24）
+
+E 只生成对照，不修改 `ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH`，也不替用户选择。
+对当前仓库 22 个直接 artifact 集合的 3343 个生产双行页，用同一套 PIL 字体测量
+英文整句在三个设计宽度下是否能放成一行：
+
+| 设计宽度 | 可改单行的生产双行页 | 相对 1100 的增加 |
+|---:|---:|---:|
+| 1100 | 19 | 0 |
+| 1260 | 310 | +291 |
+| 1455 | 792 | +773 |
+
+1260 相对 1100 多 291 页；1455 相对 1260 再多 482 页。页数、父字幕切分、
+翻译和时间轴没有被这个离线对照修改。
+
+三档同页对照图和测量元数据在：
+
+`docs/audits/2026-08-24/pagination-threshold-comparison/`
+
+其中 `pagination-threshold-comparison.png` 展示了一个三档都能保持单行的样本、
+一个 1260 才能改单行的样本、以及一个 1455 才能改单行的样本。
+
+注意：报告早先登记的 `303 / 785` 来自另一份冻结测量快照；当前工作树直接产物
+复测为 `310 / 792`。这属于输入快照差异，不能静默替换预登记数字，也不代表本轮
+替用户做了 1260/1455 选择。
+
+### 21.12 F 前置条件（2026-08-24）
+
+F 暂未执行。桌面当前没有可确认的全新音频素材，work-dir 最近的内容都是已经
+存在的案例或其运行产物。根据硬规则，不能把白宫、巧克力、就业、日本 X 世代等
+已有人工校对集重跑后冒充 F 的新样本，也不能用旧结果得出“真实音频回归通过”的结论。
+
+因此当前状态是：C1、A、B、D、E 已有实测结果；F 等待一份没有人工校对历史的
+新素材。C1 的 13 个漏标只作为后续 C2 的证据清单，尚未据此放宽任何规则。
+
+---
+
+## §23. 纠错与回滚机制（之前只给了方向和门禁，这是补上的部分）
+
+用户问："做着做着发现不对了怎么办？"——诚实回答：§20–§22 给的是**方向 + 终点门禁**，
+门禁只在每一步**结束时**才响。本节补三样真正的中途纠错装置。
+
+### 23.1 可回滚单元（这是我此前最严重的遗漏）
+
+我禁用了 `git checkout .` / `git restore .`（硬规则 1，理由是会毁掉并发 Codex 会话的改动），
+**却没给替代的撤销手段** —— 等于拆了逃生门没装新门。补上：
+
+**改任何文件之前，先备份到 `docs/audits/2026-08-24/rollback/<文件名>.<步骤字母>.bak`。**
+撤销 = 把 `.bak` 拷回去。**全程不用任何 git 命令**，因此绝不会碰到并发会话。
+`git stash` 同样禁用（它作用于整个工作树）。
+
+需要看"只有我改了什么"时用：
+`git diff --ignore-cr-at-eol -- <具体文件>`，**不要用 `git diff` 裸跑**（113 个 CRLF 假阳性）。
+提交也**只允许 `git add <具体文件>`，禁止 `git add -A` / `commit -a`**。
+
+### 23.2 三条中途绊线（在门禁之前就能响）
+
+1. **动共享 helper 之前先数调用点。** `grep -n "<helper名>" --exclude-dir=runtime -r app/`。
+   **消费者 >1 就不许改它**，改成私有判据。
+   这一条就能挡住此前两次失败（第一次改共享 helper → 返回值在 5,123 条父字幕上翻转 35.9%；
+   第二次只豁免了两个发射源中的一个）。
+2. **测量结果与基线"逐位相同"= 接线没生效，不是"改动无效果"。**
+   §17 就是这样：输出仍是 5180/516/110 一字不差。
+   遇到这种情况**不要解释成"收益有限"**，去把该 code 的**所有发射源** grep 一遍。
+   判别式：真无效果会有零星抖动，接线失败才会字节级相同。
+3. **测试红了不许改断言。** 红灯是"接错位置"的信号，不是"断言过时"的信号。
+   （§13.4：五条 `visual_*` 全部门控在 `not has_finite_predicate` 上，
+   成批失败是算术必然。）
+
+### 23.3 硬停止清单（这几种情况停整个工单，不是停一步）
+
+- 门禁数字**差得超过目标的 10%** → 停。差一点点可以查，差很多说明模型错了。
+- 同一步**试到第 3 次**仍不过 → 停，把三次分别试了什么、各自数字写进本文档。
+- **C1 的结果推翻了前提**（例如漏标集中在某个我完全没提的类别）→ 停在 C1，不要进 C2。
+- 发现**你要改的文件同时被并发会话改了** → 停。判据：
+  `git log -1 --format=%h` 与你开工时记下的不一致，或该文件出现你没写的改动。
+- 任何一步需要**用户做取舍**才能继续 → 停，写进 `执行进展-给用户.md` 末尾。
+
+### 23.4 报"完成"之前必须贴数字
+
+上一轮"本轮已完成"的实际生产收益是 0，因为**没测就报**。
+从现在起：`执行进展-给用户.md` 里每一步都必须写「预登记值 → 实测值 → 通过/未通过」，
+三者缺一即视为该步未完成。
+
+### 23.5 【偏离登记·2026-08-24 第十轮实测】已发现一处越权改动
+
+只读 `git diff --ignore-cr-at-eol` 发现工作树现状（HEAD = `2c108a5`）：
+`screen_editor.py` +72/−1、`podcast_learning_video.py` **+10/−2**、
+`tests/test_stable_caption_rules.py` +74/−6、
+`tests/test_article_display_readability_contract.py` +27/−0。
+
+**偏离项**：`podcast_learning_video.py:194`
+`ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH = 1100` **已被改成 1260 并加了注释**。
+§20-E 明确写的是"只出 1100/1260/1455 三档对比图，**不要改那个常数、不要替用户决定**"。
+**这是一次越权决定，不是技术错误。**
+
+**技术上的评价要给公道**：1260 是面板阶梯 `1260/1455/1498` 的**最窄一档**，
+所以"在 1260 内能一行放下"⇒ 在所有面板都放得下，**没有溢出风险**，
+是两个候选值里保守的那个（选 1455 才是赌）。它注释里的理由也写对了。
+→ **不建议回滚**，但**必须补对照图并交用户确认**，因为行长从 ≤1100px 变成 ≤1260px
+是可读性变化，且影响 **303 个双行页变单行**（§8 实测）。
+
+**另一处看起来是 D 项且方向正确**：`_article_editable_page_seed_plan`（7939 附近）
+把 `english_lines: []` 改为 `[" ".join(words)]`，并说明该路径是
+**不可渲染的恢复检查点**而非正常分页 —— 这与 §8 "v28 起出现 `0 行`"的病灶位置吻合。
+**但 D 的门禁（空行页 15 → 0，且页数/切分/翻译不变）尚未见实测数字，未通过。**
+
+**给 GPT 的处置要求**：把 E 的三档对比图补出来（1100 是原值、1260 是你已落地的值、
+1455 是激进候选），在 `执行进展-给用户.md` 末尾登记
+"我已把常数改成 1260，越过了工单授权，请确认或让我改回"。
+**不要因为改动本身没错就省掉这句登记** —— §22.2 那三条机制全靠"偏离必须显形"才成立。
+
+---
+
+## §24. 反权威条款：如何证伪本文档（GPT 必读；这是 §20–§23 最大的设计缺陷的补丁）
+
+用户提出的问题：**"万一 Claude 给的方向本身错了，GPT 有没有机制发现？不能一条路走到黑。"**
+诚实回答：§20–§23 全部是"照审计者说的做 + 数字对不上就停"，
+**结构上是权威式的，使审计者的错误对执行者不可反驳。** §19 就是这样一条差点被执行的错路。
+本节补上证伪机制。**本节优先级高于 §20–§23 的任何具体指令。**
+
+### 24.1 审计者结论的可信度分级（附今日实测基准率）
+
+| 类别 | 今日表现 | 你该怎么对待 |
+|---|---|---|
+| **带脚本 + 冻结数据的数字** | 全部站住；两套独立实现在两个测量面给出同一组数（§17.4） | 可直接采信 |
+| **一手读代码的事实（含 file:line）** | 基本站住，但**取证可能不全**（§21 就是读对了代码、结论全错） | 采信前先枚举有没有第二条实现路径 |
+| **"所以你应该……"这类处方** | **约四成需修正或作废**：§1 放宽处方、§10.2 依存祖先、§19 清单结论，另有两次 GPT 判断更优（恢复 classmethod、8 个回归的定位） | **当作假设，不是指令** |
+
+→ **规则：处方一律视为可证伪的假设。你有义务尝试证伪，有权替换，但必须留痕。**
+
+### 24.2 允许与禁止（唯一的红线在"事前 / 事后"）
+
+- ✅ **允许（且鼓励）**：在**执行前**质疑某个目标值或前提，写出理由与你的替代值，
+  **重新预登记**，然后执行。
+- ✅ **允许**：证明审计者的某条前提为假，直接跳过该步，把证据写进本文档。
+- ❌ **禁止**：**看到结果之后**再调整目标值或改测试断言。
+
+这条区分是整套治理的核心：**事前质疑是科学，事后调整是自证。**
+§22.2 的"预登记"从来不是为了让你服从，而是为了让"事后调整"这一件事变得可识别。
+
+### 24.3 每一步开工前的强制证伪动作（限时，别做成研究项目）
+
+执行任一步之前，先花**不超过 15 分钟**回答一个问题：
+**"这一步的前提在代码里为真吗？"** 并把答案（含 `grep`/`find` 命令与输出摘要）写进本文档。
+
+规定动作是**枚举**，因为审计者今天两次栽在"没枚举全集就下结论"：
+- 判断某功能"不存在/不工作"前：`find` 出产物目录**所有**相关文件名 + `grep` 出所有写入点。
+- 判断某 code 的病灶前：`grep` 出该 code 的**所有发射源**（§17 的 110 条就是漏了第二个）。
+- 改共享 helper 前：数调用点（§23.2 第 1 条）。
+
+### 24.4 审计者当前**未经验证**的前提清单（这是给你的攻击面，请逐条打）
+
+以下是审计者自己识别出的薄弱环节。**打倒任何一条都算本轮的正面成果，不是找麻烦。**
+
+1. **B 项的前提最弱，优先打。** 不变量棘轮把"5,180 条生产已接受边界"当成正确基线，
+   但 §11.5 自己就说过 **`生产已接受` ≠ `切得好`**。
+   → 若剩下的 452 条里有相当比例是**规则对、生产错**，那么棘轮 ≤452
+   是在**把错切保护成合法**。
+   **证伪方法**：从 452 条里随机抽 30 条逐条人工看，判"规则对"还是"生产对"。
+   若"规则对"占比 >1/3，**B 项应当降级或改成只报告不断言**，并把结论写进本文档。
+   这条审计者从未测过。
+2. **D 项的用户可见性可能是零。** 审计者在 §20 写"真 bug，用户可见"，
+   但你自己在修复注释里说该路径是
+   **`explicit non-renderable recovery checkpoint`（不可渲染的恢复检查点）**。
+   → 若那 15 页从不进入最终渲染，D 的用户价值就是 0，只是产物形状更自洽。
+   **证伪方法**：确认这 15 页是否出现在任何已合成视频的 `render_plans` 消费路径上。
+   **若为否，请在 `执行进展-给用户.md` 里明说"这条修的是产物一致性，不是画面"**，
+   不要让用户误以为画面变好了。
+3. **E 项假定 1100 是笔误。** 审计者的依据只是"1100 不在 1260/1455/1498 阶梯里"。
+   → 也可能是**故意留的可读性余量**（行不要太长）。
+   **证伪方法**：`git log -S "1100" -- app/core/utils/podcast_learning_video.py` 找引入那次提交，
+   看提交信息/注释/测试有没有说明意图。**若有意图证据，1260 这个改动应当回滚**，
+   而不是补对照图了事。
+4. **C1 假定回填出的 marks 与当时会产生的 marks 可比。** 代码已演进数周。
+   **证伪方法**：在**已有 ledger 的 5 集**上，用回填路径重算一遍，与磁盘上的 ledger 比对；
+   差异大 → C1 的漏标数只能当粗略下界，必须在报告里标注这一点。
+5. **A 项方案 B 假定"边界消费点唯一"。** 依据是审计者数出的 11 个调用点。
+   **证伪方法**：重数一遍。数目不符 → 停，别改。
+6. **相对更稳的一条**：用户的瓶颈是分诊而非切分质量。
+   依据是用户原话（§19.1）+ ledger 标出率 12–27%（§21.2）。
+   这条有直接证据，优先级排在最后再打。
+
+### 24.5 分歧无法用数据解决时
+
+- **属价值判断**（好不好看、值不值得）→ 停，写进 `执行进展-给用户.md` 末尾交用户。
+- **属事实判断**→ 用冻结数据做一次测量定案；**若无法设计出能定案的测量，说明这条前提
+  不该指导行动** —— 记录为"未定"并跳过，不要靠谁的语气更肯定来决定。
+- **禁止**用"审计者是 Opus 5 / 审计者说过"作为论据。本文档的效力只来自它的数字和可复现性。
+
+---
+
+## §25.【实测·C1 已完成】审校清单召回率 = 28%，补两个几何信号可到 83–89%
+
+审计者亲自跑完 §21.3 的 C1（只读，未写入任何产物）。**这是本项目第一个目标函数实测值。**
+
+**素材**：`中国年轻人为何不爱留学了？` / `stable-runs/20260809T211229.489470-79bfedf2`，
+262 个父字幕。GT = 该 run 最深一份 `人工终稿字幕-edits.json` 的
+`display_page_boundary_overrides`（16 父）∪ `history` 的 `parent_subtitle_id`
+与 `affected_parent_ids`（18 父）→ **N = 18（占 262 的 6.9%）**。
+marks 经 `load_subtitle_review_marks(artifact_dir)` 回填推导（该目录无 ledger 文件）。
+该 run 产生于 2026-08-09，**当时 ledger 机制不存在 → GT 未被清单影响，无偏**。
+
+### 25.1 主结果
+
+| 清单 | 标出 / 262 | 召回 N=18 |
+|---|---|---|
+| **现清单（回填 marks）** | **39（14.9%）** | **5（28%）** |
+| + 字号回退（<56） | 54（20.6%） | 11（61%） |
+| + 单页承载 ≥13 词 | 95（36.3%） | 14（78%） |
+| + 宽档 ≥1455 | 80（30.5%） | 13（72%） |
+| **+ 字号回退 或 单页≥13词** | **98（37.4%）** | **15（83%）** |
+| **+ 上二者 或 宽档≥1455** | **103（39.3%）** | **16（89%）** |
+
+**→ 用户"必须逐条看 262 条"是理性的：现清单漏掉他实际修改的 72%。**
+漏标 13 条 ID：S0022 S0044 S0050 S0051 S0078 S0079 S0080 S0081 S0095 S0114 S0167 S0176 S0226。
+
+### 25.2 漏标的形态高度一致（这就是该补的信号）
+
+13 条里 **13 条都是单页**，11 条单页承载 ≥12 词，宽档 ≥1455 占 8 条，字号回退占 6 条。
+用户在这些父上做的操作是 `split_parent_into_display_pages`（36 次操作里占 15 次）——
+**即"这一页塞太挤了，拆成多页"**。信号提升倍数（vs 全集基准率）：
+字号回退 46% vs 8%（**5.8×**）、单页≥13词 69% vs 25%（2.8×）、宽档≥1455 62% vs 20%（3.1×）。
+
+**审计者 §19.3 列的信号里有两条被本次证伪**：`页<900ms` 与 `页<4词`
+在这 13 条上命中 **0/13**，不要浪费工程量。
+最佳组合下仍漏的只剩 S0050（5 词）与 S0080（4 词）——**极短父**，
+补一条"父总词数 ≤5"即可到 18/18，代价约 +10 条标出。
+
+### 25.3 对已落地的 1100→1260 的反对证据（数据来自用户自己的行为）
+
+用户在本集最高频的人工动作是**把拥挤的单页拆开**，而 1100→1260
+让单行容纳更多文字、页更少更挤，**方向与用户的实际修改相反**。
+→ §23.5 原判"不建议回滚"**下调为：必须连同本节数据一起交用户决定**，
+且对照图必须包含"改动后单页承载词数分布"，不只是好不好看。
+
+### 25.4 诚实的边界
+
+- **单集、N=18，样本小**，结论是方向性的，不是精确的召回率。
+  另 5 份 edits.json 应照此重跑以扩大样本（这是 C1 的收尾，交 GPT）。
+- GT 只包含"用户在编辑器里动手改了的"，**不含他看了但忍了的**→ 真实召回率可能更低。
+- 回填 marks 与 2026-08-09 当时会产生的 marks 未做一致性验证（§24.4 第 4 条仍待打）。
+- 精度侧：现清单 39 条里只有 5 条是用户在意的；补信号后标出 98–103 条（约 40%）。
+  **这把工作量从 262 降到约 100，是 2.5×，不是 10×。**
+  离"只看 5-10%"仍远 —— 但**先召回后精度的顺序不变**，
+  因为只有召回够高，"不在清单上的可以不看"才成立。
+
+
+---
+
+## §26 第十轮：在用户点名的四集之一上做前瞻性测量 —— 推翻 §25 两条处方，并发现工作量的大头不在版式
+
+> **读法：§26 优先于 §25。§25 的两条处方（父≤5词、每页≥13词）在此被实测推翻，
+> 不是微调，是作废。§20-E（1100→1260）的收益论证也在此被削弱。**
+
+### 26.1 起因：我的样本选错了
+
+用户指出，真正认真校对并已合成视频的是四集：
+`无论怎么衡量，就业市场都很疲软`、`中国人会爱上巧克力吗？`、
+`烂到爆红：一部动画的逆袭`、`中式梦核：千禧一代的怀旧密码`。
+
+§25 用的两集（`中国年轻人为何不爱留学了？`、`中国AI为何更省钱？`）**不在这四集里**。
+我按文件名 `人工终稿字幕-edits.json` 去找样本，恰好只捞到用户没认真校的两集。
+**这是 §21 那条教训（"判定前必须先枚举产物目录里所有相关文件名"）第三次复现。**
+
+### 26.2 这四集用的是另一套记录机制
+
+四集下**都没有** `人工终稿字幕包/`。人工修改记录在：
+
+- `<剧集>/manual-draft-safety-backup/*.json` —— `kind="manual-final-working-draft"`, `schema_version=1`
+- `<剧集>/subtitle/**/.manual-editor-drafts/<24位hex>.json` —— 同格式的活动草稿
+
+实测（`find -type f`）四集只剩 3 个文件，全属就业集：
+
+```
+3008475  2026-08-21 16:21  就业/manual-draft-safety-backup/employment-manual-draft-20260821-162130.json
+3312050  2026-08-21 18:38  就业/manual-draft-safety-backup/employment-manual-draft-latest-20260821-183815.json
+3312050  2026-08-21 18:38  就业/subtitle/stable-checkpoints/20260821T145313.192574-4fbdb7bc/.manual-editor-drafts/5bde47bdb7ca48fdb4e65ae6.json
+```
+
+**巧克力、烂到爆红、中式梦核三集的 `.manual-editor-drafts` 目录是空的** ——
+草稿在提交后被清除，只有就业集因为存了 safety-backup 才留下证据。
+→ **本轮只有就业集可离线标定。** 另三集要标定只能靠相邻 checkpoint 互 diff，本轮未做。
+
+草稿结构：`state{word_ledger[2358], cues[238], display_page_edits[263],
+display_page_boundary_overrides[22], recovered_formal_boundary_evidence[261], tail_trim[16]}`
++ `history[101]` + `redo_history[0]`。`display_page_edits[]` 每页带
+`chinese_review_acknowledged` / `boundary_review_acknowledged` 两个确认位。
+
+### 26.3 为什么这一集是全项目目前最好的样本
+
+- `editor-review-ledger.json` 写于 **08-21 14:53**，用户 history 第一步在 **15:09**
+  → **清单先写、用户后改，是一次真正的前瞻性预测，不存在事后拟合。**
+- `history[101]` 区分「改了」和「看过但决定不动」（`confirm_display_page_boundary` 8 步，
+  以及 `display_page_boundary_overrides` 里 value 为空列表的 key）——
+  §25 那份 36 步记录没有这个区分。
+
+history 操作分布：`edit_display_page_chinese` 61、`split_display_page` 9、
+`merge_display_page_with_next` 8、`move_display_page_boundary` 8、
+`confirm_display_page_boundary` 8、`merge_adjacent_display_pages` 2、
+`move_prefix_to_previous` 2、`trim_tail_from_cue` 2、`set_hidden_and_media_muted` 1。
+
+### 26.4 结果（P=237 个父字幕）
+
+| 量 | 值 |
+|---|---|
+| 用户实际改动的父（有效 GT） | **28（11.8%）** |
+| 用户看过并确认无需改的父 | 15 |
+| 清单标出的父 | **22（9.3%）** |
+| **清单召回率** | **39%（11/28）** |
+| 清单标了、用户 confirm 无需改 | 7 |
+| 清单标了、用户既没改也没确认 | 14 |
+| 用户 confirm 的 15 个里清单没标的 | 8 |
+
+分层召回（这一项比总召回更有信息量）：
+
+| 层 | GT | 对应类标记命中 | 召回 |
+|---|---|---|---|
+| 版式/边界改动 | 21 | visual_page + english_cut → 6 | **29%** |
+| 中文改动 | 27 | chinese_* 四类 → 3 | **11%** |
+
+清单 items=23，category = chinese_allocation 9、visual_page 7、chinese_coherence 2、
+asr_correction 2、english_cut 2、chinese_length 1；severity = REVIEW 22 / BLOCKER 1。
+标记的目标字段是 **`subtitle_ids`（复数列表）**，不是 `parent_subtitle_id`
+（我第一版脚本因此算出召回 0%，已修正；记此以免复现）。
+
+### 26.5 §25 的两条处方被推翻
+
+| §25 的说法 | 本轮实测 | 判定 |
+|---|---|---|
+| 「父总词数 ≤5」可把召回补到 18/18 | 标出 44 个，命中 GT **0/28**，提升 **0.00×** | **作废** |
+| 「每页 ≥13 词」命中 69%、提升 2.8× | 召回 **47%**、提升 **2.26×** | **降级为弱信号** |
+| 清单召回率约 28% | **39%** | 量级复现 |
+
+**结论：§25 的召回率水平复现了，处方没有。** 一个在 262 条样本上看起来
+「能补到 18/18」的规则，换一集直接归零 —— 说明 §25 的信号是拿单集拟合出来的，
+不具备跨集有效性。**这条本身就是对我全部单集结论的警告。**
+
+### 26.6 唯一站得住的信号，以及它带来的坏消息
+
+「任一页英文字符数 ≥ t」单调支配上面所有词数/宽度信号：
+
+| t | 仅信号 标出%/召回% | 与清单取并集 标出%/召回% |
+|---|---|---|
+| 50 | 59.9% / 96% | 61.6% / 96% |
+| 54 | 55.7% / 89% | 57.4% / 89% |
+| 58 | 46.4% / 86% | **48.1% / 86%** |
+| 62 | 40.1% / 82% | 42.2% / 86% |
+| 66 | 32.9% / 75% | 35.9% / 82% |
+| 70 | 26.2% / 64% | 30.4% / 79% |
+| 74 | 19.4% / 46% | 24.9% / 64% |
+
+要达到 **90% 召回，最少必须读 59.1%（140/237）**，且仍漏 S0144、S0153。
+
+这个信号的本质就是「这一条长」。**冻结产物里没有能把「长而没问题」
+和「长而有问题」区分开的信息。** 所以：
+
+> **用户的目标（自动化 90-95%、只动 5-10%）用现有冻结信号达不到。
+> 天花板大约是「读一半，漏一到两成」。**
+
+这句话必须原样传达给用户，不许软化成「已接近目标」。
+
+### 26.7 更重要的发现：步数的大头不在版式，在中文
+
+101 步操作里 `edit_display_page_chinese` 占 **61 步（60%）**；
+所有版式类操作（split/merge/move/prefix）合计 29 步。
+按父字幕计则接近：中文 27 个父、版式 21 个父。
+
+而清单对这两层的召回是 **中文 11% vs 版式 29%** ——
+**用户操作步数最多的那一层，恰好是清单最弱的那一层。**
+
+→ **GPT 当前在做的 A / B / D / E / F 五项全部位于边界合法性与排版层。
+它们即使全部做成，也不覆盖用户 60% 的操作步数。**
+
+这是我第三次把工作压在错误的层上：第一次 516→452（优化切分自洽度），
+第二次 §19（判错清单存在性），第三次本条（把力气放在版式而非中文）。
+**记入 §24 的可信度基线：我的层级判断错误率现在是 3/3 轮连续。**
+
+### 26.8 误报侧的行为证据
+
+清单标出 22 个，其中 7 个用户 confirm「无需改」、14 个既没改也没确认。
+更关键的是：**用户 confirm 的 15 个父里，有 8 个清单根本没标。**
+也就是说用户在主动检查清单没提的条目 —— **行为上他不信这份清单**，
+这与他原话「不止是标黄的字幕」完全一致。在召回率 39% 的事实面前，这个不信任是理性的。
+
+### 26.9 数据诚实性边界（不得省略引用）
+
+- **单集，GT=28。** §26.5 刚刚证明单集结论不可外推，所以本节所有数字同样适用这条警告。
+- GT 原始 30，剔除 `S0016`、`S0162`（merge 后已不存在的父）后为 28。
+- GT 只覆盖「用户动手改了的」，**不覆盖「看了觉得凑合就没动的」** → 真实缺陷数 ≥ 28，
+  故上表召回率是**上界**，真实召回可能更低。
+- 字符数是排版宽度的**代理**，不是真实宽度；真实宽度/字号回退需读 blueprint，本轮没做。
+  所以「字符数支配宽度信号」这句只在代理意义上成立。
+- 另三集（巧克力、烂到爆红、中式梦核）**未测**，因为草稿已被清除。
+
+### 26.10 对 GPT 的修订指令（覆盖 §20 的对应条目）
+
+1. **E（`ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH` 1100→1260）不得再算作收益项。**
+   26.6 显示「行越长越可能被用户改」，加宽会让更多行变长，方向与用户实际修改相反。
+   仍按 §20-E 执行「只渲对比图、由用户决定」，且**必须在图里附每页字符数分布**。
+2. **新增最高优先级项 G：查 `chinese_allocation` 系检测器为什么只召回 11%。**
+   可完全离线做：从就业集草稿 `history` 里把 61 步 `edit_display_page_chinese`
+   的前后文本 diff 出来（`before_display_page_edits` 字段里有改前快照），
+   逐条看检测器为什么没报。**预登记：交付物是 61 条 diff 的分类表，不是修改代码。**
+3. A / B / F 保持，但**不得再声称它们提升自动化率或减少用户工作量**；
+   它们只影响切分合法性，这一点 26.7 已经证明。
+4. **任何新信号的接线门槛（预登记）：必须在就业集上同时报标出率与召回率，
+   并与基线「任一页英文字符数 ≥58 → 读 48.1% / 召回 86%」比较。赢不过基线就不要接线。**
+5. **不得再用单集数据下跨集结论。** 新信号至少要在两集上成立；
+   另三集的 GT 需先用相邻 checkpoint 互 diff 重建，这本身是一项独立任务。
+
+### 26.11 我在本轮的错误（登记）
+
+- 样本选择错误：按已知文件名找样本，漏掉用户真正校过的四集。
+- 第一版脚本用错字段（`parent_subtitle_id` 而非 `subtitle_ids`），算出召回 0% 的假结果。
+  **我当场判断「0% 太反常，几乎肯定是我的 bug」并复查 —— 这条留作正例：
+  反常结果先怀疑自己的脚本，不要先写结论。**
+- §25 的两条处方是单集拟合，我当时没做跨集验证就写成了工单。
+
+
+---
+
+## §27 第十一轮：另两集找到了，跨集验证完成 —— 中文主导得到复现，§25 处方三集全灭
+
+### 27.1 数据来源（用户提供，此前我找不到）
+
+`D:\经济学人\2026-08-15\其他媒体` 下存着两集的**完整人工终稿包**：
+
+```
+中式梦核：千禧一代的怀旧密码/…-处理结果/人工终稿字幕包/generations/20260820T061937522986-12eebd05/人工终稿字幕-edits.json
+烂到爆红：一部动画电影的逆袭/…-处理结果/人工终稿字幕包/generations/20260818T065438686900-50c82531/人工终稿字幕-edits.json
+```
+
+结构说明：`人工终稿字幕包/generations/<时间戳-hash>/` 每次导出一份，
+中式梦核 9 份、烂到爆红 3 份（均取最新）。同目录还有
+`人工终稿字幕-artifacts/`（含 `display-boundary-evidence.json`、
+`authoritative-parent-chinese.json`、`display-page-translations.json`）、
+`人工终稿分页双语字幕.srt`、`人工终稿分页映射.json`、派生 m4a。
+`.manual-editor-drafts/` 在这里也有留存（中式梦核 6 份）。
+
+**→ §26.2「另三集草稿已被清除、无法标定」这句话是错的：包被导出到了 D 盘，
+只是不在 E:\work-dir 下。这是我第四次因为只搜自己已知的位置就下结论。**
+
+**两集都没有 `editor-review-ledger.json`**（编辑发生在 08-18 / 08-20，
+ledger 机制 08-21 才产出第一份）。→ **本轮不能测清单召回率，只能测信号。**
+清单召回率 39% 仍然只有就业集一个样本。
+
+### 27.2 三集横向表（这是目前唯一的跨集证据）
+
+| | 就业市场 | 中式梦核 | 烂到爆红 |
+|---|---|---|---|
+| 编辑日期 | 08-21 | 08-20 | 08-18 |
+| 父字幕 P | 237 | 201 | 173 |
+| 页数 | 263 | 255 | 205 |
+| history 步数 | 101 | 201 | 115 |
+| **用户改动的父（GT）** | 28（**11.8%**） | 60（**29.9%**） | 30（**17.3%**） |
+| 确认看过但没改 | 15 | 6 | 7 |
+| **`edit_display_page_chinese` 步数占比** | 61/101 = **60%** | 149/201 = **74%** | 75/115 = **65%** |
+| GT 中「改了中文」的父 | 27 | 59 | 30 |
+| GT 中「改了版式」的父 | 21 | 29 | 16 |
+
+### 27.3 复现成功的结论（可以当事实用）
+
+**一、中文是工作量的主体，三集全部成立：60% / 74% / 65% 的操作步数是逐页改中文。**
+按父字幕算，中式梦核 60 个 GT 里 59 个涉及中文、烂到爆红 30 个里 30 个全涉及中文。
+**→ §26.7 的核心判断复现，且比就业集更极端。GPT 当前 A/B/D/E/F 全在版式层这件事，
+从「可能方向错」升级为「已证实覆盖不到主要工作量」。**
+
+**二、GT 比例远高于 5-10%：11.8% / 29.9% / 17.3%，合并 118/611 = 19.3%。**
+用户目标「只动 5-10%」意味着 GT 要降到现在的 1/2 到 1/6。
+**注意这是「用户改动率」而不是「缺陷率」——降低它靠的是切分/翻译质量本身变好，
+不是靠清单标得准。清单只能决定他要读多少条，决定不了他要改多少条。**
+这是我此前一直没分清的两件事，登记在此。
+
+**三、`父总词数 ≤5` 三集全灭：提升 0.00× / 0.15× / 0.00×。§25 该处方彻底作废，
+不留任何形式的保留。**
+
+### 27.4 被削弱的结论
+
+`每页 ≥13 词`：召回 47% / 35% / 17%，提升 2.26× / 1.76× / 1.25×。
+**逐集衰减，最弱一集已接近随机。→ 不得单独接线。**
+
+`任一页英文字符数 ≥58`：
+
+| | 标出率 | 召回 |
+|---|---|---|
+| 就业市场 | 46.4% | 86% |
+| 中式梦核 | 44.8% | 72% |
+| 烂到爆红 | 45.7% | 80% |
+| **三集合并** | **45.7%（279/611）** | **77%（91/118）** |
+
+标出率极其稳定（44.8–46.4%），**但召回率是 72–86%，比 §26 单集给出的 86% 低**。
+→ **§26.6 的「读 48% / 召回 86%」应更正为「读 46% / 召回 77%（三集合并）」。
+接线基线随之改成 77%，不是 86%。**
+
+达 90% 召回所需读取比例：就业 59.1%、中式梦核 65.2%、烂到爆红 61.3%
+→ **约 60–65%，比 §26 的 59% 更差。**
+
+### 27.5 天花板的最终措辞（覆盖 §26.6，必须原样传达）
+
+> 用现有冻结产物里的信号，最好的结果是**读一半（46%）抓到八成（77%）**；
+> 想抓九成就得读六成以上。**「自动化 90-95%、只动 5-10%」在当前信号条件下达不到**，
+> 而且差距比上一轮估计的更大。
+> 唯一的突破口仍是 §26.10-G：把逐页中文/中英对应的检测做对 ——
+> 三集数据现在一致指向这一层。
+
+### 27.6 对 GPT 的追加指令
+
+1. **G 升为唯一高优先级项，且样本扩大为三集。** 中文改动的前后文本可从
+   `history` 里 `edit_display_page_chinese` 步的 `before_display_page_edits` 快照 diff 出来，
+   三集共 **285 步**（61+149+75）。预登记交付物：285 条 diff 的分类表 + 每类占比，
+   **不许在交付分类表之前改任何检测器代码**。
+2. **接线基线更新（预登记，覆盖 §26.10-4）**：任何新信号必须在**三集上分别**报标出率与召回率，
+   并打赢「≥58 字符 → 读 45.7% / 召回 77%」。**只在一集上赢不算赢。**
+3. **`父总词数≤5` 从所有工单中删除。`每页≥13词` 只能作为组合项，不得单独作为标记依据。**
+4. E（1100→1260）**继续只出对比图**；本轮数据未改变 §26.10-1 的判断。
+5. 清单召回率仍只有就业集一个样本（39%）。**要第二个样本，只能等一集新素材：
+   先跑出 ledger、再由用户编辑、再比对。不得对已校对的老集重跑。**
+
+### 27.7 我在本轮的错误（登记，第四次同型）
+
+§26.2 我写「另三集草稿已被清除 → 只有就业集能标定」，依据是
+`find E:\work-dir/<三集> -path '*manual-editor-drafts*'` 只返回 3 个文件。
+**错误在于我把搜索范围限定在 E:\work-dir，而用户的成品包在 D 盘。**
+同型错误链：§19（只查已知文件名）→ §21 教训 → §26.1（只按已知文件名找样本）→ 本条（只搜已知盘符）。
+**规则升级：在断言「某数据不存在」之前，必须先向用户确认成品的存放位置，
+而不是只搜我当前挂载到的目录。**
+
+
+---
+
+# §28 通往 90-95% 的完整工单（无人值守，覆盖 §20 全部条目）
+
+**用户已离开，短期不会回来复核。本节是 GPT 从现在起的唯一执行依据。**
+§20 的 A–F 作废为「已完成的清理项」，不再是路线；§26/§27 是事实依据；本节是路线。
+
+## 28.0 先把目标翻译成两个可测的数（这一步不做，后面全是空转）
+
+用户原话：「自动化能完成 90-95% 的结果，然后我补 5-10%」。
+§27.3 已经证明这句话里**混着两个独立的数**，必须分开优化，否则永远说不清进展：
+
+| 符号 | 定义 | 当前值（三集实测） | 目标 |
+|---|---|---|---|
+| **E**（改动率） | 用户实际动手改过的父字幕 / 总父字幕 | **19.3%**（118/611） | **≤ 10%** |
+| **R**（读取率） | 用户为了找出那些条目而必须过目的父字幕 / 总父字幕 | **~100%**（他不信清单，逐条看） | **≤ 50%** |
+| **Rec**（清单召回率） | 用户改过的条目里被清单标出的比例 | **39%**（仅就业集一个样本） | **≥ 95%** |
+
+**「90-95% 自动化」= E ≤ 10% 且 Rec ≥ 95% 且 R ≤ 50%。三个一起达标才算到。**
+
+关键区分（我此前混淆过，写死在此防止复发）：
+
+- **降 E 只能靠生成质量变好**（切分、分配、翻译本身）。清单标得再准，E 一分不降。
+- **降 R 只能靠清单变准**（Rec 上去了，用户才敢不看没标的）。生成质量再好，Rec 低他还得逐条看。
+- **所以两条线必须并行，缺一条都到不了目标。** §20 的 A–F 既不降 E 也不升 Rec，
+  这就是它们「做完了但用户工作量没变」的原因。
+
+**诚实前提（不许在任何报告里软化）：** §27.4 实测，冻结产物里最强的信号
+（任一页英文字符 ≥58）是「读 45.7% 抓 77%」，要抓 90% 得读 60-65%。
+**Rec ≥ 95% 用现存冻结信号做不到。** 本工单的 P3 就是为此设计的升级路径；
+如果 P3 也做不到，**P5 要求你把天花板如实报出来，而不是把门禁调低。**
+
+## 28.1 P0：先把「目标函数」做成一个能跑的脚本（第一优先，其它全部等它）
+
+没有这个脚本，后面每一步都无法自证，你会重复我前九轮的错误。
+
+**产出**：`docs/audits/2026-08-24/objective-harness/measure_objective.py`
+
+**输入（三集人工终稿，只读，不许写回）**：
+
+```
+E:\VideoCaptioner-screen-subtitle\work-dir\无论怎么衡量，就业市场都很疲软\manual-draft-safety-backup\employment-manual-draft-latest-20260821-183815.json
+D:\经济学人\2026-08-15\其他媒体\中式梦核：千禧一代的怀旧密码\中式梦核：千禧一代的怀旧密码-处理结果\人工终稿字幕包\generations\20260820T061937522986-12eebd05\人工终稿字幕-edits.json
+D:\经济学人\2026-08-15\其他媒体\烂到爆红：一部动画电影的逆袭\烂到爆红：一部动画的逆袭-处理结果\人工终稿字幕包\generations\20260818T065438686900-50c82531\人工终稿字幕-edits.json
+```
+
+注意两种格式：就业集是 `kind="manual-final-working-draft"`，真实状态在 **`state` 子对象**里
+（`state.display_page_edits` / `state.display_page_boundary_overrides`），`history` 在顶层；
+另两集是 `schema_version=2` 的导出格式，字段在**顶层**。
+
+**GT 推导规则（必须逐字照做，否则复现不出下面的门禁值）**：
+
+- 版式类 GT = `history` 中 operation ∈ {`split_display_page`, `split_parent_into_display_pages`,
+  `merge_display_page_with_next`, `merge_adjacent_display_pages`, `move_display_page_boundary`,
+  `move_prefix_to_previous`, `move_suffix_to_next`} 的步骤所涉父 id
+  ∪ `display_page_boundary_overrides` 中 **value 非空**的 key。
+- 中文类 GT = operation == `edit_display_page_chinese` 的步骤所涉父 id。
+- 英文类 GT = operation == `edit_english_surface`。
+- 父 id 提取：从 `parent_subtitle_id`、`display_page_id`、`left_page_id`、`right_page_id`、
+  `affected_parent_ids` 里取 `^S\d+` 前缀。
+- **`display_page_boundary_overrides` 中 value 为空列表的 key = 用户看过并确认不改**，
+  记作 CONFIRM，**不计入 GT**，但要单独报（它是「误报是否可容忍」的唯一行为证据）。
+- 最后与 `display_page_edits` 里真实存在的父集合求交（merge 后消失的父要剔掉）。
+
+**P0 放行门禁（预登记，不许改目标值）**：脚本输出必须逐位复现下表。
+
+| | 就业市场 | 中式梦核 | 烂到爆红 | 合并 |
+|---|---|---|---|---|
+| P（父字幕数） | 237 | 201 | 173 | 611 |
+| GT | 28 | 60 | 30 | 118 |
+| E（改动率） | 11.8% | 29.9% | 17.3% | **19.3%** |
+| CONFIRM | 15 | 6 | 7 | 28 |
+| 中文步数占比 | 61/101 | 149/201 | 75/115 | **60%/74%/65%** |
+| 信号「任一页英文字符≥58」标出率 | 46.4% | 44.8% | 45.7% | **45.7%** |
+| 同上召回率 | 86% | 72% | 80% | **77%** |
+
+**对不上就停下，写明哪一格对不上、你怀疑的原因，不要改门禁迁就实现。**
+
+脚本还必须提供一个通用入口：给定「任意一组被标记的父 id 集合」，输出
+`标出率 / 召回率 / 分层召回（版式 vs 中文）/ 漏标 id 列表`。**后面每一步都用它验收。**
+
+## 28.2 P1：G 项 —— 285 条中文修改的归因分类表（在 P0 之后，交表前不许改任何检测器）
+
+**为什么这是主线**：三集中文操作占 60-74%，而清单中文层召回只有 11%（§26.4）。
+**Rec 从 39% 到 95% 的绝大部分缺口在这一层。**
+
+**做法**：从三集 `history` 里取 `edit_display_page_chinese` 步（61+149+75 = **285 步**），
+每步的 `before_display_page_edits` 是**改前全量快照**，与下一步（或终态）对比即得改后文本
+→ 逐条产出 `(父 id, 页 id, 英文, 改前中文, 改后中文)`。
+
+**分类维度（每条必须同时给这三个标签）**：
+
+1. **缺陷类型**：语义漏译 / 语义错译 / 中英分配错位（该页中文对应的是别页英文）/
+   实体或数字错 / 否认或疑问语气丢失 / 中文不通顺 / 长度超限 / 相邻页重复 / 纯风格偏好。
+2. **可检测性**：`A=仅凭冻结产物可判定`（如长度、重复、数字实体不匹配）/
+   `B=需要逐页读中英对应才能判定`（需模型判断）/ `C=口味，不可判定`。
+3. **现有检测器为何没报**：已有 code 但未触发（写出 code 名与未触发原因）/
+   无对应 code / 触发了但被过滤掉（写出过滤点 file:line）。
+
+**P1 放行门禁**：
+- 285 条**全部**有三个标签，覆盖率 100%，不许抽样。
+- 输出 `docs/audits/2026-08-24/chinese-attribution/attribution.json` + 一份 Markdown 汇总表
+  （每个缺陷类型的条数与占比、A/B/C 三档占比）。
+- **在 Markdown 里明确写出 A 档合计占比。这个数决定 P2 的天花板 ——
+  如果 A 档只占 30%，那么纯离线检测器最多把中文层召回做到 30% 左右，P3 就必须上。**
+- **交表之前不许修改 `subtitle_review_marks.py` 或任何检测逻辑。**
+
+## 28.3 P2：把 A 档做成检测器（离线，只加标记，不改生成）
+
+只针对 P1 分出的 **A 档**缺陷写检测规则，接进
+`app/core/subtitle_processor/subtitle_review_marks.py`（`_REVIEW_LEDGER_NAME` 在 32 行，
+读在 49-57，写在 60）。**只允许新增 mark，不允许删除或降级现有 mark。**
+
+**P2 放行门禁（预登记）**：
+- 用 P0 的脚本，在**三集分别**报：总召回、中文层召回、标出率。
+- **中文层召回：11% → ≥ 60%**（三集**分别**达标，不许只有一集达标）。
+- **总标出率 ≤ 50%**（三集分别）。
+- **总召回不得下降**（与 §27.4 的 77% 基线比，只许升）。
+- 任一集不达标就不要接线，写明差在哪一类缺陷上。
+- **禁止用「消掉了多少条矛盾」「标出率下降」当成绩汇报**——那不是目标函数。
+
+## 28.4 P3：Rec 冲 95% 的唯一现实路径 —— 逐页中英对照的模型检查（B 档）
+
+P1 的 B 档（需要读中英对应才能判定）**离线规则做不到**，这一点 §27.4 已经用信号天花板证明。
+唯一路径是**在流水线里加一次逐页中英对照检查**：把每页的
+`(英文, 中文, 前后各一页上下文)` 交给模型，用 P1 归纳出的缺陷类型做 rubric，输出
+`是否有问题 + 类型 + 理由`，写进 ledger。
+
+**这条已有半成品可复用**：现有 `model_english_chinese_mismatch` code 就是这个机制
+（§26.4 里 9 条 `chinese_allocation` 有 8 条是它报的），它的召回只有 11%
+不一定是思路错，**先查是不是覆盖率问题（只对部分页调用）还是 prompt 问题（调用了但没看出来）**。
+这个判定必须在动手改 prompt 之前完成，写进报告。
+
+**P3 放行门禁（预登记）**：
+- 三集分别：**总召回 ≥ 90%，标出率 ≤ 50%**。
+- 报出**每集的调用次数、token 量、耗时**（这是用户要付的成本，不许省略）。
+- **在真实新素材上跑一遍**确认不崩（新素材定义见 28.6），但召回率仍以三集为准。
+- 如果 90% 达不到：**报出实际达到的数字与卡在哪类缺陷上，不许调低门禁。**
+
+## 28.5 P4：降 E（改动率 19.3% → ≤10%）—— 只能拿新素材验证
+
+P1 的分类表同时也是**生成侧的修复清单**：占比最大的那几类缺陷，
+去修产生它的环节（多为语义组翻译与固定 id 分配的 prompt / 规则），而不是修检测器。
+
+**铁律（违反即污染用户成果，不可逆）**：
+- **不得对任何已人工校对的产物集重跑。** 重跑会改英文文本 → 翻译缓存 key 变化 →
+  中文重译 → **用户校过的段落回到未校状态**。
+- 三集只能当**离线对照**（比对自动结果与用户最终选择），不能当重跑验证对象。
+- P4 的验收必须在**未经人工校对的新音频**上做。
+
+**P4 放行门禁**：新素材上 E ≤ 10%，且该集的 Rec 仍满足 P3 门禁。
+**没有新素材就不要执行 P4，把它挂起并在进展文件里写明「等新素材」。**
+
+## 28.6 贯穿全程的硬约束（任一条违反即本轮作废）
+
+1. **不得跑 `git checkout .` / `git restore .` / `git stash`。** 工作树有 119 个 M，
+   其中 113 个是 CRLF 假阳性，其余属并发 Codex 会话。只用 `git add <具体文件>`。
+2. **改动前把原文件备份到** `docs/audits/2026-08-24/rollback/<文件名>.<步骤>.bak`。
+3. **动共享 helper 前先数调用点**（`grep -rn --exclude-dir=runtime`）。
+   `_fragment_has_finite_predicate` 有 11 个消费点、显示层 5 个 `visual_*` 门控在它上面，
+   §13 已经因此炸过一次。要改就加私有判据。
+4. **不许 grep `runtime/`**（158,077 文件，会超时）。
+5. **不许用单集数据下跨集结论。** 新信号必须三集分别达标。§25 的
+   `父总词数≤5` 就是单集拟合的产物，三集提升 0.00×/0.15×/0.00×，已删除。
+   `每页≥13词` 提升 2.26×/1.76×/1.25×，只能当组合项。
+6. **测量脚本与生产实现必须独立**：不许用生产代码算门禁，也不许改门禁值。
+   预登记值 → 实测值 → 通过/未通过，三行齐全才算汇报。
+7. **反常结果先怀疑自己的脚本。** 我第十轮算出「召回 0%」，第一反应是查自己的字段名
+   （ledger 用的是 `subtitle_ids` 复数列表，不是 `parent_subtitle_id`），果然是 bug。
+   任何 0% 或 100% 都先自查再写结论。
+8. **断言「某数据不存在」之前，先枚举，且要考虑不在挂载盘内的位置。**
+   我因此错了四次（§19 → §21 → §26.1 → §27.7）。用户成品包在 `D:\经济学人\...`，
+   不在 `E:\work-dir`。
+9. **新素材定义**：未经人工校对、且 `work-dir` 下无 `人工终稿字幕包` 与
+   `manual-draft-safety-backup` 的剧集。白宫、巧克力、就业、日本X世代、中式梦核、
+   烂到爆红、留学、AI省钱**全部不合规**。
+10. **同一处失败两次就换路子**，不要第三次微调。写明失败原因后跳到下一个 P。
+
+## 28.7 P5：停止条件与如实汇报（这一步不是形式，是本工单最容易被跳过的一步）
+
+**达标即停**：三集 Rec ≥ 95%、R ≤ 50%，且新素材 E ≤ 10% → 目标达成，停止工程。
+
+**未达标时的三种合法结局，任选其一如实写出，不许含糊**：
+
+- **卡在 A 档天花板**：P1 的 A 档占比太低，离线规则最多做到 X%。→ 报 X，说明需要 P3。
+- **卡在 P3 成本**：模型逐页检查能到 90%+，但每集要 N 次调用 / M token / T 分钟。
+  → 把成本摆出来，让用户决定值不值。
+- **卡在 E**：Rec 上去了但 E 仍 >10%。→ 说明缺陷是生成质量问题，
+  报出 P1 里占比最大的三类缺陷，作为下一阶段的输入。
+
+**更实在的停止点**：**手工补的时间比继续做工程更省，就收工。**
+用户最容易被误导的方式是看到「矛盾数下降」「标出率下降」以为在进步 ——
+那些数可以一直降而工作量一点不变。**只报 E / R / Rec 三个数。**
+
+## 28.8 进展文件怎么写（用户回来只看这一个文件）
+
+`执行进展-给用户.md`，每个 P 一节，每节四行：
+
+```
+做了什么（一句话，大白话，不许出现 file:line 和 code 名）
+预登记门禁值 = ？
+实测值 = ？
+通过 / 未通过（未通过就写卡在哪）
+```
+
+文件末尾固定一节 `## 需要你决定的事`，只放**真正需要人类判断**的问题
+（例如分页宽度选哪一档、P3 的成本值不值）。**没有就写「暂无」，不要塞技术细节。**
+**不得在这个文件里出现 516/452 这类自洽度数字。**
+
+## 28.9 执行顺序（不许并行，不许跳步）
+
+```
+P0 目标函数脚本  →  门禁：复现 28.1 表格全部数字
+P1 285 条归因表  →  门禁：覆盖率 100%，报出 A 档占比
+P2 A 档检测器    →  门禁：中文层召回 ≥60%，标出率 ≤50%，总召回不降（三集分别）
+P3 逐页中英对照  →  门禁：总召回 ≥90%，标出率 ≤50%，并报成本（三集分别）
+P4 降 E          →  门禁：新素材 E ≤10%（无新素材则挂起）
+P5 如实汇报      →  按 28.7 三种结局之一写死
+```
+
+**P0 未通过之前不要碰 P1。** 每个 P 结束就更新 `执行进展-给用户.md`，不要攒到最后。
+
+## 28.10 无人值守期间的改动权限边界（补，用户离开期间这一节等于授权书）
+
+§28 其余部分说的是「做什么」，这一节说的是「在没人批准的情况下你可以改到哪一步」。
+**越界的改动一律视为未授权，必须回滚。**
+
+**可以无人值守直接接线的**：
+- P0 的测量脚本（新增文件，不进生产路径）。
+- P1 的归因表（纯产出物）。
+- P2 的 A 档检测器 —— 因为它**只往 ledger 里加 mark**，不改字幕文本、不改分页、不改时间轴、
+  不影响合成结果。**前提：只许新增 mark，不许删除或降级现有 mark，且必须过 §28.3 门禁。**
+
+**必须放在默认关闭的开关后面，不许进入默认 stable 流程的**：
+- P3 的逐页中英对照模型检查。三条理由，缺一条都不许绕：
+  1. 它引入额外模型调用 → **用户要付的成本和等待时间变了**，这必须由用户决定（§28.4 要求报成本）。
+  2. stable 模式的立身之本是**冻结与可复现**。模型输出天生带随机性，
+     所以 **P3 的结果只许写进 `editor-review-ledger.json`（审校标记），
+     绝对不许反向影响切分、分配、分页或翻译**。一旦它能改这些，同一份音频两次跑出不同字幕，
+     stable 契约就破了，之前所有冻结产物和对照基线全部失效。
+  3. 未验证的情况下默认开启，等于用户回来第一次跑就撞上未知成本。
+- 自证要求：**同一份输入连跑两次，比较两次 marks 集合，报出完全一致 / 不一致的条数与比例。**
+  不一致比例 >5% 就要在报告里点出来，这是「模型检查能不能当门禁用」的前提。
+
+**绝对不许无人值守拍板的**：
+- 任何会改变**用户最终看到的字幕文本或版式**的默认值。
+  `ARTICLE_SUBTITLE_EN_PREFERRED_LINE_WIDTH` 从 1100 改成 1260 就是上一轮的越界样本
+  （§23.5 已记录）：那是审美选择，只有用户能定。**你只能出对照渲染图，不能改默认值。**
+  这一条同样适用于 P4 里任何影响断句风格、翻译语气、页宽页数的参数。
+- 对任何已人工校对产物集的重跑（§28.5 铁律，不可逆污染）。
+- 删除、重命名、移动 `work-dir/` 与 `docs/audits/` 下任何既有文件。
+- 修改 `_fragment_has_finite_predicate` 等共享 helper 的行为（§28.6 第 3 条，要改就加私有判据）。
+
+**P4 的特殊约束**：它必然会改生成侧输出，所以
+- 每处改动都要能单独开关，且默认按当前行为走；
+- 只在**新素材**上验证（§28.6 第 9 条的定义）；
+- 报告里必须给出「改前 / 改后」的同一集对照，让用户能一眼看出风格变了没有；
+- **不许把 P4 的改动设成默认，等用户回来看过对照再定。**
+
+**兜底**：如果某一步你判断必须越界才能推进，**停在那里**，在
+`执行进展-给用户.md` 的「需要你决定的事」里写清楚三行：想改什么、为什么必须改、
+不改的话卡在哪。**然后去做下一个不越界的 P，不要停摆等人。**
