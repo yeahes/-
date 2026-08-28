@@ -3594,6 +3594,7 @@ def test_three_line_fallback_promotes_complete_two_page_alternative():
                 "to become the world's largest fast-food operator by number "
                 "of locations."
             ),
+            "Last year, Mixue Bingcheng officially overtook McDonald's",
             "to become the world's largest fast-food operator by number of locations.",
         ),
         (
@@ -3602,14 +3603,14 @@ def test_three_line_fallback_promotes_complete_two_page_alternative():
                 "You're getting plugged directly into the most aggressive "
                 "expansion engine in the modern food and beverage industry."
             ),
+            "You're getting plugged directly into the most aggressive expansion engine",
             (
-                "into the most aggressive expansion engine in the modern "
-                "food and beverage industry."
+                "in the modern food and beverage industry."
             ),
         ),
     )
 
-    for subtitle_id, text, expected_second_page in cases:
+    for subtitle_id, text, expected_first_page, expected_second_page in cases:
         _, cue = _syntax_backed_cue(
             text,
             subtitle_id,
@@ -3635,8 +3636,13 @@ def test_three_line_fallback_promotes_complete_two_page_alternative():
             continue
 
         assert len(plan["pages"]) == 2
+        assert plan["pages"][0]["english"] == expected_first_page
         assert plan["pages"][1]["english"] == expected_second_page
         assert all(len(page["english_lines"]) <= 2 for page in plan["pages"])
+        if subtitle_id == "S9522":
+            boundary = plan["pages"][1]["boundary_before"]
+            assert boundary["classification"] == "review"
+            assert boundary["complete_prepositional_continuation"] is True
 
 
 def test_forced_predicate_page_accepts_complete_adverb_preposition_phrase():

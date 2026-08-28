@@ -1,14 +1,14 @@
 # Project State
 
 Status: complete
-Last verified: 2026-08-28 21:16:42 Asia/Shanghai
+Last verified: 2026-08-28 21:38:02 Asia/Shanghai
 Branch: codex/backup-20260828
 Verified HEAD: 89d7482
 Working tree: clean; local generated media remains ignored
 
 ## Current Goal
-Prepare a recoverable GitHub backup branch containing source, tests, state,
-handoffs, and reproducible audit material without generated media.
+Keep the stable display planner contract aligned with its verified readability
+fixtures while preserving the frozen subtitle pipeline.
 
 ## Confirmed Facts
 - A completed `frozen_parent_timeline` stage is reusable only under the same input fingerprint and valid file digests.
@@ -76,7 +76,8 @@ handoffs, and reproducible audit material without generated media.
 - `runtime\\python.exe -m pytest tests\\test_stable_page_translation_contract.py -q`: 76 passed.
 - `runtime\\python.exe -m pytest tests\\test_stable_publication.py -q`: 102 passed.
 - `runtime\\python.exe -m pytest tests\\test_measure_g6_manual_diff.py tests\\test_measure_page_number_anchors.py -q`: 3 passed; number-anchor script self-test PASS.
-- Article readability contract: 109 passed, 1 failed (`test_three_line_fallback_promotes_complete_two_page_alternative`, S9522 expects `into` but current uncommitted planner selects `in`).
+- Article readability S9522 fixture verification: focused test passed; current
+  planner selects the balanced `in` page start without production changes.
 - G1 checkpoint replay: PASS, degraded=1 (S0089), 306 pages total, 0 page-signature changes outside S0089, page-translation cache validation PASS, QA queue=76, semantic queue=9.
 - Latest page-blocker probe: OpenCode Go retries rejected; offline candidate
   validated `status=PASS`, 55 pages, 27 multi-page parents, and renderer
@@ -94,8 +95,8 @@ handoffs, and reproducible audit material without generated media.
   nonblank with the expected reflowed lines.
 
 ## Next Action
-Review the local backup checkpoint, then push branch `codex/backup-20260828` to
-the configured GitHub remote when ready.
+Keep the fresh ERROR checkpoint unpublished; handle `S0098`, `S0100`, and
+`S0116` through an explicit manual bypass or targeted display-stage retry.
 
 ## Do Not Regress
 - Preserve frozen English/IDs/word ownership/final timing, reject inconsistent checkpoints, keep successful page-batch caches, and never write `D:\\软件缓存\\VideoCaptioner`.

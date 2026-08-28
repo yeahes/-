@@ -5,8 +5,8 @@ Last verified: 2026-08-28 19:17:31 Asia/Shanghai
 ## Current Goal
 
 Keep only low-risk, high-payoff work: use the committed local retry for the
-current page blocker, settle the S9522 fixture separately, then measure one
-fresh unreviewed audio run. A retry must resume from the failed display-page
+current page blocker, then measure one fresh unreviewed audio run. A retry must
+resume from the failed display-page
 stage without rebuilding frozen English, parent Chinese, fixed IDs, the word
 ledger, WhisperX alignment, or the final cue timeline.
 
@@ -138,10 +138,9 @@ ledger, WhisperX alignment, or the final cue timeline.
   unreviewed checkpoint has 55 expected pages and the two page-local issues
   recorded above; Chinese fluency and long-caption quality still require a
   fresh unreviewed run after the blocker is handled.
-- The current article readability contract remains 109 passed / 1 failed:
-  S9522's existing assertion expects `into` while the current planner selects
-  `in`; this is a separate fixture-quality item, not a regression from the
-  local retry.
+- The S9522 readability fixture now matches the current planner: the balanced
+  two-page projection keeps `into ... engine` on P01 and starts P02 at `in`.
+  Its focused regression passes; no production pagination code changed.
 - G1 failure localization is implemented. A renderable review fallback is now
   recorded as `degraded_page_count` instead of an episode-level error; a real
   non-renderable parent or an exceeded degraded threshold still blocks.

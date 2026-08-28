@@ -40,9 +40,9 @@ by an explicit manual bypass or targeted retry.
 - Committed mechanism groups: frozen resume, selected-service audit, parent
   translation, display-page translation, retry UI, offline measurement tools,
   and their focused tests.
-- Article readability remains 109 passed / 1 failed (S9522 `into` vs `in`);
-  the unverified page-selection experiment was removed and synthesis recovery is
-  already committed.
+- S9522's readability fixture now matches the current planner (`in` page start);
+  the focused regression passes. The unverified page-selection experiment was
+  removed and synthesis recovery is already committed.
 
 ## Next Action
 
@@ -53,8 +53,8 @@ re-synthesized without rerunning subtitle generation.
 
 ## Unknowns
 
-- S9522 matches HEAD baseline but differs from the old fixture expectation; it is
-  not a production regression and is out of the current scope.
+- S9522 is resolved as a fixture-only update; no production pagination change
+  was required.
 - A fresh unreviewed audio is still required for current end-to-end quality.
 
 ## Deferred
