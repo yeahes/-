@@ -82,11 +82,18 @@ PODCAST_KEYFRAME_INTERVAL_SECONDS = 2
 ARTICLE_SCALE_X = ARTICLE_WIDTH / ARTICLE_DESIGN_WIDTH
 ARTICLE_SCALE_Y = ARTICLE_HEIGHT / ARTICLE_DESIGN_HEIGHT
 ARTICLE_CARD_CONTAINER = (251, 246, 237, 255)  # #FBF6ED
+ARTICLE_CONTAINER_BACKGROUND_OPACITY = 70
+ARTICLE_SUBTITLE_BACKGROUND_OPACITY = ARTICLE_CONTAINER_BACKGROUND_OPACITY
+ARTICLE_PANEL_SHADOW_ALPHA = 22
+ARTICLE_PANEL_SHADOW_BLUR = 16
 
 TEMPLATE_DIR = RESOURCE_PATH / "podcast_template"
 ARTICLE_TEMPLATE_DIR = TEMPLATE_DIR / "article_vocab"
 TEMPLATE_FONT_DIR = TEMPLATE_DIR / "fonts"
 ARTICLE_LOGO_DIR = ARTICLE_TEMPLATE_DIR / "logos"
+ARTICLE_COVER_BACKGROUND = ARTICLE_TEMPLATE_DIR / "封面容器.png"
+ARTICLE_VOCAB_BACKGROUND = ARTICLE_TEMPLATE_DIR / "单词卡容器.png"
+ARTICLE_SUBTITLE_BACKGROUND = ARTICLE_TEMPLATE_DIR / "字幕区背景.png"
 BACKGROUND = TEMPLATE_DIR / "background.png"
 AVATAR_SOURCE = TEMPLATE_DIR / "hosts.png"
 FONT_GANTARI = TEMPLATE_FONT_DIR / "Gantari-wght.ttf"
@@ -10752,15 +10759,96 @@ def draw_article_panel(
     radius: int,
     fill_color: tuple[int, int, int, int],
     stroke_color=(230, 222, 208, 255),
+    background_path: Path | None = None,
 ) -> None:
     x0, y0, x1, y1 = rect
     shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow, "RGBA")
-    sd.rounded_rectangle((x0, y0 + acy(4), x1, y1 + acy(4)), radius=radius, fill=(0, 0, 0, 13))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(acx(16)))
+    sd.rounded_rectangle(
+        (x0, y0 + acy(4), x1, y1 + acy(4)),
+        radius=radius,
+        fill=(0, 0, 0, ARTICLE_PANEL_SHADOW_ALPHA),
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(ARTICLE_PANEL_SHADOW_BLUR))
     img.alpha_composite(shadow)
     d = ImageDraw.Draw(img, "RGBA")
-    d.rounded_rectangle(rect, radius=radius, fill=fill_color, outline=stroke_color, width=1)
+    d.rounded_rectangle(rect, radius=radius, fill=fill_color)
+    if background_path is not None:
+        draw_article_panel_background(
+            img,
+            rect,
+            radius,
+            background_path,
+            ARTICLE_CONTAINER_BACKGROUND_OPACITY,
+        )
+    d.rounded_rectangle(rect, radius=radius, outline=stroke_color, width=1)
+
+
+def draw_article_panel_background(
+    img: Image.Image,
+    rect: tuple[int, int, int, int],
+    radius: int,
+    background_path: Path,
+    opacity: int,
+) -> None:
+    """Place a bundled paper texture inside a rounded article panel."""
+    if not background_path.is_file():
+        raise RuntimeError(f"文章容器背景文件不存在：{background_path}")
+    try:
+        with Image.open(background_path) as source:
+            texture = source.convert("RGBA").resize(
+                (rect[2] - rect[0], rect[3] - rect[1]),
+                Image.Resampling.LANCZOS,
+            )
+    except Exception as exc:
+        raise RuntimeError(f"无法读取文章容器背景：{background_path}（{exc}）") from exc
+
+    opacity = max(0, min(100, int(opacity)))
+    gray = ImageOps.grayscale(texture)
+    reference_luma = float(
+        gray.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0)) or 255
+    )
+    strength = opacity / 100.0
+    factor = gray.point(
+        lambda value: max(
+            0,
+            min(
+                255,
+                round(
+                    255
+                    * (1.0 + ((value - reference_luma) / reference_luma) * strength)
+                ),
+            ),
+        )
+    )
+    factor_rgb = Image.merge("RGB", (factor, factor, factor))
+    base_crop = img.crop((rect[0], rect[1], rect[2], rect[3])).convert("RGB")
+    modulated = ImageChops.multiply(base_crop, factor_rgb).convert("RGBA")
+    texture_alpha = texture.getchannel("A")
+    corner_mask = Image.new("L", texture.size, 0)
+    ImageDraw.Draw(corner_mask).rounded_rectangle(
+        (0, 0, texture.width - 1, texture.height - 1),
+        radius=radius,
+        fill=255,
+    )
+    texture.putalpha(ImageChops.multiply(texture_alpha, corner_mask))
+    modulated.putalpha(texture.getchannel("A"))
+    img.alpha_composite(modulated, (rect[0], rect[1]))
+
+
+def draw_article_subtitle_background(
+    img: Image.Image,
+    rect: tuple[int, int, int, int],
+    radius: int,
+) -> None:
+    """Place the bundled paper texture inside the subtitle panel."""
+    draw_article_panel_background(
+        img,
+        rect,
+        radius,
+        ARTICLE_SUBTITLE_BACKGROUND,
+        ARTICLE_SUBTITLE_BACKGROUND_OPACITY,
+    )
 
 
 def draw_dashed_line(
@@ -11170,9 +11258,16 @@ def _draw_article_vocab_card_legacy(img: Image.Image, item: dict | None, rect: t
         )
 
 
-def draw_article_vocab_card(img: Image.Image, item: dict | None, rect: tuple[int, int, int, int]) -> None:
+def draw_article_vocab_card(
+    img: Image.Image,
+    item: dict | None,
+    rect: tuple[int, int, int, int],
+    *,
+    draw_panel: bool = True,
+) -> None:
     """Render one calm expression card; concepts alone receive a third line."""
-    draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
+    if draw_panel:
+        draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
     d = ImageDraw.Draw(img, "RGBA")
     x0, y0, x1, y1 = rect
     content_left_x = x0 + acx(ARTICLE_VOCAB_CONTENT_LEFT)
@@ -11500,9 +11595,12 @@ def draw_article_opening_topic_panel(
     img: Image.Image,
     rect: tuple[int, int, int, int],
     title_text: str,
+    *,
+    draw_panel: bool = True,
 ) -> None:
     """Fill the opening card area with the episode topic, not a word preview."""
-    draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
+    if draw_panel:
+        draw_article_panel(img, rect, acx(16), ARTICLE_CARD_CONTAINER)
     d = ImageDraw.Draw(img, "RGBA")
     title = str(title_text or "").strip() or TITLE_TEXT
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", title))
@@ -11660,18 +11758,33 @@ def draw_article_frame(
     img = Image.new("RGBA", (ARTICLE_WIDTH, ARTICLE_HEIGHT), (247, 243, 234, 255))
     d = ImageDraw.Draw(img, "RGBA")
 
-    draw_article_panel(img, article_rect(16, 16, 900, 530), acx(16), ARTICLE_CARD_CONTAINER)
+    draw_article_panel(
+        img,
+        article_rect(16, 16, 900, 530),
+        acx(16),
+        ARTICLE_CARD_CONTAINER,
+        background_path=ARTICLE_COVER_BACKGROUND,
+    )
     cover = decorate_article_cover(article_image, date_text, logo)
     paste_rounded(img, cover, article_rect(31, 33, 885, 513), acx(8))
 
     vocab_rect = article_rect(916, 16, 1584, 530)
+    draw_article_panel(
+        img,
+        vocab_rect,
+        acx(16),
+        ARTICLE_CARD_CONTAINER,
+        background_path=ARTICLE_VOCAB_BACKGROUND,
+    )
     vocab, vocab_state = vocab_card_display_state(vocab_plan, cue, display_time) if show_vocab else (None, "hidden")
     if vocab_state == "full" and vocab:
-        draw_article_vocab_card(img, vocab, vocab_rect)
+        draw_article_vocab_card(img, vocab, vocab_rect, draw_panel=False)
     else:
-        draw_article_opening_topic_panel(img, vocab_rect, title_text)
+        draw_article_opening_topic_panel(img, vocab_rect, title_text, draw_panel=False)
 
-    draw_article_panel(img, article_rect(16, 546, 1584, 884), acx(16), (241, 236, 227, 255))
+    subtitle_rect = article_rect(16, 546, 1584, 884)
+    draw_article_panel(img, subtitle_rect, acx(16), (241, 236, 227, 255))
+    draw_article_subtitle_background(img, subtitle_rect, acx(16))
 
     if cue:
         if cue.article_page_plan is None:

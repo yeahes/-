@@ -6941,6 +6941,65 @@ def test_article_template_uses_full_hd_canvas_and_balanced_subtitle_widths():
     assert any(center_x == 960 for center_x, _y in chinese_centers)
 
 
+def test_article_subtitle_background_uses_configured_opacity_and_rounded_clip(tmp_path):
+    texture_path = tmp_path / "subtitle-background.png"
+    texture = Image.new("RGBA", (4, 4), (200, 200, 200, 255))
+    ImageDraw.Draw(texture).rectangle((2, 0, 3, 3), fill=(240, 240, 240, 255))
+    texture.save(texture_path)
+    base = Image.new("RGBA", (20, 20), (100, 120, 140, 255))
+    rect = (2, 2, 18, 18)
+
+    with patch.object(
+        podcast_learning_video,
+        "ARTICLE_SUBTITLE_BACKGROUND",
+        texture_path,
+    ), patch.object(
+        podcast_learning_video,
+        "ARTICLE_SUBTITLE_BACKGROUND_OPACITY",
+        70,
+    ):
+        podcast_learning_video.draw_article_subtitle_background(base, rect, 4)
+
+    center = base.getpixel((4, 10))[:3]
+    assert center != (100, 120, 140)
+    assert abs(center[1] * 100 - center[0] * 120) <= 120
+    assert abs(center[2] * 100 - center[0] * 140) <= 140
+    assert base.getpixel((2, 2)) == (100, 120, 140, 255)
+
+
+def test_article_frame_assigns_each_container_texture_at_70_percent():
+    article_image = Image.new(
+        "RGB",
+        (
+            podcast_learning_video.acx(854),
+            podcast_learning_video.acy(480),
+        ),
+        (42, 96, 128),
+    )
+    calls = []
+
+    def capture_background(_img, _rect, _radius, path, opacity):
+        calls.append((path.name, opacity))
+
+    with patch.object(
+        podcast_learning_video,
+        "draw_article_panel_background",
+        side_effect=capture_background,
+    ):
+        podcast_learning_video.draw_article_frame(
+            article_image,
+            None,
+            show_vocab=False,
+            title_text="AI Economics",
+        )
+
+    assert calls == [
+        ("封面容器.png", 70),
+        ("单词卡容器.png", 70),
+        ("字幕区背景.png", 70),
+    ]
+
+
 def test_caption_wrapper_never_orphans_a_leading_connector_to_balance_two_lines():
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     text = "And the data certainly points to an isolationist trend."
