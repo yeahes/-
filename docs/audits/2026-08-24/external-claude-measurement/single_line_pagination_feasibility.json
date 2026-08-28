@@ -1,0 +1,185 @@
+{
+ "artifact_sets": 22,
+ "parents": 4656,
+ "font_size": 56,
+ "font_file": "E:\\VideoCaptioner-screen-subtitle\\resource\\podcast_template\\fonts\\RobotoSlab-SemiBold.ttf",
+ "caps_render_px": {
+  "1100_current_gate": 1512,
+  "1260_comfortable": 1512,
+  "1455_english": 1746,
+  "1498_wide_safe": 1798
+ },
+ "ledger_text_fidelity": {
+  "match": 4656
+ },
+ "production_lines_per_page": {
+  "1": 1950,
+  "2": 3343,
+  "3": 44,
+  "0": 15
+ },
+ "production_pages_per_parent": {
+  "1": 4024,
+  "2": 575,
+  "3": 50,
+  "4": 7
+ },
+ "A_one_line_fit_by_threshold": {
+  "1100_current_gate": {
+   "fits_total": 2123,
+   "of_production_1line_fits": 1813,
+   "of_production_2line_fits": 310,
+   "of_production_2line_total": 3343
+  },
+  "1260_comfortable": {
+   "fits_total": 2123,
+   "of_production_1line_fits": 1813,
+   "of_production_2line_fits": 310,
+   "of_production_2line_total": 3343
+  },
+  "1455_english": {
+   "fits_total": 2704,
+   "of_production_1line_fits": 1912,
+   "of_production_2line_fits": 792,
+   "of_production_2line_total": 3343
+  },
+  "1498_wide_safe": {
+   "fits_total": 2846,
+   "of_production_1line_fits": 1929,
+   "of_production_2line_fits": 917,
+   "of_production_2line_total": 3343
+  }
+ },
+ "B_min_single_line_pages_per_parent": {
+  "1100_current_gate": {
+   "1": 1598,
+   "2": 2211,
+   "3": 695,
+   "4": 106,
+   "5": 36,
+   "6": 8,
+   "7": 2
+  },
+  "1260_comfortable": {
+   "1": 1598,
+   "2": 2211,
+   "3": 695,
+   "4": 106,
+   "5": 36,
+   "6": 8,
+   "7": 2
+  },
+  "1455_english": {
+   "1": 1995,
+   "2": 2202,
+   "3": 368,
+   "4": 71,
+   "5": 17,
+   "6": 3
+  },
+  "1498_wide_safe": {
+   "1": 2085,
+   "2": 2179,
+   "3": 315,
+   "4": 62,
+   "5": 13,
+   "6": 2
+  }
+ },
+ "B_constraint_violations": {
+  "1100_current_gate": {
+   "pages_total": 8771,
+   "parent_over_max_pages": 46,
+   "page_under_min_words": 2059,
+   "page_under_min_duration": 1648
+  },
+  "1260_comfortable": {
+   "pages_total": 8771,
+   "parent_over_max_pages": 46,
+   "page_under_min_words": 2059,
+   "page_under_min_duration": 1648
+  },
+  "1455_english": {
+   "pages_total": 7890,
+   "page_under_min_words": 1789,
+   "page_under_min_duration": 1487,
+   "parent_over_max_pages": 20
+  },
+  "1498_wide_safe": {
+   "pages_total": 7713,
+   "page_under_min_words": 1713,
+   "page_under_min_duration": 1434,
+   "parent_over_max_pages": 15
+  }
+ },
+ "B_control_min_two_line_pages_at_1260": {
+  "1": 3809,
+  "2": 801,
+  "3": 44,
+  "4": 2
+ },
+ "declared_vs_actual_per_planner_version": {
+  "article-fixed-font-pages-v18": {
+   "pages": 306,
+   "words_lt_min": 24,
+   "dur_lt_min": 15,
+   "lines_gt_2": 8
+  },
+  "article-fixed-font-pages-v19": {
+   "pages": 1755,
+   "lines_gt_2": 23,
+   "words_lt_min": 95,
+   "dur_lt_min": 59
+  },
+  "article-fixed-font-pages-v23": {
+   "pages": 409,
+   "lines_gt_2": 6,
+   "words_lt_min": 26,
+   "dur_lt_min": 19
+  },
+  "article-fixed-font-pages-v24": {
+   "pages": 251,
+   "words_lt_min": 24,
+   "dur_lt_min": 17,
+   "lines_gt_2": 2
+  },
+  "article-fixed-font-pages-v26": {
+   "pages": 485,
+   "words_lt_min": 33,
+   "dur_lt_min": 19,
+   "lines_gt_2": 5
+  },
+  "article-fixed-font-pages-v27": {
+   "pages": 492,
+   "words_lt_min": 43,
+   "dur_lt_min": 20
+  },
+  "article-fixed-font-pages-v28": {
+   "pages": 574,
+   "words_lt_min": 40,
+   "lines_eq_0": 8,
+   "dur_lt_min": 22
+  },
+  "article-fixed-font-pages-v29": {
+   "pages": 813,
+   "words_lt_min": 70,
+   "dur_lt_min": 47,
+   "lines_eq_0": 4
+  },
+  "article-fixed-font-pages-v32": {
+   "pages": 267,
+   "words_lt_min": 27,
+   "dur_lt_min": 16,
+   "lines_eq_0": 3
+  }
+ },
+ "page_one_line_px": {
+  "min": 90,
+  "p25": 1189,
+  "median": 1738,
+  "p75": 2300,
+  "p90": 2818,
+  "p99": 3695,
+  "max": 5567
+ }
+}

@@ -12,6 +12,7 @@ This runs:
 
 - stable caption rule smoke tests
 - rule regression library cases
+- golden subtitle evaluation contract
 - Python syntax checks for core modified modules
 - generated subtitle audit for known local samples when available
 
@@ -39,21 +40,36 @@ Stable caption rules:
 runtime\python.exe tests\test_stable_caption_rules.py
 ```
 
+Durable run state and progress/resume contract:
+
+```powershell
+runtime\python.exe tests\test_stable_run_state.py
+```
+
 Generated output audit:
 
 ```powershell
-runtime\python.exe tests\audit_stable_outputs.py 222 777 999
+runtime\python.exe tests\audit_stable_outputs.py <work-dir sample>
 ```
 
-This command audits existing `work-dir\<sample>\subtitle` outputs. If those local
-outputs are absent, the sample status is `MISSING`; that is an environment/sample
-availability result, not a code failure.
+This command audits an explicitly named `work-dir\<sample>\subtitle` output.
+Use a newly generated sample when judging current code; it is deliberately not
+run by `scripts\run_regression.py`.
 
 Fixture audit:
 
 ```powershell
 runtime\python.exe -m tests.caption_audit.run_all
 ```
+
+Golden evaluation:
+
+```powershell
+runtime\python.exe scripts\evaluate_golden_subtitles.py --reference <golden-reference.json> --run <artifact-dir>
+```
+
+This is an offline comparison against manually curated English, entity,
+boundary, timing, and Chinese fact references. See `docs\GOLDEN_EVALUATION.md`.
 
 By default this checks fixture-backed samples `000`, `222`, and `888` when the
 fixture files are available.

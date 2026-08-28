@@ -31,6 +31,7 @@ class BatchTask:
         self.progress = 0
         self.error_message = ""
         self.current_thread: Optional[QThread] = None
+        self.cancelled = False
 
 
 class BatchProcessThread(QThread):
@@ -76,6 +77,11 @@ class BatchProcessThread(QThread):
 
     def _process_task(self, batch_task: BatchTask):
         try:
+            if (
+                batch_task.cancelled
+                or self.current_tasks.get(batch_task.file_path) is not batch_task
+            ):
+                return
             batch_task.status = BatchTaskStatus.RUNNING
             self.task_progress.emit(
                 batch_task.file_path, 0, str(BatchTaskStatus.RUNNING)
@@ -158,9 +164,29 @@ class BatchProcessThread(QThread):
         thread.start()
 
     def _handle_trans_sub_task(self, batch_task: BatchTask):
-        task = self.factory.create_transcript_and_subtitle_task(batch_task.file_path)
+        task = self.factory.create_transcript_and_subtitle_task(
+            batch_task.file_path,
+            source_audio_path=(
+                getattr(batch_task, "source_audio_path", None)
+                or batch_task.file_path
+            ),
+            article_reference_text=getattr(batch_task, "article_reference_text", ""),
+            article_context_data=getattr(batch_task, "article_context_data", None),
+            use_article_reference_assist=bool(
+                getattr(batch_task, "use_article_reference_assist", False)
+            ),
+            use_article_translation_terms=bool(
+                getattr(batch_task, "use_article_translation_terms", False)
+            ),
+        )
         trans_task = self.factory.create_transcribe_task(
-            batch_task.file_path, need_next_task=True
+            batch_task.file_path,
+            need_next_task=True,
+            source_audio_path=task.source_audio_path,
+            article_reference_text=task.article_reference_text,
+            article_context_data=task.article_context_data,
+            use_article_reference_assist=task.use_article_reference_assist,
+            use_article_translation_terms=task.use_article_translation_terms,
         )
         thread = TranscriptThread(trans_task)
         batch_task.current_thread = thread
@@ -199,7 +225,14 @@ class BatchProcessThread(QThread):
 
         # 创建字幕任务
         subtitle_task = self.factory.create_subtitle_task(
-            task.output_path, batch_task.file_path, need_next_task=True
+            task.output_path,
+            batch_task.file_path,
+            need_next_task=True,
+            source_audio_path=(task.source_audio_path or task.file_path),
+            article_reference_text=task.article_reference_text,
+            article_context_data=task.article_context_data,
+            use_article_reference_assist=task.use_article_reference_assist,
+            use_article_translation_terms=task.use_article_translation_terms,
         )
         thread = SubtitleThread(subtitle_task)
         batch_task.current_thread = thread
@@ -231,10 +264,30 @@ class BatchProcessThread(QThread):
         self.task_progress.emit(batch_task.file_path, progress, message)
 
     def _handle_full_process_task(self, batch_task: BatchTask):
-        task = self.factory.create_full_process_task(batch_task.file_path)
+        task = self.factory.create_full_process_task(
+            batch_task.file_path,
+            source_audio_path=(
+                getattr(batch_task, "source_audio_path", None)
+                or batch_task.file_path
+            ),
+            article_reference_text=getattr(batch_task, "article_reference_text", ""),
+            article_context_data=getattr(batch_task, "article_context_data", None),
+            use_article_reference_assist=bool(
+                getattr(batch_task, "use_article_reference_assist", False)
+            ),
+            use_article_translation_terms=bool(
+                getattr(batch_task, "use_article_translation_terms", False)
+            ),
+        )
         # 首先创建转录任务
         trans_task = self.factory.create_transcribe_task(
-            batch_task.file_path, need_next_task=True
+            batch_task.file_path,
+            need_next_task=True,
+            source_audio_path=task.source_audio_path,
+            article_reference_text=task.article_reference_text,
+            article_context_data=task.article_context_data,
+            use_article_reference_assist=task.use_article_reference_assist,
+            use_article_translation_terms=task.use_article_translation_terms,
         )
         thread = TranscriptThread(trans_task)
         batch_task.current_thread = thread
@@ -272,6 +325,19 @@ class BatchProcessThread(QThread):
             task.output_path,
             batch_task.file_path,
             need_next_task=True,
+            source_audio_path=(
+                getattr(task, "source_audio_path", None)
+                or getattr(task, "file_path", None)
+                or batch_task.file_path
+            ),
+            article_reference_text=getattr(task, "article_reference_text", ""),
+            article_context_data=getattr(task, "article_context_data", None),
+            use_article_reference_assist=bool(
+                getattr(task, "use_article_reference_assist", False)
+            ),
+            use_article_translation_terms=bool(
+                getattr(task, "use_article_translation_terms", False)
+            ),
         )
         thread = SubtitleThread(subtitle_task)
         batch_task.current_thread = thread
@@ -338,15 +404,25 @@ class BatchProcessThread(QThread):
             self.task_progress.emit(batch_task.file_path, progress_value, message)
 
     def stop_task(self, file_path: str):
-        if file_path in self.current_tasks:
-            task = self.current_tasks[file_path]
+        task = self.current_tasks.pop(file_path, None)
+        if task is not None:
+            task.cancelled = True
             if task.current_thread:
                 if hasattr(task.current_thread, "stop"):
                     task.current_thread.stop()
-            del self.current_tasks[file_path]
-            # 从队列中移除任务
-            with self.task_queue.mutex:
-                self.task_queue.queue.clear()
+        # Remove only the requested queued task. Other files must keep running.
+        with self.task_queue.mutex:
+            queued = list(self.task_queue.queue)
+            remaining = [item for item in queued if item.file_path != file_path]
+            removed_count = len(queued) - len(remaining)
+            self.task_queue.queue.clear()
+            self.task_queue.queue.extend(remaining)
+            if removed_count:
+                self.task_queue.unfinished_tasks = max(
+                    0, self.task_queue.unfinished_tasks - removed_count
+                )
+                if self.task_queue.unfinished_tasks == 0:
+                    self.task_queue.all_tasks_done.notify_all()
 
     def stop_all(self):
         self.is_running = False

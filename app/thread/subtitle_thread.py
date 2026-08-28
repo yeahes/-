@@ -2,31 +2,76 @@ import datetime
 import copy
 import json
 import os
+import shutil
 import time
+import uuid
 from pathlib import Path
-from typing import Dict
+from typing import Any, Callable, Dict, Mapping
 
 from PyQt5.QtCore import QSettings, QThread, pyqtSignal
+from app.core.llm_client import OpenAI
 
 from app.common.config import cfg
 from app.core.bk_asr.asr_data import ASRData
 from app.core.entities import SubtitleConfig, SubtitleTask, TranslatorServiceEnum
+from app.core.output_paths import (
+    media_result_dir,
+    media_result_quality_dir,
+    media_result_subtitle_dir,
+)
 from app.core.article_context import (
+    ARTICLE_ANALYSIS_META_KEY,
+    ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+    ARTICLE_ASR_CORRECTION_POLICY_VERSION,
     ArticleLLMConfig,
     analyze_article_text,
     apply_article_asr_corrections,
+    article_analysis_meta_matches,
+    article_analysis_prompt_hash,
+    build_article_asr_review_artifact,
+    build_article_glossary,
     build_translation_context_prompt,
+    clean_article_text,
     empty_article_context,
+    enrich_article_context_with_evidence,
     normalize_article_context,
     save_article_artifacts,
+)
+from app.core.subtitle_processor.stable_pipeline_contracts import stable_payload_hash
+from app.core.llm_service_config import resolve_llm_service_config
+from app.core.subtitle_processor.review_evidence_identity import (
+    load_bound_semantic_review_queue,
+)
+from app.core.subtitle_processor.stable_artifacts import (
+    file_sha256,
+    stable_artifact_dir,
+    write_json_artifact,
+    write_text_artifact,
+)
+from app.core.subtitle_processor.stable_run_state import (
+    ResumePlan,
+    StableRunStateStore,
+    build_stable_run_fingerprint,
+    format_stage_progress,
 )
 from app.core.subtitle_processor.split import SubtitleSplitter
 from app.core.subtitle_processor.summarization import SubtitleSummarizer
 from app.core.subtitle_processor.optimize import SubtitleOptimizer
 from app.core.subtitle_processor.stable_ts_alignment import (
-    align_subtitle_segments_with_whisperx_time_only,
+    align_frozen_word_ledger_with_whisperx,
+)
+from app.core.subtitle_processor.word_timing_trust import (
+    describe_word_timing_issue,
+    find_implausible_word_timing_runs,
 )
 from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor
+from app.core.subtitle_processor.subtitle_review_marks import (
+    write_subtitle_review_ledger,
+)
+from app.core.subtitle_processor.translation_quality_audit import (
+    audit_fixed_id_translation_quality,
+    build_translation_audit_rows,
+)
 from app.core.subtitle_processor.translate import TranslatorFactory, TranslatorType
 from app.core.utils.logger import setup_logger
 from app.core.utils.test_opanai import test_openai
@@ -45,14 +90,51 @@ class SubtitleThread(QThread):
     update_all = pyqtSignal(dict)
     error = pyqtSignal(str)
     MAX_DAILY_LLM_CALLS = 30
+    _STAGE_PROGRESS_RANGES = {
+        "load_subtitle": (0, 4),
+        "article_context": (4, 10),
+        "article_asr_correction": (10, 16),
+        "word_timestamp_prepare": (16, 22),
+        "api_setup": (22, 28),
+        "split_subtitle": (28, 36),
+        "optimize_subtitle": (36, 50),
+        "translate_subtitle": (50, 64),
+        "screen_subtitle_edit": (28, 92),
+        "whisperx_time_only_alignment": (92, 96),
+        "frozen_parent_timeline": (96, 96),
+        "display_page_translation": (96, 98),
+        "translation_quality_audit": (98, 99),
+        "final_subtitle_save": (99, 100),
+    }
+    _FROZEN_PARENT_CHECKPOINT_FILES = (
+        "run-manifest.json",
+        "transcript.json",
+        "word-ledger.json",
+        "subtitle-spans.json",
+        "translations.json",
+        "semantic-groups.json",
+        "final-cue-timeline.json",
+        "authoritative-parent-chinese.json",
+        "display-boundary-evidence.json",
+        "stable-boundary-snapshots.json",
+    )
 
     def __init__(self, task: SubtitleTask):
         super().__init__()
         self.task: SubtitleTask = task
+        self.attempt_id = uuid.uuid4().hex
         self.subtitle_length = 0
         self.finished_subtitle_length = 0
         self.custom_prompt_text = ""
         self._stage_timings_seconds: Dict[str, float] = {}
+        self._article_run_metadata: Dict = self._empty_article_run_metadata()
+        self._run_state_store: StableRunStateStore | None = None
+        self._resume_plan = ResumePlan(False, "missing", (), "not_initialized")
+        self._resume_stage_records: Dict[str, Dict] = {}
+        self._active_stage = ""
+        self._active_stage_started_at = 0.0
+        self._screen_editor_phase_started_at: Dict[str, float] = {}
+        self._last_progress_value = 0
         # 初始化数据库和服务使用管理器
         self.db_manager = DatabaseManager(CACHE_PATH)
         self.service_manager = ServiceUsageManager(self.db_manager)
@@ -60,8 +142,421 @@ class SubtitleThread(QThread):
     def set_custom_prompt_text(self, text: str):
         self.custom_prompt_text = text
 
+    @staticmethod
+    def _should_run_legacy_subtitle_optimization(
+        *,
+        need_optimize: bool,
+        stable_screen_mode: bool,
+    ) -> bool:
+        """Keep LLM English rewriting out of the stable word-ledger path."""
+        return bool(need_optimize and not stable_screen_mode)
+
     def _record_stage_duration(self, stage: str, started_at: float) -> None:
         self._stage_timings_seconds[stage] = round(max(0.0, time.perf_counter() - started_at), 3)
+
+    def _initialize_run_state(
+        self,
+        subtitle_config: SubtitleConfig,
+        output_dir: Path,
+    ) -> None:
+        """Create one durable run record before subtitle data is transformed."""
+        store = StableRunStateStore(output_dir)
+        fingerprint = build_stable_run_fingerprint(
+            subtitle_path=self.task.subtitle_path,
+            subtitle_config=subtitle_config,
+            article_reference_text=str(getattr(self.task, "article_reference_text", "") or ""),
+            article_context_data=getattr(self.task, "article_context_data", None),
+            use_article_reference_assist=bool(
+                getattr(self.task, "use_article_reference_assist", False)
+            ),
+            use_article_translation_terms=bool(
+                getattr(self.task, "use_article_translation_terms", False)
+            ),
+            alignment_backend=self._timeline_alignment_backend(),
+            custom_prompt_text=self.custom_prompt_text,
+            article_analysis_prompt_policy_version=ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+            article_analysis_prompt_sha256=article_analysis_prompt_hash(),
+        )
+        prior = store.load() or {}
+        self._resume_plan = store.plan_resume(fingerprint)
+        self._resume_stage_records = dict(prior.get("stages") or {})
+        self._run_state_store = store
+        store.start(fingerprint, self._resume_plan)
+        logger.info(
+            "Stable run state initialized: resume=%s prior_status=%s stages=%s reason=%s",
+            self._resume_plan.compatible,
+            self._resume_plan.previous_status,
+            list(self._resume_plan.reusable_stages),
+            self._resume_plan.reason,
+        )
+
+    def _begin_stage(
+        self,
+        stage: str,
+        label: str,
+        *,
+        details: Dict | None = None,
+    ) -> float:
+        self._active_stage = stage
+        self._active_stage_started_at = time.perf_counter()
+        if stage == "screen_subtitle_edit":
+            self._screen_editor_phase_started_at = {}
+        if self._run_state_store is not None:
+            self._run_state_store.begin_stage(stage, details=details)
+        self._emit_stage_progress(stage, label, details=details)
+        return self._active_stage_started_at
+
+    def _complete_stage(
+        self,
+        stage: str,
+        label: str,
+        started_at: float,
+        *,
+        artifact_paths: tuple[Path, ...] = (),
+        details: Dict | None = None,
+    ) -> None:
+        elapsed = max(0.0, time.perf_counter() - started_at)
+        self._stage_timings_seconds[stage] = round(elapsed, 3)
+        if self._run_state_store is not None:
+            self._run_state_store.complete_stage(
+                stage,
+                elapsed_seconds=elapsed,
+                artifact_paths=artifact_paths,
+                details=details,
+            )
+        self._emit_stage_progress(stage, label, fraction=1.0, details=details)
+
+    def _fail_active_stage(self, error: str, *, cancelled: bool = False) -> None:
+        if self._run_state_store is None or not self._active_stage:
+            return
+        self._run_state_store.fail_stage(self._active_stage, error, cancelled=cancelled)
+
+    def _emit_stage_progress(
+        self,
+        stage: str,
+        label: str,
+        *,
+        fraction: float | None = None,
+        completed: int | None = None,
+        total: int | None = None,
+        cache_hits: int = 0,
+        retries: int = 0,
+        details: Dict | None = None,
+        elapsed_started_at: float | None = None,
+    ) -> None:
+        # Several focused tests exercise a single timing helper through
+        # ``SubtitleThread.__new__`` without constructing its QThread base.
+        # Their fake signal still receives the same two-argument event.
+        instance_state = self.__dict__
+        try:
+            progress_signal = self.progress
+        except RuntimeError:
+            return
+        if "_last_progress_value" not in instance_state:
+            instance_state["_last_progress_value"] = 0
+            instance_state.setdefault("_active_stage", "")
+            instance_state.setdefault("_active_stage_started_at", 0.0)
+        start, end = self._STAGE_PROGRESS_RANGES.get(stage, (0, 100))
+        if fraction is None:
+            fraction = (completed / total) if total else 0.0
+        fraction = max(0.0, min(1.0, float(fraction)))
+        value = max(instance_state["_last_progress_value"], int(round(start + (end - start) * fraction)))
+        self._last_progress_value = min(100, value)
+        progress_started_at = elapsed_started_at or instance_state["_active_stage_started_at"]
+        elapsed = (
+            max(0.0, time.perf_counter() - progress_started_at)
+            if instance_state["_active_stage"] == stage and progress_started_at
+            else 0.0
+        )
+        eta_seconds = None
+        if completed is not None and total and completed > 0:
+            eta_seconds = max(0.0, elapsed * max(0, total - completed) / completed)
+        message = format_stage_progress(
+            label,
+            completed=completed,
+            total=total,
+            cache_hits=cache_hits,
+            retries=retries,
+            elapsed_seconds=elapsed,
+            eta_seconds=eta_seconds,
+        )
+        progress_details = {
+            "completed": completed,
+            "total": total,
+            "cache_hits": cache_hits,
+            "retries": retries,
+            **(details or {}),
+        }
+        run_state_store = instance_state.get("_run_state_store")
+        if run_state_store is not None:
+            run_state_store.update_stage(stage, details=progress_details)
+            run_state_store.update_progress(
+                percent=self._last_progress_value,
+                stage=stage,
+                message=message,
+                details=progress_details,
+            )
+        progress_signal.emit(self._last_progress_value, self.tr(message))
+
+    def _resume_stage_details(self, stage: str) -> Dict:
+        record = self._resume_stage_records.get(stage) or {}
+        return dict(record.get("details") or {}) if isinstance(record, dict) else {}
+
+    def _load_resume_article_context(self, output_dir: Path) -> Dict | None:
+        if not self._resume_plan.can_reuse("article_context"):
+            return None
+        try:
+            payload = json.loads((output_dir / "article_context.json").read_text(encoding="utf-8"))
+            context = normalize_article_context(payload)
+            article_text = str(
+                getattr(self.task, "article_reference_text", "") or ""
+            ).strip()
+            if not article_analysis_meta_matches(context, article_text):
+                logger.warning(
+                    "Resume article context uses a stale analysis prompt policy; recomputing"
+                )
+                return None
+            return context
+        except Exception as exc:
+            logger.warning("Resume article context unavailable; recomputing: %s", exc)
+            return None
+
+    def _load_resume_asr_correction(self, output_dir: Path) -> ASRData | None:
+        if not self._resume_plan.can_reuse("article_asr_correction"):
+            return None
+        details = self._resume_stage_details("article_asr_correction")
+        if (
+            str(details.get("policy_version") or "")
+            != ARTICLE_ASR_CORRECTION_POLICY_VERSION
+        ):
+            logger.info(
+                "Resume ASR correction policy changed; recalculating article entities"
+            )
+            return None
+        try:
+            payload = json.loads((output_dir / "asr_corrected.json").read_text(encoding="utf-8"))
+            return ASRData.from_json(payload)
+        except Exception as exc:
+            logger.warning("Resume ASR correction unavailable; recalculating: %s", exc)
+            return None
+
+    def _recorded_frozen_parent_artifact_dir(self) -> Path | None:
+        if not self._resume_plan.can_reuse("frozen_parent_timeline"):
+            return None
+        record = self._resume_stage_records.get("frozen_parent_timeline") or {}
+        artifacts = record.get("artifacts") if isinstance(record, Mapping) else None
+        if not isinstance(artifacts, Mapping):
+            return None
+        paths = {
+            str(name): Path(str(value.get("path") or "")).resolve()
+            for name, value in artifacts.items()
+            if isinstance(value, Mapping) and value.get("path")
+        }
+        required = set(self._FROZEN_PARENT_CHECKPOINT_FILES)
+        if not required.issubset(paths):
+            return None
+        parents = {paths[name].parent for name in required}
+        return next(iter(parents)) if len(parents) == 1 else None
+
+    def _legacy_frozen_parent_artifact_dir(self, output_dir: Path) -> Path | None:
+        """Accept one old page-stage failure after full structural validation."""
+        if not self._resume_plan.compatible or self._resume_plan.previous_status != "failed":
+            return None
+        failure_path = output_dir / "stable-last-failure.json"
+        try:
+            failure = json.loads(failure_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        error_codes = [
+            str(value)
+            for value in failure.get("validation_error_codes") or []
+            if str(value)
+        ]
+        if not error_codes or any(
+            not code.startswith("display_page_") for code in error_codes
+        ):
+            return None
+        try:
+            if Path(str(failure.get("source_subtitle") or "")).resolve() != Path(
+                self.task.subtitle_path
+            ).resolve():
+                return None
+        except OSError:
+            return None
+        checkpoint_manifest_path = Path(
+            str(failure.get("editable_checkpoint_manifest_path") or "")
+        )
+        try:
+            checkpoint_manifest = json.loads(
+                checkpoint_manifest_path.resolve().read_text(encoding="utf-8-sig")
+            )
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            not checkpoint_manifest.get("editable_checkpoint")
+            or not checkpoint_manifest.get("render_blocked")
+            or str(checkpoint_manifest.get("source_subtitle") or "")
+            != str(failure.get("source_subtitle") or "")
+        ):
+            return None
+        timeline_path = Path(
+            str(checkpoint_manifest.get("final_cue_timeline_path") or "")
+        )
+        artifact_dir = timeline_path.resolve().parent
+        if not all(
+            (artifact_dir / name).is_file()
+            for name in self._FROZEN_PARENT_CHECKPOINT_FILES
+        ):
+            return None
+        return artifact_dir
+
+    def _load_resume_frozen_parent_checkpoint(
+        self,
+        screen_editor: ScreenSubtitleEditor,
+        output_dir: Path,
+    ) -> tuple[ASRData | None, Path | None]:
+        artifact_dir = self._recorded_frozen_parent_artifact_dir()
+        resume_kind = "recorded"
+        if artifact_dir is None:
+            artifact_dir = self._legacy_frozen_parent_artifact_dir(output_dir)
+            resume_kind = "legacy_page_failure"
+        if artifact_dir is None:
+            return None, None
+        try:
+            restored = screen_editor.restore_frozen_parent_checkpoint(artifact_dir)
+        except Exception as exc:
+            logger.warning(
+                "Frozen parent checkpoint rejected; running normal stable stage: %s",
+                exc,
+            )
+            return None, None
+        logger.info(
+            "Frozen parent/timeline checkpoint resumed without English, translation, or alignment rerun: kind=%s path=%s",
+            resume_kind,
+            artifact_dir,
+        )
+        return restored, artifact_dir
+
+    def _frozen_parent_checkpoint_paths(
+        self,
+        coverage_report_path: str,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> tuple[Path, ...]:
+        artifact_dir = artifact_dir or stable_artifact_dir(Path(coverage_report_path))
+        paths = tuple(
+            artifact_dir / name for name in self._FROZEN_PARENT_CHECKPOINT_FILES
+        )
+        missing = [path.name for path in paths if not path.is_file()]
+        if missing:
+            raise RuntimeError(
+                "frozen_parent_checkpoint_incomplete: " + ", ".join(missing)
+            )
+        return paths
+
+    def _handle_screen_editor_progress(self, event: Dict) -> None:
+        """Translate editor events into the existing two-argument GUI signal."""
+        if not isinstance(event, dict):
+            return
+        phase = str(event.get("phase") or "")
+        if phase == "display_page_translation":
+            completed = event.get("completed")
+            total = event.get("total")
+            self._emit_stage_progress(
+                "display_page_translation",
+                "双语分页语义分配",
+                completed=int(completed) if completed is not None else None,
+                total=int(total) if total is not None else None,
+                cache_hits=int(event.get("cache_hits") or 0),
+                retries=int(event.get("retries") or 0),
+                details={key: value for key, value in event.items() if key != "phase"},
+            )
+            return
+        phase_timers = self.__dict__.setdefault("_screen_editor_phase_started_at", {})
+        phase_started_at = phase_timers.setdefault(phase, time.perf_counter()) if phase else None
+        completed = event.get("completed")
+        total = event.get("total")
+        cache_hits = int(event.get("cache_hits") or 0)
+        retries = int(event.get("retries") or 0)
+        if phase == "english_boundaries":
+            fraction = 0.08 * (float(completed or 0) / max(1, int(total or 1)))
+            label = "英文边界冻结"
+        elif phase == "full_translation":
+            fraction = 0.08 + 0.34 * (float(completed or 0) / max(1, int(total or 1)))
+            label = "完整中文翻译"
+        elif phase == "allocation":
+            fraction = 0.42 + 0.46 * (float(completed or 0) / max(1, int(total or 1)))
+            label = "中文分配"
+        elif phase == "allocation_retry":
+            fraction = 0.88
+            label = "中文分配复核"
+        else:
+            fraction = 0.90 if phase == "finalization" else 0.0
+            label = "上屏短字幕校正"
+        self._emit_stage_progress(
+            "screen_subtitle_edit",
+            label,
+            fraction=fraction,
+            completed=int(completed) if completed is not None else None,
+            total=int(total) if total is not None else None,
+            cache_hits=cache_hits,
+            retries=retries,
+            details={"phase": phase, **{key: value for key, value in event.items() if key != "phase"}},
+            elapsed_started_at=phase_started_at,
+        )
+
+    @staticmethod
+    def _empty_article_run_metadata() -> Dict:
+        return {
+            "schema_version": 1,
+            "reference_text_present": False,
+            "reference_text_hash": "",
+            "normalized_context_hash": "",
+            "glossary_hash": "",
+            "use_article_reference_assist": False,
+            "use_article_translation_terms": False,
+            "article_reference_enabled": False,
+            "correction_requested": False,
+            "correction_ran": False,
+            "correction_applied": False,
+            "translation_terms_applied": False,
+        }
+
+    def _set_article_run_metadata(
+        self,
+        article_context: Dict,
+        *,
+        correction_ran: bool = False,
+        correction_applied: bool = False,
+        translation_terms_applied: bool = False,
+    ) -> None:
+        """Persist actual task state, never infer it from stale output files."""
+        article_text = clean_article_text(
+            str(getattr(self.task, "article_reference_text", "") or "")
+        )
+        normalized_context = normalize_article_context(article_context)
+        context_payload = {
+            key: value
+            for key, value in normalized_context.items()
+            if not key.startswith("_")
+        }
+        glossary = build_article_glossary(normalized_context)
+        use_assist = bool(getattr(self.task, "use_article_reference_assist", False))
+        use_terms = bool(getattr(self.task, "use_article_translation_terms", False))
+        self._article_run_metadata = {
+            "schema_version": 1,
+            "reference_text_present": bool(article_text),
+            "reference_text_hash": stable_payload_hash(article_text) if article_text else "",
+            "normalized_context_hash": stable_payload_hash(context_payload),
+            "glossary_hash": stable_payload_hash(glossary),
+            "use_article_reference_assist": use_assist,
+            "use_article_translation_terms": use_terms,
+            "article_reference_enabled": bool(article_text) and (use_assist or use_terms),
+            "correction_requested": bool(article_text) and use_assist,
+            "correction_ran": bool(correction_ran),
+            "correction_applied": bool(correction_applied),
+            "translation_terms_applied": bool(translation_terms_applied),
+        }
 
     def _screen_manifest_metadata(self, screen_editor: ScreenSubtitleEditor) -> dict:
         metadata = screen_editor.manifest_metadata()
@@ -78,7 +573,180 @@ class SubtitleThread(QThread):
             )
         metadata["stage_timings_seconds"] = dict(self._stage_timings_seconds)
         metadata["stage_timings_total_seconds"] = round(sum(self._stage_timings_seconds.values()), 3)
+        article_run_metadata = self.__dict__.get("_article_run_metadata")
+        if not isinstance(article_run_metadata, dict):
+            article_run_metadata = self._empty_article_run_metadata()
+        metadata["run_comparison"] = {
+            "schema_version": 1,
+            "article_reference": dict(article_run_metadata),
+            "translation_runtime_config": {
+                "translation_model": str(metadata.get("translation_model", "") or ""),
+                "full_translation_model": str(
+                    metadata.get("full_translation_model", "") or ""
+                ),
+                "allocation_review_model": str(
+                    metadata.get("allocation_review_model", "") or ""
+                ),
+                "display_page_translation_model": str(
+                    metadata.get("display_page_translation_model", "") or ""
+                ),
+                "allocation_quality_retry_model": str(
+                    metadata.get("allocation_quality_retry_model", "") or ""
+                ),
+                "display_page_retry_model": str(
+                    metadata.get("display_page_retry_model", "") or ""
+                ),
+                "model_role_policy_version": str(
+                    metadata.get("model_role_policy_version", "") or ""
+                ),
+                "prompt_version": str(metadata.get("prompt_version", "") or ""),
+                "target_language": str(getattr(screen_editor, "target_language", "") or ""),
+                "max_cjk_chars": int(getattr(screen_editor, "max_cjk_chars", 0) or 0),
+                "max_english_words": int(getattr(screen_editor, "max_english_words", 0) or 0),
+                "allocation_batch_size": int(
+                    getattr(screen_editor, "allocation_batch_size", 0) or 0
+                ),
+                "allocation_max_concurrency": int(
+                    getattr(screen_editor, "allocation_max_concurrency", 0) or 0
+                ),
+                "translation_request_policy": dict(
+                    metadata.get("translation_request_policy") or {}
+                ),
+                "chinese_polish_enabled": bool(
+                    getattr(screen_editor, "enable_chinese_polish", False)
+                ),
+            },
+        }
+        translation_audit = self.__dict__.get("_translation_quality_audit")
+        if isinstance(translation_audit, dict):
+            metadata["translation_quality_audit"] = {
+                "status": str(translation_audit.get("status") or "UNKNOWN"),
+                "service": str(translation_audit.get("service") or ""),
+                "model": str(translation_audit.get("model") or ""),
+                "source_subtitle_count": int(
+                    translation_audit.get("source_subtitle_count") or 0
+                ),
+                "audited_subtitle_count": int(
+                    translation_audit.get("audited_subtitle_count") or 0
+                ),
+                "issue_count": int(translation_audit.get("issue_count") or 0),
+                "batch_error_count": len(
+                    translation_audit.get("batch_errors") or []
+                ),
+                "unaudited_subtitle_ids": [
+                    str(value)
+                    for value in translation_audit.get("unaudited_subtitle_ids") or []
+                    if str(value)
+                ],
+            }
+            audit_path = str(
+                self.__dict__.get("_translation_quality_audit_path") or ""
+            ).strip()
+            if audit_path:
+                metadata["translation_quality_audit_path"] = audit_path
         return metadata
+
+    @staticmethod
+    def _merge_translation_quality_audit_warning(
+        validation_summary: Mapping[str, Any] | None,
+        audit: Mapping[str, Any] | None,
+    ) -> dict:
+        """Keep incomplete model-audit evidence without blocking valid pages."""
+        base = validation_summary or {}
+        summary = {
+            "status": str(base.get("status") or "WARNING"),
+            "errors": [
+                dict(item)
+                for item in base.get("errors") or []
+                if isinstance(item, Mapping)
+            ],
+            "warnings": [
+                dict(item)
+                for item in base.get("warnings") or []
+                if isinstance(item, Mapping)
+            ],
+            "info": [
+                dict(item)
+                for item in base.get("info") or []
+                if isinstance(item, Mapping)
+            ],
+        }
+        if not isinstance(audit, Mapping):
+            return summary
+        status = str(audit.get("status") or "UNKNOWN")
+        if status == "PASS":
+            return summary
+        source_count = int(audit.get("source_subtitle_count") or 0)
+        audited_count = int(audit.get("audited_subtitle_count") or 0)
+        missing_ids = [
+            str(value)
+            for value in audit.get("unaudited_subtitle_ids") or []
+            if str(value)
+        ]
+        if not missing_ids:
+            missing_ids = sorted(
+                {
+                    str(value)
+                    for item in audit.get("batch_errors") or []
+                    if isinstance(item, Mapping)
+                    for value in item.get("subtitle_ids") or []
+                    if str(value)
+                },
+                key=lambda value: (
+                    0,
+                    int(value[1:]),
+                )
+                if value.startswith("S") and value[1:].isdigit()
+                else (1, value),
+            )
+        warning = {
+            "code": "translation_quality_audit_incomplete",
+            "message": (
+                f"中文质量审计只完成 {audited_count}/{source_count} 条；"
+                "未完成部分保留在审计文件中，不影响已通过分页和时间轴的结果进入编辑器。"
+            ),
+            "status": status,
+            "audited_subtitle_count": audited_count,
+            "source_subtitle_count": source_count,
+            "missing_subtitle_ids": missing_ids,
+            "batch_errors": [
+                dict(item)
+                for item in audit.get("batch_errors") or []
+                if isinstance(item, Mapping)
+            ],
+        }
+        if not any(
+            str(item.get("code") or "") == warning["code"]
+            for item in summary["warnings"]
+        ):
+            summary["warnings"].append(warning)
+        if not summary["errors"] and summary["status"] == "ERROR":
+            summary["status"] = "WARNING"
+        return summary
+
+    @staticmethod
+    def _require_valid_final_timeline_before_display_pages(
+        screen_editor: ScreenSubtitleEditor,
+    ) -> None:
+        validation = dict(
+            (getattr(screen_editor, "_final_cue_timeline", {}) or {}).get(
+                "validation", {}
+            )
+            or {}
+        )
+        errors = list(validation.get("errors") or [])
+        if validation.get("status") != "PASS" or errors:
+            codes = sorted(
+                {
+                    str(error.get("code") or "final_cue_timeline_invalid")
+                    for error in errors
+                    if isinstance(error, dict)
+                }
+            )
+            details = ", ".join(codes) if codes else "validation_missing"
+            raise RuntimeError(
+                "final_cue_timeline_invalid_before_display_pages: " + details
+            )
 
     @staticmethod
     def _timeline_alignment_backend() -> str:
@@ -90,37 +758,128 @@ class SubtitleThread(QThread):
         except Exception:
             return os.getenv("VIDEOCAPTIONER_ALIGNMENT_BACKEND", "stable-ts").strip().lower()
 
-    def _apply_whisperx_time_only_if_enabled(self, asr_data: ASRData) -> ASRData:
+    def _apply_whisperx_time_only_if_enabled(
+        self,
+        asr_data: ASRData,
+        *,
+        alignment_source: ASRData,
+        word_ledger: ASRData,
+        screen_editor: ScreenSubtitleEditor,
+    ) -> ASRData:
         if self._timeline_alignment_backend() != "whisperx-time-only":
             return asr_data
-        audio_path = getattr(self.task, "video_path", None) or ""
+
+        def cue_text_by_id(data: ASRData) -> Dict[str, tuple[str, str]]:
+            return {
+                str(getattr(segment, "subtitle_id", "") or ""): (
+                    segment.text,
+                    segment.translated_text,
+                )
+                for segment in data.segments
+            }
+
+        def use_stable_ledger_fallback(reason: str) -> ASRData:
+            baseline_issues = find_implausible_word_timing_runs(
+                word_ledger.segments
+            )
+            if baseline_issues:
+                raise RuntimeError(
+                    "Authoritative word ledger has implausibly compressed timing at "
+                    + describe_word_timing_issue(baseline_issues[0])
+                )
+            logger.warning(
+                "WhisperX time-only unavailable; rebuilding final cues from stable word ledger: %s",
+                reason,
+            )
+            self._emit_stage_progress(
+                "whisperx_time_only_alignment",
+                "WhisperX不可用，使用稳定词级时间轴",
+                fraction=0.5,
+                details={"fallback_reason": reason},
+            )
+            screen_editor.record_final_timeline_alignment(
+                requested_backend="whisperx-time-only",
+                applied_backend="stable-ts-fallback",
+                fallback_reason=reason,
+            )
+            rebuilt = screen_editor.rebuild_final_cue_timeline(
+                asr_data,
+                word_ledger,
+                alignment_backend="stable-ts-fallback",
+            )
+            if cue_text_by_id(asr_data) != cue_text_by_id(rebuilt):
+                raise RuntimeError(
+                    self.tr("最终时间轴降级失败：稳定词账本重建改变了字幕文本。")
+                )
+            return rebuilt
+
+        # ``video_path`` historically served both as the report-output anchor
+        # and alignment input.  Prefer the explicit source path so isolated
+        # E2E runs can keep all writes out of the original audio directory.
+        audio_path = (
+            getattr(self.task, "source_audio_path", None)
+            or getattr(self.task, "video_path", None)
+            or ""
+        )
         if not audio_path or not Path(audio_path).exists():
-            logger.warning("WhisperX time-only skipped: source audio is missing: %s", audio_path)
-            raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：找不到源音频。"))
+            return use_stable_ledger_fallback("source_audio_missing")
         try:
             stage_started = time.perf_counter()
-            self.progress.emit(92, self.tr("WhisperX最终时间轴对齐..."))
-            aligned = align_subtitle_segments_with_whisperx_time_only(
+            self._emit_stage_progress(
+                "whisperx_time_only_alignment",
+                "WhisperX最终时间轴对齐",
+                fraction=0.2,
+            )
+            aligned_word_ledger = align_frozen_word_ledger_with_whisperx(
                 audio_path,
-                asr_data,
+                alignment_source,
+                word_ledger,
                 language="en",
                 callback=None,
             )
             self._record_stage_duration("whisperx_time_only_alignment", stage_started)
-            if not aligned or not aligned.has_data() or len(aligned.segments) != len(asr_data.segments):
-                logger.warning("WhisperX time-only did not produce a complete subtitle timeline")
-                raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：字幕没有完整匹配到音频。"))
-            for old, new in zip(asr_data.segments, aligned.segments):
-                if old.text != new.text or old.translated_text != new.translated_text:
-                    logger.warning("WhisperX time-only rejected: subtitle text changed during mapping")
-                    raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：对齐过程改变了字幕文本。"))
-            logger.info("WhisperX time-only applied to final subtitle timings")
-            return aligned
+            if (
+                not aligned_word_ledger
+                or not aligned_word_ledger.has_data()
+                or len(aligned_word_ledger.segments) != len(word_ledger.segments)
+            ):
+                return use_stable_ledger_fallback("incomplete_frozen_word_ledger")
+            local_timing_fallbacks = []
+            local_timing_fallbacks.extend(
+                getattr(aligned_word_ledger, "whisperx_expansion_fallbacks", []) or []
+            )
+            local_timing_fallbacks.extend(
+                getattr(aligned_word_ledger, "whisperx_density_fallbacks", []) or []
+            )
+            local_timing_fallbacks.extend(
+                getattr(aligned_word_ledger, "whisperx_monotonicity_fallbacks", []) or []
+            )
+            aligned_issues = find_implausible_word_timing_runs(
+                aligned_word_ledger.segments
+            )
+            if aligned_issues:
+                raise RuntimeError(
+                    "WhisperX word ledger has implausibly compressed timing at "
+                    + describe_word_timing_issue(aligned_issues[0])
+                )
+            screen_editor.record_final_timeline_alignment(
+                requested_backend="whisperx-time-only",
+                applied_backend="whisperx-time-only",
+                local_timing_fallbacks=local_timing_fallbacks,
+            )
+            rebuilt = screen_editor.rebuild_final_cue_timeline(
+                asr_data,
+                aligned_word_ledger,
+                alignment_backend="whisperx-time-only",
+            )
+            if cue_text_by_id(asr_data) != cue_text_by_id(rebuilt):
+                logger.warning("WhisperX time-only rejected: final cue text changed during ledger rebuild")
+                return use_stable_ledger_fallback("cue_text_changed_during_rebuild")
+            logger.info("WhisperX time-only rebuilt final cue timings from the frozen word ledger")
+            return rebuilt
         except Exception as exc:
             logger.warning("WhisperX time-only failed: %s", exc)
-            if isinstance(exc, RuntimeError):
-                raise
-            raise RuntimeError(self.tr("WhisperX最终时间轴对齐失败：") + str(exc)) from exc
+            return use_stable_ledger_fallback(f"alignment_exception:{type(exc).__name__}")
 
     @staticmethod
     def _subtitle_layout_names() -> Dict[str, str]:
@@ -190,6 +949,14 @@ class SubtitleThread(QThread):
         context = normalize_article_context(
             getattr(self.task, "article_context_data", None)
         )
+        if self._has_article_context(context) and not article_analysis_meta_matches(
+            context,
+            article_text,
+        ):
+            logger.warning(
+                "Discarding stale article context: source or analysis policy does not match"
+            )
+            context = empty_article_context()
         if not self._has_article_context(context):
             llm_config = self._article_llm_config(subtitle_config)
             if llm_config is not None:
@@ -203,6 +970,8 @@ class SubtitleThread(QThread):
                     logger.warning("Article context analysis failed, fallback to empty context: %s", exc)
                     context = empty_article_context()
 
+        context = enrich_article_context_with_evidence(context, article_text)
+        self.task.article_context_data = dict(context)
         try:
             save_article_artifacts(output_dir, article_text, context)
         except Exception as exc:
@@ -219,6 +988,234 @@ class SubtitleThread(QThread):
             )
         except Exception as exc:
             logger.warning("Saving %s failed: %s", name, exc)
+
+    @staticmethod
+    def _prepare_article_asr_review_artifact(
+        article_output_dir: Path,
+        frozen_asr_data: ASRData,
+        *,
+        correction_ran: bool,
+    ) -> dict:
+        """Bind uncertain corrections before an alignment backend can move time."""
+        try:
+            correction_path = article_output_dir / "correction_log.json"
+            correction_logs = []
+            source_file_hash = ""
+            if correction_ran and correction_path.is_file():
+                payload = json.loads(
+                    correction_path.read_text(encoding="utf-8-sig")
+                )
+                if isinstance(payload, list):
+                    correction_logs = payload
+                source_file_hash = file_sha256(correction_path)
+            return build_article_asr_review_artifact(
+                correction_logs,
+                frozen_asr_data.segments,
+                word_ledger_hash="",
+                source_file_hash=source_file_hash,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Article ASR review preparation unavailable; continuing without marks: %s",
+                exc,
+            )
+            return build_article_asr_review_artifact(
+                [],
+                frozen_asr_data.segments,
+                word_ledger_hash="",
+                source_file_hash="",
+            )
+
+    @staticmethod
+    def _write_article_asr_review_artifact(
+        coverage_report_path: str | None,
+        prepared_artifact: Mapping,
+    ) -> None:
+        """Publish the pre-alignment ID binding under the final ledger hash."""
+        if not coverage_report_path:
+            return
+        try:
+            artifact_dir = stable_artifact_dir(Path(coverage_report_path))
+            ledger_path = artifact_dir / "word-ledger.json"
+            ledger_payload = json.loads(
+                ledger_path.read_text(encoding="utf-8-sig")
+            )
+            word_ledger_hash = str((ledger_payload or {}).get("hash") or "")
+            review_artifact = dict(prepared_artifact or {})
+            review_artifact["word_ledger_hash"] = word_ledger_hash
+            write_json_artifact(
+                artifact_dir / "article-asr-correction-review.json",
+                review_artifact,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Article ASR review artifact unavailable; continuing without marks: %s",
+                exc,
+            )
+
+    @staticmethod
+    def _run_translation_quality_audit(
+        screen_editor: ScreenSubtitleEditor,
+        asr_data: ASRData,
+        coverage_report_path: str | None,
+        *,
+        progress_callback: Callable[[Dict], None] | None = None,
+        allow_page_projection_failure: bool = False,
+    ) -> dict:
+        """Run the read-only quality audit with the selected LLM service."""
+        if not coverage_report_path:
+            return {}
+        artifact_dir = stable_artifact_dir(Path(coverage_report_path))
+        rows = build_translation_audit_rows(
+            asr_data.segments,
+            getattr(screen_editor, "_display_page_translation_artifact", {}) or {},
+        )
+        page_artifact = dict(
+            getattr(screen_editor, "_display_page_translation_artifact", {}) or {}
+        )
+        try:
+            llm_runtime = resolve_llm_service_config()
+            service_name = str(llm_runtime.service.value or "").strip()
+            model = str(llm_runtime.model or "").strip()
+            api_key = str(llm_runtime.api_key or "").strip()
+            base_url = str(llm_runtime.base_url or "").strip()
+        except Exception as exc:
+            llm_runtime = None
+            service_name = ""
+            model = ""
+            api_key = ""
+            base_url = ""
+            logger.warning("Translation quality audit service config unavailable: %s", exc)
+
+        cache_namespace = "".join(
+            character.lower() if character.isalnum() else "_"
+            for character in service_name
+        ).strip("_") or "unknown"
+        page_projection_passed = str(page_artifact.get("status") or "") == "PASS"
+        audit_enabled = page_projection_passed or allow_page_projection_failure
+        if not audit_enabled:
+            payload = {
+                "schema_version": 1,
+                "status": "SKIPPED",
+                "service": service_name,
+                "model": model,
+                "source_subtitle_count": len(rows),
+                "audited_subtitle_count": 0,
+                "issue_count": 0,
+                "items": [],
+                "batch_errors": [
+                    {
+                        "code": (
+                            "translation_quality_audit_skipped_"
+                            "page_projection_failed"
+                        )
+                    }
+                ],
+            }
+        else:
+            if llm_runtime is None:
+                payload = {
+                    "schema_version": 1,
+                    "status": "UNAVAILABLE",
+                    "service": service_name,
+                    "model": model,
+                    "source_subtitle_count": len(rows),
+                    "audited_subtitle_count": 0,
+                    "issue_count": 0,
+                    "items": [],
+                    "batch_errors": [
+                        {"code": "translation_quality_audit_service_unavailable"}
+                    ],
+                }
+        if audit_enabled and (
+            llm_runtime is not None and (not api_key or not base_url or not model)
+        ):
+            payload = {
+                "schema_version": 1,
+                "status": "UNAVAILABLE",
+                "service": service_name,
+                "model": model,
+                "source_subtitle_count": len(rows),
+                "audited_subtitle_count": 0,
+                "issue_count": 0,
+                "items": [],
+                "batch_errors": [
+                    {"code": "translation_quality_audit_not_configured"}
+                ],
+            }
+        elif audit_enabled and llm_runtime is not None:
+            client = OpenAI(
+                base_url=base_url,
+                api_key=api_key,
+                max_retries=0,
+                timeout=90,
+            )
+
+            def completion(request: dict) -> dict:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": str(request["system_prompt"]),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "target_ids": [
+                                        str(value)
+                                        for value in request["target_ids"]
+                                    ],
+                                    "subtitles": request["rows"],
+                                    **(
+                                        {
+                                            "candidate_issues": request[
+                                                "candidate_issues"
+                                            ]
+                                        }
+                                        if request.get("candidate_issues")
+                                        else {}
+                                    ),
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
+                content = str(response.choices[0].message.content or "").strip()
+                if content.startswith("```"):
+                    content = content.removeprefix("```json").removeprefix("```")
+                    content = content.removesuffix("```").strip()
+                parsed = json.loads(content)
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        "translation quality audit returned non-object JSON"
+                    )
+                return parsed
+
+            payload = audit_fixed_id_translation_quality(
+                rows,
+                completion,
+                model=model,
+                cache_dir=(
+                    artifact_dir
+                    / "translation-quality-audit-cache"
+                    / cache_namespace
+                ),
+                progress_callback=progress_callback,
+            )
+            payload["service"] = service_name
+            payload["cache_namespace"] = cache_namespace
+        write_json_artifact(
+            artifact_dir / "translation-quality-audit.json",
+            payload,
+        )
+        write_subtitle_review_ledger(artifact_dir)
+        return payload
 
     @staticmethod
     def _srt_timestamp(ms: int) -> str:
@@ -252,7 +1249,357 @@ class SubtitleThread(QThread):
             )
             lines.extend(line for line in body if line)
             lines.append("")
-        save_path.write_text("\n".join(lines), encoding="utf-8-sig")
+        write_text_artifact(
+            save_path,
+            "\n".join(lines),
+            encoding="utf-8-sig",
+        )
+
+    @staticmethod
+    def _stable_run_id() -> str:
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S.%f")
+        return f"{timestamp}-{uuid.uuid4().hex[:8]}"
+
+    @staticmethod
+    def _bind_stable_review_artifact_identity(
+        artifact_dir: Path | None,
+        *,
+        stable_run_id: str,
+        manifest: Mapping[str, Any],
+        run_dir: Path,
+    ) -> None:
+        """Bind copied review artifacts to the stable run that owns them."""
+        if artifact_dir is None:
+            return
+        manifest_path = artifact_dir / "run-manifest.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        payload["stable_run_id"] = str(stable_run_id or "")
+        payload["stable_run_dir"] = str(run_dir)
+        payload["attempt_id"] = str(manifest.get("attempt_id") or "")
+        code_commit = str(manifest.get("code_commit") or "").strip()
+        if code_commit:
+            payload["code_commit"] = code_commit
+        write_json_artifact(manifest_path, payload)
+
+    @staticmethod
+    def _snapshot_stable_validation_artifacts(
+        coverage_report_path: str | None,
+        run_dir: Path,
+    ) -> tuple[str | None, Path | None, Path | None]:
+        if not coverage_report_path:
+            return None, None, None
+        report_source = Path(coverage_report_path)
+        if not report_source.is_file():
+            return coverage_report_path, None, None
+
+        report_target = run_dir / report_source.name
+        shutil.copy2(report_source, report_target)
+        artifact_source = stable_artifact_dir(report_source)
+        if not artifact_source.is_dir():
+            return str(report_target), None, None
+        artifact_target = run_dir / artifact_source.name
+        shutil.copytree(
+            artifact_source,
+            artifact_target,
+            ignore=shutil.ignore_patterns("translation-quality-audit-cache"),
+        )
+        semantic_queue = artifact_target / "semantic-review-queue.json"
+        if (
+            semantic_queue.is_file()
+            and load_bound_semantic_review_queue(artifact_target) is None
+        ):
+            semantic_queue.unlink()
+        return str(report_target), artifact_source, artifact_target
+
+    @staticmethod
+    def _rebase_stable_manifest_artifact_paths(
+        manifest_meta: dict,
+        artifact_source: Path | None,
+        artifact_target: Path | None,
+    ) -> dict:
+        metadata = copy.deepcopy(manifest_meta)
+        if artifact_source is None or artifact_target is None:
+            return metadata
+        for key in (
+            "final_cue_timeline_path",
+            "display_page_translation_path",
+            "parent_chinese_authority_path",
+            "display_boundary_evidence_path",
+            "qa_review_points_srt",
+            "qa_review_points_json",
+        ):
+            value = str(metadata.get(key) or "")
+            if not value:
+                continue
+            source_path = Path(value)
+            try:
+                relative = source_path.resolve().relative_to(artifact_source.resolve())
+            except (OSError, ValueError):
+                continue
+            metadata[key] = str(artifact_target / relative)
+        return metadata
+
+    def _write_stable_failure_record(
+        self,
+        output_dir: Path,
+        *,
+        coverage_report_path: str | None,
+        validation_summary: dict | None,
+        manifest_meta: dict | None,
+        editable_checkpoint_manifest_path: Path | None = None,
+    ) -> None:
+        failure = {
+            "schema_version": 1,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "attempt_id": self._stable_attempt_id(),
+            "source_subtitle": self.task.subtitle_path,
+            "output_path": str(self.task.output_path or ""),
+            "coverage_report": coverage_report_path,
+            "validation_status": "failed",
+            "render_blocked": True,
+            "validation_error_codes": [
+                str(issue.get("code"))
+                for issue in (validation_summary or {}).get("errors", [])
+                if issue.get("code")
+            ],
+            "validation_summary": validation_summary or {},
+        }
+        if manifest_meta:
+            failure.update(manifest_meta)
+        if editable_checkpoint_manifest_path is not None:
+            failure["editable_checkpoint_manifest_path"] = str(
+                editable_checkpoint_manifest_path
+            )
+        write_json_artifact(output_dir / "stable-last-failure.json", failure)
+
+    @staticmethod
+    def _editable_checkpoint_contract_is_complete(
+        asr_data: ASRData,
+        *,
+        coverage_report_path: str | None,
+        manifest_meta: Mapping | None,
+    ) -> bool:
+        """Require complete frozen authority before exposing a failed result."""
+        if not asr_data or not asr_data.segments or not coverage_report_path:
+            return False
+        report_path = Path(coverage_report_path)
+        artifact_dir = stable_artifact_dir(report_path)
+        spans_path = artifact_dir / "subtitle-spans.json"
+        ledger_path = artifact_dir / "word-ledger.json"
+        timeline_path = Path(str((manifest_meta or {}).get("final_cue_timeline_path") or ""))
+        if not spans_path.is_file() or not ledger_path.is_file() or not timeline_path.is_file():
+            return False
+        try:
+            timeline_path.resolve().relative_to(artifact_dir.resolve())
+        except (OSError, ValueError):
+            return False
+        try:
+            spans = json.loads(spans_path.read_text(encoding="utf-8-sig"))
+            ledger_payload = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        words = list((ledger_payload or {}).get("words") or [])
+        records = list((timeline or {}).get("records") or [])
+        validation = dict((timeline or {}).get("validation") or {})
+        segments = list(asr_data.segments)
+        if (
+            not isinstance(spans, list)
+            or len(spans) != len(segments)
+            or not words
+            or len(records) != len(segments)
+            or validation.get("status") != "PASS"
+            or list(validation.get("errors") or [])
+        ):
+            return False
+        expected_ids = [f"S{index:04d}" for index in range(1, len(segments) + 1)]
+        if (
+            [str(span.get("subtitle_id") or "") for span in spans] != expected_ids
+            or [str(record.get("subtitle_id") or "") for record in records] != expected_ids
+        ):
+            return False
+        previous_word_end = -1
+        previous_cue_end = -1
+        for segment, span, record, subtitle_id in zip(
+            segments,
+            spans,
+            records,
+            expected_ids,
+        ):
+            try:
+                word_start = int(span.get("word_start"))
+                word_end = int(span.get("word_end"))
+                record_start = int(record.get("word_start"))
+                record_end = int(record.get("word_end"))
+                cue_start = int(record.get("start_ms"))
+                cue_end = int(record.get("end_ms"))
+                envelope_start = int(record.get("word_envelope_start_ms"))
+                envelope_end = int(record.get("word_envelope_end_ms"))
+                first_word_start = int(words[word_start].get("start_ms"))
+                last_word_end = int(words[word_end].get("end_ms"))
+            except (IndexError, TypeError, ValueError):
+                return False
+            if (
+                str(getattr(segment, "subtitle_id", "") or "") != subtitle_id
+                or not str(getattr(segment, "translated_text", "") or "").strip()
+                or word_start != previous_word_end + 1
+                or word_end < word_start
+                or record_start != word_start
+                or record_end != word_end
+                or envelope_start != first_word_start
+                or envelope_end != last_word_end
+                or cue_start > envelope_start
+                or cue_end < envelope_end
+                or cue_start < previous_cue_end
+                or cue_end <= cue_start
+            ):
+                return False
+            previous_word_end = word_end
+            previous_cue_end = cue_end
+        return previous_word_end == len(words) - 1
+
+    @staticmethod
+    def _stable_validation_summary_blocks_render(
+        validation_summary: dict | None,
+    ) -> bool:
+        if not validation_summary:
+            return False
+        if validation_summary.get("status") != "ERROR":
+            return False
+        errors = validation_summary.get("errors")
+        if not isinstance(errors, list) or not errors:
+            return True
+        review_items = (validation_summary.get("review") or {}).get("items")
+        if not isinstance(review_items, list):
+            return True
+        error_review_severity = {
+            str(item.get("code") or ""): str(item.get("severity") or "")
+            for item in review_items
+            if isinstance(item, dict) and item.get("source_level") == "error"
+        }
+        for error in errors:
+            if not isinstance(error, dict):
+                return True
+            code = str(error.get("code") or "")
+            if error_review_severity.get(code) not in {"REVIEW", "INFO"}:
+                return True
+        return False
+
+    def _stable_attempt_id(self) -> str:
+        attempt_id = str(self.__dict__.get("attempt_id", "") or "").strip()
+        if not attempt_id:
+            attempt_id = uuid.uuid4().hex
+            self.__dict__["attempt_id"] = attempt_id
+        return attempt_id
+
+    def _write_stable_editable_checkpoint(
+        self,
+        output_dir: Path,
+        asr_data: ASRData,
+        subtitle_config: SubtitleConfig,
+        *,
+        coverage_report_path: str | None,
+        validation_summary: dict | None,
+        manifest_meta: dict | None,
+    ) -> Path:
+        """Snapshot complete failed subtitles for editing without publishing them."""
+        run_id = self._stable_run_id()
+        run_dir = output_dir / "stable-checkpoints" / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        stable_paths = {
+            "original_top_srt": run_dir / "stable-final-original-top.srt",
+            "translation_top_srt": run_dir / "stable-final-translation-top.srt",
+            "only_original_srt": run_dir / "stable-final-only-original.srt",
+            "only_translation_srt": run_dir / "stable-final-only-translation.srt",
+        }
+        try:
+            for mode, path in stable_paths.items():
+                self._write_stable_srt(asr_data, path, mode.removesuffix("_srt"))
+            (
+                published_coverage_report,
+                artifact_source,
+                artifact_target,
+            ) = self._snapshot_stable_validation_artifacts(
+                coverage_report_path,
+                run_dir,
+            )
+            if artifact_target is None or not all(
+                (artifact_target / name).is_file()
+                for name in ("subtitle-spans.json", "word-ledger.json")
+            ):
+                raise RuntimeError(
+                    "editable_checkpoint_missing_frozen_word_artifacts"
+                )
+            published_meta = self._rebase_stable_manifest_artifact_paths(
+                manifest_meta or {},
+                artifact_source,
+                artifact_target,
+            )
+            error_codes = [
+                str(issue.get("code"))
+                for issue in (validation_summary or {}).get("errors", [])
+                if issue.get("code")
+            ]
+            source_media_path = ""
+            for candidate in (
+                getattr(self.task, "source_audio_path", None),
+                getattr(self.task, "video_path", None),
+            ):
+                if candidate and Path(candidate).is_file():
+                    source_media_path = str(Path(candidate).resolve())
+                    break
+            manifest = {
+                "schema_version": 2,
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "attempt_id": self._stable_attempt_id(),
+                "stable_run_id": run_id,
+                "stable_run_dir": str(run_dir),
+                "editable_checkpoint": True,
+                "source_subtitle": self.task.subtitle_path,
+                "output_path": str(self.task.output_path or ""),
+                "coverage_report": published_coverage_report,
+                "validation_status": "failed",
+                "render_blocked": True,
+                "validation_error_codes": error_codes,
+                "validation_summary": validation_summary or {},
+                "layout": subtitle_config.subtitle_layout,
+                "stable_mode": subtitle_config.screen_subtitle_stable_mode,
+                "subtitle_count": len(asr_data.segments),
+                "paths": {key: str(path) for key, path in stable_paths.items()},
+                "paths_sha256": {
+                    key: file_sha256(path) for key, path in stable_paths.items()
+                },
+                "source_media_path": source_media_path,
+            }
+            manifest.update(published_meta)
+            self._bind_stable_review_artifact_identity(
+                artifact_target,
+                stable_run_id=run_id,
+                manifest=manifest,
+                run_dir=run_dir,
+            )
+            qa_review_paths = self._write_source_audio_qc_queue(
+                published_coverage_report,
+                artifact_dir=artifact_target or artifact_source,
+            )
+            if qa_review_paths:
+                manifest["qa_review_queue"] = qa_review_paths
+            manifest_path = run_dir / "stable-final-manifest.json"
+            write_json_artifact(manifest_path, manifest)
+            from app.core.subtitle_processor.manual_final_subtitle_editor import (
+                ManualFinalSubtitleSession,
+            )
+
+            ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+            return manifest_path
+        except Exception:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
 
     def _save_stable_subtitle_outputs(
         self,
@@ -275,85 +1622,238 @@ class SubtitleThread(QThread):
         output_dir = output_path.parent
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        stable_paths = {
-            "original_top_srt": output_dir / "stable-final-original-top.srt",
-            "translation_top_srt": output_dir / "stable-final-translation-top.srt",
-            "only_original_srt": output_dir / "stable-final-only-original.srt",
-            "only_translation_srt": output_dir / "stable-final-only-translation.srt",
-        }
-        self._write_stable_srt(asr_data, stable_paths["original_top_srt"], "original_top")
-        self._write_stable_srt(
-            asr_data, stable_paths["translation_top_srt"], "translation_top"
-        )
-        self._write_stable_srt(
-            asr_data, stable_paths["only_original_srt"], "only_original"
-        )
-        self._write_stable_srt(
-            asr_data, stable_paths["only_translation_srt"], "only_translation"
-        )
-
-        if validation_summary and validation_summary.get("status") == "ERROR":
+        if self._stable_validation_summary_blocks_render(validation_summary):
             validation_status = "failed"
         render_blocked = validation_status == "failed"
-        if not render_blocked:
+        if render_blocked:
+            editable_checkpoint_manifest_path = None
+            if self._editable_checkpoint_contract_is_complete(
+                asr_data,
+                coverage_report_path=coverage_report_path,
+                manifest_meta=manifest_meta,
+            ):
+                try:
+                    editable_checkpoint_manifest_path = (
+                        self._write_stable_editable_checkpoint(
+                            output_dir,
+                            asr_data,
+                            subtitle_config,
+                            coverage_report_path=coverage_report_path,
+                            validation_summary=validation_summary,
+                            manifest_meta=manifest_meta,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Stable editable checkpoint save failed: %s", exc
+                    )
+            self._write_stable_failure_record(
+                output_dir,
+                coverage_report_path=coverage_report_path,
+                validation_summary=validation_summary,
+                manifest_meta=manifest_meta,
+                editable_checkpoint_manifest_path=editable_checkpoint_manifest_path,
+            )
+            logger.warning(
+                "Stable subtitle publication blocked; previous success preserved; "
+                "editable_checkpoint=%s failure=%s",
+                editable_checkpoint_manifest_path or "unavailable",
+                output_dir / "stable-last-failure.json",
+            )
+            return
+
+        run_id = self._stable_run_id()
+        run_dir = output_dir / "stable-runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        stable_paths = {
+            "original_top_srt": run_dir / "stable-final-original-top.srt",
+            "translation_top_srt": run_dir / "stable-final-translation-top.srt",
+            "only_original_srt": run_dir / "stable-final-only-original.srt",
+            "only_translation_srt": run_dir / "stable-final-only-translation.srt",
+        }
+        published = False
+        try:
+            self._write_stable_srt(
+                asr_data, stable_paths["original_top_srt"], "original_top"
+            )
+            self._write_stable_srt(
+                asr_data, stable_paths["translation_top_srt"], "translation_top"
+            )
+            self._write_stable_srt(
+                asr_data, stable_paths["only_original_srt"], "only_original"
+            )
+            self._write_stable_srt(
+                asr_data, stable_paths["only_translation_srt"], "only_translation"
+            )
+            (
+                published_coverage_report,
+                artifact_source,
+                artifact_target,
+            ) = self._snapshot_stable_validation_artifacts(
+                coverage_report_path,
+                run_dir,
+            )
+            published_meta = self._rebase_stable_manifest_artifact_paths(
+                manifest_meta or {},
+                artifact_source,
+                artifact_target,
+            )
+            manifest = {
+                "schema_version": 2,
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "stable_run_id": run_id,
+                "stable_run_dir": str(run_dir),
+                "source_subtitle": self.task.subtitle_path,
+                "output_path": str(output_path),
+                "coverage_report": published_coverage_report,
+                "validation_status": "passed",
+                "render_blocked": False,
+                "validation_error_codes": [],
+                "validation_summary": validation_summary or {},
+                "layout": subtitle_config.subtitle_layout,
+                "stable_mode": subtitle_config.screen_subtitle_stable_mode,
+                "subtitle_count": len(asr_data.segments),
+                "paths": {key: str(path) for key, path in stable_paths.items()},
+                "paths_sha256": {
+                    key: file_sha256(path)
+                    for key, path in stable_paths.items()
+                },
+            }
+            manifest.update(published_meta)
+            self._bind_stable_review_artifact_identity(
+                artifact_target,
+                stable_run_id=run_id,
+                manifest=manifest,
+                run_dir=run_dir,
+            )
+            run_manifest_path = run_dir / "stable-final-manifest.json"
+            manifest_path = output_dir / "stable-final-manifest.json"
+            # The run-local manifest is a private candidate needed by the
+            # display-page exporter. The discoverable root manifest remains
+            # the publication commit point and must not be replaced yet.
+            write_json_artifact(run_manifest_path, manifest)
+
+            source_subtitle_paths = self._write_source_audio_subtitle_exports(asr_data)
+            display_page_required = (
+                str(manifest.get("display_page_translation_status") or "") == "PASS"
+                and bool(str(manifest.get("display_page_translation_path") or "").strip())
+            )
+            if display_page_required:
+                display_parent_paths = dict(source_subtitle_paths)
+                display_parent_paths.setdefault(
+                    "named_bilingual_original_top_srt",
+                    str(stable_paths["original_top_srt"]),
+                )
+                source_subtitle_paths.update(
+                    self._write_source_audio_display_page_exports(
+                        run_manifest_path,
+                        display_parent_paths,
+                    )
+                )
+            if source_subtitle_paths:
+                manifest["source_subtitle_dir"] = str(self._source_audio_subtitle_dir())
+                manifest["source_subtitle_paths"] = source_subtitle_paths
+                manifest["source_subtitle_paths_sha256"] = {
+                    key: file_sha256(Path(value))
+                    for key, value in source_subtitle_paths.items()
+                    if value and Path(value).is_file()
+                }
+            qa_review_paths = self._write_source_audio_qc_queue(
+                published_coverage_report,
+                artifact_dir=artifact_target or artifact_source,
+            )
+            if qa_review_paths:
+                manifest["qa_review_queue"] = qa_review_paths
+            summary_paths = self._write_stable_result_summary(manifest)
+            if summary_paths:
+                manifest["result_summary_paths"] = summary_paths
+
+            write_json_artifact(run_manifest_path, manifest)
+            write_json_artifact(manifest_path, manifest)
+            published = True
+        except Exception:
+            if not published:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+
+        # These are compatibility/convenience exports. They run only after
+        # the immutable run and root manifest have committed successfully.
+        for key, run_path in stable_paths.items():
+            compatibility_path = output_dir / run_path.name
+            try:
+                write_text_artifact(
+                    compatibility_path,
+                    run_path.read_text(encoding="utf-8-sig"),
+                    encoding="utf-8-sig",
+                )
+            except Exception as exc:
+                logger.warning("Stable compatibility export failed (%s): %s", key, exc)
+
+        try:
             if output_path.suffix.lower() == ".ass":
-                asr_data.to_ass(
-                    save_path=str(output_path),
+                output_text = asr_data.to_ass(
                     style_str=subtitle_config.subtitle_style,
                     layout=subtitle_config.subtitle_layout,
                 )
             elif output_path.suffix.lower() == ".srt":
-                asr_data.to_srt(
-                    save_path=str(output_path),
-                    layout=subtitle_config.subtitle_layout,
-                )
+                output_text = asr_data.to_srt(layout=subtitle_config.subtitle_layout)
+            else:
+                output_text = ""
+            if output_text:
+                write_text_artifact(output_path, output_text)
+        except Exception as exc:
+            logger.warning("Stable compatibility output failed: %s", exc)
 
-        manifest = {
-            "schema_version": 1,
-            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "source_subtitle": self.task.subtitle_path,
-            "output_path": str(output_path),
-            "coverage_report": coverage_report_path,
-            "validation_status": validation_status,
-            "render_blocked": render_blocked,
-            "validation_error_codes": [
-                str(issue.get("code"))
-                for issue in (validation_summary or {}).get("errors", [])
-                if issue.get("code")
-            ],
-            "validation_summary": validation_summary or {},
-            "layout": subtitle_config.subtitle_layout,
-            "stable_mode": subtitle_config.screen_subtitle_stable_mode,
-            "subtitle_count": len(asr_data.segments),
-            "paths": {key: str(path) for key, path in stable_paths.items()},
-        }
-        if manifest_meta:
-            manifest.update(manifest_meta)
-        source_subtitle_paths = self._write_source_audio_subtitle_exports(asr_data)
-        if source_subtitle_paths:
-            manifest["source_subtitle_dir"] = str(self._source_audio_report_dir())
-            manifest["source_subtitle_paths"] = source_subtitle_paths
-        summary_paths = self._write_stable_result_summary(manifest)
-        if summary_paths:
-            manifest["result_summary_paths"] = summary_paths
-        manifest_path = output_dir / "stable-final-manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        logger.info("Stable subtitle manifest published: %s", manifest_path)
+
+    def _write_source_audio_qc_queue(
+        self,
+        coverage_report_path: str | None,
+        *,
+        artifact_dir: Path | None = None,
+    ) -> dict:
+        """Create one concise, time-addressable review SRT beside the source audio."""
+        source_dir = self._source_audio_quality_dir()
+        if source_dir is None or not coverage_report_path:
+            return {}
+        source_dir.mkdir(parents=True, exist_ok=True)
+        report_path = Path(coverage_report_path)
+        artifact_dir = artifact_dir or report_path.with_name(
+            f"{report_path.stem.removesuffix('-coverage-report')}-artifacts"
         )
-        logger.info("Stable subtitle manifest saved: %s", manifest_path)
+        if not artifact_dir.exists():
+            return {}
+        try:
+            from scripts.build_qa_summary import write_qa_review_artifacts
+
+            result = write_qa_review_artifacts(
+                artifact_dir,
+                source_audio_dir=source_dir,
+            )
+            logger.info(
+                "Source audio QA review queue saved: %s",
+                result.get("source_audio_qa_review_queue_srt", ""),
+            )
+            return result
+        except Exception as exc:
+            logger.warning("Saving source audio QA review queue failed: %s", exc)
+            return {}
 
     def _write_stable_result_summary(self, manifest: dict) -> dict:
         summary = self._build_stable_result_summary(manifest)
         if not summary:
             return {}
-        source_dir = self._source_audio_report_dir()
+        source_dir = self._source_audio_quality_dir()
         if source_dir is None:
             return {}
         paths = {"source_summary_txt": str(source_dir / "字幕处理结果摘要.txt")}
         for path_text in paths.values():
             try:
-                Path(path_text).write_text(summary, encoding="utf-8-sig")
+                write_text_artifact(
+                    Path(path_text),
+                    summary,
+                    encoding="utf-8-sig",
+                )
             except Exception as exc:
                 logger.warning("Writing stable result summary failed: %s", exc)
         return paths
@@ -363,23 +1863,37 @@ class SubtitleThread(QThread):
         errors = list(validation.get("errors") or [])
         warnings = list(validation.get("warnings") or [])
         info = list(validation.get("info") or [])
-        repair_log = list(manifest.get("safe_auto_repair_log") or [])
-        repair_candidates = list(manifest.get("safe_auto_repair_candidates") or [])
-        changed_repairs = self._unique_summary_repairs([
-            item for item in repair_log
-            if str(item.get("code") or "").endswith("_repaired")
-            or str(item.get("code") or "") in {
-                "safe_repair_changed",
-                "chinese_text_repaired",
-                "severe_chinese_speed_repaired",
-                "missing_chinese_filled",
-                "timing_padding_repaired",
-            }
-        ])
-        rejected_repairs = [
-            item for item in repair_log
-            if "rejected" in str(item.get("code") or "") or "skipped" in str(item.get("code") or "")
+        polish_log = list(manifest.get("chinese_polish_log") or [])
+        applied_polish = [item for item in polish_log if item.get("decision") == "applied"]
+        rejected_polish = [
+            item for item in polish_log
+            if item.get("decision") in {"rejected", "skipped", "batch_skipped"}
         ]
+        repair_log = list(manifest.get("safe_auto_repair_log") or [])
+        actual_repairs = []
+        seen_repairs = set()
+        for item in repair_log:
+            changed = (
+                str(item.get("before_chinese") or "")
+                != str(item.get("after_chinese") or "")
+                or item.get("before_start_ms") != item.get("after_start_ms")
+                or item.get("before_end_ms") != item.get("after_end_ms")
+            )
+            if not changed:
+                continue
+            key = (
+                str(item.get("subtitle_id") or ""),
+                str(item.get("before_chinese") or ""),
+                str(item.get("after_chinese") or ""),
+                item.get("before_start_ms"),
+                item.get("before_end_ms"),
+                item.get("after_start_ms"),
+                item.get("after_end_ms"),
+            )
+            if key in seen_repairs:
+                continue
+            seen_repairs.add(key)
+            actual_repairs.append(item)
 
         status = str(manifest.get("validation_status") or "unknown")
         blocked = bool(manifest.get("render_blocked"))
@@ -399,7 +1913,7 @@ class SubtitleThread(QThread):
             f"生成时间：{manifest.get('created_at', '')}",
             f"字幕数量：{manifest.get('subtitle_count', 0)}",
             f"稳定模式：{'开' if manifest.get('stable_mode') else '关'}",
-            f"安全修复：{'开' if manifest.get('safe_auto_repair_enabled') else '关'}",
+            f"中文字幕润色：{'开' if manifest.get('chinese_polish_enabled') else '关'}",
             f"状态：{status}",
             f"是否阻止合成：{'是' if blocked else '否'}",
             "",
@@ -407,9 +1921,9 @@ class SubtitleThread(QThread):
             f"- ERROR：{len(errors)}",
             f"- WARNING：{len(warnings)}",
             f"- INFO：{len(info)}",
-            f"- 修复候选：{len(repair_candidates)}",
-            f"- 实际修复：{len(changed_repairs)}",
-            f"- 跳过/拒绝：{len(rejected_repairs)}",
+            f"- 实际修复：{len(actual_repairs)}",
+            f"- 润色成功：{len(applied_polish)}",
+            f"- 润色跳过/拒绝：{len(rejected_polish)}",
         ]
 
         if errors:
@@ -420,26 +1934,35 @@ class SubtitleThread(QThread):
             lines.extend(["", "主要 WARNING："])
             lines.extend(self._summary_issue_lines(warnings, limit=8))
 
-        if changed_repairs:
-            lines.extend(["", "本次实际修复："])
-            for item in changed_repairs[:12]:
-                subtitle_id = item.get("subtitle_id", "")
-                code = item.get("code", "")
-                before = str(item.get("before_chinese") or "").strip()
-                after = str(item.get("after_chinese") or "").strip()
-                time_range = self._summary_time_range(item)
-                if before or after:
-                    lines.append(f"- {subtitle_id} {time_range} {code}")
-                    lines.append(f"  前：{before}")
-                    lines.append(f"  后：{after}")
+        if actual_repairs:
+            lines.extend(["", "本次自动修复："])
+            for item in actual_repairs[:12]:
+                subtitle_id = str(item.get("subtitle_id") or "")
+                before_chinese = str(item.get("before_chinese") or "")
+                after_chinese = str(item.get("after_chinese") or "")
+                if before_chinese != after_chinese:
+                    lines.append(
+                        f"- {subtitle_id}：{before_chinese} -> {after_chinese}"
+                    )
                 else:
-                    lines.append(f"- {subtitle_id} {time_range} {code}")
+                    lines.append(
+                        f"- {subtitle_id}：时间轴 "
+                        f"{item.get('before_start_ms')}-{item.get('before_end_ms')} -> "
+                        f"{item.get('after_start_ms')}-{item.get('after_end_ms')}"
+                    )
 
-        if rejected_repairs:
-            lines.extend(["", "已跳过或拒绝的修复："])
-            for item in rejected_repairs[:12]:
+        if applied_polish:
+            lines.extend(["", "本次中文润色："])
+            for item in applied_polish[:12]:
                 lines.append(
-                    f"- {item.get('subtitle_id', '')} {item.get('code', '')}：{item.get('reason', '')}"
+                    f"- {item.get('semantic_group_id', '')}：{', '.join(item.get('subtitle_ids') or [])}"
+                )
+
+        if rejected_polish:
+            lines.extend(["", "已跳过或拒绝的中文润色："])
+            for item in rejected_polish[:12]:
+                lines.append(
+                    f"- {item.get('semantic_group_id', '')}：{item.get('reason', '')}"
                 )
 
         paths = manifest.get("paths") or {}
@@ -455,11 +1978,20 @@ class SubtitleThread(QThread):
             lines.append(f"- 音频目录英文字幕：{source_paths.get('only_original_srt')}")
         if manifest.get("coverage_report"):
             lines.append(f"- 详细报告：{manifest.get('coverage_report')}")
+        qa_review_queue = manifest.get("qa_review_queue") or {}
+        if qa_review_queue.get("source_audio_qa_review_queue_srt"):
+            lines.append(
+                f"- 剪映质检队列：{qa_review_queue.get('source_audio_qa_review_queue_srt')}"
+            )
+        if qa_review_queue.get("source_audio_semantic_review_queue_srt"):
+            lines.append(
+                f"- 中文语义复核队列：{qa_review_queue.get('source_audio_semantic_review_queue_srt')}"
+            )
 
         if blocked or errors:
             recommendation = "建议：先处理 ERROR，不建议直接合成。"
-        elif changed_repairs:
-            recommendation = "建议：可以导入视频抽查实际修复点和 WARNING 位置。"
+        elif applied_polish:
+            recommendation = "建议：可以导入视频抽查已润色语义组和 WARNING 位置。"
         elif warnings:
             recommendation = "建议：可以合成，但优先抽查 WARNING 中的英文切分和阅读速度。"
         else:
@@ -507,11 +2039,22 @@ class SubtitleThread(QThread):
         return unique
 
     def _source_audio_subtitle_paths(self) -> dict:
-        source_dir = self._source_audio_report_dir()
+        source_dir = self._source_audio_subtitle_dir()
         if source_dir is None:
             return {}
+        source_path = Path(
+            str(
+                getattr(self.task, "source_audio_path", None)
+                or getattr(self.task, "video_path", None)
+                or ""
+            )
+        )
+        source_stem = source_path.stem or "双语字幕"
         return {
             "bilingual_original_top_srt": str(source_dir / "双语字幕.srt"),
+            "named_bilingual_original_top_srt": str(
+                source_dir / f"{source_stem}-原文在上双语字幕.srt"
+            ),
             "only_translation_srt": str(source_dir / "中文字幕.srt"),
             "only_original_srt": str(source_dir / "英文字幕.srt"),
         }
@@ -524,6 +2067,11 @@ class SubtitleThread(QThread):
             self._write_stable_srt(
                 asr_data,
                 Path(paths["bilingual_original_top_srt"]),
+                "original_top",
+            )
+            self._write_stable_srt(
+                asr_data,
+                Path(paths["named_bilingual_original_top_srt"]),
                 "original_top",
             )
             self._write_stable_srt(
@@ -542,14 +2090,85 @@ class SubtitleThread(QThread):
             return {}
         return paths
 
+    def _write_source_audio_display_page_exports(
+        self,
+        manifest_path: Path,
+        source_subtitle_paths: Mapping[str, str],
+    ) -> dict:
+        source_path = Path(
+            str(
+                getattr(self.task, "source_audio_path", None)
+                or getattr(self.task, "video_path", None)
+                or ""
+            )
+        )
+        source_dir = self._source_audio_subtitle_dir()
+        if source_dir is None:
+            return {}
+        source_dir.mkdir(parents=True, exist_ok=True)
+        source_stem = source_path.stem or "双语字幕"
+        parent_path = str(
+            source_subtitle_paths.get("named_bilingual_original_top_srt")
+            or source_subtitle_paths.get("bilingual_original_top_srt")
+            or ""
+        )
+        from app.core.subtitle_processor.manual_final_subtitle_editor import (
+            ManualFinalSubtitleSession,
+        )
+
+        try:
+            session = ManualFinalSubtitleSession.load_from_manifest(manifest_path)
+            exported = session.export_display_page_subtitles(
+                source_dir / f"{source_stem}-实际分页双语字幕.srt",
+                source_dir / f"{source_stem}-实际分页映射.json",
+                source_parent_subtitle_path=parent_path or None,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"stable_display_page_export_failed: {exc}"
+            ) from exc
+        exported_srt = Path(str(exported.get("srt") or ""))
+        exported_map = Path(str(exported.get("map") or ""))
+        if not (
+            exported_srt.is_file()
+            and exported_srt.stat().st_size > 0
+            and exported_map.is_file()
+            and exported_map.stat().st_size > 0
+        ):
+            raise RuntimeError(
+                "stable_display_page_export_failed: missing_or_empty_export_pair"
+            )
+        return {
+            "display_page_bilingual_srt": str(exported_srt),
+            "display_page_map": str(exported_map),
+        }
+
     def _source_audio_report_dir(self) -> Path | None:
-        source_path = getattr(self.task, "video_path", None) or ""
-        if not source_path:
+        source_media_text = (
+            getattr(self.task, "source_audio_path", None)
+            or getattr(self.task, "video_path", None)
+            or ""
+        )
+        output_anchor_text = (
+            getattr(self.task, "video_path", None) or source_media_text
+        )
+        if not source_media_text or not output_anchor_text:
             return None
-        source_dir = Path(source_path).parent
-        if not source_dir.exists():
+        output_anchor = Path(output_anchor_text)
+        if not output_anchor.parent.exists():
             return None
-        return source_dir
+        return media_result_dir(
+            source_media_text,
+            output_anchor=output_anchor,
+        )
+
+    def _source_audio_subtitle_dir(self) -> Path | None:
+        result_dir = self._source_audio_report_dir()
+        return media_result_subtitle_dir(result_dir) if result_dir is not None else None
+
+    def _source_audio_quality_dir(self) -> Path | None:
+        result_dir = self._source_audio_report_dir()
+        return media_result_quality_dir(result_dir) if result_dir is not None else None
 
     def _setup_api_config(self) -> SubtitleConfig:
         """设置API配置，返回SubtitleConfig"""
@@ -609,18 +2228,41 @@ class SubtitleThread(QThread):
             assert subtitle_path is not None, self.tr("字幕文件路径为空")
 
             subtitle_config = self.task.subtitle_config
+            article_output_dir = self._article_output_dir()
+            self._initialize_run_state(subtitle_config, article_output_dir)
 
-            stage_started = time.perf_counter()
+            stage_started = self._begin_stage("load_subtitle", "加载原始字幕")
             asr_raw = ASRData.from_subtitle_file(subtitle_path)
             asr_data = asr_raw
             word_time_asr_data = None
-            article_output_dir = self._article_output_dir()
             self._save_stage_json(article_output_dir, "asr_raw.json", asr_raw)
-            self._record_stage_duration("load_subtitle", stage_started)
+            self._complete_stage(
+                "load_subtitle",
+                "加载原始字幕",
+                stage_started,
+                artifact_paths=(article_output_dir / "asr_raw.json",),
+                details={"subtitle_count": len(asr_raw.segments)},
+            )
 
-            stage_started = time.perf_counter()
-            article_context = self._resolve_article_context(subtitle_config, article_output_dir)
-            self._record_stage_duration("article_context", stage_started)
+            stage_started = self._begin_stage("article_context", "分析参考原文")
+            article_context = self._load_resume_article_context(article_output_dir)
+            article_context_resumed = article_context is not None
+            if article_context is None:
+                article_context = self._resolve_article_context(subtitle_config, article_output_dir)
+            if self._article_reference_enabled() and self._has_article_context(article_context):
+                self.task.article_context_data = dict(article_context)
+            article_artifact_paths = (
+                (article_output_dir / "article_context.json",)
+                if self._article_reference_enabled()
+                else ()
+            )
+            self._complete_stage(
+                "article_context",
+                "分析参考原文",
+                stage_started,
+                artifact_paths=article_artifact_paths,
+                details={"resumed": article_context_resumed},
+            )
             article_translation_prompt = ""
             if (
                 str(getattr(self.task, "article_reference_text", "") or "").strip()
@@ -631,34 +2273,97 @@ class SubtitleThread(QThread):
                 except Exception as exc:
                     logger.warning("Building article translation prompt failed: %s", exc)
                     article_translation_prompt = ""
+            article_correction_ran = False
+            article_correction_applied = False
             if (
                 str(getattr(self.task, "article_reference_text", "") or "").strip()
                 and bool(getattr(self.task, "use_article_reference_assist", False))
             ):
-                stage_started = time.perf_counter()
+                stage_started = self._begin_stage("article_asr_correction", "参考原文实体校正")
                 try:
-                    asr_corrected = apply_article_asr_corrections(
-                        asr_raw,
-                        article_context,
-                        output_dir=article_output_dir,
-                    )
+                    asr_corrected = self._load_resume_asr_correction(article_output_dir)
+                    article_correction_resumed = asr_corrected is not None
+                    if asr_corrected is None:
+                        asr_corrected = apply_article_asr_corrections(
+                            asr_raw,
+                            article_context,
+                            output_dir=article_output_dir,
+                            article_text=str(
+                                getattr(self.task, "article_reference_text", "")
+                                or ""
+                            ),
+                        )
                     asr_data = asr_corrected
+                    prior_correction_details = self._resume_stage_details(
+                        "article_asr_correction"
+                    )
+                    article_correction_ran = bool(
+                        prior_correction_details.get("correction_ran", True)
+                    )
+                    article_correction_applied = [
+                        segment.text for segment in asr_raw.segments
+                    ] != [segment.text for segment in asr_corrected.segments]
                     self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
                     self.update_all.emit(asr_data.to_json())
                 except Exception as exc:
                     logger.warning("Article ASR correction failed, using original ASR: %s", exc)
+                    article_correction_resumed = False
                     self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
-                self._record_stage_duration("article_asr_correction", stage_started)
+                self._complete_stage(
+                    "article_asr_correction",
+                    "参考原文实体校正",
+                    stage_started,
+                    artifact_paths=(article_output_dir / "asr_corrected.json",),
+                    details={
+                        "resumed": article_correction_resumed,
+                        "correction_ran": article_correction_ran,
+                        "correction_applied": article_correction_applied,
+                        "policy_version": ARTICLE_ASR_CORRECTION_POLICY_VERSION,
+                    },
+                )
             else:
+                stage_started = self._begin_stage("article_asr_correction", "跳过参考原文实体校正")
                 self._save_stage_json(article_output_dir, "asr_corrected.json", asr_data)
+                self._complete_stage(
+                    "article_asr_correction",
+                    "跳过参考原文实体校正",
+                    stage_started,
+                    artifact_paths=(article_output_dir / "asr_corrected.json",),
+                    details={"skipped": True, "correction_ran": False, "correction_applied": False},
+                )
+            self._set_article_run_metadata(
+                article_context,
+                correction_ran=article_correction_ran,
+                correction_applied=article_correction_applied,
+                translation_terms_applied=bool(article_translation_prompt),
+            )
 
-            # 1. 分割成字词级时间戳（对于非断句字幕且开启分割选项）
-            stage_started = time.perf_counter()
-            if subtitle_config.need_split and not asr_data.is_word_timestamp():
+            # WhisperX time-only aligns these natural ASR phrases, then maps
+            # word times back to the frozen ledger.  Do not use final cue text
+            # as alignment input after English boundaries are frozen.
+            alignment_source_asr_data = copy.deepcopy(asr_data)
+
+            # 1. 稳定模式必须先建立词级账本；不能再依赖旧的“字幕分割”开关。
+            stage_started = self._begin_stage("word_timestamp_prepare", "准备词级时间轴")
+            stable_screen_mode = bool(
+                subtitle_config.need_screen_subtitle_edit
+                and subtitle_config.screen_subtitle_stable_mode
+            )
+            if (subtitle_config.need_split or stable_screen_mode) and not asr_data.is_word_timestamp():
                 asr_data.split_to_word_segments()
             if asr_data.is_word_timestamp():
                 word_time_asr_data = copy.deepcopy(asr_data)
-            self._record_stage_duration("word_timestamp_prepare", stage_started)
+            elif stable_screen_mode:
+                raise RuntimeError(
+                    "上屏稳定模式需要词级时间戳，但当前转录结果无法建立词级账本。"
+                    "请切换支持词级时间戳的转录模型，或关闭上屏稳定模式。"
+                )
+            self._complete_stage(
+                "word_timestamp_prepare",
+                "准备词级时间轴",
+                stage_started,
+                details={"word_timestamp_count": len(word_time_asr_data.segments) if word_time_asr_data else 0},
+            )
 
             # 获取API配置，会先检查可用性（优先使用设置的API，其次使用自带的公益API）
             if (
@@ -677,21 +2382,15 @@ class SubtitleThread(QThread):
                     )
                 )
             ):
-                stage_started = time.perf_counter()
-                self.progress.emit(2, self.tr("开始验证API配置..."))
+                stage_started = self._begin_stage("api_setup", "验证翻译服务")
                 subtitle_config = self._setup_api_config()
                 os.environ["OPENAI_BASE_URL"] = subtitle_config.base_url
                 os.environ["OPENAI_API_KEY"] = subtitle_config.api_key
-                self._record_stage_duration("api_setup", stage_started)
+                self._complete_stage("api_setup", "验证翻译服务", stage_started)
 
             # 2. 重新断句（对于字词级字幕）
-            stable_screen_mode = (
-                subtitle_config.need_screen_subtitle_edit
-                and subtitle_config.screen_subtitle_stable_mode
-            )
             if asr_data.is_word_timestamp() and not stable_screen_mode:
-                stage_started = time.perf_counter()
-                self.progress.emit(5, self.tr("字幕断句..."))
+                stage_started = self._begin_stage("split_subtitle", "英文语义粗切")
                 logger.info("正在字幕断句...")
                 screen_edit_mode = subtitle_config.need_screen_subtitle_edit
                 coarse_english_limit = max(
@@ -722,7 +2421,13 @@ class SubtitleThread(QThread):
                 asr_data = splitter.split_subtitle(asr_data)
                 asr_data.save(save_path=split_path)
                 self.update_all.emit(asr_data.to_json())
-                self._record_stage_duration("split_subtitle", stage_started)
+                self._complete_stage(
+                    "split_subtitle",
+                    "英文语义粗切",
+                    stage_started,
+                    artifact_paths=(Path(split_path),),
+                    details={"subtitle_count": len(asr_data.segments)},
+                )
             self._save_stage_json(article_output_dir, "segmented_english.json", asr_data)
 
             # 3. 优化字幕
@@ -732,9 +2437,11 @@ class SubtitleThread(QThread):
             )
             self.subtitle_length = len(asr_data.segments)
 
-            if subtitle_config.need_optimize:
-                stage_started = time.perf_counter()
-                self.progress.emit(0, self.tr("优化字幕..."))
+            if self._should_run_legacy_subtitle_optimization(
+                need_optimize=subtitle_config.need_optimize,
+                stable_screen_mode=stable_screen_mode,
+            ):
+                stage_started = self._begin_stage("optimize_subtitle", "优化字幕")
                 logger.info("正在优化字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
                 optimizer = SubtitleOptimizer(
@@ -746,7 +2453,9 @@ class SubtitleThread(QThread):
                 )
                 asr_data = optimizer.optimize_subtitle(asr_data)
                 self.update_all.emit(asr_data.to_json())
-                self._record_stage_duration("optimize_subtitle", stage_started)
+                self._complete_stage("optimize_subtitle", "优化字幕", stage_started)
+            elif subtitle_config.need_optimize:
+                logger.info("稳定上屏模式跳过旧 LLM 英文优化；最终边界由本地词级规则决定")
 
             # 4. 翻译字幕
             translator_map = {
@@ -762,10 +2471,9 @@ class SubtitleThread(QThread):
             if subtitle_config.need_translate and subtitle_config.need_screen_subtitle_edit:
                 logger.info(
                     "跳过普通翻译：上屏短字幕校正将基于语义粗切字幕直接完成翻译和细切"
-                )
+            )
             if should_translate_before_screen_edit:
-                stage_started = time.perf_counter()
-                self.progress.emit(0, self.tr("翻译字幕..."))
+                stage_started = self._begin_stage("translate_subtitle", "翻译字幕")
                 logger.info("正在翻译字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
                 os.environ["DEEPLX_ENDPOINT"] = subtitle_config.deeplx_endpoint
@@ -787,14 +2495,13 @@ class SubtitleThread(QThread):
                 ):
                     asr_data.remove_punctuation()
                 self.update_all.emit(asr_data.to_json())
-                self._record_stage_duration("translate_subtitle", stage_started)
+                self._complete_stage("translate_subtitle", "翻译字幕", stage_started)
             self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
 
             # 5. 上屏短字幕校正
             coverage_report_path = None
             if subtitle_config.need_screen_subtitle_edit:
-                stage_started = time.perf_counter()
-                self.progress.emit(0, self.tr("上屏短字幕校正..."))
+                stage_started = self._begin_stage("screen_subtitle_edit", "上屏短字幕校正")
                 if any(seg.translated_text for seg in asr_data.segments):
                     logger.info("正在进行上屏短字幕校正...")
                 else:
@@ -808,26 +2515,196 @@ class SubtitleThread(QThread):
                 )
                 screen_editor = ScreenSubtitleEditor(
                     model=subtitle_config.llm_model,
+                    full_translation_model=(
+                        subtitle_config.screen_subtitle_full_translation_model
+                    ),
+                    allocation_review_model=(
+                        subtitle_config.screen_subtitle_allocation_review_model
+                    ),
                     target_language=subtitle_config.target_language,
                     batch_num=max(20, subtitle_config.batch_size),
                     thread_num=min(4, max(1, subtitle_config.thread_num)),
                     max_cjk_chars=subtitle_config.screen_subtitle_max_cjk,
                     max_english_words=subtitle_config.screen_subtitle_max_english,
                     enable_stable_mode=subtitle_config.screen_subtitle_stable_mode,
-                    enable_quality_check=(
-                        subtitle_config.need_screen_subtitle_quality_check
-                        and not subtitle_config.screen_subtitle_stable_mode
+                    enable_chinese_polish=subtitle_config.screen_subtitle_chinese_polish,
+                    preserve_aligned_timing=(
+                        self._timeline_alignment_backend()
+                        in {"whisperx", "whisperx-time-only"}
                     ),
-                    enable_safe_auto_repair=subtitle_config.screen_subtitle_safe_auto_repair,
                     allocation_max_concurrency=subtitle_config.screen_subtitle_allocation_max_concurrency,
                     allocation_batch_size=subtitle_config.screen_subtitle_allocation_batch_size,
+                    translation_request_budget=subtitle_config.screen_subtitle_translation_request_budget,
+                    translation_request_max_attempts=subtitle_config.screen_subtitle_translation_request_max_attempts,
                     article_context_prompt=article_translation_prompt,
+                    article_context_data=article_context,
                     coverage_report_path=coverage_report_path,
                     update_callback=self.callback,
+                    progress_callback=self._handle_screen_editor_progress,
                 )
-                asr_data = screen_editor.edit(asr_data, word_time_asr_data=word_time_asr_data)
-                self._record_stage_duration("screen_subtitle_edit", stage_started)
-                if screen_editor.has_blocking_validation_errors():
+                resumed_parent_data, resumed_artifact_dir = (
+                    self._load_resume_frozen_parent_checkpoint(
+                        screen_editor,
+                        article_output_dir,
+                    )
+                )
+                parent_checkpoint_resumed = resumed_parent_data is not None
+                if parent_checkpoint_resumed:
+                    asr_data = resumed_parent_data
+                    pre_timeline_blocked = False
+                    self._handle_screen_editor_progress(
+                        {
+                            "phase": "finalization",
+                            "completed": 1,
+                            "total": 1,
+                            "cache_hits": len(asr_data.segments),
+                            "resumed_stage": "frozen_parent_timeline",
+                        }
+                    )
+                else:
+                    asr_data = screen_editor.edit(
+                        asr_data,
+                        word_time_asr_data=word_time_asr_data,
+                    )
+                    article_asr_review_artifact = (
+                        self._prepare_article_asr_review_artifact(
+                            article_output_dir,
+                            asr_data,
+                            correction_ran=article_correction_ran,
+                        )
+                    )
+                    pre_timeline_blocked = (
+                        screen_editor.has_blocking_validation_errors()
+                    )
+                    frozen_word_ledger = screen_editor.export_frozen_word_ledger()
+                    if not frozen_word_ledger.has_data():
+                        raise RuntimeError(
+                            self.tr("最终时间轴构建失败：缺少冻结词级账本。")
+                        )
+                    try:
+                        timeline_stage_started = self._begin_stage(
+                            "whisperx_time_only_alignment",
+                            "最终词级时间轴对齐",
+                        )
+                        asr_data = self._apply_whisperx_time_only_if_enabled(
+                            asr_data,
+                            alignment_source=alignment_source_asr_data,
+                            word_ledger=frozen_word_ledger,
+                            screen_editor=screen_editor,
+                        )
+                        self._complete_stage(
+                            "whisperx_time_only_alignment",
+                            "最终词级时间轴对齐",
+                            timeline_stage_started,
+                        )
+                        # The alignment backend has finished. Any remaining
+                        # validation belongs to the still-running screen stage.
+                        self._active_stage = "screen_subtitle_edit"
+                        self._active_stage_started_at = stage_started
+                    except RuntimeError as exc:
+                        validation_summary = {
+                            "status": "ERROR",
+                            "errors": [
+                                {
+                                    "code": "whisperx_time_mapping_incomplete",
+                                    "message": str(exc),
+                                }
+                            ],
+                            "warnings": [],
+                            "info": [],
+                        }
+                        self._save_stable_subtitle_outputs(
+                            asr_data,
+                            subtitle_config,
+                            coverage_report_path=coverage_report_path,
+                            validation_status="failed",
+                            validation_summary=validation_summary,
+                            manifest_meta=self._screen_manifest_metadata(
+                                screen_editor
+                            ),
+                        )
+                        raise
+                    if self._timeline_alignment_backend() != "whisperx-time-only":
+                        asr_data = screen_editor.rebuild_final_cue_timeline(
+                            asr_data,
+                            frozen_word_ledger,
+                            alignment_backend=self._timeline_alignment_backend(),
+                        )
+                    asr_data = screen_editor.repair_after_final_time_alignment(
+                        asr_data,
+                        # Every backend now reaches the same frozen-ledger final
+                        # timeline. Later passes may alter Chinese only.
+                        preserve_aligned_timing=True,
+                        # A structurally blocked result needs only a frozen local
+                        # timeline for editing.
+                        allow_chinese_compression=not pre_timeline_blocked,
+                    )
+                    self._write_article_asr_review_artifact(
+                        coverage_report_path,
+                        article_asr_review_artifact,
+                    )
+                try:
+                    self._require_valid_final_timeline_before_display_pages(
+                        screen_editor
+                    )
+                except RuntimeError as exc:
+                    validation_summary = {
+                        "status": "ERROR",
+                        "errors": [
+                            {
+                                "code": "final_cue_timeline_invalid",
+                                "message": str(exc),
+                                "items": list(
+                                    (
+                                        getattr(
+                                            screen_editor,
+                                            "_final_cue_timeline",
+                                            {},
+                                        )
+                                        or {}
+                                    ).get("validation", {}).get("errors", [])
+                                    or []
+                                ),
+                            }
+                        ],
+                        "warnings": [],
+                        "info": [],
+                    }
+                    self._save_stable_subtitle_outputs(
+                        asr_data,
+                        subtitle_config,
+                        coverage_report_path=coverage_report_path,
+                        validation_status="failed",
+                        validation_summary=validation_summary,
+                        manifest_meta=self._screen_manifest_metadata(screen_editor),
+                    )
+                    raise
+                checkpoint_stage_started = self._begin_stage(
+                    "frozen_parent_timeline",
+                    "复用已冻结父字幕与时间轴"
+                    if parent_checkpoint_resumed
+                    else "保存已冻结父字幕与时间轴",
+                )
+                checkpoint_paths = self._frozen_parent_checkpoint_paths(
+                    coverage_report_path,
+                    artifact_dir=resumed_artifact_dir,
+                )
+                self._complete_stage(
+                    "frozen_parent_timeline",
+                    "已复用父字幕检查点"
+                    if parent_checkpoint_resumed
+                    else "父字幕检查点已保存",
+                    checkpoint_stage_started,
+                    artifact_paths=checkpoint_paths,
+                    details={
+                        "resumed": parent_checkpoint_resumed,
+                        "subtitle_count": len(asr_data.segments),
+                        "artifact_dir": str(checkpoint_paths[0].parent),
+                    },
+                )
+                self._active_stage = "screen_subtitle_edit"
+                self._active_stage_started_at = stage_started
+                if pre_timeline_blocked:
                     message = screen_editor.blocking_validation_message()
                     self._save_stable_subtitle_outputs(
                         asr_data,
@@ -846,16 +2723,59 @@ class SubtitleThread(QThread):
                         + message
                     )
                 try:
-                    asr_data = self._apply_whisperx_time_only_if_enabled(asr_data)
+                    page_stage_started = self._begin_stage(
+                        "display_page_translation",
+                        "双语分页语义分配",
+                    )
+                    asr_data = screen_editor.apply_display_page_translations_after_final_timing(
+                        asr_data
+                    )
+                    self._complete_stage(
+                        "display_page_translation",
+                        "双语分页语义分配",
+                        page_stage_started,
+                    )
+                    self._active_stage = "screen_subtitle_edit"
+                    self._active_stage_started_at = stage_started
                 except RuntimeError as exc:
+                    display_page_errors = list(
+                        getattr(exc, "display_page_errors", []) or []
+                    )
+                    try:
+                        # Parent Chinese and fixed IDs are already authoritative
+                        # here.  A renderer-page failure must not suppress the
+                        # higher-value English/Chinese review queue.
+                        audit_payload = self._run_translation_quality_audit(
+                            screen_editor,
+                            asr_data,
+                            coverage_report_path,
+                            allow_page_projection_failure=True,
+                        )
+                        self.__dict__["_translation_quality_audit"] = dict(
+                            audit_payload or {}
+                        )
+                        self.__dict__["_translation_quality_audit_path"] = (
+                            str(
+                                stable_artifact_dir(Path(coverage_report_path))
+                                / "translation-quality-audit.json"
+                            )
+                            if coverage_report_path
+                            else ""
+                        )
+                    except Exception as audit_exc:
+                        logger.warning(
+                            "Translation quality audit after page failure unavailable: %s",
+                            audit_exc,
+                        )
+                    issue = {
+                        "code": "display_page_translation_invalid",
+                        "message": str(exc),
+                    }
+                    if display_page_errors:
+                        issue["items"] = display_page_errors
                     validation_summary = {
                         "status": "ERROR",
-                        "errors": [
-                            {
-                                "code": "whisperx_time_mapping_incomplete",
-                                "message": str(exc),
-                            }
-                        ],
+                        "errors": [issue],
                         "warnings": [],
                         "info": [],
                     }
@@ -868,7 +2788,71 @@ class SubtitleThread(QThread):
                         manifest_meta=self._screen_manifest_metadata(screen_editor),
                     )
                     raise
-                asr_data = screen_editor.repair_after_final_time_alignment(asr_data)
+                audit_stage_started = self._begin_stage(
+                    "translation_quality_audit",
+                    "翻译质量审计",
+                )
+
+                def audit_progress(event: Dict) -> None:
+                    completed = event.get("completed")
+                    total = event.get("total")
+                    self._emit_stage_progress(
+                        "translation_quality_audit",
+                        "翻译质量审计",
+                        completed=(
+                            int(completed) if completed is not None else None
+                        ),
+                        total=int(total) if total is not None else None,
+                        cache_hits=int(event.get("cache_hits") or 0),
+                        retries=int(event.get("retries") or 0),
+                        details=dict(event),
+                    )
+
+                translation_audit = self._run_translation_quality_audit(
+                    screen_editor,
+                    asr_data,
+                    coverage_report_path,
+                    progress_callback=audit_progress,
+                )
+                self.__dict__["_translation_quality_audit"] = dict(
+                    translation_audit or {}
+                )
+                self.__dict__["_translation_quality_audit_path"] = (
+                    str(
+                        stable_artifact_dir(Path(coverage_report_path))
+                        / "translation-quality-audit.json"
+                    )
+                    if coverage_report_path
+                    else ""
+                )
+                self._complete_stage(
+                    "translation_quality_audit",
+                    "翻译质量审计",
+                    audit_stage_started,
+                    details={
+                        "status": str(
+                            translation_audit.get("status") or "UNKNOWN"
+                        ),
+                        "audited_subtitle_count": int(
+                            translation_audit.get("audited_subtitle_count") or 0
+                        ),
+                        "source_subtitle_count": int(
+                            translation_audit.get("source_subtitle_count") or 0
+                        ),
+                    },
+                )
+                if translation_audit.get("status") != "PASS":
+                    logger.warning(
+                        "Translation quality audit is %s (%s/%s); publishing the "
+                        "bound display result with an explicit warning.",
+                        translation_audit.get("status") or "UNKNOWN",
+                        translation_audit.get("audited_subtitle_count") or 0,
+                        translation_audit.get("source_subtitle_count") or 0,
+                    )
+                final_validation_summary = self._merge_translation_quality_audit_warning(
+                    screen_editor.last_validation_summary,
+                    translation_audit,
+                )
                 final_duration_errors = screen_editor._subtitle_duration_issues(
                     asr_data.segments,
                     "ERROR",
@@ -896,9 +2880,8 @@ class SubtitleThread(QThread):
                     raise RuntimeError(
                         self.tr("最终时间轴存在严重短字幕，已停止后续合成。")
                     )
-                if (
+                if self._stable_validation_summary_blocks_render(
                     screen_editor.last_validation_summary
-                    and screen_editor.last_validation_summary.get("status") == "ERROR"
                 ):
                     self._save_stable_subtitle_outputs(
                         asr_data,
@@ -912,6 +2895,12 @@ class SubtitleThread(QThread):
                         self.tr("字幕体检发现 ERROR，已停止后续合成。报告路径：")
                         + coverage_report_path
                     )
+                self._complete_stage(
+                    "screen_subtitle_edit",
+                    "上屏短字幕校正",
+                    stage_started,
+                    details={"subtitle_count": len(asr_data.segments)},
+                )
                 self.update_all.emit(asr_data.to_json())
                 self._save_stage_json(article_output_dir, "translated_subtitles.json", asr_data)
 
@@ -934,35 +2923,50 @@ class SubtitleThread(QThread):
                     logger.info(f"字幕保存到 {save_path}")
 
             # 6. 保存字幕
-            stage_started = time.perf_counter()
-            asr_data.save(
-                save_path=self.task.output_path,
-                ass_style=subtitle_config.subtitle_style,
-                layout=subtitle_config.subtitle_layout,
-            )
+            stage_started = self._begin_stage("final_subtitle_save", "写入稳定终稿")
+            if not subtitle_config.need_screen_subtitle_edit:
+                asr_data.save(
+                    save_path=self.task.output_path,
+                    ass_style=subtitle_config.subtitle_style,
+                    layout=subtitle_config.subtitle_layout,
+                )
             self._save_stage_json(article_output_dir, "final_subtitles.json", asr_data)
-            self._record_stage_duration("final_subtitle_save", stage_started)
             self._save_stable_subtitle_outputs(
                 asr_data,
                 subtitle_config,
                 coverage_report_path=coverage_report_path,
                 validation_status="passed",
                 validation_summary=(
-                    screen_editor.last_validation_summary
+                    final_validation_summary
                     if subtitle_config.need_screen_subtitle_edit
                     else None
                 ),
                 manifest_meta=self._screen_manifest_metadata(screen_editor),
             )
+            self._complete_stage(
+                "final_subtitle_save",
+                "写入稳定终稿",
+                stage_started,
+                artifact_paths=(
+                    article_output_dir / "final_subtitles.json",
+                    article_output_dir / "stable-final-manifest.json",
+                ),
+                details={"subtitle_count": len(asr_data.segments)},
+            )
             logger.info(f"字幕保存到 {self.task.output_path}")
 
             # 7. 文件移动与清理
             if self.task.need_next_task and self.task.video_path:
-                # 保存srt/ass文件到视频目录（对于全流程任务）
-                save_srt_path = (
-                    Path(self.task.video_path).parent
-                    / f"{Path(self.task.video_path).stem}.srt"
+                # 保留兼容 SRT，但与其他用户可见产物放在同一结果目录。
+                source_media = (
+                    getattr(self.task, "source_audio_path", None)
+                    or self.task.video_path
                 )
+                subtitle_dir = self._source_audio_subtitle_dir()
+                if subtitle_dir is None:
+                    subtitle_dir = media_result_subtitle_dir(source_media)
+                subtitle_dir.mkdir(parents=True, exist_ok=True)
+                save_srt_path = subtitle_dir / f"{Path(source_media).stem}.srt"
                 asr_data.to_srt(
                     save_path=str(save_srt_path), layout=subtitle_config.subtitle_layout
                 )
@@ -984,26 +2988,38 @@ class SubtitleThread(QThread):
                 if os.path.exists(split_path):
                     os.remove(split_path)
 
+            if self._run_state_store is not None:
+                self._run_state_store.complete_run()
+            self._last_progress_value = 100
             self.progress.emit(100, self.tr("优化完成"))
             logger.info("优化完成")
             self.finished.emit(self.task.video_path, self.task.output_path)
         except Exception as e:
             logger.exception(f"优化失败: {str(e)}")
+            self._fail_active_stage(str(e))
             self.error.emit(str(e))
-            self.progress.emit(100, self.tr("优化失败"))
+            self.progress.emit(self._last_progress_value, self.tr("优化失败"))
 
     def callback(self, result: Dict):
         self.finished_subtitle_length += len(result)
-        # 简单计算当前进度（0-100%）
-        progress = min(
-            int((self.finished_subtitle_length / self.subtitle_length) * 100), 100
+        stage = self._active_stage or "translate_subtitle"
+        labels = {
+            "optimize_subtitle": "优化字幕",
+            "translate_subtitle": "翻译字幕",
+            "screen_subtitle_edit": "上屏短字幕校正",
+        }
+        self._emit_stage_progress(
+            stage,
+            labels.get(stage, "处理字幕"),
+            completed=min(self.finished_subtitle_length, max(1, self.subtitle_length)),
+            total=max(1, self.subtitle_length),
         )
-        self.progress.emit(progress, self.tr("{0}% 处理字幕").format(progress))
         self.update.emit(result)
 
     def stop(self):
         """停止所有处理"""
         try:
+            self._fail_active_stage("user_cancelled", cancelled=True)
             # 先停止优化器
             if hasattr(self, "optimizer"):
                 try:
@@ -1018,8 +3034,8 @@ class SubtitleThread(QThread):
                 logger.warning("线程未能在3秒内正常停止")
 
             # 发送进度信号
-            self.progress.emit(100, self.tr("已终止"))
+            self.progress.emit(self._last_progress_value, self.tr("已终止"))
 
         except Exception as e:
             logger.error(f"停止线程时出错：{str(e)}")
-            self.progress.emit(100, self.tr("终止时发生错误"))
+            self.progress.emit(self._last_progress_value, self.tr("终止时发生错误"))

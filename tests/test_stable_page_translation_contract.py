@@ -1,0 +1,5255 @@
+import copy
+import hashlib
+import json
+import tempfile
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from PIL import Image, ImageDraw
+
+from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
+from app.core.subtitle_processor.screen_editor import (
+    DISPLAY_PAGE_TRANSLATION_PROMPT,
+    ScreenSubtitleEditor,
+    ScreenSubtitleItem,
+)
+from app.core.subtitle_processor.authoritative_parent_chinese import (
+    AuthoritativeParentChineseError,
+    bind_display_page_parent_records,
+    build_authoritative_parent_chinese_artifact,
+    parent_chinese_records_by_id,
+    validate_authoritative_parent_chinese_artifact,
+    validate_display_page_parent_records,
+)
+from app.core.subtitle_processor.stable_display_page_contract import (
+    DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION,
+    DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION,
+    DisplayPageContractError,
+    build_display_page_contract,
+    display_page_id,
+    page_translation_cache_key,
+    parent_chinese_by_id,
+    validate_page_translation_response,
+)
+from app.core.subtitle_processor.stable_pipeline_contracts import (
+    WORD_LEDGER_HASH_VERSION,
+    canonical_word_ledger_hash,
+)
+from app.core.subtitle_processor.manual_final_subtitle_editor import (
+    ManualFinalSubtitleSession,
+)
+from app.core.utils import podcast_learning_video
+
+
+FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "stable_pages"
+    / "page_translation_contract.json"
+)
+
+
+def _cases():
+    payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    return {case["case_id"]: case for case in payload["cases"]}
+
+
+def _timed_cue(case):
+    cue = podcast_learning_video.Cue(
+        int(case["subtitle_id"][1:]),
+        float(case["start"]),
+        float(case["end"]),
+        case["english"],
+        case["parent_chinese"],
+        "male",
+        subtitle_id=case["subtitle_id"],
+    )
+    words = cue.en.split()
+    duration = cue.end - cue.start
+    cue.word_timing = tuple(
+        {
+            "word_id": int(case["word_start"]) + index,
+            "surface": word,
+            "start": cue.start + duration * index / len(words),
+            "end": cue.start + duration * (index + 1) / len(words),
+        }
+        for index, word in enumerate(words)
+    )
+    return cue
+
+
+def _contract(case):
+    pages = [
+        {
+            "display_page_id": display_page_id(case["subtitle_id"], index),
+            "word_start": page["word_start"],
+            "word_end": page["word_end"],
+            "english": page["english"],
+        }
+        for index, page in enumerate(case["pages"], 1)
+    ]
+    return build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": case["subtitle_id"],
+                "english": case["english"],
+                "chinese": case["parent_chinese"],
+                "word_start": case["word_start"],
+                "word_end": case["word_end"],
+                "pages": pages,
+            }
+        ],
+        layout_profile={
+            "template": "article",
+            "english_font_size": 58,
+            "chinese_font_size": 48,
+        },
+    )
+
+
+def _response(case, *, reverse=False):
+    pages = [
+        {
+            "display_page_id": display_page_id(case["subtitle_id"], index),
+            "source_english": page["english"],
+            "zh": page["chinese"],
+        }
+        for index, page in enumerate(case["pages"], 1)
+    ]
+    if reverse:
+        pages.reverse()
+    return {"pages": pages}
+
+
+def test_article_visual_page_text_parent_chinese_flag_is_display_only():
+    cue = podcast_learning_video.Cue(
+        1,
+        0.0,
+        4.0,
+        "First frozen page. Second frozen page.",
+        "完整父句中文。",
+        "male",
+        subtitle_id="S0001",
+    )
+    cue.article_page_plan = {
+        "status": "ok",
+        "pages": [
+            {
+                "en": "First frozen page.",
+                "zh": "第一页中文。",
+                "start": 0.0,
+                "end": 2.0,
+            },
+            {
+                "en": "Second frozen page.",
+                "zh": "第二页中文。",
+                "start": 2.0,
+                "end": 4.0,
+            },
+        ],
+    }
+
+    with patch.object(
+        podcast_learning_video,
+        "PODCAST_ARTICLE_WHOLE_PARENT_CHINESE",
+        False,
+    ):
+        assert podcast_learning_video.article_visual_page_text(cue, 1.0) == (
+            "First frozen page.",
+            "第一页中文。",
+        )
+        assert podcast_learning_video.article_visual_page_text(cue, 3.0) == (
+            "Second frozen page.",
+            "第二页中文。",
+        )
+
+    with patch.object(
+        podcast_learning_video,
+        "PODCAST_ARTICLE_WHOLE_PARENT_CHINESE",
+        True,
+    ):
+        assert podcast_learning_video.article_visual_page_text(cue, 1.0) == (
+            "First frozen page.",
+            "完整父句中文。",
+        )
+        assert podcast_learning_video.article_visual_page_text(cue, 3.0) == (
+            "Second frozen page.",
+            "完整父句中文。",
+        )
+
+        cue.article_page_plan["pages"] = [cue.article_page_plan["pages"][0]]
+        assert podcast_learning_video.article_visual_page_text(cue, 1.0) == (
+            "First frozen page.",
+            "第一页中文。",
+        )
+
+
+def _error_codes(result):
+    return {
+        str(error.get("code") if isinstance(error, dict) else error)
+        for error in result.get("errors", [])
+    }
+
+
+def _immutable_parent_snapshot(cue):
+    return (
+        cue.subtitle_id,
+        cue.en,
+        cue.start,
+        cue.end,
+        cue.word_timing,
+    )
+
+
+def _assert_exact_page_identity(plan, case):
+    expected_ids = [
+        display_page_id(case["subtitle_id"], index)
+        for index in range(1, len(case["pages"]) + 1)
+    ]
+    assert [page["display_page_id"] for page in plan["pages"]] == expected_ids
+    assert all(page_id != "S0000" for page_id in expected_ids)
+    assert " ".join(page["en"] for page in plan["pages"]) == case["english"]
+
+
+def _page_translations(artifact):
+    return {
+        page["display_page_id"]: page["zh"]
+        for parent in artifact["parents"]
+        for page in parent["pages"]
+    }
+
+
+def _word_entries_for_segments(segments):
+    entries = []
+    for segment in segments:
+        words = segment.text.split()
+        duration = segment.end_time - segment.start_time
+        for index, word in enumerate(words):
+            entries.append(
+                {
+                    "token": ScreenSubtitleEditor._word_tokens(word)[0],
+                    "surface": word,
+                    "start_time": segment.start_time + duration * index // len(words),
+                    "end_time": segment.start_time + duration * (index + 1) // len(words),
+                }
+            )
+    return entries
+
+
+def _syntax_backed_page_cue(text, subtitle_id="S0001", *, seconds_per_word=0.32):
+    words = text.split()
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.max_english_words = 16
+    editor._active_word_entries = [
+        {
+            "token": ScreenSubtitleEditor._word_tokens(word)[0],
+            "surface": word,
+            "start_time": round(index * seconds_per_word * 1000),
+            "end_time": round((index * seconds_per_word + 0.24) * 1000),
+            "alignment_source": "fixture",
+        }
+        for index, word in enumerate(words)
+    ]
+    editor._active_source_word_spans = {1: (0, len(words) - 1)}
+    editor._syntax_protected_cuts = set()
+    editor._syntax_hard_cut_issues = {}
+    editor._syntax_soft_cut_issues = {}
+    editor._orphaned_finite_predicate_cache = {}
+    editor._syntax_nlp = None
+    editor._prepare_syntax_cut_hints()
+    cue = podcast_learning_video.Cue(
+        int(subtitle_id[1:]),
+        0.0,
+        len(words) * seconds_per_word,
+        text,
+        "测试字幕。",
+        "male",
+        subtitle_id=subtitle_id,
+        word_timing=tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * seconds_per_word,
+                "end": index * seconds_per_word + 0.24,
+            }
+            for index, word in enumerate(words)
+        ),
+        display_boundary_evidence=editor._display_boundary_evidence_for_span(
+            0, len(words) - 1
+        ),
+    )
+    return editor, cue
+
+
+def _assert_preflight_fails_before_ffmpeg(cues, subtitle_path):
+    with patch.object(podcast_learning_video.subprocess, "Popen") as popen:
+        try:
+            podcast_learning_video.prepare_article_visual_page_plans(cues, subtitle_path)
+        except podcast_learning_video.RenderStructuralOverflowError as exc:
+            assert any(
+                error.get("reason")
+                in {
+                    "missing_or_invalid_display_page_translations",
+                    "missing_or_invalid_display_page_translation_artifact",
+                }
+                for error in exc.errors
+            )
+        else:
+            raise AssertionError("invalid page artifact must fail renderer preflight")
+    assert not popen.called
+
+
+def _srt_timestamp_from_ms(value):
+    milliseconds = int(value)
+    hours, milliseconds = divmod(milliseconds, 3_600_000)
+    minutes, milliseconds = divmod(milliseconds, 60_000)
+    seconds, milliseconds = divmod(milliseconds, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def _write_persisted_manual_draft_package(root, case):
+    subtitle_path = root / "manual-final.srt"
+    artifact_dir = root / "manual-final-artifacts"
+    artifact_dir.mkdir()
+    timeline_path = artifact_dir / "final-cue-timeline.json"
+    ledger_path = artifact_dir / "word-ledger.json"
+    draft_artifact_path = artifact_dir / "manual-draft-page-plan.json"
+    manifest_path = root / "stable-final-manifest.json"
+    start_ms = round(float(case["start"]) * 1000)
+    end_ms = round(float(case["end"]) * 1000)
+    words = case["english"].split()
+    chinese = str(case["parent_chinese"])
+    subtitle_path.write_text(
+        "1\n"
+        f"{_srt_timestamp_from_ms(start_ms)} --> {_srt_timestamp_from_ms(end_ms)}\n"
+        f"{case['english']}\n{chinese}\n",
+        encoding="utf-8",
+    )
+    timeline_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "records": [
+                    {
+                        "subtitle_id": case["subtitle_id"],
+                        "word_start": 0,
+                        "word_end": len(words) - 1,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "original": case["english"],
+                        "translated": chinese,
+                    }
+                ],
+                "validation": {"status": "PASS", "errors": []},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    duration = end_ms - start_ms
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {
+                        "surface": word,
+                        "start_ms": start_ms + duration * index // len(words),
+                        "end_ms": start_ms + duration * (index + 1) // len(words),
+                    }
+                    for index, word in enumerate(words)
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "schema_version": 2,
+        "render_blocked": True,
+        "validation_error_codes": ["manual_page_translation_required"],
+        "paths": {"original_top_srt": str(subtitle_path)},
+        "paths_sha256": {
+            "original_top_srt": hashlib.sha256(
+                subtitle_path.read_bytes()
+            ).hexdigest()
+        },
+        "final_cue_timeline_path": str(timeline_path),
+        "final_cue_timeline_sha256": hashlib.sha256(
+            timeline_path.read_bytes()
+        ).hexdigest(),
+        "word_ledger_path": str(ledger_path),
+        "word_ledger_sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    source_cues = podcast_learning_video.parse_srt(subtitle_path)
+    assert podcast_learning_video.attach_article_word_timing(
+        source_cues,
+        subtitle_path,
+    )
+    blueprint = podcast_learning_video.build_article_display_page_blueprint(
+        source_cues
+    )
+    frozen_render_plans = blueprint["render_plans"]
+    frozen_plan = frozen_render_plans[0]
+    manual_draft_chinese_pages = (
+        "我是说，如果你能把一种能力很强、",
+        "优化程度很高的人工智能，融入经济的每个领域，包括制造业、农业、",
+        "本地服务业，而且不需要一个5000亿美元的数据中心来运行它。",
+    )
+    assert len(frozen_plan["pages"]) == len(manual_draft_chinese_pages)
+    assert "".join(manual_draft_chinese_pages) == chinese
+    semantic_page_translations = {
+        page["display_page_id"]: {
+            "parent_subtitle_id": frozen_plan["parent_subtitle_id"],
+            "word_start": page["word_start"],
+            "word_end": page["word_end"],
+            "english": page["english"],
+            "chinese": page_chinese,
+        }
+        for page, page_chinese in zip(
+            frozen_plan["pages"],
+            manual_draft_chinese_pages,
+        )
+    }
+    draft_artifact = (
+        podcast_learning_video.build_article_manual_draft_page_artifact(
+            source_cues,
+            frozen_render_plans=frozen_render_plans,
+            semantic_page_translations=semantic_page_translations,
+        )
+    )
+    assert draft_artifact["status"] == "REVIEW"
+    draft_artifact_path.write_text(
+        json.dumps(draft_artifact, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    draft_artifact_sha256 = hashlib.sha256(
+        draft_artifact_path.read_bytes()
+    ).hexdigest()
+    manifest.update(
+        {
+            "manual_draft_page_plan_path": str(draft_artifact_path),
+            "manual_draft_page_plan_sha256": draft_artifact_sha256,
+            "manual_final_override": {
+                "schema_version": 2,
+                "subtitle_path": str(subtitle_path),
+                "subtitle_sha256": hashlib.sha256(
+                    subtitle_path.read_bytes()
+                ).hexdigest(),
+                "artifact_dir": str(artifact_dir),
+                "manual_draft_page_plan_path": str(draft_artifact_path),
+                "manual_draft_page_plan_sha256": draft_artifact_sha256,
+            },
+        }
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return {
+        "subtitle_path": subtitle_path,
+        "manifest_path": manifest_path,
+        "draft_artifact_path": draft_artifact_path,
+        "draft_artifact": draft_artifact,
+    }
+
+
+def test_s0078_reordered_chinese_is_bound_by_page_id():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    artifact = validate_page_translation_response(
+        contract,
+        _response(case, reverse=True),
+    )
+
+    expected_aggregate = "".join(page["chinese"] for page in case["pages"])
+    assert artifact["status"] == "PASS"
+    assert artifact["errors"] == []
+    assert artifact["parents"][0]["aggregate_chinese"] == expected_aggregate
+    assert parent_chinese_by_id(artifact) == {
+        case["subtitle_id"]: case["parent_chinese"]
+    }
+    translations = _page_translations(artifact)
+    page_ids = [display_page_id(case["subtitle_id"], index) for index in (1, 2)]
+    first = translations[page_ids[0]]
+    second = translations[page_ids[1]]
+    assert "推出" in first and "模型" in first
+    assert "投入" not in first and "算力" not in first
+    assert "投入" in second and "算力" in second
+    assert all(anchor in second for anchor in ("大量资金", "刻意降低", "算力总需求", "技术"))
+    assert "推出" not in second
+
+
+def test_s0252_monotonic_translation_remains_page_aligned():
+    case = _cases()["s0252_monotonic_chinese"]
+    contract = _contract(case)
+    artifact = validate_page_translation_response(
+        contract,
+        _response(case, reverse=True),
+    )
+
+    assert artifact["status"] == "PASS"
+    translations = _page_translations(artifact)
+    ordered = [
+        translations[display_page_id(case["subtitle_id"], index)]
+        for index in range(1, 4)
+    ]
+    assert ordered == [page["chinese"] for page in case["pages"]]
+    assert "人工智能" in ordered[0] and "制造业" not in ordered[0]
+    assert all(anchor in ordered[1] for anchor in ("制造业", "农业", "本地服务业"))
+    assert "数据中心" not in ordered[1]
+    assert "5000亿美元" in ordered[2] and "数据中心" in ordered[2]
+
+
+def test_page_translation_rejects_missing_duplicate_and_unknown_page_ids():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    page_1 = display_page_id(case["subtitle_id"], 1)
+    page_2 = display_page_id(case["subtitle_id"], 2)
+    invalid_cases = [
+        (
+            {"pages": [{"display_page_id": page_1, "zh": "第一页"}]},
+            {"page_translation_id_missing", "page_translation_cardinality_mismatch"},
+        ),
+        (
+            {
+                "pages": [
+                    {"display_page_id": page_1, "zh": "第一页"},
+                    {"display_page_id": page_1, "zh": "重复页"},
+                    {"display_page_id": page_2, "zh": "第二页"},
+                ]
+            },
+            {"page_translation_id_duplicate", "page_translation_cardinality_mismatch"},
+        ),
+        (
+            {
+                "pages": [
+                    {"display_page_id": page_1, "zh": "第一页"},
+                    {"display_page_id": "S9999.P01", "zh": "未知页"},
+                ]
+            },
+            {
+                "page_translation_id_unknown",
+                "page_translation_id_missing",
+            },
+        ),
+        (
+            {
+                "pages": [
+                    {"display_page_id": "", "zh": "无标识页"},
+                    {"display_page_id": page_2, "zh": "第二页"},
+                ]
+            },
+            {"page_translation_id_missing", "page_translation_cardinality_mismatch"},
+        ),
+    ]
+
+    for response, expected_codes in invalid_cases:
+        artifact = validate_page_translation_response(contract, response)
+        assert artifact["status"] == "ERROR"
+        assert artifact["parents"] == []
+        assert expected_codes <= _error_codes(artifact)
+        try:
+            parent_chinese_by_id(artifact)
+        except DisplayPageContractError as exc:
+            assert exc.code == "page_translation_artifact_invalid"
+        else:
+            raise AssertionError("invalid page rows must not partially update parents")
+
+
+def test_missing_page_retains_other_complete_parent_for_scoped_retry():
+    first = _cases()["s0078_reordered_chinese"]
+    second = _cases()["s0252_monotonic_chinese"]
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": case["subtitle_id"],
+                "english": case["english"],
+                "chinese": case["parent_chinese"],
+                "word_start": case["word_start"],
+                "word_end": case["word_end"],
+                "pages": [
+                    {
+                        "display_page_id": display_page_id(
+                            case["subtitle_id"], index
+                        ),
+                        "word_start": page["word_start"],
+                        "word_end": page["word_end"],
+                        "english": page["english"],
+                    }
+                    for index, page in enumerate(case["pages"], 1)
+                ],
+            }
+            for case in (first, second)
+        ],
+        layout_profile={"template": "article"},
+    )
+    response = _response(second)
+
+    artifact = validate_page_translation_response(
+        contract,
+        response,
+        require_source_echo=True,
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert [
+        parent["parent_subtitle_id"] for parent in artifact["parents"]
+    ] == [second["subtitle_id"]]
+    assert {
+        page_id
+        for error in artifact["errors"]
+        if error.get("code") == "page_translation_id_missing"
+        for page_id in error.get("ids") or []
+    } == {
+        display_page_id(first["subtitle_id"], index)
+        for index in range(1, len(first["pages"]) + 1)
+    }
+    try:
+        parent_chinese_by_id(artifact)
+    except DisplayPageContractError as exc:
+        assert exc.code == "page_translation_artifact_invalid"
+    else:
+        raise AssertionError("partial parents remain review-only until full validation")
+
+
+def test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages():
+    parents = [
+        {
+            "parent_subtitle_id": "S0001",
+            "english": "A valid parent",
+            "chinese": "甲乙",
+            "word_start": 0,
+            "word_end": 2,
+            "pages": [
+                {
+                    "display_page_id": "S0001.P01",
+                    "word_start": 0,
+                    "word_end": 0,
+                    "english": "A",
+                },
+                {
+                    "display_page_id": "S0001.P02",
+                    "word_start": 1,
+                    "word_end": 2,
+                    "english": "valid parent",
+                },
+            ],
+        },
+        {
+            "parent_subtitle_id": "S0002",
+            "english": "Students return",
+            "chinese": "留学生",
+            "word_start": 3,
+            "word_end": 4,
+            "pages": [
+                {
+                    "display_page_id": "S0002.P01",
+                    "word_start": 3,
+                    "word_end": 3,
+                    "english": "Students",
+                },
+                {
+                    "display_page_id": "S0002.P02",
+                    "word_start": 4,
+                    "word_end": 4,
+                    "english": "return",
+                },
+            ],
+        },
+    ]
+    render_plans = [
+        {
+            "parent_subtitle_id": parent["parent_subtitle_id"],
+            "english": parent["english"],
+            "chinese": parent["chinese"],
+            "word_start": parent["word_start"],
+            "word_end": parent["word_end"],
+            "english_font_size": 56,
+            "pages": [
+                {
+                    **dict(page),
+                    "start_ms": int(page["word_start"]) * 1000,
+                    "end_ms": (int(page["word_end"]) + 1) * 1000,
+                    "english_lines": [str(page["english"])],
+                    "english_font_size": 56,
+                    "english_width": 100,
+                }
+                for page in parent["pages"]
+            ],
+        }
+        for parent in parents
+    ]
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        render_plans=render_plans,
+    )
+    response = {
+        "pages": [
+            {"display_page_id": "S0001.P01", "zh": "甲"},
+            {"display_page_id": "S0001.P02", "zh": "乙"},
+            {"display_page_id": "S0002.P01", "zh": "留"},
+            {"display_page_id": "S0002.P02", "zh": "学生"},
+        ]
+    }
+
+    def boundaries(text, **_kwargs):
+        return {1, 2} if text == "甲乙" else {3}
+
+    with patch(
+        "app.core.subtitle_processor.stable_display_page_contract.chinese_token_boundaries",
+        side_effect=boundaries,
+    ):
+        artifact = validate_page_translation_response(contract, response)
+
+    assert artifact["status"] == "ERROR"
+    assert artifact["render_plans"] == contract["render_plans"]
+    assert [parent["parent_subtitle_id"] for parent in artifact["parents"]] == [
+        "S0001"
+    ]
+    assert artifact["parents"][0]["aggregate_chinese"] == "甲乙"
+    assert artifact["errors"] == [
+        {
+            "code": "page_translation_chinese_token_split",
+            "parent_subtitle_id": "S0002",
+            "display_page_id": "S0002.P01",
+            "boundary_offset": 1,
+            "split_token": "留学生",
+        }
+    ]
+
+
+def test_hmm_only_function_word_join_is_not_a_page_token_split():
+    parent_chinese = (
+        "但合法重组庞大供应链、变更官方原产国以降低关税负担，"
+        "是公认的商业做法。"
+    )
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0003",
+                "english": (
+                    "Legally restructuring supply chains changes origin "
+                    "and reduces tariff liability"
+                ),
+                "chinese": parent_chinese,
+                "word_start": 0,
+                "word_end": 8,
+                "pages": [
+                    {
+                        "display_page_id": "S0003.P01",
+                        "word_start": 0,
+                        "word_end": 4,
+                        "english": "Legally restructuring supply chains changes",
+                    },
+                    {
+                        "display_page_id": "S0003.P02",
+                        "word_start": 5,
+                        "word_end": 8,
+                        "english": "origin and reduces tariff liability",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article"},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0003.P01",
+                    "zh": "但合法重组庞大供应链、变更官方原产国",
+                },
+                {
+                    "display_page_id": "S0003.P02",
+                    "zh": "以降低关税负担，是公认的商业做法。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_source_owned_name_plus_one_grammar_character_is_not_added_meaning():
+    parent_chinese = (
+        "原文称，纳瓦罗没搞懂全球贸易传统规则的复杂成因，就急着拆掉。"
+    )
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0004",
+                "english": (
+                    "Navarro is trying to tear down traditional trade rules "
+                    "without understanding why they exist"
+                ),
+                "chinese": parent_chinese,
+                "word_start": 0,
+                "word_end": 12,
+                "pages": [
+                    {
+                        "display_page_id": "S0004.P01",
+                        "word_start": 0,
+                        "word_end": 6,
+                        "english": (
+                            "Navarro is trying to tear down traditional trade rules"
+                        ),
+                    },
+                    {
+                        "display_page_id": "S0004.P02",
+                        "word_start": 7,
+                        "word_end": 12,
+                        "english": "without understanding why they exist",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article"},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0004.P01",
+                    "zh": "原文称，纳瓦罗正急着拆掉全球贸易传统规则，",
+                },
+                {
+                    "display_page_id": "S0004.P02",
+                    "zh": "却没搞懂这些规则的复杂成因。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_source_owned_name_does_not_hide_new_multi_character_meaning():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0005",
+                "english": "Navarro does not understand the rules",
+                "chinese": "纳瓦罗没搞懂这些规则。",
+                "word_start": 0,
+                "word_end": 5,
+                "pages": [
+                    {
+                        "display_page_id": "S0005.P01",
+                        "word_start": 0,
+                        "word_end": 2,
+                        "english": "Navarro does not",
+                    },
+                    {
+                        "display_page_id": "S0005.P02",
+                        "word_start": 3,
+                        "word_end": 5,
+                        "english": "understand the rules",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article"},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0005.P01", "zh": "纳瓦罗操纵这些规则，"},
+                {"display_page_id": "S0005.P02", "zh": "却没搞懂。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_parent_meaning_added"
+        and "操纵" in (error.get("added_tokens") or [])
+        for error in artifact["errors"]
+    )
+
+
+def test_page_translation_retry_contract_contains_only_failed_parent_pages():
+    parents = [
+        {
+            "parent_subtitle_id": "S0186",
+            "english": "A valid parent with two pages",
+            "chinese": "有效父字幕",
+            "word_start": 0,
+            "word_end": 5,
+            "pages": [
+                {
+                    "display_page_id": "S0186.P01",
+                    "word_start": 0,
+                    "word_end": 2,
+                    "english": "A valid parent",
+                },
+                {
+                    "display_page_id": "S0186.P02",
+                    "word_start": 3,
+                    "word_end": 5,
+                    "english": "with two pages",
+                },
+            ],
+        },
+        {
+            "parent_subtitle_id": "S0187",
+            "english": "back from policy changes to the shift within you",
+            "chinese": "从宏观政策巨变，拉回到作为个体的你内心的心理转变。",
+            "word_start": 6,
+            "word_end": 14,
+            "pages": [
+                {
+                    "display_page_id": "S0187.P01",
+                    "word_start": 6,
+                    "word_end": 9,
+                    "english": "back from policy changes",
+                },
+                {
+                    "display_page_id": "S0187.P02",
+                    "word_start": 10,
+                    "word_end": 14,
+                    "english": "to the shift within you",
+                },
+            ],
+        },
+    ]
+    render_plans = []
+    for parent in parents:
+        render_plans.append(
+            {
+                "parent_subtitle_id": parent["parent_subtitle_id"],
+                "english": parent["english"],
+                "chinese": parent["chinese"],
+                "word_start": parent["word_start"],
+                "word_end": parent["word_end"],
+                "english_font_size": 56,
+                "pages": [
+                    {
+                        **dict(page),
+                        "start_ms": int(page["word_start"]) * 1000,
+                        "end_ms": (int(page["word_end"]) + 1) * 1000,
+                        "english_lines": [page["english"]],
+                        "english_font_size": 56,
+                        "english_width": 100,
+                    }
+                    for page in parent["pages"]
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        render_plans=render_plans,
+    )
+
+    retry_contract = ScreenSubtitleEditor._display_page_retry_contract(
+        contract,
+        [
+            {
+                "code": "page_translation_chinese_token_split",
+                "parent_subtitle_id": "S0187",
+                "display_page_id": "S0187.P01",
+            }
+        ],
+    )
+
+    assert [
+        parent["parent_subtitle_id"] for parent in retry_contract["parents"]
+    ] == ["S0187"]
+    assert [
+        plan["parent_subtitle_id"] for plan in retry_contract["render_plans"]
+    ] == ["S0187"]
+    assert [
+        page["display_page_id"]
+        for page in retry_contract["parents"][0]["pages"]
+    ] == ["S0187.P01", "S0187.P02"]
+
+    baseline = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0186.P01",
+                    "source_english": "A valid parent",
+                    "zh": "有效",
+                },
+                {
+                    "display_page_id": "S0186.P02",
+                    "source_english": "with two pages",
+                    "zh": "父字幕",
+                },
+                {
+                    "display_page_id": "S0187.P01",
+                    "source_english": "back from policy changes",
+                    "zh": "从宏观政策巨变，拉回",
+                },
+                {
+                    "display_page_id": "S0187.P02",
+                    "source_english": "to the shift within you",
+                    "zh": "到作为个体的你内心的心理转变。",
+                },
+            ]
+        },
+        require_source_echo=True,
+    )
+    assert baseline["status"] == "ERROR"
+    assert [parent["parent_subtitle_id"] for parent in baseline["parents"]] == [
+        "S0186"
+    ]
+    retry_artifact = validate_page_translation_response(
+        retry_contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0187.P01",
+                    "source_english": "back from policy changes",
+                    "zh": "从宏观政策巨变",
+                },
+                {
+                    "display_page_id": "S0187.P02",
+                    "source_english": "to the shift within you",
+                    "zh": "拉回到作为个体的你内心的心理转变。",
+                },
+            ]
+        },
+        require_source_echo=True,
+    )
+    assert retry_artifact["status"] == "PASS"
+
+    merged = ScreenSubtitleEditor._merge_display_page_translation_artifacts(
+        contract,
+        baseline,
+        retry_artifact,
+    )
+
+    assert merged["status"] == "PASS"
+    assert (
+        merged["parents"][1]["aggregate_chinese"]
+        == "从宏观政策巨变拉回到作为个体的你内心的心理转变。"
+    )
+    assert parent_chinese_by_id(merged) == {
+        "S0186": "有效父字幕",
+        "S0187": "从宏观政策巨变，拉回到作为个体的你内心的心理转变。",
+    }
+
+    final_errors = ScreenSubtitleEditor._final_display_page_retry_errors(
+        merged,
+        [],
+        [
+            {
+                "code": "page_translation_parent_meaning_added",
+                "parent_subtitle_id": "S0187",
+            }
+        ],
+    )
+    assert final_errors == []
+
+
+def test_structural_page_response_retries_only_identifiable_missing_parent():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": case["subtitle_id"],
+                "english": case["english"],
+                "chinese": case["parent_chinese"],
+                "word_start": case["word_start"],
+                "word_end": case["word_end"],
+                "pages": [
+                    {
+                        "display_page_id": display_page_id(case["subtitle_id"], index),
+                        "word_start": page["word_start"],
+                        "word_end": page["word_end"],
+                        "english": page["english"],
+                    }
+                    for index, page in enumerate(case["pages"], 1)
+                ],
+            },
+            {
+                "parent_subtitle_id": "S0187",
+                "english": "A second parent",
+                "chinese": "第二条父字幕",
+                "word_start": 20,
+                "word_end": 22,
+                "pages": [
+                    {
+                        "display_page_id": "S0187.P01",
+                        "word_start": 20,
+                        "word_end": 20,
+                        "english": "A",
+                    },
+                    {
+                        "display_page_id": "S0187.P02",
+                        "word_start": 21,
+                        "word_end": 22,
+                        "english": "second parent",
+                    },
+                ],
+            },
+        ],
+        layout_profile={"template": "article"},
+    )
+    structural_errors = [
+        {
+            "code": "page_translation_id_missing",
+            "ids": [f"{case['subtitle_id']}.P02"],
+        },
+        {"code": "page_translation_cardinality_mismatch"},
+    ]
+    full_retry = ScreenSubtitleEditor._display_page_errors_require_full_retry(
+        structural_errors
+    )
+    assert not full_retry
+    retry = (
+        contract
+        if full_retry
+        else ScreenSubtitleEditor._display_page_retry_contract(
+            contract, structural_errors
+        )
+    )
+    assert [parent["parent_subtitle_id"] for parent in retry["parents"]] == [
+        case["subtitle_id"],
+    ]
+
+    assert ScreenSubtitleEditor._display_page_errors_require_full_retry(
+        [{"code": "page_translation_cardinality_mismatch"}]
+    )
+    assert ScreenSubtitleEditor._display_page_errors_require_full_retry(
+        [
+            {
+                "code": "page_translation_id_unknown",
+                "ids": ["S9999.P01"],
+            }
+        ]
+    )
+
+
+def test_page_translation_cache_key_invalidates_semantic_page_contract_changes():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+
+    def key(value, prompt="display-page-translation-v1", algorithm="page-id-v1"):
+        return page_translation_cache_key(
+            value,
+            model="deepseek-v4-flash",
+            target_language="简体中文",
+            prompt_version=prompt,
+            algorithm_version=algorithm,
+        )
+
+    assert key(contract) == key(copy.deepcopy(contract))
+
+    changed_boundary = copy.deepcopy(contract)
+    changed_boundary["parents"][0]["pages"][0]["word_end"] -= 1
+    changed_boundary["parents"][0]["pages"][1]["word_start"] -= 1
+    assert key(contract) != key(changed_boundary)
+
+    changed_parent_chinese = copy.deepcopy(contract)
+    changed_parent_chinese["parents"][0]["source_chinese"] += "补充"
+    assert key(contract) != key(changed_parent_chinese)
+    assert key(contract) != key(contract, prompt="display-page-translation-v2")
+    assert key(contract) != key(contract, algorithm="page-id-v2")
+
+    changed_timing = copy.deepcopy(contract)
+    for page in changed_timing["parents"][0]["pages"]:
+        page["start_ms"] = 100
+        page["end_ms"] = 200
+    assert key(contract) != key(changed_timing)
+
+    changed_planner = copy.deepcopy(contract)
+    changed_planner["planner_version"] = "article-fixed-font-pages-next"
+    assert key(contract) != key(changed_planner)
+
+
+def test_page_contract_and_cache_identity_include_frozen_font_and_boundary_evidence():
+    case = _cases()["s0078_reordered_chinese"]
+    cue = _timed_cue(case)
+    cue.display_boundary_evidence = {
+        str(case["pages"][1]["word_start"]): {
+            "hard_issues": [],
+            "soft_issues": ["dependency_phrase_entrance_split"],
+            "boundary_score": 12.0,
+            "pause_ms": 120,
+        }
+    }
+    blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+
+    def build(render_plans):
+        return build_display_page_contract(
+            blueprint["parents"],
+            layout_profile=blueprint["layout_profile"],
+            planner_version=blueprint["planner_version"],
+            render_plans=render_plans,
+        )
+
+    def key(contract):
+        return page_translation_cache_key(
+            contract,
+            model="test-model",
+            target_language="简体中文",
+            prompt_version="display-page-translation-v2",
+            algorithm_version="fixed-parent-page-allocation-v3",
+        )
+
+    baseline = build(blueprint["render_plans"])
+    changed_font_plans = copy.deepcopy(blueprint["render_plans"])
+    changed_font_plans[0]["english_font_size"] = 54
+    changed_font_plans[0]["font_fallback"] = {
+        "used": True,
+        "from": 56,
+        "to": 54,
+        "reason": "test",
+    }
+    for page in changed_font_plans[0]["pages"]:
+        page["english_font_size"] = 54
+    changed_boundary_plans = copy.deepcopy(blueprint["render_plans"])
+    changed_boundary_plans[0]["pages"][1]["boundary_before"] = {
+        "classification": "hard",
+        "confidence": "high",
+        "issue_codes": ["test_atomic_boundary"],
+    }
+
+    changed_font = build(changed_font_plans)
+    changed_boundary = build(changed_boundary_plans)
+
+    assert baseline["contract_hash"] != changed_font["contract_hash"]
+    assert baseline["contract_hash"] != changed_boundary["contract_hash"]
+    assert key(baseline) != key(changed_font)
+    assert key(baseline) != key(changed_boundary)
+
+
+def test_article_english_font_fallback_has_a_52px_automatic_floor():
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_FALLBACK_SIZES == (
+        56,
+        54,
+        52,
+    )
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_EMERGENCY_FALLBACK_SIZES == ()
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_LEGACY_FALLBACK_SIZES == (50,)
+    assert (
+        podcast_learning_video.ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
+        == (56, 54, 52, 50)
+    )
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_NORMAL_MIN_SIZE == 52
+    assert podcast_learning_video.ARTICLE_SUBTITLE_EN_MIN_SIZE == 50
+
+
+def test_screenshot_page_boundaries_consume_frozen_boundary_evidence():
+    cases = [
+        (
+            "They're diverting those funds toward getting better results from accessible, some to much older hardware.",
+            "results",
+            "from",
+        ),
+        (
+            "like write text or play chess, but can reason through completely novel problems across any discipline.",
+            "reason",
+            "through",
+        ),
+        (
+            "But I'm looking at these sources, and they're arguing that being cut off from the most sophisticated chip-making gear is actually forcing these companies to become better engineers.",
+            "they're",
+            "arguing",
+        ),
+        (
+            "And achieving that level of universal, human-like reasoning across every domain requires an almost infinite amount of computing power.",
+            "every",
+            "domain",
+        ),
+        (
+            "You can't spend billions building an AGI model and expect to charge them a massive premium to use it.",
+            "expect",
+            "to",
+        ),
+        (
+            "You have to build something highly efficient that delivers an immediate, undeniable, and cheap return on investment.",
+            "immediate,",
+            "undeniable,",
+        ),
+        (
+            "We've actually seen reports in these sources that highly demanded AI services from Zipu AI,",
+            "reports",
+            "in",
+        ),
+        (
+            "Because the global market, which initially rewarded America's tech giants with higher share prices for these aggressive AI spending plans, they're suddenly looking across the Pacific.",
+            "share",
+            "prices",
+        ),
+        (
+            "relying on far less computing power, and completely avoiding these massive capital sinkholes.",
+            "and",
+            "completely",
+        ),
+        (
+            "I mean, Chinese tech titans are projected to invest less than a tenth of that amount in data centers by 2026.",
+            "invest",
+            "less",
+        ),
+    ]
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    for case_index, (text, left_word, right_word) in enumerate(cases, 1):
+        words = text.split()
+        split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == left_word and words[index] == right_word
+        )
+        cue = podcast_learning_video.Cue(
+            case_index,
+            0.0,
+            max(4.0, len(words) * 0.35),
+            text,
+            "测试字幕。",
+            "male",
+            subtitle_id=f"S{case_index:04d}",
+        )
+        cue.word_timing = tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * 0.3,
+                "end": index * 0.3 + 0.22,
+            }
+            for index, word in enumerate(words)
+        )
+        cue.display_boundary_evidence = {
+            str(split): {
+                "hard_issues": ["test_atomic_boundary"],
+                "soft_issues": [],
+                "boundary_score": 0.0,
+                "pause_ms": 80,
+            }
+        }
+
+        plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+        assert plan["status"] == "ok", text
+        assert split not in {page["word_start"] for page in plan["pages"][1:]}, text
+
+
+def test_real_syntax_evidence_steers_results_from_without_injected_fixture_issue():
+    text = (
+        "They're diverting those funds toward getting better results from "
+        "accessible, some to much older hardware."
+    )
+    editor, cue = _syntax_backed_page_cue(text, "S0066")
+    words = text.split()
+    split = words.index("from")
+    evaluation = editor._evaluate_stable_cut_boundary(split - 1, split)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert "dependency_phrase_entrance_split" in evaluation["soft_issues"]
+    assert plan["status"] == "ok"
+    assert split not in {page["word_start"] for page in plan["pages"][1:]}
+    assert words.index("some") in {
+        page["word_start"] for page in plan["pages"][1:]
+    }
+
+
+def test_medium_review_page_boundary_can_beat_static_font_reduction_on_quality():
+    text = (
+        "We've actually seen reports in these sources that highly demanded AI "
+        "services from Zipu AI,"
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0221")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 2
+    assert plan["font_size"]["english"] == 56
+    assert plan["font_fallback"] == {"used": False}
+    assert plan["pages"][1]["boundary_before"]["classification"] == "review"
+    assert plan["pages"][1]["boundary_before"]["confidence"] == "medium"
+    assert " ".join(page["en"] for page in plan["pages"]) == text
+
+
+def test_attached_clause_page_transition_loses_to_same_font_static_layout():
+    text = (
+        "Just to make the older machines do something they were never "
+        "designed to do."
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0150")
+    words = text.split()
+    split = words.index("they")
+    decision = podcast_learning_video._article_display_boundary_decision(cue, split)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert decision["classification"] == "review"
+    assert decision["confidence"] == "medium"
+    assert "dependency_phrase_entrance_split" in decision["issue_codes"]
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    assert plan["font_size"]["english"] == 56
+
+
+def test_complete_phrase_page_starts_remain_eligible_without_a_pause():
+    cases = (
+        (
+            "So they literally have to invent entirely new ways to solve the same "
+            "math problem out of pure survival.",
+            "ways",
+            "to",
+        ),
+        (
+            "smaller Chinese AI firms aren't throwing their limited capital into a "
+            "bottomless pit of cutting-edge chips to process raw data.",
+            "capital",
+            "into",
+        ),
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    for case_index, (text, page_left, page_start) in enumerate(cases, 1):
+        words = text.split()
+        split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == page_left and words[index] == page_start
+        )
+        cue = podcast_learning_video.Cue(
+            case_index,
+            0.0,
+            10.0,
+            text,
+            "测试字幕。",
+            "male",
+            subtitle_id=f"S{case_index:04d}",
+            word_timing=tuple(
+                {
+                    "word_id": index,
+                    "surface": word,
+                    "start": index * 0.4,
+                    "end": index * 0.4 + 0.4,
+                }
+                for index, word in enumerate(words)
+            ),
+        )
+
+        plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+        assert plan["status"] == "ok", text
+        assert plan["font_size"]["english"] == 56, text
+        assert podcast_learning_video._article_page_break_score(
+            cue,
+            words,
+            split,
+            len(words) / 2,
+            cue.word_timing,
+        ) is not None, text
+
+
+def test_atomic_of_and_dangling_coordinator_page_boundaries_are_hard():
+    cases = (
+        ("They underwrite half of a large data center.", "half", "of"),
+        ("They reviewed the sources and they reached a conclusion.", "and", "they"),
+    )
+
+    for case_index, (text, left_word, right_word) in enumerate(cases, 1):
+        _, cue = _syntax_backed_page_cue(text, f"S{case_index:04d}")
+        words = text.split()
+        split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == left_word and words[index] == right_word
+        )
+
+        decision = podcast_learning_video._article_display_boundary_decision(
+            cue,
+            split,
+        )
+
+        assert decision["classification"] == "hard", text
+        assert decision["confidence"] == "high", text
+
+
+def test_strong_pause_keeps_hard_boundary_as_last_resort_not_preferred_split():
+    text = (
+        "But I'm looking at these sources, and they're arguing that being cut "
+        "off from the most sophisticated chip-making gear is actually forcing "
+        "these companies to become better engineers."
+    )
+    editor, cue = _syntax_backed_page_cue(text, "S0120")
+    words = text.split()
+    cursor = 0.0
+    timings = []
+    for index, word in enumerate(words):
+        if word == "being":
+            cursor += 0.9
+        elif word == "is":
+            cursor += 0.8
+        start = cursor
+        end = start + 0.24
+        timings.append(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": start,
+                "end": end,
+            }
+        )
+        cursor = end + 0.04
+    cue.word_timing = tuple(timings)
+    cue.end = timings[-1]["end"] + 0.12
+    cue.display_boundary_evidence = editor._display_boundary_evidence_for_span(
+        0, len(words) - 1
+    )
+    for split in range(1, len(words)):
+        evidence = cue.display_boundary_evidence.get(str(split))
+        if evidence is not None:
+            evidence["pause_ms"] = round(
+                (timings[split]["start"] - timings[split - 1]["end"]) * 1000
+            )
+
+    split = words.index("is")
+    decision = podcast_learning_video._article_display_boundary_decision(cue, split)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert "subject_finite_verb_split" in decision["issue_codes"]
+    assert decision["classification"] == "review"
+    assert decision["confidence"] == "high"
+    assert decision["pause_ms"] >= 600
+    assert decision["relaxed_raw_hard"] is True
+    # The strong-pause boundary remains a human REVIEW, never an automatic
+    # safe split. Same-screen line wrapping can now keep every page at the
+    # normal font floor, so the editor must expose a confirmable review rather
+    # than an unconfirmable structural seed.
+    assert plan["status"] == "ok"
+    is_page = next(page for page in plan["pages"] if page["word_start"] == split)
+    assert is_page["boundary_before"]["classification"] == "review"
+    assert is_page["boundary_before"]["confidence"] == "high"
+    assert is_page["boundary_before"]["relaxed_raw_hard"] is True
+    assert all(
+        page["english_font_size"] in {56, 54, 52}
+        for page in plan["pages"]
+    )
+
+
+def test_low_confidence_tight_transition_does_not_force_major_font_reduction():
+    text = (
+        "They're tasked with producing advanced chips domestically to replace "
+        "the ones they can no longer import."
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0126")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert plan["status"] == "ok"
+    assert plan["font_size"]["english"] == 56
+
+
+def test_page_context_prefers_whole_attached_phrases_over_atomic_inner_cuts():
+    cases = (
+        (
+            "and then engineering a lightweight, highly aerodynamic four-cylinder "
+            "engine that somehow wins the exact same race,",
+            "somehow",
+            "wins",
+        ),
+        (
+            "They're forcing the domestic supply chain to communicate and optimize "
+            "at a level they never would have reached if they could just easily "
+            "import the hardware.",
+            "they",
+            "never",
+        ),
+        (
+            "Because in America, you have dozens of incredibly well-funded firms "
+            "locked in this expensive, almost existential race to develop AGI, "
+            "artificial general intelligence.",
+            "locked",
+            "in",
+        ),
+        (
+            "I mean, if you can integrate a highly capable, highly optimized AI "
+            "into every facet of your economy, manufacturing, agriculture, local "
+            "services, without requiring a 500 billion data center to run it.",
+            "facet",
+            "of",
+        ),
+    )
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    for case_index, (text, bad_left, bad_right) in enumerate(cases, 1):
+        _, cue = _syntax_backed_page_cue(
+            text,
+            f"S{case_index:04d}",
+            seconds_per_word=0.4,
+        )
+        words = text.split()
+        bad_split = next(
+            index
+            for index in range(1, len(words))
+            if words[index - 1] == bad_left and words[index] == bad_right
+        )
+
+        plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+        if plan["status"] == "ok":
+            assert bad_split not in {
+                page["word_start"] for page in plan["pages"][1:]
+            }, text
+            assert all(
+                int(page.get("english_font_size") or plan["font_size"]["english"])
+                in {56, 54, 52}
+                for page in plan["pages"]
+            ), text
+        else:
+            # A complete but unusually wide source sentence may have no
+            # grammar-safe normal-font partition.  It remains an explicit
+            # editable seed; automatic planning must not force a fragment or
+            # silently drop to legacy 50px rendering.
+            assert plan["status"] == "render_structural_overflow", text
+            assert plan["errors"][0]["reason"] == (
+                "no_complete_normal_font_page_partition"
+            ), text
+            assert "fixed_font_span_unreadable" in plan["errors"][0][
+                "attempted_reasons"
+            ], text
+            assert bad_split not in {
+                int(page["word_start"])
+                for page in (plan.get("pages") or [])[1:]
+            }, text
+
+
+def test_structural_exception_can_use_actual_pixel_fit_above_sixteen_words():
+    text = (
+        "But the truly wild part of that leak is that NVIDIA's stock didn't "
+        "soar on the news."
+    )
+    _, cue = _syntax_backed_page_cue(text, "S0002")
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert len(text.split()) == 17
+    assert plan["status"] == "ok"
+    assert len(plan["pages"]) == 1
+    assert plan["font_size"]["english"] == 56
+
+
+def test_no_partition_failure_reports_deterministic_attempt_reasons():
+    text = "Supercalifragilisticexpialidocious Pneumonoultramicroscopicsilicovolcanoconiosis"
+    _, cue = _syntax_backed_page_cue(text, "S0999", seconds_per_word=0.2)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    plan = podcast_learning_video._build_article_english_page_plan(cue, draw)
+
+    assert plan["status"] == "render_structural_overflow"
+    assert plan["errors"][0]["attempted_reasons"]
+    assert "fixed_font_span_unreadable" in plan["errors"][0]["attempted_reasons"]
+
+
+def test_invalid_page_translation_cache_is_replaced_only_after_validation():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    invalid_cached = {
+        "pages": [
+            {
+                "display_page_id": display_page_id(case["subtitle_id"], 1),
+                "zh": case["pages"][0]["chinese"],
+            }
+        ]
+    }
+    valid_fresh = _response(case)
+
+    class Cache:
+        def __init__(self):
+            self.writes = []
+
+        def get_llm_result(self, *args, **kwargs):
+            return json.dumps(invalid_cached, ensure_ascii=False)
+
+        def set_llm_result(self, *args, **kwargs):
+            self.writes.append(json.loads(args[1]))
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.article_context_prompt = ""
+    editor.model = "test-model"
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(valid_fresh, ensure_ascii=False)
+                            )
+                        )
+                    ]
+                )
+            )
+        )
+    )
+
+    result, cache_hit = editor._request_display_page_translations(contract)
+
+    assert result == valid_fresh
+    assert cache_hit is False
+    assert editor.cache_manager.writes[0] == valid_fresh
+    assert editor.cache_manager.writes[1]["schema_version"] == 1
+    assert [
+        page["source_english"]
+        for page in editor.cache_manager.writes[1]["pages"]
+    ] == [page["english"] for page in case["pages"]]
+    assert editor._display_page_external_request_count == 1
+
+
+def test_incomplete_fresh_page_response_is_retried_before_leaving_request_contract():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    valid = _response(case)
+    incomplete = {"pages": valid["pages"][:-1]}
+    returned = [incomplete, valid]
+
+    class Cache:
+        def get_llm_result(self, *args, **kwargs):
+            return None
+
+        def set_llm_result(self, *args, **kwargs):
+            return None
+
+    def create(**kwargs):
+        payload = returned.pop(0)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(payload, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.article_context_prompt = ""
+    editor.model = "test-model"
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.translation_request_max_attempts = 3
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._llm_request_ledger = []
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result, cache_hit = editor._request_display_page_translations(contract)
+
+    assert result == valid
+    assert cache_hit is False
+    assert returned == []
+    assert editor._display_page_external_request_count == 2
+
+
+def test_page_translation_requests_use_flash_then_pro_for_quality_retry():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    valid = _response(case)
+    calls = []
+
+    class Cache:
+        def get_llm_result(self, *args, **kwargs):
+            return None
+
+        def set_llm_result(self, *args, **kwargs):
+            return None
+
+    def create(**kwargs):
+        calls.append(kwargs["model"])
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(valid, ensure_ascii=False))
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    initial, initial_hit = editor._request_display_page_translations(contract)
+    retry, retry_hit = editor._request_display_page_translations(
+        contract,
+        retry_errors=[
+            {
+                "code": "display_page_naturalness_review",
+                "parent_subtitle_id": case["subtitle_id"],
+            }
+        ],
+    )
+
+    assert initial == valid
+    assert retry == valid
+    assert initial_hit is False
+    assert retry_hit is False
+    assert calls == ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+
+def test_retry_page_translation_batches_are_one_parent_scoped():
+    parents = []
+    for index in range(1, 3):
+        parent_id = f"S{index:04d}"
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": f"Alpha {index}.",
+                "chinese": f"第{index}段内容。",
+                "word_start": (index - 1) * 2,
+                "word_end": (index - 1) * 2 + 1,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": (index - 1) * 2,
+                        "word_end": (index - 1) * 2,
+                        "english": "Alpha",
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": (index - 1) * 2 + 1,
+                        "word_end": (index - 1) * 2 + 1,
+                        "english": f"{index}.",
+                    },
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        planner_version="one-parent-retry-regression-v1",
+    )
+
+    class Cache:
+        def get_llm_result(self, *args, **kwargs):
+            return None
+
+        def set_llm_result(self, *args, **kwargs):
+            return None
+
+    calls = []
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        calls.append([item["parent_subtitle_id"] for item in payload])
+        rows = [
+            {
+                "display_page_id": page["display_page_id"],
+                "source_english": page["english"],
+                "zh": "第{}段".format(int(item["parent_subtitle_id"][1:]))
+                if page["display_page_id"].endswith(".P01")
+                else "内容。",
+            }
+            for item in payload
+            for page in item["pages"]
+        ]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.translation_request_max_attempts = 1
+    editor.allocation_max_concurrency = 1
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor._display_page_translation_quality_errors = lambda *args: []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    response, cache_hit = editor._request_display_page_translations(
+        contract,
+        retry_errors=[
+            {
+                "code": "page_translation_id_missing",
+                "ids": ["S0001.P01", "S0001.P02", "S0002.P01", "S0002.P02"],
+            }
+        ],
+    )
+
+    assert cache_hit is False
+    assert calls == [["S0001"], ["S0002"]]
+    assert [row["display_page_id"] for row in response["pages"]] == [
+        "S0001.P01",
+        "S0001.P02",
+        "S0002.P01",
+        "S0002.P02",
+    ]
+
+
+def test_page_translation_retry_prompt_binds_semantic_anchor_to_expected_page():
+    prompt = ScreenSubtitleEditor._display_page_retry_correction_instructions(
+        [
+            {
+                "code": "display_page_semantic_validation_failed",
+                "parent_subtitle_id": "S0260",
+                "issues": [
+                    {
+                        "anchor": "negation",
+                        "expected_subtitle_id": "S0260.P01",
+                        "actual_subtitle_ids": ["S0260.P02"],
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert "semantic anchor \"negation\" on page S0260.P01" in prompt
+    assert "do not place it on S0260.P02" in prompt
+
+
+def test_residual_page_retry_shrinks_scope_until_all_parents_are_valid():
+    parents = []
+    for index in range(1, 4):
+        parent_id = f"S{index:04d}"
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": f"English parent {index}.",
+                "chinese": f"第{index}段内容。",
+                "word_start": (index - 1) * 2,
+                "word_end": (index - 1) * 2 + 1,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": (index - 1) * 2,
+                        "word_end": (index - 1) * 2,
+                        "english": f"English parent",
+                        "start_ms": index * 1000,
+                        "end_ms": index * 1000 + 500,
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": (index - 1) * 2 + 1,
+                        "word_end": (index - 1) * 2 + 1,
+                        "english": f"{index}.",
+                        "start_ms": index * 1000 + 500,
+                        "end_ms": index * 1000 + 1000,
+                    }
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"chinese_font_size": 48, "max_lines": 2},
+        planner_version="residual-retry-regression-v1",
+    )
+    baseline = validate_page_translation_response(
+        contract,
+        {"pages": []},
+        require_source_echo=True,
+    )
+    requested_scopes = []
+
+    def request(retry_contract, *, retry_errors=None):
+        requested_scopes.append(
+            [
+                parent["parent_subtitle_id"]
+                for parent in retry_contract.get("parents") or []
+            ]
+        )
+        selected = requested_scopes[-1]
+        returned = selected[:1] if len(requested_scopes) == 1 else selected
+        rows = []
+        for parent in retry_contract.get("parents") or []:
+            if parent["parent_subtitle_id"] not in returned:
+                continue
+            for page_index, page in enumerate(parent["pages"]):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": (
+                            f"第{parent['parent_subtitle_id'][1:].lstrip('0')}段"
+                            if page_index == 0
+                            else "内容。"
+                        ),
+                    }
+                )
+        return {"pages": rows}, False
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor._request_display_page_translations = request
+    editor._display_page_translation_quality_errors = lambda *args: []
+
+    repaired, quality_errors, cache_hit = editor._retry_residual_display_page_errors(
+        contract,
+        baseline,
+        [],
+        cache_hit=True,
+    )
+
+    assert requested_scopes == [
+        ["S0001", "S0002", "S0003"],
+        ["S0002", "S0003"],
+    ]
+    assert repaired["status"] == "PASS"
+    assert repaired["errors"] == []
+    assert [parent["parent_subtitle_id"] for parent in repaired["parents"]] == [
+        "S0001",
+        "S0002",
+        "S0003",
+    ]
+    assert quality_errors == []
+    assert cache_hit is False
+
+
+def test_page_translation_batches_preserve_completed_cache_after_later_timeout():
+    parents = []
+    word_cursor = 0
+    for index in range(1, 8):
+        parent_id = f"S{100 + index:04d}"
+        english_words = [
+            f"alpha{index}",
+            f"beta{index}",
+            f"gamma{index}",
+            f"delta{index}",
+        ]
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": " ".join(english_words),
+                "chinese": f"第{index}部分，内容完整。",
+                "word_start": word_cursor,
+                "word_end": word_cursor + 3,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": word_cursor,
+                        "word_end": word_cursor + 1,
+                        "english": " ".join(english_words[:2]),
+                        "start_ms": index * 10000,
+                        "end_ms": index * 10000 + 2000,
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": word_cursor + 2,
+                        "word_end": word_cursor + 3,
+                        "english": " ".join(english_words[2:]),
+                        "start_ms": index * 10000 + 2000,
+                        "end_ms": index * 10000 + 4000,
+                    },
+                ],
+            }
+        )
+        word_cursor += 4
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"chinese_font_size": 48, "max_lines": 2},
+        planner_version="batch-regression-v1",
+    )
+
+    class Cache:
+        def __init__(self):
+            self.values = {}
+            self.writes = []
+
+        def get_llm_result(self, cache_key, *args, **kwargs):
+            return self.values.get(cache_key)
+
+        def set_llm_result(self, cache_key, value, *args, **kwargs):
+            self.values[cache_key] = value
+            self.writes.append(cache_key)
+
+    cache = Cache()
+    request_scopes = []
+    fail_last_batch = True
+
+    def create(**kwargs):
+        nonlocal fail_last_batch
+        payload = json.loads(kwargs["messages"][1]["content"])
+        parent_ids = [item["parent_subtitle_id"] for item in payload]
+        request_scopes.append(parent_ids)
+        if parent_ids == ["S0107"] and fail_last_batch:
+            raise TimeoutError("display-page batch timed out")
+        rows = []
+        for item in payload:
+            parent_index = int(item["parent_subtitle_id"][1:]) - 100
+            chinese_parts = [f"第{parent_index}部分，", "内容完整。"]
+            for page, chinese in zip(item["pages"], chinese_parts):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": chinese,
+                    }
+                )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = cache
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with patch("app.core.subtitle_processor.screen_editor.time.sleep"):
+        try:
+            editor._request_display_page_translations(contract)
+        except RuntimeError as exc:
+            assert "batch 2/2" in str(exc)
+            assert exc.completed_parent_ids == [
+                f"S{index:04d}" for index in range(101, 107)
+            ]
+            assert len(exc.partial_response["pages"]) == 12
+            assert exc.failed_parent_ids == ["S0107"]
+        else:
+            raise AssertionError("a timed-out page batch must fail the current run")
+
+    first_scope = [f"S{index:04d}" for index in range(101, 107)]
+    assert request_scopes == [
+        first_scope,
+        ["S0107"],
+        ["S0107"],
+        ["S0107"],
+    ]
+    # One completed batch and its six independently reusable parent units survive.
+    assert len(cache.writes) == 7
+
+    fail_last_batch = False
+    response, cache_hit = editor._request_display_page_translations(contract)
+
+    assert request_scopes[-1] == ["S0107"]
+    assert request_scopes.count(first_scope) == 1
+    assert cache_hit is False
+    assert validate_page_translation_response(
+        contract,
+        response,
+        require_source_echo=True,
+    )["status"] == "PASS"
+
+
+    request_count = len(request_scopes)
+    response, cache_hit = editor._request_display_page_translations(contract)
+    assert cache_hit is True
+    assert len(request_scopes) == request_count
+    assert validate_page_translation_response(
+        contract,
+        response,
+        require_source_echo=True,
+    )["status"] == "PASS"
+
+    response, cache_hit = editor._request_display_page_translation_batch(contract)
+    assert cache_hit is False
+    legacy_cache_key = cache.writes[-1]
+    for cache_key in list(cache.values):
+        if cache_key != legacy_cache_key:
+            cache.values.pop(cache_key)
+    request_count = len(request_scopes)
+
+    response, cache_hit = editor._request_display_page_translations(contract)
+
+    assert cache_hit is True
+    assert len(request_scopes) == request_count
+    assert validate_page_translation_response(
+        contract,
+        response,
+        require_source_echo=True,
+    )["status"] == "PASS"
+
+
+def test_page_translation_unit_cache_rebinds_shifted_ids_with_same_semantics():
+    case = copy.deepcopy(next(iter(_cases().values())))
+
+    class Cache:
+        def __init__(self):
+            self.values = {}
+
+        def get_llm_result(self, cache_key, *args, **kwargs):
+            return self.values.get(cache_key)
+
+        def set_llm_result(self, cache_key, value, *args, **kwargs):
+            self.values[cache_key] = value
+
+    cache = Cache()
+    api_calls = []
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        api_calls.append([entry["parent_subtitle_id"] for entry in payload])
+        rows = []
+        for parent in payload:
+            for page, fixture_page in zip(parent["pages"], case["pages"]):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": fixture_page["chinese"],
+                    }
+                )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = cache
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    original_contract = _contract(case)
+    original_response, original_hit = editor._request_display_page_translations(
+        original_contract
+    )
+    assert original_hit is False
+    assert validate_page_translation_response(
+        original_contract,
+        original_response,
+        require_source_echo=True,
+    )["status"] == "PASS"
+    assert len(api_calls) == 1
+
+    shifted = copy.deepcopy(case)
+    shifted["subtitle_id"] = "S0999"
+    shift = 1000
+    shifted["word_start"] += shift
+    shifted["word_end"] += shift
+    for page in shifted["pages"]:
+        page["word_start"] += shift
+        page["word_end"] += shift
+    shifted_contract = _contract(shifted)
+
+    shifted_response, shifted_hit = editor._request_display_page_translations(
+        shifted_contract
+    )
+
+    assert shifted_hit is True
+    assert len(api_calls) == 1
+    shifted_artifact = validate_page_translation_response(
+        shifted_contract,
+        shifted_response,
+        require_source_echo=True,
+    )
+    assert shifted_artifact["status"] == "PASS"
+    assert [
+        page["display_page_id"]
+        for parent in shifted_artifact["parents"]
+        for page in parent["pages"]
+    ] == [
+        display_page_id("S0999", index)
+        for index in range(1, len(case["pages"]) + 1)
+    ]
+
+    changed_chinese = copy.deepcopy(shifted)
+    changed_chinese["parent_chinese"] += "变化"
+    assert editor._display_page_translation_unit_cache_key(
+        shifted_contract
+    ) != editor._display_page_translation_unit_cache_key(
+        _contract(changed_chinese)
+    )
+
+
+def test_mixed_page_batch_freezes_valid_parent_for_scoped_retry():
+    cases = [
+        _cases()["s0078_reordered_chinese"],
+        _cases()["s0252_monotonic_chinese"],
+    ]
+    parents = [
+        {
+            "parent_subtitle_id": case["subtitle_id"],
+            "english": case["english"],
+            "chinese": case["parent_chinese"],
+            "word_start": case["word_start"],
+            "word_end": case["word_end"],
+            "pages": [
+                {
+                    "display_page_id": display_page_id(case["subtitle_id"], index),
+                    "word_start": page["word_start"],
+                    "word_end": page["word_end"],
+                    "english": page["english"],
+                }
+                for index, page in enumerate(case["pages"], 1)
+            ],
+        }
+        for case in cases
+    ]
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        planner_version="mixed-batch-scoped-retry-v1",
+    )
+
+    class Cache:
+        def __init__(self):
+            self.values = {}
+            self.unit_writes = []
+
+        def get_llm_result(self, cache_key, *args, **kwargs):
+            return self.values.get(cache_key)
+
+        def set_llm_result(self, cache_key, value, *args, **kwargs):
+            self.values[cache_key] = value
+            if str(kwargs.get("task") or "").endswith("_unit_v1"):
+                self.unit_writes.append(cache_key)
+
+    cache = Cache()
+    request_scopes = []
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.target_language = "简体中文"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.cache_manager = cache
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_translation_reviews = []
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_quality_errors = lambda *args: []
+
+    def split_into_parent_batches(batch_contract, *, one_parent_per_batch=False):
+        return [
+            ScreenSubtitleEditor._display_page_contract_for_parent_ids(
+                batch_contract,
+                [parent["parent_subtitle_id"]],
+            )
+            for parent in batch_contract.get("parents") or []
+        ]
+
+    editor._display_page_translation_batch_contracts = split_into_parent_batches
+
+    def request_batch(batch_contract, *, retry_errors=None, cache_only=False):
+        if cache_only:
+            return None, False
+        request_scopes.append(
+            [
+                parent["parent_subtitle_id"]
+                for parent in batch_contract.get("parents") or []
+            ]
+        )
+        assert request_scopes[-1] == [cases[1]["subtitle_id"]]
+        return _response(cases[1]), False
+
+    editor._request_display_page_translation_batch = request_batch
+
+    def request_api(batch_contract, *, retry_errors=None):
+        request_scopes.append(
+            [
+                parent["parent_subtitle_id"]
+                for parent in batch_contract.get("parents") or []
+            ]
+        )
+        if len(request_scopes) == 1:
+            # The first parent is valid; the second parent is missing entirely.
+            return {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": cases[0]["pages"][index - 1]["chinese"],
+                    }
+                    for index, page in enumerate(parents[0]["pages"], 1)
+                ]
+            }, "", [{
+                "attempt": 1,
+                "elapsed_seconds": 0.0,
+                "response": None,
+                "error": None,
+            }]
+        if len(request_scopes) == 2:
+            assert request_scopes[-1] == [cases[1]["subtitle_id"]]
+            return {"pages": []}, "", [{
+                "attempt": 1,
+                "elapsed_seconds": 0.0,
+                "response": None,
+                "error": None,
+            }]
+        assert request_scopes[-1] == [cases[1]["subtitle_id"]]
+        return _response(cases[1]), "", [{
+            "attempt": 1,
+            "elapsed_seconds": 0.0,
+            "response": None,
+            "error": None,
+        }]
+
+    editor._request_display_page_translation_api_only = request_api
+    editor._record_llm_request = lambda *args, **kwargs: None
+    editor._record_llm_cache_stat = lambda *args, **kwargs: None
+    editor._emit_progress_event = lambda *args, **kwargs: None
+
+    first, first_hit = editor._request_display_page_translations(contract)
+    assert first_hit is False
+    assert [row["display_page_id"] for row in first["pages"]] == [
+        page["display_page_id"] for page in parents[0]["pages"]
+    ]
+    first_valid_rows = [dict(row) for row in first["pages"]]
+    assert len(cache.unit_writes) == 1
+
+    second, second_hit = editor._request_display_page_translations(contract)
+    assert second_hit is False
+    assert request_scopes == [
+        [cases[0]["subtitle_id"]],
+        [cases[1]["subtitle_id"]],
+        [cases[1]["subtitle_id"]],
+    ]
+    assert [row["display_page_id"] for row in second["pages"]] == [
+        page["display_page_id"]
+        for parent in parents
+        for page in parent["pages"]
+    ]
+    assert second["pages"][: len(first_valid_rows)] == first_valid_rows
+
+
+def test_page_translation_terminal_failure_does_not_start_later_batches():
+    parents = []
+    for index in range(1, 14):
+        parent_id = f"S{index:04d}"
+        word_start = (index - 1) * 4
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": f"alpha {index} beta {index}",
+                "chinese": f"第{index}条完整中文。",
+                "word_start": word_start,
+                "word_end": word_start + 3,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": word_start,
+                        "word_end": word_start + 1,
+                        "english": f"alpha {index}",
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": word_start + 2,
+                        "word_end": word_start + 3,
+                        "english": f"beta {index}",
+                    },
+                ],
+            }
+        )
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        planner_version="fail-fast-batch-regression-v1",
+    )
+
+    class Cache:
+        def __init__(self):
+            self.writes = []
+
+        def get_llm_result(self, *_args, **_kwargs):
+            return None
+
+        def set_llm_result(self, _key, value, *_args, **_kwargs):
+            self.writes.append(json.loads(value))
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-flash"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.allocation_max_concurrency = 2
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_request_ledger = []
+    editor._llm_request_ledger_lock = threading.Lock()
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.progress_callback = None
+    started_scopes = []
+    both_started = threading.Barrier(2)
+
+    def request(batch_contract, *, retry_errors=None):
+        parent_ids = [
+            str(parent["parent_subtitle_id"])
+            for parent in batch_contract["parents"]
+        ]
+        started_scopes.append(parent_ids)
+        both_started.wait(timeout=1)
+        if parent_ids[0] == "S0001":
+            return None, "terminal page request failure", []
+        time.sleep(0.03)
+        return (
+            {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": (
+                            f"第{int(parent['parent_subtitle_id'][1:])}条"
+                            if page["display_page_id"].endswith(".P01")
+                            else "完整中文。"
+                        ),
+                    }
+                    for parent in batch_contract["parents"]
+                    for page in parent["pages"]
+                ]
+            },
+            "",
+            [],
+        )
+
+    with patch.object(
+        editor,
+        "_request_display_page_translation_api_only",
+        side_effect=request,
+    ):
+        try:
+            editor._request_display_page_translations(contract)
+        except RuntimeError as exc:
+            assert "batch 1/3" in str(exc)
+        else:
+            raise AssertionError("the terminal batch failure must stop publication")
+
+    assert started_scopes == [
+        [f"S{index:04d}" for index in range(1, 7)],
+        [f"S{index:04d}" for index in range(7, 13)],
+    ]
+    # The one successful in-flight batch seeds six parent units in addition to
+    # retaining the original complete batch response.
+    assert len(editor.cache_manager.writes) == 7
+    assert editor.cache_manager.writes[0]["pages"][0]["display_page_id"] == (
+        "S0007.P01"
+    )
+
+
+def test_page_translation_batches_retry_empty_batch_and_keep_other_valid_batch():
+    parents = []
+    word_cursor = 0
+    for index in range(1, 8):
+        parent_id = f"S{200 + index:04d}"
+        words = [f"alpha{index}", f"beta{index}", f"gamma{index}", f"delta{index}"]
+        parents.append(
+            {
+                "parent_subtitle_id": parent_id,
+                "english": " ".join(words),
+                "chinese": f"第{index}部分，内容完整。",
+                "word_start": word_cursor,
+                "word_end": word_cursor + 3,
+                "pages": [
+                    {
+                        "display_page_id": f"{parent_id}.P01",
+                        "word_start": word_cursor,
+                        "word_end": word_cursor + 1,
+                        "english": " ".join(words[:2]),
+                    },
+                    {
+                        "display_page_id": f"{parent_id}.P02",
+                        "word_start": word_cursor + 2,
+                        "word_end": word_cursor + 3,
+                        "english": " ".join(words[2:]),
+                    },
+                ],
+            }
+        )
+        word_cursor += 4
+    contract = build_display_page_contract(
+        parents,
+        layout_profile={"template": "article"},
+        planner_version="batch-empty-response-v1",
+    )
+    request_scopes = []
+
+    class Cache:
+        def get_llm_result(self, *args, **kwargs):
+            return None
+
+        def set_llm_result(self, *args, **kwargs):
+            return None
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        parent_ids = [item["parent_subtitle_id"] for item in payload]
+        request_scopes.append(parent_ids)
+        if len(parent_ids) == 6 and request_scopes.count(parent_ids) == 1:
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"pages": []}'))]
+            )
+        rows = []
+        for item in payload:
+            for page_index, page in enumerate(item["pages"], 1):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": (
+                            f"第{int(item['parent_subtitle_id'][1:]) - 200}部分，"
+                            if page_index == 1
+                            else "内容完整。"
+                        ),
+                    }
+                )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = Cache()
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    response, cache_hit = editor._request_display_page_translations(contract)
+    artifact = validate_page_translation_response(
+        contract,
+        response,
+        require_source_echo=True,
+    )
+
+    assert cache_hit is False
+    assert request_scopes == [
+        [f"S{index:04d}" for index in range(201, 207)],
+        [f"S{index:04d}" for index in range(201, 207)],
+        ["S0207"],
+    ]
+    assert artifact["status"] == "PASS"
+    assert [
+        parent["parent_subtitle_id"] for parent in artifact["parents"]
+    ] == [f"S{index:04d}" for index in range(201, 208)]
+def test_page_translation_source_echo_is_required_for_new_requests():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    valid = _response(case)
+    missing = json.loads(json.dumps(valid, ensure_ascii=False))
+    missing["pages"][0].pop("source_english")
+    mismatched = json.loads(json.dumps(valid, ensure_ascii=False))
+    mismatched["pages"][0]["source_english"] = case["pages"][1]["english"]
+
+    assert validate_page_translation_response(
+        contract, valid, require_source_echo=True
+    )["status"] == "PASS"
+    missing_result = validate_page_translation_response(
+        contract, missing, require_source_echo=True
+    )
+    mismatch_result = validate_page_translation_response(
+        contract, mismatched, require_source_echo=True
+    )
+    assert "page_translation_source_echo_missing" in _error_codes(missing_result)
+    assert "page_translation_source_echo_mismatch" in _error_codes(mismatch_result)
+
+
+def test_page_translation_rejects_page_level_chinese_speed_overflow():
+    case = _cases()["s0078_reordered_chinese"]
+    contract = _contract(case)
+    contract["parents"][0]["pages"][0]["start_ms"] = 0
+    contract["parents"][0]["pages"][0]["end_ms"] = 900
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": display_page_id(case["subtitle_id"], 1),
+                    "zh": case["pages"][0]["chinese"],
+                },
+                {
+                    "display_page_id": display_page_id(case["subtitle_id"], 2),
+                    "zh": case["pages"][1]["chinese"],
+                },
+            ]
+        },
+    )
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+
+    errors = editor._display_page_translation_quality_errors(contract, artifact)
+
+    assert any(
+        error.get("code") == "display_page_chinese_reading_speed_exceeded"
+        for error in errors
+    )
+
+
+def test_page_translation_rejects_repeated_parent_meaning():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0201",
+                "english": "Production disappeared from the market almost overnight.",
+                "chinese": "这些产量几乎一夜之间从市场消失。",
+                "word_start": 0,
+                "word_end": 7,
+                "pages": [
+                    {
+                        "display_page_id": "S0201.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "Production disappeared from the market",
+                        "start_ms": 0,
+                        "end_ms": 2200,
+                    },
+                    {
+                        "display_page_id": "S0201.P02",
+                        "word_start": 4,
+                        "word_end": 7,
+                        "english": "almost overnight.",
+                        "start_ms": 2200,
+                        "end_ms": 4200,
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0201.P01", "zh": "这些产量从市场消失，"},
+                {"display_page_id": "S0201.P02", "zh": "这些产量几乎一夜之间从市场消失。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_parent_meaning_repeated"
+        and error.get("parent_subtitle_id") == "S0201"
+        for error in artifact["errors"]
+    )
+
+
+def test_page_translation_rejects_significant_parent_expansion_but_allows_reordering():
+    parent = {
+        "parent_subtitle_id": "S0202",
+        "english": "China changed the market by expanding output quickly.",
+        "chinese": "中国通过迅速扩大产量改变了市场。",
+        "word_start": 0,
+        "word_end": 7,
+        "pages": [
+            {
+                "display_page_id": "S0202.P01",
+                "word_start": 0,
+                "word_end": 3,
+                "english": "China changed the market",
+                "start_ms": 0,
+                "end_ms": 2200,
+            },
+            {
+                "display_page_id": "S0202.P02",
+                "word_start": 4,
+                "word_end": 7,
+                "english": "by expanding output quickly.",
+                "start_ms": 2200,
+                "end_ms": 4500,
+            },
+        ],
+    }
+    contract = build_display_page_contract(
+        [parent],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    reordered = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0202.P01", "zh": "中国改变了市场，"},
+                {"display_page_id": "S0202.P02", "zh": "靠的是迅速扩大产量。"},
+            ]
+        },
+    )
+    expanded = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0202.P01", "zh": "中国改变了整个全球市场的基本运行方式，"},
+                {"display_page_id": "S0202.P02", "zh": "背后的关键原因正是迅速扩大产量并形成全面优势。"},
+            ]
+        },
+    )
+
+    assert reordered["status"] == "PASS"
+    assert expanded["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_parent_meaning_expanded"
+        and error.get("parent_subtitle_id") == "S0202"
+        for error in expanded["errors"]
+    )
+
+
+def test_page_translation_rejects_new_parent_content_below_growth_limit():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0188",
+                "english": (
+                    "That cannot support 300 stores of expansion and tens of "
+                    "millions in recurring revenue."
+                ),
+                "chinese": "这不足以支撑300家门店扩张和数千万的经常性收入。",
+                "word_start": 0,
+                "word_end": 13,
+                "pages": [
+                    {
+                        "display_page_id": "S0188.P01",
+                        "word_start": 0,
+                        "word_end": 6,
+                        "english": "That cannot support 300 stores of expansion",
+                        "start_ms": 0,
+                        "end_ms": 2600,
+                    },
+                    {
+                        "display_page_id": "S0188.P02",
+                        "word_start": 7,
+                        "word_end": 13,
+                        "english": "and tens of millions in recurring revenue.",
+                        "start_ms": 2600,
+                        "end_ms": 5200,
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0188.P01",
+                    "zh": "这不足以支撑300家门店扩张的行为诱因，",
+                },
+                {
+                    "display_page_id": "S0188.P02",
+                    "zh": "以及数千万的经常性收入。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_parent_meaning_added"
+        and error.get("parent_subtitle_id") == "S0188"
+        and set(error.get("added_tokens") or []) >= {"行为", "诱因"}
+        for error in artifact["errors"]
+    )
+
+
+def test_page_translation_allows_neutral_parent_binding_word():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0188",
+                "english": (
+                    "That cannot support 300 stores of expansion and tens of "
+                    "millions in recurring revenue."
+                ),
+                "chinese": "这不足以支撑300家门店扩张和数千万的经常性收入。",
+                "word_start": 0,
+                "word_end": 13,
+                "pages": [
+                    {
+                        "display_page_id": "S0188.P01",
+                        "word_start": 0,
+                        "word_end": 6,
+                        "english": "That cannot support 300 stores of expansion",
+                        "start_ms": 0,
+                        "end_ms": 2600,
+                    },
+                    {
+                        "display_page_id": "S0188.P02",
+                        "word_start": 7,
+                        "word_end": 13,
+                        "english": "and tens of millions in recurring revenue.",
+                        "start_ms": 2600,
+                        "end_ms": 5200,
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {
+                    "display_page_id": "S0188.P01",
+                    "zh": "这不足以支撑300家门店扩张，",
+                },
+                {
+                    "display_page_id": "S0188.P02",
+                    "zh": "以及数千万的经常性收入。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_page_projection_does_not_invent_a_token_across_two_complete_pages():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0017",
+                "english": "People pay 58 yuan for domestic chocolate.",
+                "chinese": "人们为一块国产巧克力掏出58元。",
+                "word_start": 0,
+                "word_end": 6,
+                "pages": [
+                    {
+                        "display_page_id": "S0017.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "People pay 58 yuan",
+                    },
+                    {
+                        "display_page_id": "S0017.P02",
+                        "word_start": 4,
+                        "word_end": 6,
+                        "english": "for domestic chocolate.",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0017.P01", "zh": "人们掏出58元"},
+                {"display_page_id": "S0017.P02", "zh": "为一块国产巧克力。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_page_projection_allows_grammatical_form_of_existing_relation():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0133",
+                "english": "The reason for local roasting is better control.",
+                "chinese": "是因为本地烘焙能带来更好的掌控。",
+                "word_start": 0,
+                "word_end": 7,
+                "pages": [
+                    {
+                        "display_page_id": "S0133.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "The reason for local roasting",
+                    },
+                    {
+                        "display_page_id": "S0133.P02",
+                        "word_start": 4,
+                        "word_end": 7,
+                        "english": "is better control.",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0133.P01", "zh": "本地烘焙的原因"},
+                {"display_page_id": "S0133.P02", "zh": "是能带来更好的掌控。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_page_level_continuation_fragment_is_review_not_blocker():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0111",
+                "english": (
+                    "Now, when you compare that to Alphabet talking about a 205 "
+                    "billion spend for a much shorter time frame..."
+                ),
+                "chinese": "那么，把这个数字与Alphabet相比，它谈的是在更短时间内投入2050亿美元……",
+                "word_start": 0,
+                "word_end": 18,
+                "pages": [
+                    {
+                        "display_page_id": "S0111.P01",
+                        "word_start": 0,
+                        "word_end": 7,
+                        "english": "Now, when you compare that to Alphabet talking",
+                        "start_ms": 0,
+                        "end_ms": 2200,
+                    },
+                    {
+                        "display_page_id": "S0111.P02",
+                        "word_start": 8,
+                        "word_end": 18,
+                        "english": "about a 205 billion spend for a much shorter time frame...",
+                        "start_ms": 2200,
+                        "end_ms": 6000,
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0111.P01", "zh": "那么，把这个数字与Alphabet相比："},
+                {"display_page_id": "S0111.P02", "zh": "也就是在更短时间内投入2050亿美元……"},
+            ]
+        },
+    )
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+
+    errors = editor._display_page_translation_quality_errors(contract, artifact)
+
+    assert errors == []
+    reviews = editor._display_page_translation_reviews
+    assert len(reviews) == 1
+    assert reviews[0]["code"] == "display_page_continuation_review"
+    assert reviews[0]["parent_subtitle_id"] == "S0111"
+    assert reviews[0]["issue_codes"] == ["unnatural_chinese_fragment"]
+
+
+def test_page_translation_rejects_repeated_adjacent_fact():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0301",
+                "english": "The market changed and the pressure became visible.",
+                "chinese": "市场发生变化，竞争压力变得清晰可见。",
+                "word_start": 0,
+                "word_end": 8,
+                "pages": [
+                    {
+                        "display_page_id": "S0301.P01",
+                        "word_start": 0,
+                        "word_end": 3,
+                        "english": "The market changed and",
+                    },
+                    {
+                        "display_page_id": "S0301.P02",
+                        "word_start": 4,
+                        "word_end": 8,
+                        "english": "the pressure became visible.",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0301.P01", "zh": "竞争压力变得清晰，"},
+                {"display_page_id": "S0301.P02", "zh": "竞争压力变得清晰可见。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_adjacent_meaning_repeated"
+        for error in artifact["errors"]
+    )
+
+
+def test_page_translation_rejects_condition_after_completed_question():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0302",
+                "english": "What happens to that shared memory when the last building is removed?",
+                "chinese": "最后一座建筑被拆除时，这份记忆会怎样？",
+                "word_start": 0,
+                "word_end": 9,
+                "pages": [
+                    {
+                        "display_page_id": "S0302.P01",
+                        "word_start": 0,
+                        "word_end": 5,
+                        "english": "What happens to that shared memory",
+                    },
+                    {
+                        "display_page_id": "S0302.P02",
+                        "word_start": 6,
+                        "word_end": 9,
+                        "english": "when the last building is removed?",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0302.P01", "zh": "这份共同的记忆会怎样？"},
+                {"display_page_id": "S0302.P02", "zh": "当最后一座建筑被拆除时。"},
+            ]
+        },
+    )
+
+    assert artifact["status"] == "ERROR"
+    assert any(
+        error.get("code") == "page_translation_clause_order_reversed"
+        for error in artifact["errors"]
+    )
+
+
+def test_page_translation_allows_complete_question_before_new_condition_sentence():
+    contract = build_display_page_contract(
+        [
+            {
+                "parent_subtitle_id": "S0303",
+                "english": "What happens next? If demand falls, prices will follow.",
+                "chinese": "接下来会怎样？如果需求下降，价格也会随之下跌。",
+                "word_start": 0,
+                "word_end": 8,
+                "pages": [
+                    {
+                        "display_page_id": "S0303.P01",
+                        "word_start": 0,
+                        "word_end": 2,
+                        "english": "What happens next?",
+                    },
+                    {
+                        "display_page_id": "S0303.P02",
+                        "word_start": 3,
+                        "word_end": 8,
+                        "english": "If demand falls, prices will follow.",
+                    },
+                ],
+            }
+        ],
+        layout_profile={"template": "article", "max_lines": 2},
+    )
+    artifact = validate_page_translation_response(
+        contract,
+        {
+            "pages": [
+                {"display_page_id": "S0303.P01", "zh": "接下来会怎样？"},
+                {
+                    "display_page_id": "S0303.P02",
+                    "zh": "如果需求下降，价格也会随之下跌。",
+                },
+            ]
+        },
+    )
+
+    assert artifact["status"] == "PASS"
+
+
+def test_renderer_uses_valid_page_mapping_without_proportional_fallback():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    for case in _cases().values():
+        cue = _timed_cue(case)
+        blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+        assert blueprint["parents"], case["case_id"]
+        frozen_plan = blueprint["render_plans"][0]
+        frozen_parent = blueprint["parents"][0]
+        page_count = len(frozen_parent["pages"])
+        chinese = case["parent_chinese"]
+        page_word_counts = [
+            int(page["word_end"]) - int(page["word_start"]) + 1
+            for page in frozen_parent["pages"]
+        ]
+        expected_chinese = (
+            podcast_learning_video._strict_split_chinese_visual_pages(
+                chinese,
+                page_count,
+                page_word_counts,
+                strict=True,
+            )
+        )
+        assert expected_chinese is not None
+        assert len(expected_chinese) == page_count
+        contract = build_display_page_contract(
+            [frozen_parent],
+            layout_profile=blueprint["layout_profile"],
+            planner_version=blueprint["planner_version"],
+            render_plans=blueprint["render_plans"],
+        )
+        artifact = validate_page_translation_response(
+            contract,
+            {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "zh": zh,
+                    }
+                    for page, zh in reversed(
+                        list(zip(frozen_parent["pages"], expected_chinese))
+                    )
+                ]
+            },
+        )
+        cue.zh = parent_chinese_by_id(artifact)[case["subtitle_id"]]
+        assert podcast_learning_video.apply_article_display_page_translation_artifact(
+            [cue],
+            artifact,
+        )
+
+        with patch.object(
+            podcast_learning_video,
+            "_strict_split_chinese_visual_pages",
+            side_effect=AssertionError("proportional Chinese fallback is forbidden"),
+        ):
+            plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+        assert plan["status"] == "ok"
+        assert plan["font_size"] == {
+            "english": int(frozen_plan["english_font_size"]),
+            "chinese": podcast_learning_video.ARTICLE_SUBTITLE_ZH_FONT_SIZE,
+        }
+        assert [page["display_page_id"] for page in plan["pages"]] == [
+            page["display_page_id"] for page in frozen_plan["pages"]
+        ]
+        assert " ".join(page["en"] for page in plan["pages"]) == case["english"]
+        assert [page["zh"] for page in plan["pages"]] == expected_chinese
+
+
+def test_renderer_fails_closed_when_paginated_page_mapping_is_missing():
+    case = _cases()["s0078_reordered_chinese"]
+    cue = _timed_cue(case)
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+
+    with patch.object(
+        podcast_learning_video,
+        "_strict_split_chinese_visual_pages",
+        side_effect=AssertionError("proportional Chinese fallback is forbidden"),
+    ):
+        plan = podcast_learning_video.build_article_visual_page_plan(cue, draw)
+
+    assert plan["status"] == "render_structural_overflow"
+    assert plan["errors"][0]["reason"] == "missing_or_invalid_display_page_translations"
+
+
+def test_page_translation_preserves_parent_chinese_and_srt_structure():
+    case = _cases()["s0078_reordered_chinese"]
+    cue = _timed_cue(case)
+    before = _immutable_parent_snapshot(cue)
+    contract = _contract(case)
+    artifact = validate_page_translation_response(contract, _response(case))
+    parent_chinese = parent_chinese_by_id(artifact)[case["subtitle_id"]]
+    display_chinese = artifact["parents"][0]["aggregate_chinese"]
+    cue.zh = parent_chinese
+    cue.display_page_translations = _page_translations(artifact)
+
+    with tempfile.TemporaryDirectory() as raw:
+        old_srt_path = Path(raw) / "old.srt"
+        updated_srt_path = Path(raw) / "updated.srt"
+        old_srt_path.write_text(
+            "1\n00:05:05,025 --> 00:05:14,811\n"
+            + case["english"]
+            + "\n"
+            + case["parent_chinese"]
+            + "\n",
+            encoding="utf-8",
+        )
+        updated_srt_path.write_text(
+            "1\n00:05:05,025 --> 00:05:14,811\n"
+            + case["english"]
+            + "\n"
+            + parent_chinese
+            + "\n",
+            encoding="utf-8",
+        )
+
+        old_srt_cue = podcast_learning_video.parse_srt(old_srt_path)[0]
+        updated_srt_cue = podcast_learning_video.parse_srt(updated_srt_path)[0]
+        assert (
+            updated_srt_cue.index,
+            updated_srt_cue.start,
+            updated_srt_cue.end,
+            updated_srt_cue.en,
+        ) == (
+            old_srt_cue.index,
+            old_srt_cue.start,
+            old_srt_cue.end,
+            old_srt_cue.en,
+        )
+        assert old_srt_cue.zh == case["parent_chinese"]
+        assert updated_srt_cue.zh == parent_chinese
+
+    assert _immutable_parent_snapshot(cue) == before
+    assert cue.zh == case["parent_chinese"]
+    assert display_chinese != cue.zh
+    assert "".join(cue.display_page_translations.values()) == display_chinese
+
+
+def test_screen_editor_applies_mocked_page_response_after_final_timing_only():
+    case = _cases()["s0078_reordered_chinese"]
+    paginated = ASRDataSeg(
+        case["english"],
+        int(case["start"] * 1000),
+        int(case["end"] * 1000),
+        case["parent_chinese"],
+    )
+    paginated.subtitle_id = case["subtitle_id"]
+    paginated.word_start = 0
+    paginated.word_end = len(paginated.text.split()) - 1
+    single_page = ASRDataSeg(
+        "That is the point.",
+        paginated.end_time + 100,
+        paginated.end_time + 1700,
+        "这就是关键。",
+    )
+    single_page.subtitle_id = "S0079"
+    single_page.word_start = paginated.word_end + 1
+    single_page.word_end = single_page.word_start + len(single_page.text.split()) - 1
+    asr_data = ASRData([paginated, single_page])
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.enable_stable_mode = True
+    editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
+    editor._active_source_segments_by_id = {}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = [
+        ScreenSubtitleItem(
+            source_ids=[1],
+            original=paginated.text,
+            translated=paginated.translated_text,
+            word_start=paginated.word_start,
+            word_end=paginated.word_end,
+            subtitle_id=paginated.subtitle_id,
+        ),
+        ScreenSubtitleItem(
+            source_ids=[2],
+            original=single_page.text,
+            translated=single_page.translated_text,
+            word_start=single_page.word_start,
+            word_end=single_page.word_end,
+            subtitle_id=single_page.subtitle_id,
+        ),
+    ]
+    editor._display_page_translation_artifact = {}
+    editor._display_page_translation_path = ""
+    editor._display_page_external_request_count = 0
+    editor.coverage_report_path = None
+
+    def mocked_request(contract, *, retry_errors=None):
+        # The production contract now validates an exact per-page source echo.
+        # This fixture returns that echo, so no retry should be necessary.
+        assert retry_errors is None
+        parents = list(contract.get("parents") or [])
+        assert [parent["parent_subtitle_id"] for parent in parents] == [case["subtitle_id"]]
+        pages = list(parents[0]["pages"])
+        assert len(pages) == len(case["pages"])
+        return (
+            {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": expected["chinese"],
+                    }
+                    for page, expected in zip(reversed(pages), reversed(case["pages"]))
+                ]
+            },
+            False,
+        )
+
+    editor._request_display_page_translations = mocked_request
+    editor._display_page_translation_quality_errors = lambda contract, artifact: []
+    editor._record_display_page_translation_failure = lambda *args, **kwargs: None
+    editor._report_subtitle_coverage_gaps = lambda *args, **kwargs: None
+    post_page_audits = []
+
+    def capture_post_page_artifacts(*args, **kwargs):
+        audit = editor._english_boundary_audit_payload(kwargs["final_segments"])
+        post_page_audits.append(audit)
+
+    editor._write_stable_pipeline_artifacts = capture_post_page_artifacts
+
+    before = [
+        (
+            segment.subtitle_id,
+            segment.text,
+            segment.word_start,
+            segment.word_end,
+            segment.start_time,
+            segment.end_time,
+        )
+        for segment in asr_data.segments
+    ]
+    old_single_chinese = single_page.translated_text
+
+    result = editor.apply_display_page_translations_after_final_timing(asr_data)
+
+    display_chinese = "".join(page["chinese"] for page in case["pages"])
+    assert result is asr_data
+    assert paginated.translated_text == case["parent_chinese"]
+    assert single_page.translated_text == old_single_chinese
+    assert [
+        (
+            segment.subtitle_id,
+            segment.text,
+            segment.word_start,
+            segment.word_end,
+            segment.start_time,
+            segment.end_time,
+        )
+        for segment in asr_data.segments
+    ] == before
+    artifact = editor._display_page_translation_artifact
+    assert artifact["status"] == "PASS"
+    assert artifact["parents"][0]["aggregate_chinese"] == display_chinese
+    assert parent_chinese_by_id(artifact) == {
+        case["subtitle_id"]: case["parent_chinese"]
+    }
+    assert [parent["parent_subtitle_id"] for parent in artifact["parents"]] == [
+        case["subtitle_id"]
+    ]
+    assert post_page_audits
+    assert post_page_audits[-1]["schema_version"] == 2
+    assert any(
+        record.get("scope") == "display_page"
+        for record in post_page_audits[-1]["records"]
+    )
+
+    editor._last_subtitle_items[0].translated = "被篡改的父字幕中文。"
+    try:
+        editor.apply_display_page_translations_after_final_timing(asr_data)
+    except RuntimeError as exc:
+        assert "fixed-ID parent Chinese drifted" in str(exc)
+    else:
+        raise AssertionError("real parent-Chinese drift must remain render-blocking")
+
+
+def test_flash_page_fragment_retries_only_parent_and_pro_residual_stays_review():
+    cases = [
+        _cases()["s0078_reordered_chinese"],
+        _cases()["s0252_monotonic_chinese"],
+    ]
+    segments = []
+    next_word_id = 0
+    for case in cases:
+        segment = ASRDataSeg(
+            case["english"],
+            int(case["start"] * 1000),
+            int(case["end"] * 1000),
+            case["parent_chinese"],
+        )
+        segment.subtitle_id = case["subtitle_id"]
+        segment.word_start = next_word_id
+        segment.word_end = next_word_id + len(segment.text.split()) - 1
+        next_word_id = segment.word_end + 1
+        segments.append(segment)
+    asr_data = ASRData(segments)
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.enable_stable_mode = True
+    editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
+    editor._active_source_segments_by_id = {}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._display_page_translation_artifact = {}
+    editor._display_page_translation_path = ""
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.coverage_report_path = None
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = SimpleNamespace(
+        get_llm_result=lambda *args, **kwargs: None,
+        set_llm_result=lambda *args, **kwargs: None,
+    )
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    request_scopes = []
+    quality_scopes = []
+    initial_second_parent = {}
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        request_scopes.append(
+            {
+                "model": kwargs["model"],
+                "parents": copy.deepcopy(payload),
+            }
+        )
+        rows = []
+        fixture_by_parent_id = {
+            case["subtitle_id"]: case for case in cases
+        }
+        for parent in payload:
+            fixture = fixture_by_parent_id[parent["parent_subtitle_id"]]
+            for page_index, page in enumerate(parent["pages"], 1):
+                rows.append(
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "source_english": page["english"],
+                        "zh": fixture["pages"][page_index - 1]["chinese"],
+                    }
+                )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    editor._display_page_translation_response_is_cacheable = lambda *args: True
+
+    def residual_fragment_review(contract, artifact):
+        parent_ids = [
+            str(parent.get("parent_subtitle_id") or "")
+            for parent in contract.get("parents") or []
+        ]
+        quality_scopes.append(parent_ids)
+        if len(parent_ids) == 2 and not initial_second_parent:
+            second = next(
+                parent
+                for parent in artifact.get("parents") or []
+                if parent.get("parent_subtitle_id") == cases[1]["subtitle_id"]
+            )
+            initial_second_parent.update(copy.deepcopy(second))
+        editor._display_page_translation_reviews = [
+            {
+                "code": "display_page_continuation_review",
+                "parent_subtitle_id": cases[0]["subtitle_id"],
+                "issue_codes": ["unnatural_chinese_fragment"],
+                "issues": [],
+            }
+        ]
+        return []
+
+    editor._display_page_translation_quality_errors = residual_fragment_review
+    editor._record_display_page_translation_failure = lambda *args, **kwargs: None
+    editor._report_subtitle_coverage_gaps = lambda *args, **kwargs: None
+    editor._write_stable_pipeline_artifacts = lambda *args, **kwargs: None
+
+    result = editor.apply_display_page_translations_after_final_timing(asr_data)
+
+    assert result is asr_data
+    assert [segment.translated_text for segment in segments] == [
+        case["parent_chinese"] for case in cases
+    ]
+    assert [scope["model"] for scope in request_scopes] == [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ]
+    assert [
+        parent["parent_subtitle_id"] for parent in request_scopes[0]["parents"]
+    ] == [case["subtitle_id"] for case in cases]
+    assert [
+        parent["parent_subtitle_id"] for parent in request_scopes[1]["parents"]
+    ] == [cases[0]["subtitle_id"]]
+    initial_first_pages = {
+        page["display_page_id"]
+        for page in request_scopes[0]["parents"][0]["pages"]
+    }
+    retry_pages = {
+        page["display_page_id"]
+        for page in request_scopes[1]["parents"][0]["pages"]
+    }
+    second_pages = {
+        page["display_page_id"]
+        for page in request_scopes[0]["parents"][1]["pages"]
+    }
+    assert retry_pages == initial_first_pages
+    assert retry_pages.isdisjoint(second_pages)
+    assert quality_scopes == [
+        [case["subtitle_id"] for case in cases],
+        [cases[0]["subtitle_id"]],
+        [case["subtitle_id"] for case in cases],
+    ]
+    artifact = editor._display_page_translation_artifact
+    assert artifact["status"] == "PASS"
+    assert artifact["review_count"] == 1
+    assert artifact["reviews"][0]["parent_subtitle_id"] == cases[0]["subtitle_id"]
+    final_second_parent = next(
+        parent
+        for parent in artifact["parents"]
+        if parent["parent_subtitle_id"] == cases[1]["subtitle_id"]
+    )
+    canonical = lambda value: json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert canonical(final_second_parent) == canonical(initial_second_parent)
+    assert parent_chinese_by_id(artifact) == {
+        case["subtitle_id"]: case["parent_chinese"] for case in cases
+    }
+
+
+def test_display_page_local_fluency_findings_are_review_not_semantic_blockers():
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    contract = {
+        "parents": [
+            {
+                "parent_subtitle_id": "S0301",
+                "english": "A complete parent split across two display pages.",
+                "source_chinese": "一条完整父字幕被分到两个显示页。",
+                "pages": [
+                    {
+                        "display_page_id": "S0301.P01",
+                        "english": "A complete parent split",
+                        "start_ms": 0,
+                        "end_ms": 3000,
+                    },
+                    {
+                        "display_page_id": "S0301.P02",
+                        "english": "across two display pages.",
+                        "start_ms": 3000,
+                        "end_ms": 6000,
+                    },
+                ],
+            }
+        ]
+    }
+    artifact = {
+        "status": "PASS",
+        "parents": [
+            {
+                "parent_subtitle_id": "S0301",
+                "pages": [
+                    {"display_page_id": "S0301.P01", "zh": "一条完整父字幕"},
+                    {"display_page_id": "S0301.P02", "zh": "被分到两个显示页。"},
+                ],
+            }
+        ],
+    }
+    editor._validate_group_chinese_allocation = lambda *_args, **_kwargs: {
+        "valid": False,
+        "issue_codes": [
+            "unnatural_chinese_fragment",
+            "dangling_preposition",
+            "modifier_head_split",
+            "punctuation_discontinuity",
+        ],
+        "issues": [{"reason": "page_local_fluency"}],
+    }
+
+    errors = editor._display_page_translation_quality_errors(contract, artifact)
+
+    assert errors == []
+    assert editor._display_page_translation_reviews == [
+        {
+            "code": "display_page_continuation_review",
+            "parent_subtitle_id": "S0301",
+            "issue_codes": [
+                "unnatural_chinese_fragment",
+                "dangling_preposition",
+                "modifier_head_split",
+                "punctuation_discontinuity",
+            ],
+            "issues": [{"reason": "page_local_fluency"}],
+        }
+    ]
+
+    editor._validate_group_chinese_allocation = lambda *_args, **_kwargs: {
+        "valid": False,
+        "issue_codes": ["semantic_loss", "modifier_head_split"],
+        "issues": [{"reason": "meaning_missing"}],
+    }
+    errors = editor._display_page_translation_quality_errors(contract, artifact)
+    assert [error["code"] for error in errors] == [
+        "display_page_semantic_validation_failed"
+    ]
+    assert editor._display_page_translation_reviews == []
+
+
+def test_display_page_semantics_use_authoritative_parent_chinese_not_english_scaffolding():
+    contract = {
+        "parents": [
+            {
+                "parent_subtitle_id": "S0015",
+                "english": (
+                    "Because it's like walking into a dollar store during a recession "
+                    "and seeing a line out the door for a 30 artisanal candy bar."
+                ),
+                "source_chinese": (
+                    "这就像在经济衰退期走进一元店，却看到人们排长队买30美元的手工巧克力棒。"
+                ),
+                "pages": [
+                    {
+                        "display_page_id": "S0015.P01",
+                        "english": (
+                            "Because it's like walking into a dollar store during a recession"
+                        ),
+                        "start_ms": 61655,
+                        "end_ms": 65247,
+                    },
+                    {
+                        "display_page_id": "S0015.P02",
+                        "english": (
+                            "and seeing a line out the door for a 30 artisanal candy bar."
+                        ),
+                        "start_ms": 65247,
+                        "end_ms": 69483,
+                    },
+                ],
+            }
+        ]
+    }
+    artifact = {
+        "status": "PASS",
+        "parents": [
+            {
+                "parent_subtitle_id": "S0015",
+                "pages": [
+                    {
+                        "display_page_id": "S0015.P01",
+                        "zh": "这就像在经济衰退期走进一元店",
+                    },
+                    {
+                        "display_page_id": "S0015.P02",
+                        "zh": "却看到人们排长队买30美元的手工巧克力棒。",
+                    },
+                ],
+            }
+        ],
+    }
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+
+    errors = editor._display_page_translation_quality_errors(contract, artifact)
+
+    assert errors == []
+
+
+def test_display_page_prompt_makes_parent_chinese_the_semantic_ceiling():
+    assert DISPLAY_PAGE_TRANSLATION_PROMPT_VERSION == "display-page-translation-v10"
+    assert DISPLAY_PAGE_TRANSLATION_ALGORITHM_VERSION == "fixed-parent-page-allocation-v9"
+    assert "semantic ceiling" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "Never restore a concept from the English" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "Do not introduce a new multi-character content word" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "a natural Chinese continuation across adjacent pages is allowed" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "merely to make a fragment page stand alone" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "Read the projected pages aloud in order" in DISPLAY_PAGE_TRANSLATION_PROMPT
+    assert "bare “的/在/从/对/把/将”" in DISPLAY_PAGE_TRANSLATION_PROMPT
+
+
+def test_display_page_retry_prompt_constrains_arbitrary_validator_tokens():
+    case = _cases()["s0078_reordered_chinese"]
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+
+    prompt = editor._display_page_translation_request_prompt(
+        _contract(case),
+        retry_errors=[
+            {
+                "code": "page_translation_parent_meaning_added",
+                "parent_subtitle_id": case["subtitle_id"],
+                "added_tokens": ["背景", "结论"],
+            },
+            {
+                "code": "page_translation_id_missing",
+                "ids": [f"{case['subtitle_id']}.P02"],
+            },
+            {
+                "code": "page_translation_chinese_token_split",
+                "parent_subtitle_id": case["subtitle_id"],
+                "display_page_id": f"{case['subtitle_id']}.P01",
+                "split_token": "留学生",
+            },
+        ],
+    )
+
+    assert f"Parent {case['subtitle_id']}" in prompt
+    assert '["背景", "结论"]' in prompt
+    assert "Do not replace them with synonyms" in prompt
+    assert f'["{case["subtitle_id"]}.P02"]' in prompt
+    assert '"留学生" entirely on one page' in prompt
+    assert "English is placement evidence only" in prompt
+
+
+def test_display_page_error_evidence_retains_retry_rejection_reason():
+    errors = ScreenSubtitleEditor._merge_display_page_error_evidence(
+        [{"code": "page_translation_id_missing", "ids": ["S0188.P01", "S0188.P02"]}],
+        [],
+        [
+            {
+                "code": "page_translation_parent_meaning_expanded",
+                "parent_subtitle_id": "S0188",
+                "growth": 10,
+                "allowed_growth": 8,
+            }
+        ],
+    )
+
+    assert [error["code"] for error in errors] == [
+        "page_translation_id_missing",
+        "page_translation_parent_meaning_expanded",
+    ]
+
+
+def test_review_only_initial_page_projection_survives_worse_pro_retry():
+    case = _cases()["s0078_reordered_chinese"]
+    segment = ASRDataSeg(
+        case["english"],
+        int(case["start"] * 1000),
+        int(case["end"] * 1000),
+        case["parent_chinese"],
+    )
+    segment.subtitle_id = case["subtitle_id"]
+    segment.word_start = 0
+    segment.word_end = len(segment.text.split()) - 1
+    asr_data = ASRData([segment])
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.model = "deepseek-v4-flash"
+    editor.full_translation_model = "deepseek-v4-pro"
+    editor.allocation_review_model = "deepseek-v4-flash"
+    editor.display_page_translation_model = "deepseek-v4-flash"
+    editor.enable_stable_mode = True
+    editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
+    editor._active_source_segments_by_id = {}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._display_page_translation_artifact = {}
+    editor._display_page_translation_path = ""
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.coverage_report_path = None
+    editor.article_context_prompt = ""
+    editor.article_context_data = {}
+    editor.target_language = "简体中文"
+    editor.timeout = 5
+    editor.cache_manager = SimpleNamespace(
+        get_llm_result=lambda *args, **kwargs: None,
+        set_llm_result=lambda *args, **kwargs: None,
+    )
+    editor._llm_cache_stats = {}
+    editor._llm_cache_used = False
+    request_models = []
+    initial_rows = []
+
+    def create(**kwargs):
+        request_models.append(kwargs["model"])
+        payload = json.loads(kwargs["messages"][1]["content"])
+        rows = []
+        for parent in payload:
+            for page_index, page in enumerate(parent["pages"], 1):
+                if kwargs["model"] == "deepseek-v4-pro":
+                    chinese = (
+                        f"这是第{page_index}页新增加的冗长解释内容，"
+                        "它反复补充父字幕中不存在的大量说明和结论。"
+                    )
+                else:
+                    chinese = case["pages"][page_index - 1]["chinese"]
+                row = {
+                    "display_page_id": page["display_page_id"],
+                    "source_english": page["english"],
+                    "zh": chinese,
+                }
+                rows.append(row)
+                if kwargs["model"] == "deepseek-v4-flash":
+                    initial_rows.append(copy.deepcopy(row))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps({"pages": rows}, ensure_ascii=False)
+                    )
+                )
+            ]
+        )
+
+    editor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    editor._display_page_translation_response_is_cacheable = lambda *args: True
+    quality_calls = 0
+
+    def initial_review_only(_contract, artifact):
+        nonlocal quality_calls
+        quality_calls += 1
+        editor._display_page_translation_reviews = []
+        if artifact.get("status") == "PASS" and quality_calls == 1:
+            editor._display_page_translation_reviews = [
+                {
+                    "code": "display_page_continuation_review",
+                    "parent_subtitle_id": case["subtitle_id"],
+                    "issue_codes": ["unnatural_chinese_fragment"],
+                    "issues": [],
+                }
+            ]
+        return []
+
+    editor._display_page_translation_quality_errors = initial_review_only
+    editor._record_display_page_translation_failure = lambda *args, **kwargs: None
+    editor._report_subtitle_coverage_gaps = lambda *args, **kwargs: None
+    editor._write_stable_pipeline_artifacts = lambda *args, **kwargs: None
+
+    result = editor.apply_display_page_translations_after_final_timing(asr_data)
+
+    assert result is asr_data
+    assert request_models == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    artifact = editor._display_page_translation_artifact
+    assert artifact["status"] == "PASS"
+    assert artifact["errors"] == []
+    assert artifact["review_count"] == 1
+    assert artifact["reviews"][0]["parent_subtitle_id"] == case["subtitle_id"]
+    assert artifact["retry_attempt_errors"]
+    final_rows = [
+        {
+            "display_page_id": page["display_page_id"],
+            "source_english": page["english"],
+            "zh": page["zh"],
+        }
+        for parent in artifact["parents"]
+        for page in parent["pages"]
+    ]
+    assert final_rows == initial_rows
+
+
+def test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id():
+    text = (
+        "the ultimate consequence of this AI-enabled independence is a massive "
+        "redistribution of where economic value actually flows."
+    )
+    segment = ASRDataSeg(text, 1000, 8600, "这是完整中文。")
+    segment.subtitle_id = "S0201"
+    segment.word_start = 0
+    segment.word_end = len(text.split()) - 1
+    asr_data = ASRData([segment])
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.enable_stable_mode = True
+    editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
+    editor._active_source_segments_by_id = {}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._translation_structure_errors = []
+    editor._display_page_translation_artifact = {}
+    editor._display_page_translation_path = ""
+    editor._display_page_external_request_count = 0
+    editor.coverage_report_path = None
+    editor._display_boundary_evidence_for_span = lambda *args, **kwargs: {}
+    before = (segment.text, segment.translated_text, segment.start_time, segment.end_time)
+
+    overflow = podcast_learning_video.RenderStructuralOverflowError(
+        [{"cue_index": 1, "reason": "hard_page_boundary"}],
+        partial_blueprint={
+            "schema_version": 2,
+            "status": "ERROR",
+            "planner_version": "article-fixed-font-pages-v27",
+            "layout_profile": {"english_min_size": 52},
+            "parents": [],
+            "render_plans": [
+                {
+                    "parent_subtitle_id": "S0201",
+                    "editable_seed": True,
+                    "renderable": False,
+                    "pages": [],
+                }
+            ],
+            "errors": [{"cue_index": 1, "reason": "hard_page_boundary"}],
+        },
+    )
+    with patch(
+        "app.core.utils.podcast_learning_video.build_article_display_page_blueprint",
+        side_effect=overflow,
+    ):
+        try:
+            editor.apply_display_page_translations_after_final_timing(asr_data)
+        except RuntimeError as exc:
+            assert "display_page_translation_invalid" in str(exc)
+        else:
+            raise AssertionError("visual overflow must remain render-blocking")
+
+    issue = editor._translation_structure_errors[-1]
+    assert issue["code"] == "display_page_blueprint_invalid"
+    assert issue["subtitle_ids"] == ["S0201"]
+    assert issue["items"] == [
+        {
+            "subtitle_id": "S0201",
+            "cue_index": 1,
+            "reason": "hard_page_boundary",
+        }
+    ]
+    assert editor._display_page_translation_artifact["status"] == "ERROR"
+    assert editor._display_page_translation_artifact["render_plans"] == [
+        {
+            "parent_subtitle_id": "S0201",
+            "editable_seed": True,
+            "renderable": False,
+            "pages": [],
+        }
+    ]
+    assert editor._display_page_translation_artifact["errors"] == [
+        {
+            "cue_index": 1,
+            "reason": "hard_page_boundary",
+            "code": "display_page_blueprint_invalid",
+            "parent_subtitle_id": "S0201",
+        }
+    ]
+    assert (segment.text, segment.translated_text, segment.start_time, segment.end_time) == before
+
+
+def test_screen_editor_keeps_valid_page_chinese_when_another_parent_overflows():
+    valid_english = (
+        "Teams compare old memories with new technology across changing urban spaces today."
+    )
+    failed_english = "This caption cannot find a safe normal font partition today."
+    valid = ASRDataSeg(valid_english, 0, 6000, "旧记忆。新技术对照。")
+    failed = ASRDataSeg(failed_english, 6100, 11000, "这条字幕需要人工分页。")
+    valid.subtitle_id = "S0001"
+    valid.word_start = 0
+    valid.word_end = len(valid_english.split()) - 1
+    failed.subtitle_id = "S0002"
+    failed.word_start = valid.word_end + 1
+    failed.word_end = failed.word_start + len(failed_english.split()) - 1
+    asr_data = ASRData([valid, failed])
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.enable_stable_mode = True
+    editor.target_language = "zh-CN"
+    editor._active_word_entries = _word_entries_for_segments(asr_data.segments)
+    editor._active_source_segments_by_id = {}
+    editor._last_semantic_groups = []
+    editor._last_subtitle_items = []
+    editor._translation_structure_errors = []
+    editor._display_page_translation_artifact = {}
+    editor._display_page_translation_path = ""
+    editor._display_page_external_request_count = 0
+    editor._display_page_translation_reviews = []
+    editor.coverage_report_path = None
+    editor._display_boundary_evidence_payload = lambda: {"boundaries": {}}
+    editor._display_page_translation_quality_errors = lambda *args: []
+    editor._record_display_page_translation_failure = lambda *args, **kwargs: None
+
+    valid_words = valid_english.split()
+    valid_plan = {
+        "parent_subtitle_id": "S0001",
+        "english": valid_english,
+        "chinese": valid.translated_text,
+        "word_start": valid.word_start,
+        "word_end": valid.word_end,
+        "english_font_size": 56,
+        "font_fallback": {"used": False},
+        "pages": [
+            {
+                "display_page_id": "S0001.P01",
+                "word_start": 0,
+                "word_end": 5,
+                "english": " ".join(valid_words[:6]),
+                "start_ms": 0,
+                "end_ms": 3000,
+                "english_lines": [" ".join(valid_words[:6])],
+                "english_font_size": 56,
+                "english_width": 1498,
+                "boundary_before": {},
+            },
+            {
+                "display_page_id": "S0001.P02",
+                "word_start": 6,
+                "word_end": 11,
+                "english": " ".join(valid_words[6:]),
+                "start_ms": 3000,
+                "end_ms": 6000,
+                "english_lines": [" ".join(valid_words[6:])],
+                "english_font_size": 56,
+                "english_width": 1498,
+                "boundary_before": {"classification": "allow", "confidence": "high"},
+            },
+        ],
+    }
+    failed_plan = {
+        "parent_subtitle_id": "S0002",
+        "english": failed_english,
+        "chinese": failed.translated_text,
+        "word_start": failed.word_start,
+        "word_end": failed.word_end,
+        "english_font_size": 52,
+        "font_fallback": {"used": False},
+        "editable_seed": True,
+        "renderable": False,
+        "failure_reasons": ["no_complete_normal_font_page_partition"],
+        "pages": [
+            {
+                "display_page_id": "S0002.P01",
+                "word_start": failed.word_start,
+                "word_end": failed.word_end,
+                "english": failed_english,
+                "start_ms": 6100,
+                "end_ms": 11000,
+                "english_lines": [],
+                "english_font_size": 52,
+                "english_width": 1498,
+                "boundary_before": {},
+            }
+        ],
+    }
+    partial_blueprint = {
+        "schema_version": 2,
+        "status": "ERROR",
+        "planner_version": "article-fixed-font-pages-v27",
+        "layout_profile": podcast_learning_video.article_display_page_layout_profile(),
+        "parents": [],
+        "render_plans": [valid_plan, failed_plan],
+        "errors": [
+            {
+                "cue_index": 2,
+                "reason": "no_complete_normal_font_page_partition",
+            }
+        ],
+    }
+    overflow = podcast_learning_video.RenderStructuralOverflowError(
+        partial_blueprint["errors"],
+        partial_blueprint=partial_blueprint,
+    )
+
+    def request(contract, **_kwargs):
+        assert [parent["parent_subtitle_id"] for parent in contract["parents"]] == [
+            "S0001"
+        ]
+        return (
+            {
+                "pages": [
+                    {
+                        "display_page_id": "S0001.P01",
+                        "source_english": valid_plan["pages"][0]["english"],
+                        "zh": "旧记忆。",
+                    },
+                    {
+                        "display_page_id": "S0001.P02",
+                        "source_english": valid_plan["pages"][1]["english"],
+                        "zh": "新技术对照。",
+                    },
+                ]
+            },
+            False,
+        )
+
+    with (
+        patch(
+            "app.core.utils.podcast_learning_video.build_article_display_page_blueprint",
+            side_effect=overflow,
+        ),
+        patch.object(editor, "_request_display_page_translations", side_effect=request),
+    ):
+        try:
+            editor.apply_display_page_translations_after_final_timing(asr_data)
+        except RuntimeError as exc:
+            assert "display_page_translation_invalid" in str(exc)
+        else:
+            raise AssertionError("the failed parent must keep formal publication blocked")
+
+    artifact = editor._display_page_translation_artifact
+    assert artifact["status"] == "ERROR"
+    assert [parent["parent_subtitle_id"] for parent in artifact["parents"]] == [
+        "S0001"
+    ]
+    assert [page["zh"] for page in artifact["parents"][0]["pages"]] == [
+        "旧记忆。",
+        "新技术对照。",
+    ]
+    assert [plan["parent_subtitle_id"] for plan in artifact["render_plans"]] == [
+        "S0001",
+        "S0002",
+    ]
+    assert artifact["render_plans"][1]["editable_seed"] is True
+    assert any(
+        error.get("parent_subtitle_id") == "S0002"
+        for error in artifact["errors"]
+    )
+
+
+def test_screen_editor_normalizes_page_errors_to_frozen_parent_ids():
+    parents = [
+        {
+            "parent_subtitle_id": "S0201",
+            "pages": [
+                {"display_page_id": "S0201.P01"},
+                {"display_page_id": "S0201.P02"},
+            ],
+        },
+        {
+            "parent_subtitle_id": "S0202",
+            "pages": [{"display_page_id": "S0202.P01"}],
+        },
+    ]
+    items = ScreenSubtitleEditor._display_page_failure_items(
+        [
+            {
+                "code": "page_translation_chinese_token_split",
+                "display_page_id": "S0201.P02",
+            },
+            {
+                "code": "missing_display_page_ids",
+                "ids": ["S0202.P01"],
+            },
+        ],
+        parents,
+        fallback_reason="display_page_translation_invalid",
+    )
+
+    assert items == [
+        {
+            "subtitle_id": "S0201",
+            "display_page_id": "S0201.P02",
+            "reason": "page_translation_chinese_token_split",
+        },
+        {
+            "subtitle_id": "S0202",
+            "display_page_id": "S0202.P01",
+            "reason": "missing_display_page_ids",
+        },
+    ]
+
+
+def test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_tampered():
+    case = _cases()["s0078_reordered_chinese"]
+    aggregate_chinese = "".join(page["chinese"] for page in case["pages"])
+    words = case["english"].split()
+    start_ms = int(case["start"] * 1000)
+    end_ms = int(case["end"] * 1000)
+    duration = end_ms - start_ms
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        subtitle_path = root / "stable-final-original-top.srt"
+        subtitle_path.write_text(
+            "1\n00:05:05,025 --> 00:05:14,811\n"
+            + case["english"]
+            + "\n"
+            + aggregate_chinese
+            + "\n",
+            encoding="utf-8",
+        )
+        artifact_dir = root / "styled-subtitles-artifacts"
+        artifact_dir.mkdir()
+        timeline_path = artifact_dir / "final-cue-timeline.json"
+        timeline_path.write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "subtitle_id": case["subtitle_id"],
+                            "word_start": 0,
+                            "word_end": len(words) - 1,
+                            "start_ms": start_ms,
+                            "end_ms": end_ms,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (artifact_dir / "word-ledger.json").write_text(
+            json.dumps(
+                {
+                    "words": [
+                        {
+                            "surface": word,
+                            "start_ms": start_ms + duration * index // len(words),
+                            "end_ms": start_ms + duration * (index + 1) // len(words),
+                        }
+                        for index, word in enumerate(words)
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        page_artifact_path = artifact_dir / "display-page-translations.json"
+        manifest_path = root / "stable-final-manifest.json"
+        stable_sha256 = hashlib.sha256(subtitle_path.read_bytes()).hexdigest()
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "paths": {"original_top_srt": str(subtitle_path)},
+                    "paths_sha256": {"original_top_srt": stable_sha256},
+                    "final_cue_timeline_path": str(timeline_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        source_cues = podcast_learning_video.parse_srt(subtitle_path)
+        assert podcast_learning_video.attach_article_word_timing(source_cues, subtitle_path)
+        blueprint = podcast_learning_video.build_article_display_page_blueprint(source_cues)
+        contract = build_display_page_contract(
+            blueprint["parents"],
+            layout_profile=blueprint["layout_profile"],
+            planner_version=blueprint["planner_version"],
+            render_plans=blueprint["render_plans"],
+        )
+        expected_pages = list(contract["parents"][0]["pages"])
+        artifact = validate_page_translation_response(
+            contract,
+            {
+                "pages": [
+                    {
+                        "display_page_id": page["display_page_id"],
+                        "zh": expected["chinese"],
+                    }
+                    for page, expected in zip(expected_pages, case["pages"])
+                ]
+            },
+        )
+        assert artifact["status"] == "PASS"
+        page_artifact_path.write_text(
+            json.dumps(artifact, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "paths": {"original_top_srt": str(subtitle_path)},
+                    "paths_sha256": {"original_top_srt": stable_sha256},
+                    "final_cue_timeline_path": str(timeline_path),
+                    "display_page_translation_path": str(page_artifact_path),
+                    "display_page_translation_status": "PASS",
+                    "display_page_translation_contract_hash": artifact["contract_hash"],
+                    "display_page_translation_sha256": hashlib.sha256(
+                        page_artifact_path.read_bytes()
+                    ).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        valid_cues = podcast_learning_video.parse_srt(subtitle_path)
+        with patch.object(
+            podcast_learning_video,
+            "_build_article_english_page_plan",
+            side_effect=AssertionError("renderer must consume the frozen plan"),
+        ):
+            podcast_learning_video.prepare_article_visual_page_plans(
+                valid_cues,
+                subtitle_path,
+            )
+        assert valid_cues[0].subtitle_id == case["subtitle_id"]
+        assert valid_cues[0].article_page_plan["status"] == "ok"
+        assert [page["zh"] for page in valid_cues[0].article_page_plan["pages"]] == [
+            page["chinese"] for page in case["pages"]
+        ]
+        page_artifact_path.unlink()
+        _assert_preflight_fails_before_ffmpeg(
+            podcast_learning_video.parse_srt(subtitle_path),
+            subtitle_path,
+        )
+
+        tampered = copy.deepcopy(artifact)
+        tampered["parents"][0]["pages"][0]["display_page_id"] = "S9999.P01"
+        page_artifact_path.write_text(
+            json.dumps(tampered, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        _assert_preflight_fails_before_ffmpeg(
+            podcast_learning_video.parse_srt(subtitle_path),
+            subtitle_path,
+        )
+
+        contract_tampered = copy.deepcopy(artifact)
+        contract_tampered["contract_hash"] = "0" * 64
+        page_artifact_path.write_text(
+            json.dumps(contract_tampered, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["display_page_translation_sha256"] = hashlib.sha256(
+            page_artifact_path.read_bytes()
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        _assert_preflight_fails_before_ffmpeg(
+            podcast_learning_video.parse_srt(subtitle_path),
+            subtitle_path,
+        )
+
+
+def test_parse_srt_preserves_numeric_only_bilingual_line_order():
+    cases = (
+        ("90%?\n90%？", "90%?", "90%？"),
+        ("90%？\n90%?", "90%?", "90%？"),
+    )
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        for index, (payload, expected_english, expected_chinese) in enumerate(
+            cases,
+            1,
+        ):
+            subtitle_path = root / f"numeric-{index}.srt"
+            subtitle_path.write_text(
+                f"1\n00:00:00,000 --> 00:00:01,000\n{payload}\n",
+                encoding="utf-8",
+            )
+
+            cue = podcast_learning_video.parse_srt(subtitle_path)[0]
+
+            assert cue.en == expected_english
+            assert cue.zh == expected_chinese
+
+
+def test_attach_article_word_timing_restores_hash_bound_boundary_evidence():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        subtitle_path = root / "stable-final-original-top.srt"
+        timeline_path = root / "final-cue-timeline.json"
+        ledger_path = root / "word-ledger.json"
+        evidence_path = root / "display-boundary-evidence.json"
+        manifest_path = root / "stable-final-manifest.json"
+        english = "Models improve through feedback."
+        chinese = "模型通过反馈改进。"
+        subtitle_path.write_text(
+            f"1\n00:00:00,000 --> 00:00:04,000\n{english}\n{chinese}\n",
+            encoding="utf-8",
+        )
+        timeline_path.write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "subtitle_id": "S0001",
+                            "word_start": 0,
+                            "word_end": 3,
+                            "start_ms": 0,
+                            "end_ms": 4000,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        ledger_path.write_text(
+            json.dumps(
+                {
+                    "words": [
+                        {"surface": word, "start_ms": index * 1000, "end_ms": (index + 1) * 1000}
+                        for index, word in enumerate(english.split())
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        boundaries = {
+            "1": {"hard_issues": ["subject_predicate_split"], "soft_issues": [], "pause_ms": 0},
+            "2": {"hard_issues": ["verb_preposition_complement_split"], "soft_issues": [], "pause_ms": 0},
+            "3": {"hard_issues": [], "soft_issues": [], "pause_ms": 420},
+        }
+        evidence_path.write_text(
+            json.dumps({"boundaries": boundaries}),
+            encoding="utf-8",
+        )
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "paths": {"original_top_srt": str(subtitle_path)},
+                    "paths_sha256": {
+                        "original_top_srt": hashlib.sha256(
+                            subtitle_path.read_bytes()
+                        ).hexdigest()
+                    },
+                    "final_cue_timeline_path": str(timeline_path),
+                    "final_cue_timeline_sha256": hashlib.sha256(
+                        timeline_path.read_bytes()
+                    ).hexdigest(),
+                    "word_ledger_path": str(ledger_path),
+                    "word_ledger_sha256": hashlib.sha256(
+                        ledger_path.read_bytes()
+                    ).hexdigest(),
+                    "display_boundary_evidence_path": str(evidence_path),
+                    "display_boundary_evidence_sha256": hashlib.sha256(
+                        evidence_path.read_bytes()
+                    ).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cues = podcast_learning_video.parse_srt(subtitle_path)
+        assert podcast_learning_video.attach_article_word_timing(cues, subtitle_path)
+        assert cues[0].display_boundary_evidence == boundaries
+
+        evidence_path.write_text(
+            json.dumps({"boundaries": {**boundaries, "2": {}}}),
+            encoding="utf-8",
+        )
+        tampered = podcast_learning_video.parse_srt(subtitle_path)
+        assert not podcast_learning_video.attach_article_word_timing(
+            tampered,
+            subtitle_path,
+        )
+        assert tampered[0].display_boundary_evidence is None
+
+
+def test_manual_draft_page_artifact_is_loaded_only_from_manifest_hash_binding():
+    case = _cases()["s0252_monotonic_chinese"]
+    with tempfile.TemporaryDirectory() as raw:
+        package = _write_persisted_manual_draft_package(Path(raw), case)
+        manifest = json.loads(
+            package["manifest_path"].read_text(encoding="utf-8")
+        )
+        override = manifest["manual_final_override"]
+        assert manifest["manual_draft_page_plan_path"] == override[
+            "manual_draft_page_plan_path"
+        ]
+        assert manifest["manual_draft_page_plan_sha256"] == override[
+            "manual_draft_page_plan_sha256"
+        ]
+        assert override["artifact_dir"] == str(
+            package["draft_artifact_path"].parent
+        )
+        assert package["draft_artifact"]["status"] == "REVIEW"
+        assert all(
+            "chinese" in page and "zh" not in page
+            for plan in package["draft_artifact"]["render_plans"]
+            for page in plan["pages"]
+        )
+        cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+        assert podcast_learning_video.attach_article_word_timing(
+            cues,
+            package["subtitle_path"],
+        )
+
+        assert podcast_learning_video.load_article_manual_draft_page_artifact(
+            cues,
+            package["subtitle_path"],
+        )
+        assert cues[0].article_page_plan["status"] == "ok"
+
+        unbound_manifest = copy.deepcopy(manifest)
+        unbound_manifest.pop("manual_draft_page_plan_sha256")
+        package["manifest_path"].write_text(
+            json.dumps(unbound_manifest, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        unbound_cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+        assert podcast_learning_video.attach_article_word_timing(
+            unbound_cues,
+            package["subtitle_path"],
+        )
+        assert not podcast_learning_video.load_article_manual_draft_page_artifact(
+            unbound_cues,
+            package["subtitle_path"],
+        )
+
+        mismatched_override = copy.deepcopy(manifest)
+        mismatched_override["manual_final_override"][
+            "manual_draft_page_plan_sha256"
+        ] = "0" * 64
+        package["manifest_path"].write_text(
+            json.dumps(mismatched_override, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        mismatched_cues = podcast_learning_video.parse_srt(
+            package["subtitle_path"]
+        )
+        assert podcast_learning_video.attach_article_word_timing(
+            mismatched_cues,
+            package["subtitle_path"],
+        )
+        assert not podcast_learning_video.load_article_manual_draft_page_artifact(
+            mismatched_cues,
+            package["subtitle_path"],
+        )
+
+        wrong_owner = copy.deepcopy(manifest)
+        wrong_owner["manual_final_override"]["artifact_dir"] = str(
+            package["subtitle_path"].parent
+        )
+        package["manifest_path"].write_text(
+            json.dumps(wrong_owner, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        wrong_owner_cues = podcast_learning_video.parse_srt(
+            package["subtitle_path"]
+        )
+        assert podcast_learning_video.attach_article_word_timing(
+            wrong_owner_cues,
+            package["subtitle_path"],
+        )
+        assert not podcast_learning_video.load_article_manual_draft_page_artifact(
+            wrong_owner_cues,
+            package["subtitle_path"],
+        )
+
+
+def test_manual_draft_preflight_consumes_frozen_artifact_without_replanning():
+    case = _cases()["s0252_monotonic_chinese"]
+    with tempfile.TemporaryDirectory() as raw:
+        package = _write_persisted_manual_draft_package(Path(raw), case)
+        cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+
+        with (
+            patch.object(
+                podcast_learning_video,
+                "_build_article_english_page_plan",
+                side_effect=AssertionError("frozen manual draft must not replan"),
+            ) as strict_planner,
+            patch.object(
+                podcast_learning_video,
+                "build_article_manual_draft_page_plan",
+                side_effect=AssertionError("frozen manual draft must not fallback"),
+            ) as fallback_planner,
+        ):
+            podcast_learning_video.prepare_article_visual_page_plans(
+                cues,
+                package["subtitle_path"],
+                allow_manual_draft=True,
+            )
+
+        strict_planner.assert_not_called()
+        fallback_planner.assert_not_called()
+        assert cues[0].article_page_plan["status"] == "ok"
+
+
+def test_manual_draft_preflight_rejects_missing_or_tampered_artifact_before_ffmpeg():
+    case = _cases()["s0252_monotonic_chinese"]
+    for mutation in ("missing", "tampered"):
+        with tempfile.TemporaryDirectory() as raw:
+            package = _write_persisted_manual_draft_package(Path(raw), case)
+            if mutation == "missing":
+                package["draft_artifact_path"].unlink()
+            else:
+                package["draft_artifact_path"].write_bytes(
+                    package["draft_artifact_path"].read_bytes() + b"\n"
+                )
+            cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+
+            with (
+                patch.object(
+                    podcast_learning_video,
+                    "_build_article_english_page_plan",
+                    side_effect=AssertionError("invalid persisted draft must not replan"),
+                ) as strict_planner,
+                patch.object(
+                    podcast_learning_video,
+                    "build_article_manual_draft_page_plan",
+                    side_effect=AssertionError("invalid persisted draft must not fallback"),
+                ) as fallback_planner,
+                patch.object(podcast_learning_video.subprocess, "Popen") as popen,
+            ):
+                try:
+                    podcast_learning_video.prepare_article_visual_page_plans(
+                        cues,
+                        package["subtitle_path"],
+                        allow_manual_draft=True,
+                    )
+                except podcast_learning_video.RenderStructuralOverflowError as exc:
+                    assert any(
+                        error.get("reason")
+                        == "missing_or_invalid_manual_draft_page_artifact"
+                        for error in exc.errors
+                    )
+                else:
+                    raise AssertionError(
+                        "missing or tampered manual draft artifact must fail preflight"
+                    )
+
+            strict_planner.assert_not_called()
+            fallback_planner.assert_not_called()
+            assert not popen.called
+
+
+def test_loaded_manual_draft_pages_match_persisted_identity_text_timing_and_font():
+    case = _cases()["s0252_monotonic_chinese"]
+    with tempfile.TemporaryDirectory() as raw:
+        package = _write_persisted_manual_draft_package(Path(raw), case)
+        cues = podcast_learning_video.parse_srt(package["subtitle_path"])
+
+        podcast_learning_video.prepare_article_visual_page_plans(
+            cues,
+            package["subtitle_path"],
+            allow_manual_draft=True,
+        )
+
+        frozen_plan = package["draft_artifact"]["render_plans"][0]
+        loaded_plan = cues[0].article_page_plan
+        assert loaded_plan["source"] == "frozen_manual_draft_page_artifact"
+        assert loaded_plan["font_size"]["english"] == frozen_plan[
+            "english_font_size"
+        ]
+        assert len(loaded_plan["pages"]) == len(frozen_plan["pages"])
+        for loaded, frozen in zip(loaded_plan["pages"], frozen_plan["pages"]):
+            assert loaded["display_page_id"] == frozen["display_page_id"]
+            assert loaded["parent_subtitle_id"] == frozen_plan[
+                "parent_subtitle_id"
+            ]
+            assert loaded["en"] == frozen["english"]
+            assert loaded["zh"] == frozen["chinese"]
+            assert loaded["global_word_start"] == frozen["word_start"]
+            assert loaded["global_word_end"] == frozen["word_end"]
+            assert round(loaded["start"] * 1000) == frozen["start_ms"]
+            assert round(loaded["end"] * 1000) == frozen["end_ms"]
+            assert loaded["english_font_size"] == frozen["english_font_size"]
+            assert loaded["en_lines"] == frozen["english_lines"]
+            assert loaded["en_width"] == frozen["english_width"]
+
+
+def test_stable_artifact_write_failure_is_not_reported_as_success():
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.coverage_report_path = ""
+    with tempfile.TemporaryDirectory() as raw:
+        editor.coverage_report_path = str(Path(raw) / "stable-coverage-report.txt")
+        editor.model = "test-model"
+        editor._llm_cache_used = False
+        editor.target_language = "zh-CN"
+        editor.max_cjk_chars = 28
+        editor.max_english_words = 16
+        editor.enable_chinese_polish = False
+        editor.allocation_max_concurrency = 1
+        editor.allocation_batch_size = 1
+        editor._chinese_cache_contract = {}
+        editor._llm_cache_stats = {}
+        editor._allocation_runtime_stats = {}
+        editor._active_word_entries = []
+        editor._frozen_subtitle_ids = []
+        editor._translation_structure_errors = []
+        editor._display_coverage_repairs = []
+        editor._display_coverage_unresolved = []
+        editor._final_cue_timeline = {}
+        editor._final_word_timing_reconciliations = []
+        editor._display_page_translation_artifact = {"status": "PASS"}
+        editor._final_cue_timeline_path = ""
+        editor._display_page_translation_path = ""
+        editor._display_page_translation_sha256 = ""
+        editor._last_llm_raw_returns = []
+        editor._last_full_translation_style_retry_log = []
+        editor._last_allocation_inputs = []
+        editor._last_allocation_raw_returns = []
+        editor._last_allocation_validation = []
+        editor._last_allocation_retry_log = []
+        editor._last_allocation_unresolved = []
+        editor._allocation_isolation_report = {}
+        editor._last_semantic_group_debug = []
+        editor._current_git_commit = lambda: "test"
+        editor._word_ledger_payload = lambda source: {"words": []}
+        editor._semantic_groups_payload = lambda groups: []
+        editor._boundary_snapshot_payload = lambda: {}
+        editor._english_boundary_audit_payload = lambda segments: {}
+        editor._final_allocation_payload = lambda groups, items: []
+
+        with patch(
+            "app.core.subtitle_processor.screen_editor.write_json_artifact_set",
+            side_effect=OSError("disk full"),
+        ):
+            try:
+                editor._write_stable_pipeline_artifacts([], [], [], [])
+            except RuntimeError as exc:
+                assert "stable_artifact_write_failed" in str(exc)
+            else:
+                raise AssertionError("artifact write failure must block the stable pipeline")
+
+        assert editor._display_page_translation_path == ""
+        assert editor._display_page_translation_sha256 == ""
+
+
+def test_golden_page_translations_pass_existing_fixed_id_semantic_gate():
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    for case in _cases().values():
+        contract = _contract(case)
+        artifact = validate_page_translation_response(contract, _response(case))
+
+        assert artifact["status"] == "PASS"
+        quality_errors = editor._display_page_translation_quality_errors(
+            contract,
+            artifact,
+        )
+
+        assert quality_errors == [], {
+            "case_id": case["case_id"],
+            "issue_codes": [
+                issue_code
+                for error in quality_errors
+                for issue_code in error.get("issue_codes", [])
+            ],
+        }
+
+
+def test_frozen_artifact_mismatch_reports_the_exact_single_page_parent():
+    cue = podcast_learning_video.Cue(
+        199,
+        0.0,
+        3.0,
+        "A complete short sentence.",
+        "一条完整的短句。",
+        "male",
+        subtitle_id="S0199",
+        word_timing=tuple(
+            {
+                "word_id": index,
+                "surface": word,
+                "start": index * 0.7,
+                "end": index * 0.7 + 0.5,
+            }
+            for index, word in enumerate("A complete short sentence.".split())
+        ),
+    )
+    blueprint = podcast_learning_video.build_article_display_page_blueprint([cue])
+    artifact = {
+        "schema_version": podcast_learning_video.DISPLAY_PAGE_SCHEMA_VERSION,
+        "status": "PASS",
+        "planner_version": blueprint["planner_version"],
+        "layout_profile": blueprint["layout_profile"],
+        "render_plans": blueprint["render_plans"],
+        "parents": [],
+    }
+    failures = []
+
+    with patch.object(
+        podcast_learning_video,
+        "_article_plan_from_frozen_artifact",
+        return_value=None,
+    ):
+        applied = podcast_learning_video.apply_article_display_page_translation_artifact(
+            [cue],
+            artifact,
+            failure_items=failures,
+        )
+
+    assert applied is False
+    assert failures == [
+        {
+            "subtitle_id": "S0199",
+            "reason": "display_page_artifact_blueprint_mismatch",
+        }
+    ]
+    assert ScreenSubtitleEditor._display_page_failure_items(
+        failures,
+        [],
+        render_plans=artifact["render_plans"],
+        fallback_reason="display_page_artifact_blueprint_mismatch",
+    ) == failures
+
+
+def test_parent_chinese_authority_binds_exact_id_text_and_word_span():
+    records = [
+        {
+            "subtitle_id": "S0057",
+            "english": "A fixed English parent.",
+            "chinese": "一条固定中文。",
+            "word_start": 120,
+            "word_end": 123,
+            "provenance": {
+                "kind": "automatic",
+                "producer": "fixed_id_allocation",
+            },
+        }
+    ]
+    authority = build_authoritative_parent_chinese_artifact(
+        records,
+        source_word_ledger_hash="ledger-hash",
+        producer="fixed_id_allocation",
+    )
+
+    validated = validate_authoritative_parent_chinese_artifact(
+        authority,
+        expected_parents=records,
+        expected_word_ledger_hash="ledger-hash",
+    )
+    record = parent_chinese_records_by_id(validated)["S0057"]
+
+    assert record["source_hash"]
+    assert record["chinese_hash"]
+    assert record["record_hash"]
+
+
+def test_parent_chinese_authority_reports_empty_fixed_id_record_details():
+    try:
+        build_authoritative_parent_chinese_artifact(
+            [
+                {
+                    "subtitle_id": "S0233",
+                    "english": "A fixed English parent.",
+                    "chinese": "",
+                    "word_start": 120,
+                    "word_end": 123,
+                }
+            ],
+            source_word_ledger_hash="ledger-hash",
+            producer="fixed_id_allocation",
+        )
+        assert False, "an empty fixed-ID Chinese record must be rejected"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_record_invalid"
+        assert exc.details["subtitle_id"] == "S0233"
+        assert exc.details["invalid_fields"] == ["chinese"]
+        assert exc.details["word_start"] == 120
+        assert exc.details["word_end"] == 123
+
+
+def test_parent_chinese_authority_rejects_tampered_chinese_and_identity():
+    records = [
+        {
+            "subtitle_id": "S0057",
+            "english": "A fixed English parent.",
+            "chinese": "一条固定中文。",
+            "word_start": 120,
+            "word_end": 123,
+        }
+    ]
+    authority = build_authoritative_parent_chinese_artifact(
+        records,
+        source_word_ledger_hash="ledger-hash",
+        producer="fixed_id_allocation",
+    )
+    tampered = copy.deepcopy(authority)
+    tampered["records"][0]["chinese"] = "被替换的旧译文。"
+
+    try:
+        validate_authoritative_parent_chinese_artifact(tampered)
+        assert False, "tampered Chinese must invalidate the authority record"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_hash_mismatch"
+
+    wrong_span = [{**records[0], "word_end": 124}]
+    try:
+        validate_authoritative_parent_chinese_artifact(
+            authority,
+            expected_parents=wrong_span,
+        )
+        assert False, "a different frozen word span must be rejected"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_projection_mismatch"
+
+
+def test_display_page_projection_must_reference_but_cannot_replace_parent_chinese():
+    records = [
+        {
+            "subtitle_id": "S0057",
+            "english": "A fixed English parent.",
+            "chinese": "一条固定中文。",
+            "word_start": 120,
+            "word_end": 123,
+        }
+    ]
+    authority = build_authoritative_parent_chinese_artifact(
+        records,
+        source_word_ledger_hash="ledger-hash",
+        producer="stable_display_page_translation",
+    )
+    record = parent_chinese_records_by_id(authority)["S0057"]
+    display_artifact = {
+        "status": "PASS",
+        "parents": [
+            {
+                "parent_subtitle_id": "S0057",
+                "parent_english_hash": record["english_hash"],
+                "source_parent_chinese": record["chinese"],
+                "source_parent_chinese_hash": record["chinese_hash"],
+                "word_start": 120,
+                "word_end": 123,
+                "aggregate_chinese": "页面可以调整语序。",
+                "pages": [],
+            }
+        ],
+    }
+    bound = bind_display_page_parent_records(
+        display_artifact,
+        {"S0057": record},
+    )
+    validate_display_page_parent_records(bound, {"S0057": record})
+
+    assert bound["parents"][0]["aggregate_chinese"] == "页面可以调整语序。"
+    stale = copy.deepcopy(bound)
+    stale["parents"][0]["source_parent_chinese"] = "旧版父字幕中文。"
+    try:
+        validate_display_page_parent_records(stale, {"S0057": record})
+        assert False, "a page projection from another parent translation must fail"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_page_conflict"
+
+
+def test_legacy_page_projection_loads_only_when_aggregate_matches_parent_authority():
+    authority = build_authoritative_parent_chinese_artifact(
+        [
+            {
+                "subtitle_id": "S0058",
+                "english": "A legacy fixed English parent.",
+                "chinese": "旧分页必须完整还原父译文。",
+                "word_start": 130,
+                "word_end": 134,
+            }
+        ],
+        source_word_ledger_hash="ledger-hash",
+        producer="legacy_page_projection_test",
+    )
+    record = parent_chinese_records_by_id(authority)["S0058"]
+    legacy = {
+        "status": "PASS",
+        "parents": [
+            {
+                "parent_subtitle_id": "S0058",
+                "parent_english_hash": record["english_hash"],
+                "source_parent_chinese_hash": "legacy-pre-projection-hash",
+                "word_start": 130,
+                "word_end": 134,
+                "aggregate_chinese": "旧分页必须完整还原父译文。",
+                "pages": [],
+            }
+        ],
+    }
+
+    bound = bind_display_page_parent_records(legacy, {"S0058": record})
+
+    assert bound["parents"][0]["source_parent_chinese"] == record["chinese"]
+    assert (
+        bound["parents"][0]["source_parent_chinese_hash"]
+        == record["chinese_hash"]
+    )
+    validate_display_page_parent_records(legacy, {"S0058": record})
+    validate_display_page_parent_records(bound, {"S0058": record})
+
+    stale_reference = copy.deepcopy(legacy)
+    stale_reference["parents"][0]["parent_record_hash"] = "stale-record"
+    try:
+        validate_display_page_parent_records(stale_reference, {"S0058": record})
+        assert False, "an existing stale authority reference must fail"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_page_reference_mismatch"
+
+    stale = copy.deepcopy(legacy)
+    stale["parents"][0]["aggregate_chinese"] = "旧分页已是另一份显示译文。"
+    try:
+        bind_display_page_parent_records(stale, {"S0058": record})
+        assert False, "a legacy page projection must not invent parent authority"
+    except AuthoritativeParentChineseError as exc:
+        assert exc.code == "authoritative_parent_chinese_page_conflict"
+
+
+def test_word_ledger_hash_has_one_cross_module_owner():
+    ledger = [
+        {
+            "word_id": 0,
+            "surface": "Most",
+            "normalized": "most",
+            "start_ms": 100,
+            "end_ms": 300,
+        },
+        {
+            "word_id": 1,
+            "surface": "likely,",
+            "normalized": "likely",
+            "start_ms": 320,
+            "end_ms": 620,
+        },
+    ]
+    expected = canonical_word_ledger_hash(ledger)
+
+    assert WORD_LEDGER_HASH_VERSION == "canonical-word-ledger-v1"
+    assert ManualFinalSubtitleSession._semantic_word_ledger_hash(ledger) == expected
+    assert ManualFinalSubtitleSession._formal_word_ledger_hash(ledger) == expected
+
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor._active_word_entries = [
+        {
+            "surface": row["surface"],
+            "token": row["normalized"],
+            "start_time": row["start_ms"],
+            "end_time": row["end_ms"],
+        }
+        for row in ledger
+    ]
+    assert editor._word_ledger_hash() == expected
+
+    tampered = copy.deepcopy(ledger)
+    tampered[1]["end_ms"] += 1
+    assert canonical_word_ledger_hash(tampered) != expected
+
+
+if __name__ == "__main__":
+    test_s0078_reordered_chinese_is_bound_by_page_id()
+    test_s0252_monotonic_translation_remains_page_aligned()
+    test_page_translation_rejects_missing_duplicate_and_unknown_page_ids()
+    test_missing_page_retains_other_complete_parent_for_scoped_retry()
+    test_chinese_token_split_keeps_frozen_plans_and_unaffected_parent_pages()
+    test_hmm_only_function_word_join_is_not_a_page_token_split()
+    test_source_owned_name_plus_one_grammar_character_is_not_added_meaning()
+    test_source_owned_name_does_not_hide_new_multi_character_meaning()
+    test_page_translation_retry_contract_contains_only_failed_parent_pages()
+    test_structural_page_response_retries_only_identifiable_missing_parent()
+    test_page_translation_cache_key_invalidates_semantic_page_contract_changes()
+    test_page_contract_and_cache_identity_include_frozen_font_and_boundary_evidence()
+    test_article_english_font_fallback_has_a_52px_automatic_floor()
+    test_screenshot_page_boundaries_consume_frozen_boundary_evidence()
+    test_real_syntax_evidence_steers_results_from_without_injected_fixture_issue()
+    test_medium_review_page_boundary_can_beat_static_font_reduction_on_quality()
+    test_attached_clause_page_transition_loses_to_same_font_static_layout()
+    test_complete_phrase_page_starts_remain_eligible_without_a_pause()
+    test_atomic_of_and_dangling_coordinator_page_boundaries_are_hard()
+    test_strong_pause_keeps_hard_boundary_as_last_resort_not_preferred_split()
+    test_low_confidence_tight_transition_does_not_force_major_font_reduction()
+    test_page_context_prefers_whole_attached_phrases_over_atomic_inner_cuts()
+    test_structural_exception_can_use_actual_pixel_fit_above_sixteen_words()
+    test_no_partition_failure_reports_deterministic_attempt_reasons()
+    test_invalid_page_translation_cache_is_replaced_only_after_validation()
+    test_incomplete_fresh_page_response_is_retried_before_leaving_request_contract()
+    test_page_translation_requests_use_flash_then_pro_for_quality_retry()
+    test_residual_page_retry_shrinks_scope_until_all_parents_are_valid()
+    test_page_translation_batches_preserve_completed_cache_after_later_timeout()
+    test_page_translation_unit_cache_rebinds_shifted_ids_with_same_semantics()
+    test_page_translation_batches_retry_empty_batch_and_keep_other_valid_batch()
+    test_page_translation_rejects_page_level_chinese_speed_overflow()
+    test_page_translation_rejects_repeated_parent_meaning()
+    test_page_translation_rejects_significant_parent_expansion_but_allows_reordering()
+    test_page_translation_rejects_new_parent_content_below_growth_limit()
+    test_page_translation_allows_neutral_parent_binding_word()
+    test_page_projection_does_not_invent_a_token_across_two_complete_pages()
+    test_page_projection_allows_grammatical_form_of_existing_relation()
+    test_page_level_continuation_fragment_is_review_not_blocker()
+    test_page_translation_rejects_repeated_adjacent_fact()
+    test_page_translation_rejects_condition_after_completed_question()
+    test_page_translation_allows_complete_question_before_new_condition_sentence()
+    test_display_page_local_fluency_findings_are_review_not_semantic_blockers()
+    test_display_page_semantics_use_authoritative_parent_chinese_not_english_scaffolding()
+    test_display_page_prompt_makes_parent_chinese_the_semantic_ceiling()
+    test_display_page_retry_prompt_constrains_arbitrary_validator_tokens()
+    test_display_page_error_evidence_retains_retry_rejection_reason()
+    test_review_only_initial_page_projection_survives_worse_pro_retry()
+    test_renderer_uses_valid_page_mapping_without_proportional_fallback()
+    test_renderer_fails_closed_when_paginated_page_mapping_is_missing()
+    test_page_translation_preserves_parent_chinese_and_srt_structure()
+    test_screen_editor_applies_mocked_page_response_after_final_timing_only()
+    test_flash_page_fragment_retries_only_parent_and_pro_residual_stays_review()
+    test_screen_editor_records_visual_overflow_against_the_frozen_subtitle_id()
+    test_screen_editor_keeps_valid_page_chinese_when_another_parent_overflows()
+    test_screen_editor_normalizes_page_errors_to_frozen_parent_ids()
+    test_renderer_preflight_loads_manifest_page_artifact_and_rejects_missing_or_tampered()
+    test_parse_srt_preserves_numeric_only_bilingual_line_order()
+    test_attach_article_word_timing_restores_hash_bound_boundary_evidence()
+    test_manual_draft_page_artifact_is_loaded_only_from_manifest_hash_binding()
+    test_manual_draft_preflight_consumes_frozen_artifact_without_replanning()
+    test_manual_draft_preflight_rejects_missing_or_tampered_artifact_before_ffmpeg()
+    test_loaded_manual_draft_pages_match_persisted_identity_text_timing_and_font()
+    test_stable_artifact_write_failure_is_not_reported_as_success()
+    test_golden_page_translations_pass_existing_fixed_id_semantic_gate()
+    test_frozen_artifact_mismatch_reports_the_exact_single_page_parent()
+    test_parent_chinese_authority_binds_exact_id_text_and_word_span()
+    test_parent_chinese_authority_rejects_tampered_chinese_and_identity()
+    test_display_page_projection_must_reference_but_cannot_replace_parent_chinese()
+    test_legacy_page_projection_loads_only_when_aggregate_matches_parent_authority()
+    test_word_ledger_hash_has_one_cross_module_owner()
+    print("stable page translation contract tests passed")

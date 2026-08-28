@@ -31,6 +31,10 @@ MODEL_PATH = APPDATA_PATH / "models"
 
 FASER_WHISPER_PATH = BIN_PATH / "Faster-Whisper-XXL"
 
+# Article-template display experiment; production behavior remains unchanged
+# until this flag is explicitly enabled.
+PODCAST_ARTICLE_WHOLE_PARENT_CHINESE = False
+
 # 日志配置
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

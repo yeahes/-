@@ -1,0 +1,85 @@
+# Project State
+Status: active
+Last verified: 2026-08-24 11:36:00 Asia/Shanghai
+Branch: main
+Verified HEAD: 2c108a5
+Working tree: tracked changes include the structural arm F scope correction,
+C1/A/B/D/E audit documentation, the historical boundary/page guards, and the
+pending 1260px pagination experiment; generated `output/` directories remain
+untracked and preserved.
+
+## Current Goal
+Execute EXTERNAL-AUDIT-2026-08-24 §28 in order: P0 objective harness, then P1
+Chinese attribution, without changing detectors before the P1 table passes.
+
+## Next action
+Start P2 only from the P1 A-grade table; do not alter or remove existing marks.
+
+## Unknowns
+P0 reproduces all registered E/Rec baseline fields: P=611, GT=118, E=19.3%,
+and the character>=58 signal is 45.7% marked / 77.1% recalled. P1 covers all
+285 Chinese edit steps; A=91 (31.9%), B=119, C=75. P2 still needs separate
+three-set recall/mark-rate measurement; P4 still needs new audio.
+
+## Confirmed Facts
+- Fixed-parent bilingual A/B changes four newest White House parents; three clear improvements and one REVIEW improvement pass page-Chinese contracts.
+- Historical White House, Chocolate v27/v29, and Employment guards have zero fixed-parent changes.
+- Variable-parent `3 -> 2/4` checked 18,457 partitions for 14 targets and found zero feasible candidates; it made zero API calls.
+- `More -> Restore Recent Subtitles` loads manifests directly and normal close retains dirty edits in a hash-bound draft.
+- Real `work-dir` discovery returns 20 episode entries in 0.367 seconds; newest White House is one entry backed by five historical runs.
+- Complete-parent deletion now uses schema-v3 media derivation and a pure
+  source-to-presentation time map; source authority remains immutable.
+- An `ERROR` display-page artifact with render plans remains a usable frozen
+  geometry checkpoint; semantic errors still block publication.
+- Local editor refreshes reuse those frozen plans instead of invoking a full
+  Pillow page replan after every page edit, boundary move, merge, or confirm.
+- Article analysis is hosted in an independent non-modal dialog; the task page
+  remains at the compact default layout while the dialog is open.
+- Article dialog custom colors refresh from qfluentwidgets' completed theme
+  signal, including when the theme changes while the dialog is open.
+- ID-bound page translation reuse preserves valid sibling pages and leaves
+  exact missing/blank pages for formal contract validation.
+- Source-scoped page errors remain blocking for their recorded parent/page;
+  the Japanese X-generation replay reports only `S0136.P01/P02` after the
+  six-parent deletion.
+- Focused deletion/editor/publication/synthesis regression: 262 passed.
+- Full regression: 29/30 checks passed. The isolated failure is the existing
+  `S9522` article page-start assertion (`into` expected, `in` selected), with
+  no production pagination diff in this task.
+
+## Approved Decisions
+- Integrate only the fixed-parent material-improvement selector; reject the tested variable-parent design.
+- Group recovery entries per audio while preserving unsaved drafts and discovering source-adjacent manual packages.
+- The user will run the complete regression; Codex runs focused tests and real read-only replays.
+
+## Relevant Paths
+- Evidence: `docs/handoffs/2026-08-23-fixed-parent-production-and-recovery-list.md`
+- Recovery: `app/core/subtitle_processor/manual_final_subtitle_editor.py`, `app/view/subtitle_interface.py`
+- Experiments: `scripts/experiment_fixed_parent_bilingual_pages.py`, `scripts/audit_variable_parent_count_joint_planning.py`
+- Commits: production selector `bb9d98d`; consolidated recovery `815c497`.
+
+## Last Verification
+- Frozen-plan focused tests: 3 passed.
+- Article-context state and dark-theme style tests: 4 passed.
+- Full offline regression: 29/30 checks passed; the existing article display
+  readability contract still fails at `test_three_line_fallback_promotes_complete_two_page_alternative`.
+- Real Japanese X-generation model refresh: about 0.05s first refresh and
+  about 0.01s subsequent refreshes after local page edits.
+- `runtime\\python.exe -m pytest tests/test_stable_publication.py -q`: 96
+  passed after isolating internal Qt model publication from user edits.
+- Read-only original Japanese X-generation checkpoint replay keeps 241 frozen
+  plans (235 after deleting S0001-S0006) and reuses all 296 remaining pages.
+- Full `scripts/run_regression.py` completed 29/30 checks; the only failure is
+  the unrelated existing article-display readability assertion.
+
+## Next Action
+Implement only P1 A-grade offline marks, then measure P2 per set before wiring them.
+
+## Do Not Regress
+- Do not mutate production artifacts, frozen English/IDs/timing, caches, audio, checkpoints, or untracked `output/`.
+
+## Unknowns
+- Direct Qt GUI acceptance is pending because the bundled offscreen Qt plugin
+  hangs during QApplication initialization in this environment.
+- The pre-existing S9522 article readability assertion needs a separately
+  scoped pagination decision.

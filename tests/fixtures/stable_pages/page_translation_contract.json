@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "s0078_reordered_chinese",
+      "subtitle_id": "S0078",
+      "start": 305.025,
+      "end": 314.811,
+      "word_start": 897,
+      "word_end": 918,
+      "english": "They launched a highly powerful, incredibly efficient model by investing heavily in techniques that deliberately reduce the overall demand for computing power.",
+      "parent_chinese": "他们把大量资金投入到刻意降低算力总需求的技术上，从而推出了一款性能强大、效率惊人的模型。",
+      "pages": [
+        {
+          "word_start": 897,
+          "word_end": 904,
+          "english": "They launched a highly powerful, incredibly efficient model",
+          "chinese": "他们推出了一款性能强大、效率惊人的模型。"
+        },
+        {
+          "word_start": 905,
+          "word_end": 918,
+          "english": "by investing heavily in techniques that deliberately reduce the overall demand for computing power.",
+          "chinese": "这源于他们把大量资金投入到刻意降低算力总需求的技术上。"
+        }
+      ]
+    },
+    {
+      "case_id": "s0252_monotonic_chinese",
+      "subtitle_id": "S0252",
+      "start": 950.427,
+      "end": 963.777,
+      "word_start": 2737,
+      "word_end": 2768,
+      "english": "I mean, if you can integrate a highly capable, highly optimized AI into every facet of your economy, manufacturing, agriculture, local services, without requiring a 500 billion data center to run it.",
+      "parent_chinese": "我是说，如果你能把一种能力很强、优化程度很高的人工智能，融入经济的每个领域，包括制造业、农业、本地服务业，而且不需要一个5000亿美元的数据中心来运行它。",
+      "pages": [
+        {
+          "word_start": 2737,
+          "word_end": 2748,
+          "english": "I mean, if you can integrate a highly capable, highly optimized AI",
+          "chinese": "我是说，如果你能把一种能力很强、优化程度很高的人工智能，"
+        },
+        {
+          "word_start": 2749,
+          "word_end": 2758,
+          "english": "into every facet of your economy, manufacturing, agriculture, local services,",
+          "chinese": "融入经济的每个领域，包括制造业、农业、本地服务业，"
+        },
+        {
+          "word_start": 2759,
+          "word_end": 2768,
+          "english": "without requiring a 500 billion data center to run it.",
+          "chinese": "而且不需要一个5000亿美元的数据中心来运行它。"
+        }
+      ]
+    }
+  ]
+}

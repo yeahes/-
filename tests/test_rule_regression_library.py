@@ -147,26 +147,7 @@ def test_rule_regression_timing_repairs_keep_text_and_ids():
             assert after == before, case["id"]
 
 
-def test_rule_regression_local_chinese_speed_fallbacks():
-    editor = _editor()
-    for case in _load_cases()["local_chinese_speed_fallback"]:
-        seg = ASRDataSeg(
-            text=case["english"],
-            translated_text=case["chinese"],
-            start_time=case["start_ms"],
-            end_time=case["end_ms"],
-        )
-        fallback = editor._local_chinese_speed_fallback(seg)
-        assert fallback == case["expected_chinese"], case["id"]
-        assert editor._is_valid_chinese_compression(
-            fallback,
-            seg,
-            [seg],
-            0,
-        ), case["id"]
-
-
-def test_rule_regression_local_fallback_is_applied_when_llm_compression_misses():
+def test_rule_regression_llm_miss_keeps_original_chinese_without_local_rewrite():
     editor = _editor()
     editor._request_chinese_compression = lambda *args, **kwargs: {"items": []}
     cases = _load_cases()["local_chinese_speed_fallback"]
@@ -187,35 +168,8 @@ def test_rule_regression_local_fallback_is_applied_when_llm_compression_misses()
     assert [segment.text for segment in repaired] == [segment.text for segment in segments]
     assert [segment.subtitle_id for segment in repaired] == [segment.subtitle_id for segment in segments]
     assert [segment.translated_text for segment in repaired] == [
-        case["expected_chinese"] for case in cases
+        case["chinese"] for case in cases
     ]
-    assert not editor._subtitle_health_issues(repaired)["reading_speed_errors"]
-
-
-def test_rule_regression_speed_fallback_is_not_restored_as_soft_omission():
-    editor = _editor()
-    before = ASRDataSeg(
-        text="But they have a much bigger test coming.",
-        translated_text="但他们即将进行一次规模大得多的测试。",
-        start_time=470400,
-        end_time=471920,
-    )
-    before.subtitle_id = "S0154"
-    after = ASRDataSeg(
-        text=before.text,
-        translated_text="更大的测试要来了。",
-        start_time=before.start_time,
-        end_time=before.end_time,
-    )
-    after.subtitle_id = before.subtitle_id
-
-    keep = editor._should_keep_speed_repair_despite_soft_omission(
-        [before],
-        [after],
-        {"issue_codes": ["group_allocation_information_omission"]},
-    )
-
-    assert keep is True
 
 
 def test_rule_regression_translation_writeback_is_id_driven():
@@ -264,8 +218,6 @@ if __name__ == "__main__":
     test_rule_regression_english_syntax_boundaries()
     test_rule_regression_chinese_allocation_quality()
     test_rule_regression_timing_repairs_keep_text_and_ids()
-    test_rule_regression_local_chinese_speed_fallbacks()
-    test_rule_regression_local_fallback_is_applied_when_llm_compression_misses()
-    test_rule_regression_speed_fallback_is_not_restored_as_soft_omission()
+    test_rule_regression_llm_miss_keeps_original_chinese_without_local_rewrite()
     test_rule_regression_translation_writeback_is_id_driven()
     print("rule regression library tests passed")

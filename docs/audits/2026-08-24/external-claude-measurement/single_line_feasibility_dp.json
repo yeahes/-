@@ -1,0 +1,372 @@
+{
+ "totals": {
+  "parents": 4656,
+  "eligible": 4199,
+  "exempt_too_short": 457
+ },
+ "constraints": {
+  "min_words": 4,
+  "min_duration_ms": 900,
+  "max_pages": 4,
+  "font_size": 56
+ },
+ "single_line_only": {
+  "1100_current_gate": {
+   "feasible_le_max": 3613,
+   "infeasible": 491,
+   "needs_more_pages": 95,
+   "pages_1": 832,
+   "pages_2": 1671,
+   "pages_3": 954,
+   "pages_4": 156,
+   "pages_5": 64,
+   "pages_6": 22,
+   "pages_7": 7,
+   "pages_8": 2
+  },
+  "1260_comfortable": {
+   "feasible_le_max": 3990,
+   "infeasible": 164,
+   "needs_more_pages": 45,
+   "pages_1": 1140,
+   "pages_2": 2054,
+   "pages_3": 687,
+   "pages_4": 109,
+   "pages_5": 34,
+   "pages_6": 9,
+   "pages_7": 2
+  },
+  "1455_english": {
+   "feasible_le_max": 4145,
+   "infeasible": 34,
+   "needs_more_pages": 20,
+   "pages_1": 1533,
+   "pages_2": 2174,
+   "pages_3": 367,
+   "pages_4": 71,
+   "pages_5": 17,
+   "pages_6": 3
+  },
+  "1498_wide_safe": {
+   "feasible_le_max": 4162,
+   "infeasible": 22,
+   "needs_more_pages": 15,
+   "pages_1": 1619,
+   "pages_2": 2163,
+   "pages_3": 320,
+   "pages_4": 60,
+   "pages_5": 13,
+   "pages_6": 2
+  }
+ },
+ "control_two_line": {
+  "1100_current_gate": {
+   "feasible_le_max": 4199,
+   "pages_1": 2858,
+   "pages_2": 1241,
+   "pages_3": 91,
+   "pages_4": 9
+  },
+  "1260_comfortable": {
+   "feasible_le_max": 4199,
+   "pages_1": 3346,
+   "pages_2": 808,
+   "pages_3": 43,
+   "pages_4": 2
+  },
+  "1455_english": {
+   "feasible_le_max": 4199,
+   "pages_1": 3740,
+   "pages_2": 439,
+   "pages_3": 20
+  },
+  "1498_wide_safe": {
+   "feasible_le_max": 4199,
+   "pages_1": 3804,
+   "pages_2": 380,
+   "pages_3": 15
+  }
+ },
+ "hard_examples_at_1455": [
+  {
+   "parent_subtitle_id": "S0106",
+   "words": 32,
+   "duration_ms": 12148,
+   "min_single_line_pages_at_1455": 5,
+   "english": "As China attempts to transition its economy away from basic manufacturing, that historical overinvestment in heavy power infrastructure is now perfectly positioned to feed the voracious energy appetit"
+  },
+  {
+   "parent_subtitle_id": "S0190",
+   "words": 11,
+   "duration_ms": 5664,
+   "min_single_line_pages_at_1455": null,
+   "english": "The overarching policy stance still heavily emphasizes high-quality employment and self-reliance."
+  },
+  {
+   "parent_subtitle_id": "S0215",
+   "words": 39,
+   "duration_ms": 13168,
+   "min_single_line_pages_at_1455": 5,
+   "english": "While balancing safety and innovation is a global challenge, Chinese leaders are willing to forcefully intervene in the market to ensure the technology serves the state's broader social goals, rather "
+  },
+  {
+   "parent_subtitle_id": "S0102",
+   "words": 8,
+   "duration_ms": 3242,
+   "min_single_line_pages_at_1455": null,
+   "english": "Right. But when you're constrained, every single parameter,"
+  },
+  {
+   "parent_subtitle_id": "S0062",
+   "words": 38,
+   "duration_ms": 10867,
+   "min_single_line_pages_at_1455": 5,
+   "english": "Yeah. If the legacy brands are just completely ignoring the nuances of the local palette and they're keeping average consumption stuck at like one bar a year, that leaves a massive void for domestic c"
+  },
+  {
+   "parent_subtitle_id": "S0064",
+   "words": 9,
+   "duration_ms": 2582,
+   "min_single_line_pages_at_1455": null,
+   "english": "I mean, the landscape is shifting at unprecedented speed."
+  },
+  {
+   "parent_subtitle_id": "S0218",
+   "words": 40,
+   "duration_ms": 13990,
+   "min_single_line_pages_at_1455": 5,
+   "english": "Wow. Yeah. If 1.4 billion people suddenly jumped from eating one bar a year to even just a fraction of Western consumption levels, the sheer volume of cacao required to meet that new baseline would co"
+  },
+  {
+   "parent_subtitle_id": "S0062",
+   "words": 38,
+   "duration_ms": 10867,
+   "min_single_line_pages_at_1455": 5,
+   "english": "Yeah. If the legacy brands are just completely ignoring the nuances of the local palette and they're keeping average consumption stuck at like one bar a year, that leaves a massive void for domestic c"
+  },
+  {
+   "parent_subtitle_id": "S0064",
+   "words": 9,
+   "duration_ms": 2582,
+   "min_single_line_pages_at_1455": null,
+   "english": "I mean, the landscape is shifting at unprecedented speed."
+  },
+  {
+   "parent_subtitle_id": "S0218",
+   "words": 40,
+   "duration_ms": 13990,
+   "min_single_line_pages_at_1455": 5,
+   "english": "Wow. Yeah. If 1.4 billion people suddenly jumped from eating one bar a year to even just a fraction of Western consumption levels, the sheer volume of cacao required to meet that new baseline would co"
+  },
+  {
+   "parent_subtitle_id": "S0162",
+   "words": 7,
+   "duration_ms": 3483,
+   "min_single_line_pages_at_1455": null,
+   "english": "no importer can artificially compress demand indefinitely."
+  },
+  {
+   "parent_subtitle_id": "S0001",
+   "words": 41,
+   "duration_ms": 15250,
+   "min_single_line_pages_at_1455": 5,
+   "english": "Right now, a Chinese graduate returning from an overseas university can expect an average starting salary of about 12 800 yuan a month, which is only marginally higher than the 10 700 yuan offered to "
+  },
+  {
+   "parent_subtitle_id": "S0023",
+   "words": 8,
+   "duration_ms": 2982,
+   "min_single_line_pages_at_1455": null,
+   "english": "and just, you know, basic English business negotiations."
+  },
+  {
+   "parent_subtitle_id": "S0134",
+   "words": 8,
+   "duration_ms": 2781,
+   "min_single_line_pages_at_1455": null,
+   "english": "There is this growing perception among hiring managers"
+  },
+  {
+   "parent_subtitle_id": "S0230",
+   "words": 34,
+   "duration_ms": 13208,
+   "min_single_line_pages_at_1455": 6,
+   "english": "But wait, did these elite, centuries-old institutions, places that employ some of the world's leading economic minds, actually build their long-term operational models around the assumption that wealt"
+  },
+  {
+   "parent_subtitle_id": "S0255",
+   "words": 8,
+   "duration_ms": 2662,
+   "min_single_line_pages_at_1455": null,
+   "english": "they often share the exact same university classrooms."
+  },
+  {
+   "parent_subtitle_id": "S0059",
+   "words": 8,
+   "duration_ms": 3020,
+   "min_single_line_pages_at_1455": null,
+   "english": "We were talking about retro computer-generated visual styles."
+  },
+  {
+   "parent_subtitle_id": "S0202",
+   "words": 37,
+   "duration_ms": 11440,
+   "min_single_line_pages_at_1455": 5,
+   "english": "If this generation is spending so much time projecting their need for safety onto these abandoned pre 2008 neighborhoods, what happens to that shared cultural memory when the last of those old buildin"
+  },
+  {
+   "parent_subtitle_id": "S0049",
+   "words": 10,
+   "duration_ms": 2542,
+   "min_single_line_pages_at_1455": null,
+   "english": "It wants to wrap you in this eerie, suspended nostalgia."
+  },
+  {
+   "parent_subtitle_id": "S0058",
+   "words": 8,
+   "duration_ms": 3102,
+   "min_single_line_pages_at_1455": null,
+   "english": "We were talking about retro computer-generated visual styles."
+  },
+  {
+   "parent_subtitle_id": "S0202",
+   "words": 37,
+   "duration_ms": 11211,
+   "min_single_line_pages_at_1455": 5,
+   "english": "If this generation is spending so much time projecting their need for safety onto these abandoned pre 2008 neighborhoods, what happens to that shared cultural memory when the last of those old buildin"
+  },
+  {
+   "parent_subtitle_id": "S0003",
+   "words": 38,
+   "duration_ms": 13509,
+   "min_single_line_pages_at_1455": 5,
+   "english": "But what is incredibly difficult to explain is that while unmarried, cohabiting couples with a woman as older have jumped to 22%, the marriage rate for that exact same demographic hasn't budged past 1"
+  },
+  {
+   "parent_subtitle_id": "S0171",
+   "words": 7,
+   "duration_ms": 3502,
+   "min_single_line_pages_at_1455": null,
+   "english": "A profound desire for submissiveness. Okay. Interesting."
+  },
+  {
+   "parent_subtitle_id": "S0065",
+   "words": 9,
+   "duration_ms": 2362,
+   "min_single_line_pages_at_1455": null,
+   "english": "We have to read those modeled estimates carefully, though."
+  },
+  {
+   "parent_subtitle_id": "S0100",
+   "words": 7,
+   "duration_ms": 2462,
+   "min_single_line_pages_at_1455": null,
+   "english": "Self-help and psychological services are booming online."
+  },
+  {
+   "parent_subtitle_id": "S0146",
+   "words": 7,
+   "duration_ms": 2942,
+   "min_single_line_pages_at_1455": null,
+   "english": "A neutral thermometer basically became the thermostat."
+  },
+  {
+   "parent_subtitle_id": "S0146",
+   "words": 7,
+   "duration_ms": 2942,
+   "min_single_line_pages_at_1455": null,
+   "english": "A neutral thermometer basically became the thermostat."
+  },
+  {
+   "parent_subtitle_id": "S0045",
+   "words": 7,
+   "duration_ms": 2902,
+   "min_single_line_pages_at_1455": null,
+   "english": "Historically speaking, it basically slammed shut overnight."
+  },
+  {
+   "parent_subtitle_id": "S0091",
+   "words": 7,
+   "duration_ms": 2481,
+   "min_single_line_pages_at_1455": null,
+   "english": "originally designed for a completely different demographic?"
+  },
+  {
+   "parent_subtitle_id": "S0196",
+   "words": 39,
+   "duration_ms": 11307,
+   "min_single_line_pages_at_1455": 5,
+   "english": "Exactly. All of this, the locked doors in the 90s, the decades of irregular work, the wage stagnation today, it has left the Ice Age generation with permanently low lifetime earnings and very little i"
+  },
+  {
+   "parent_subtitle_id": "S0226",
+   "words": 32,
+   "duration_ms": 11648,
+   "min_single_line_pages_at_1455": 5,
+   "english": "So you are going to have a tiny younger workforce paying taxes to financially support a massive, underfunded, rapidly aging mammoth club whose escalating medical bills are fully subsidized by the stat"
+  },
+  {
+   "parent_subtitle_id": "S0241",
+   "words": 42,
+   "duration_ms": 14956,
+   "min_single_line_pages_at_1455": 6,
+   "english": "If an entire generation's lifetime wealth, their housing security, and their dignity in retirement can be permanently crippled simply by the exact calendar year they happen to graduate college, how sa"
+  },
+  {
+   "parent_subtitle_id": "S0001",
+   "words": 40,
+   "duration_ms": 17392,
+   "min_single_line_pages_at_1455": 5,
+   "english": "A low-budget Chinese animated movie about a cow in a dream sequence made just 11 140 in its first 10 days, but then it inexplicably skyrocketed to over 11.4 million yuan, beating out Hollywood blockbu"
+  },
+  {
+   "parent_subtitle_id": "S0015",
+   "words": 7,
+   "duration_ms": 2862,
+   "min_single_line_pages_at_1455": null,
+   "english": "You're trading your hard-earned money for entertainment."
+  },
+  {
+   "parent_subtitle_id": "S0111",
+   "words": 7,
+   "duration_ms": 2542,
+   "min_single_line_pages_at_1455": null,
+   "english": "The audience effectively became the marketing department."
+  },
+  {
+   "parent_subtitle_id": "S0114",
+   "words": 7,
+   "duration_ms": 2822,
+   "min_single_line_pages_at_1455": null,
+   "english": "Netizens started making jokes about artificial intelligence,"
+  },
+  {
+   "parent_subtitle_id": "S0165",
+   "words": 9,
+   "duration_ms": 1922,
+   "min_single_line_pages_at_1455": null,
+   "english": "because the sun is shining beautifully through the window."
+  },
+  {
+   "parent_subtitle_id": "S0184",
+   "words": 10,
+   "duration_ms": 2022,
+   "min_single_line_pages_at_1455": null,
+   "english": "But not everyone in the industry is laughing about this."
+  },
+  {
+   "parent_subtitle_id": "S0196",
+   "words": 8,
+   "duration_ms": 2521,
+   "min_single_line_pages_at_1455": null,
+   "english": "They argue this current popularity is entirely synthetic."
+  },
+  {
+   "parent_subtitle_id": "S0224",
+   "words": 49,
+   "duration_ms": 14391,
+   "min_single_line_pages_at_1455": 6,
+   "english": "Exactly. And you have to wonder, if sitting in a theater with 30 strangers, all howling with laughter at how spectacularly human and flawed a piece of media is, might actually be a more valuable piece"
+  }
+ ]
+}

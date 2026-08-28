@@ -1,0 +1,168 @@
+{
+  "schema_version": 2,
+  "sample_id": "dreamcore-curated-v2",
+  "english_segmentation": {
+    "windows": [
+      {
+        "anchor_id": "empty-scene-contrast",
+        "english_anchor": "The low hum of a flickering, low-resolution CRT television echoes in the background, but there isn't a single human being in sight.",
+        "expected_segments": [
+          "The low hum of a flickering, low-resolution CRT television echoes in the background,",
+          "but there isn't a single human being in sight."
+        ]
+      },
+      {
+        "anchor_id": "liminal-space-explanation",
+        "english_anchor": "But to really grasp what Chinese Dreamcore is doing, we have to trace the psychological root of the trend back to this concept of the liminal space.",
+        "expected_segments": [
+          "But to really grasp what Chinese Dreamcore is doing,",
+          "we have to trace the psychological root of the trend back to this concept of the liminal space."
+        ]
+      },
+      {
+        "anchor_id": "ordinary-office-contrast",
+        "english_anchor": "It was just a random office space, but it made everyone who looked at it deeply uncomfortable.",
+        "expected_segments": [
+          "It was just a random office space,",
+          "but it made everyone who looked at it deeply uncomfortable."
+        ]
+      },
+      {
+        "anchor_id": "transitional-state-example",
+        "english_anchor": "These are ambiguous transitional states. Think of an empty parking lot or a public square in the dead of night.",
+        "expected_segments": [
+          "These are ambiguous transitional states.",
+          "Think of an empty parking lot or a public square in the dead of night."
+        ]
+      }
+    ]
+  },
+  "parent_translation": {
+    "anchors": [
+      {
+        "anchor_id": "dreamcore-name",
+        "english_anchor": "Right. We are taking a deep dive today into our source material to explore a massive internet phenomenon known as Chinese Dream Corps.",
+        "must_contain_any": [["中式梦核"], ["网络现象"]],
+        "accepted_chinese": ["今天，我们将深入素材，探讨一个庞大的网络现象：中式梦核。"],
+        "max_chinese_chars": 34
+      },
+      {
+        "anchor_id": "four-chan-origin",
+        "english_anchor": "Yeah. Yeah. So back in May 2019, on a 4 chan thread dedicated to the paranormal...",
+        "must_contain_any": [["2019年5月"], ["4chan"], ["灵异"]],
+        "accepted_chinese": ["2019年5月，4chan上一个讨论灵异现象的帖子里……"],
+        "max_chinese_chars": 30
+      },
+      {
+        "anchor_id": "backrooms-photo",
+        "english_anchor": "Yeah. An anonymous user posted a simple photograph of an empty carpeted room with like this sickly yellow wallpaper and the buzzing glare of fluorescent lights.",
+        "must_contain_any": [["匿名用户"], ["黄墙纸", "黄色墙纸"], ["荧光灯"]],
+        "accepted_chinese": ["一名匿名用户发了一张照片：空荡的地毯房、病态的黄墙纸，以及嗡嗡作响的荧光灯。"],
+        "max_chinese_chars": 43
+      },
+      {
+        "anchor_id": "backrooms-definition",
+        "english_anchor": "Yeah, the back rooms perfectly encapsulates the liminal space.",
+        "must_contain_any": [["后室"], ["阈限空间"]],
+        "accepted_chinese": ["“后室”完美体现了阈限空间。"],
+        "max_chinese_chars": 16
+      }
+    ]
+  },
+  "fixed_id_allocation": {
+    "anchors": [
+      {
+        "anchor_id": "dreamcore-owner",
+        "english_anchor": "Chinese Dream Corps",
+        "must_contain_any": [["中式梦核"]],
+        "must_not_appear_in_adjacent": true
+      },
+      {
+        "anchor_id": "origin-date-owner",
+        "english_anchor": "May 2019",
+        "must_contain_any": [["2019年5月"]],
+        "must_not_appear_in_adjacent": true
+      },
+      {
+        "anchor_id": "fluorescent-owner",
+        "english_anchor": "fluorescent lights",
+        "must_contain_any": [["荧光灯"]],
+        "must_not_appear_in_adjacent": true
+      },
+      {
+        "anchor_id": "liminal-definition-owner",
+        "english_anchor": "back rooms perfectly encapsulates the liminal space",
+        "must_contain_any": [["后室"], ["阈限空间"]],
+        "must_not_appear_in_adjacent": true
+      }
+    ]
+  },
+  "display_pages": {
+    "windows": [
+      {
+        "anchor_id": "deep-dive-pages",
+        "english_anchor": "Right. We are taking a deep dive today into our source material to explore a massive internet phenomenon known as Chinese Dream Corps.",
+        "expected_segments": [
+          "Right. We are taking a deep dive today into our source material",
+          "to explore a massive internet phenomenon known as Chinese Dream Corps."
+        ],
+        "max_words_per_page": 12,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["深入", "素材"]]},
+          {"must_contain_any": [["网络现象"], ["中式梦核"]]}
+        ]
+      },
+      {
+        "anchor_id": "scale-pages",
+        "english_anchor": "And looking at the sheer scale of this, it is clear this isn't just some passing art trend.",
+        "expected_segments": [
+          "And looking at the sheer scale of this,",
+          "it is clear this isn't just some passing art trend."
+        ],
+        "max_words_per_page": 10,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["规模"]]},
+          {"must_contain_any": [["短暂", "艺术潮流"]]}
+        ]
+      },
+      {
+        "anchor_id": "night-example-pages",
+        "english_anchor": "Think of an empty parking lot or a public square in the dead of night.",
+        "expected_segments": [
+          "Think of an empty parking lot",
+          "or a public square in the dead of night."
+        ],
+        "max_words_per_page": 9,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["停车场"]]},
+          {"must_contain_any": [["深夜"], ["公共广场"]]}
+        ]
+      },
+      {
+        "anchor_id": "four-chan-pages",
+        "english_anchor": "Yeah. Yeah. So back in May 2019, on a 4 chan thread dedicated to the paranormal...",
+        "expected_segments": [
+          "Yeah. Yeah. So back in May 2019,",
+          "on a 4 chan thread dedicated to the paranormal..."
+        ],
+        "max_words_per_page": 9,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["2019年5月"]]},
+          {"must_contain_any": [["4chan"], ["灵异"]]}
+        ]
+      }
+    ]
+  },
+  "thresholds": {
+    "min_overall_score": 0.9,
+    "min_component_score": 0.85
+  }
+}

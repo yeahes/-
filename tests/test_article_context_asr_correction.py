@@ -5,9 +5,14 @@ from pathlib import Path
 
 from app.core.article_context import (
     ARTICLE_ANALYSIS_META_KEY,
+    ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
     ARTICLE_RAW_RESPONSE_KEY,
     analyze_article_text,
+    article_analysis_cache_key,
+    article_analysis_prompt_hash,
+    article_text_hash,
     apply_article_asr_corrections,
+    build_article_asr_review_artifact,
     build_article_glossary,
     empty_article_context,
     enrich_article_context_with_evidence,
@@ -67,6 +72,14 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
                 output_dir=Path(tmp),
             )
 
+    def _correct_with_context(self, segments, context):
+        with tempfile.TemporaryDirectory() as tmp:
+            return apply_article_asr_corrections(
+                ASRData(segments),
+                context,
+                output_dir=Path(tmp),
+            )
+
     def test_corrects_only_article_glossary_proper_names(self):
         raw = [
             ASRDataSeg("Right, Li Yang Wenfing.", 100, 200),
@@ -96,6 +109,268 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             ],
         )
 
+    def test_exact_article_entity_is_not_rewritten_as_another_article_entity(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "places": [
+                    {"canonical_name": "Red Sea", "aliases": [], "category": "region"},
+                    {"canonical_name": "Russia", "aliases": [], "category": "country"},
+                ]
+            },
+            "Shipping through the Red Sea changed while Russia adjusted exports.",
+        )
+        raw = [
+            ASRDataSeg("Red", 100, 250),
+            ASRDataSeg("Sea", 250, 500),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw), context, output_dir=Path(tmp)
+            )
+            rejected = json.loads(
+                (Path(tmp) / "correction_rejected.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["Red", "Sea"])
+        collision = next(
+            item
+            for item in rejected
+            if item.get("original_text") == "Red Sea"
+            and item.get("candidate_text") == "Russia"
+        )
+        self.assertEqual(collision["reason"], "source_is_exact_other_article_entity")
+
+    def test_capitalized_multiword_entity_is_not_collapsed_by_phonetics(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "places": [
+                    {"canonical_name": "Russia", "aliases": [], "category": "country"}
+                ]
+            },
+            "Russia adjusted its exports.",
+        )
+        raw = [
+            ASRDataSeg("Red", 100, 250),
+            ASRDataSeg("Sea", 250, 500),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw), context, output_dir=Path(tmp)
+            )
+            rejected = json.loads(
+                (Path(tmp) / "correction_rejected.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["Red", "Sea"])
+        collision = next(
+            item
+            for item in rejected
+            if item.get("original_text") == "Red Sea"
+            and item.get("candidate_text") == "Russia"
+        )
+        self.assertEqual(
+            collision["reason"],
+            "multiword_entity_cannot_collapse_to_unrelated_entity",
+        )
+
+    def test_lowercase_word_is_not_expanded_into_multiword_article_entity(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "places": [
+                    {"canonical_name": "New York", "aliases": [], "category": "city"}
+                ]
+            },
+            "The company later opened pubs in New York.",
+        )
+        raw = [ASRDataSeg("network", 100, 400)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw), context, output_dir=Path(tmp)
+            )
+            rejected = json.loads(
+                (Path(tmp) / "correction_rejected.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["network"])
+        candidate = next(
+            item
+            for item in rejected
+            if item.get("original_text") == "network"
+            and item.get("candidate_text") == "New York"
+        )
+        self.assertEqual(
+            candidate["reason"],
+            "lowercase_single_token_cannot_expand_to_multiword_entity",
+        )
+
+    def test_capitalized_compound_can_still_expand_to_multiword_entity(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "companies": [
+                    {
+                        "canonical_name": "Mixue Bingcheng",
+                        "aliases": [],
+                        "category": "company",
+                    }
+                ]
+            },
+            "Mixue Bingcheng operates a large franchise network.",
+        )
+        raw = [ASRDataSeg("MixueBingcheng", 100, 500)]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            ["Mixue Bingcheng"],
+        )
+
+    def test_uncertain_proper_name_candidate_remains_review_only(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "companies": [
+                    {
+                        "canonical_name": "Fulujia",
+                        "aliases": ["Lucky Deer"],
+                        "category": "company",
+                    }
+                ]
+            },
+            "Fulujia, whose name means Lucky Deer, operates thousands of pubs.",
+        )
+        raw = [ASRDataSeg("Felugia", 100, 500)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw), context, output_dir=Path(tmp)
+            )
+            rejected = json.loads(
+                (Path(tmp) / "correction_rejected.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["Felugia"])
+        candidate = next(
+            item
+            for item in rejected
+            if item.get("original_text") == "Felugia"
+            and item.get("candidate_text") == "Fulujia"
+        )
+        self.assertEqual(candidate["result"], "review_only")
+        self.assertEqual(candidate["reason"], "below_high_confidence_threshold")
+
+    def test_article_review_artifact_maps_only_best_uncertain_candidate_to_frozen_id(self):
+        final = ASRDataSeg("They opened a Felugia pub.", 1000, 2200)
+        final.subtitle_id = "S0002"
+        base = {
+            "candidate_id": "candidate-company",
+            "original_text": "Felugia",
+            "candidate_text": "Fulujia",
+            "original_token_count": 1,
+            "candidate_token_count": 1,
+            "final_confidence": 0.8167,
+            "start_time": 1400,
+            "end_time": 1700,
+            "source_key": "companies",
+            "category": "company",
+            "entity_gate_passed": True,
+            "applied": False,
+            "result": "review_only",
+            "reason": "below_high_confidence_threshold",
+        }
+        expanded = {
+            **base,
+            "candidate_id": "candidate-brand",
+            "candidate_text": "Fulujia beer",
+            "candidate_token_count": 2,
+        }
+        noisy = {
+            **base,
+            "candidate_id": "candidate-noisy",
+            "original_text": "fully",
+            "candidate_text": "Fulujia",
+            "entity_gate_passed": False,
+        }
+
+        artifact = build_article_asr_review_artifact(
+            [expanded, noisy, base],
+            [final],
+            word_ledger_hash="ledger-hash",
+            source_file_hash="source-hash",
+        )
+
+        self.assertEqual(artifact["word_ledger_hash"], "ledger-hash")
+        self.assertEqual(artifact["source_file_hash"], "source-hash")
+        self.assertEqual(artifact["item_count"], 1)
+        self.assertEqual(artifact["items"][0]["candidate_id"], "candidate-company")
+        self.assertEqual(artifact["items"][0]["subtitle_ids"], ["S0002"])
+        self.assertEqual(artifact["items"][0]["suggested_text"], "Fulujia")
+
+    def test_does_not_collapse_function_words_into_a_distant_article_entity(self):
+        article = (
+            "The character was known literally only as Stifler's Mom. "
+            "Later, platforms such as OnlyFans changed distribution."
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "platforms": [
+                    {
+                        "canonical_name": "OnlyFans",
+                        "aliases": [],
+                        "category": "adult content platform",
+                    }
+                ]
+            },
+            article,
+        )
+        words = [
+            "known",
+            "literally",
+            "only",
+            "as",
+            "Stifler's",
+            "Mom.",
+            "Later,",
+            "OnlyFans",
+            "changed",
+            "distribution.",
+        ]
+        raw = [
+            ASRDataSeg(word, index * 100, (index + 1) * 100)
+            for index, word in enumerate(words)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads(
+                (Path(tmp) / "correction_log.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            [segment.text.strip() for segment in corrected.segments],
+            words,
+        )
+        rejected = [
+            item
+            for item in logs
+            if item.get("original_text") == "only as"
+            and item.get("candidate_text") == "OnlyFans"
+        ]
+        self.assertTrue(rejected)
+        self.assertTrue(all(not item.get("applied") for item in rejected))
+        self.assertTrue(
+            all(
+                item.get("reason") == "candidate_would_merge_function_words"
+                for item in rejected
+            )
+        )
+
     def test_corrects_near_threshold_person_name_when_last_name_matches_article_entity(self):
         raw = [
             ASRDataSeg(
@@ -112,6 +387,305 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             "Taylor Swift's marriage was a massive cultural event.",
         )
 
+    def test_person_description_context_corrects_low_similarity_titled_name(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {
+                        "canonical_name": "Ms Hao",
+                        "aliases": [],
+                        "category": "person",
+                    }
+                ]
+            },
+            (
+                "Ms Hao, a 25-year-old Chinese woman, was working for a startup "
+                "in America when she decided to return home."
+            ),
+        )
+        words = (
+            "Like the case of Ms. Howe. Yes, exactly. Ms. Howe is a 25 year-old "
+            "Chinese woman working for a startup in America."
+        ).split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads(
+                (Path(tmp) / "correction_log.json").read_text(encoding="utf-8")
+            )
+
+        corrected_text = " ".join(segment.text for segment in corrected.segments)
+        self.assertEqual(corrected_text.count("Ms Hao"), 2)
+        applied = [
+            item
+            for item in logs
+            if item.get("applied") and item.get("canonical_name") == "Ms Hao"
+        ]
+        self.assertEqual(len(applied), 2)
+        self.assertTrue(all(item.get("context_match") for item in applied))
+
+    def test_similar_titled_name_without_matching_description_is_not_rewritten(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {
+                        "canonical_name": "Ms Hao",
+                        "aliases": [],
+                        "category": "person",
+                    }
+                ]
+            },
+            "Ms Hao discussed cross-border education policy in Beijing.",
+        )
+        words = "Ms. Howe presented unrelated laboratory findings yesterday.".split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+
+    def test_exact_haigui_surface_is_preserved(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "haigui",
+                        "aliases": ["sea turtles"],
+                        "category": "term",
+                    }
+                ]
+            },
+            "Returning graduates are known as haigui or sea turtles.",
+        )
+        raw = [ASRDataSeg("haigui", 100, 420)]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["haigui"])
+
+    def test_article_defined_single_token_term_repairs_framed_multiword_asr_surface(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "fudaoke",
+                        "aliases": ["remedial class"],
+                        "category": "Chinese term",
+                    }
+                ]
+            },
+            (
+                "To many young people, counselling is like a fudaoke, "
+                "just a remedial class for emotional well-being."
+            ),
+        )
+        words = (
+            "Many young people now refer to therapy as a food of oak. "
+            "They later describe a remedial class for emotional well-being."
+        ).split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        text = " ".join(segment.text for segment in corrected.segments)
+        self.assertIn("therapy as a fudaoke.", text)
+        self.assertIn("a remedial class", text)
+
+    def test_article_defined_term_does_not_rewrite_unframed_ordinary_phrase(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "fudaoke",
+                        "aliases": ["remedial class"],
+                        "category": "Chinese term",
+                    }
+                ]
+            },
+            "Counselling is like a fudaoke, just a remedial class.",
+        )
+        words = "They placed the food of oak beside the table.".split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+
+    def test_extended_term_path_does_not_collapse_general_technical_words_or_correct_surface(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "counselling",
+                        "aliases": ["therapy"],
+                        "category": "therapy term",
+                    },
+                    {
+                        "canonical_name": "fudaoke",
+                        "aliases": ["remedial class"],
+                        "category": "Chinese term",
+                    },
+                ]
+            },
+            "Counselling is therapy. A fudaoke is a remedial class.",
+        )
+        words = "They entered a counselling room and described it as a fudaoke.".split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+
+    def test_extended_term_context_must_be_adjacent_and_cannot_consume_trailing_function_word(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "fudaoke",
+                        "aliases": ["remedial class"],
+                        "category": "Chinese term",
+                    }
+                ]
+            },
+            "Counselling is like a fudaoke, just a remedial class.",
+        )
+        raw_cases = (
+            "As usual, they placed a food oak beside the table.",
+            "They frame the food oak as a bad habit.",
+        )
+        for sentence in raw_cases:
+            words = sentence.split()
+            raw = [
+                ASRDataSeg(word, index * 200, index * 200 + 160)
+                for index, word in enumerate(words)
+            ]
+
+            corrected = self._correct_with_context(raw, context)
+
+            self.assertEqual(
+                [segment.text for segment in corrected.segments],
+                [segment.text for segment in raw],
+            )
+
+    def test_article_alias_title_and_description_repair_adjacent_titled_person(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {
+                        "canonical_name": "Yuan Chengmei",
+                        "aliases": ["Dr Yuan"],
+                        "category": "psychiatrist",
+                    }
+                ]
+            },
+            (
+                "Yuan Chengmei of SMHC points to better identification of "
+                "milder cases of mental distress. Dr Yuan discusses demand."
+            ),
+        )
+        words = (
+            "But Dr. Yuan Qingmai from SMHC points out that they identify "
+            "milder cases of mental distress."
+        ).split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertIn(
+            "Dr. Yuan Chengmei from SMHC",
+            " ".join(segment.text for segment in corrected.segments),
+        )
+
+    def test_adjacent_title_without_article_description_overlap_remains_review_only(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {
+                        "canonical_name": "Yuan Chengmei",
+                        "aliases": ["Dr Yuan"],
+                        "category": "psychiatrist",
+                    }
+                ]
+            },
+            "Yuan Chengmei of SMHC identifies milder cases of mental distress. Dr Yuan spoke.",
+        )
+        words = "Dr. Yuan Qingmai presented unrelated laboratory findings yesterday.".split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+
+    def test_adjacent_title_with_scattered_topic_words_but_no_shared_description_remains_review_only(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {
+                        "canonical_name": "Yuan Chengmei",
+                        "aliases": ["Dr Yuan"],
+                        "category": "psychiatrist",
+                    }
+                ]
+            },
+            (
+                "Yuan Chengmei of SMHC points to better identification of "
+                "milder cases of mental distress. Dr Yuan discusses demand."
+            ),
+        )
+        words = (
+            "Dr. Yuan Qingmai from SMHC identifies unrelated cases of "
+            "mental distress."
+        ).split()
+        raw = [
+            ASRDataSeg(word, index * 200, index * 200 + 160)
+            for index, word in enumerate(words)
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+
     def test_does_not_rewrite_common_words_or_numbers(self):
         raw = [
             ASRDataSeg("it doesn't just change where they sell,", 100, 200),
@@ -122,6 +696,100 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
 
         corrected = self._correct(raw)
         self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+
+    def test_does_not_conflate_places_with_demonyms_or_consume_trailing_words(self):
+        context = {
+            "places": [
+                {"canonical_name": "America", "aliases": [], "category": "place"},
+                {"canonical_name": "China", "aliases": [], "category": "place"},
+            ],
+            "organisations": [
+                {"canonical_name": "Census Bureau", "aliases": [], "category": "organisation"},
+                {
+                    "canonical_name": "American Enterprise Institute",
+                    "aliases": [],
+                    "category": "organisation",
+                },
+            ],
+        }
+        raw = [
+            ASRDataSeg("Americans", 100, 200),
+            ASRDataSeg("have", 200, 300),
+            ASRDataSeg("applied.", 300, 400),
+            ASRDataSeg("Chinese", 500, 600),
+            ASRDataSeg("founders", 600, 700),
+            ASRDataSeg("are", 700, 800),
+            ASRDataSeg("growing.", 800, 900),
+            ASRDataSeg("Census", 1000, 1100),
+            ASRDataSeg("Bureau,", 1100, 1200),
+            ASRDataSeg("there", 1200, 1300),
+            ASRDataSeg("are", 1300, 1400),
+            ASRDataSeg("signs.", 1400, 1500),
+            ASRDataSeg("American", 1600, 1700),
+            ASRDataSeg("Enterprise", 1700, 1800),
+            ASRDataSeg("Institute", 1800, 1900),
+            ASRDataSeg("details", 1900, 2000),
+            ASRDataSeg("findings.", 2000, 2100),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            " ".join(seg.text for seg in corrected.segments),
+            " ".join(seg.text for seg in raw),
+        )
+        american_logs = [item for item in logs if item.get("original_text") == "Americans"]
+        self.assertTrue(american_logs)
+        self.assertTrue(all(item["reason"] == "place_demonym_not_entity" for item in american_logs))
+        self.assertTrue(
+            any(
+                item.get("original_text") == "Census Bureau, there"
+                and item["reason"] == "candidate_would_delete_non_entity_token"
+                for item in logs
+            )
+        )
+        self.assertTrue(
+            any(
+                item.get("original_text") == "American Enterprise Institute details"
+                and item["reason"] == "candidate_would_delete_non_entity_token"
+                for item in logs
+            )
+        )
+
+    def test_multi_token_entity_candidate_cannot_consume_acronym_fragment(self):
+        context = {
+            "places": [
+                {"canonical_name": "Japan", "aliases": [], "category": "place"},
+            ],
+        }
+        raw = [
+            ASRDataSeg("U", 100, 180),
+            ASRDataSeg(".S.,", 180, 360),
+            ASRDataSeg("Japan,", 420, 560),
+            ASRDataSeg("and", 600, 700),
+            ASRDataSeg("South", 700, 820),
+            ASRDataSeg("Korea", 820, 940),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+        rejected = [item for item in logs if item.get("original_text") == ".S., Japan,"]
+        self.assertTrue(rejected)
+        self.assertTrue(all(not item.get("applied") for item in rejected))
+        self.assertTrue(
+            all(item.get("reason") == "candidate_would_delete_non_entity_token" for item in rejected)
+        )
 
     def test_skips_self_replacements_and_technical_terms_for_asr_correction(self):
         context = {
@@ -152,6 +820,97 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
         )
         self.assertEqual([item["corrected_text"] for item in logs], ["DeepSeek"])
 
+    def test_corrects_article_defined_domain_term_from_phonetic_asr_forms(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "haigui",
+                        "aliases": ["sea turtles"],
+                        "category": "term",
+                    }
+                ]
+            },
+            (
+                "Last year the proportion of returnees, who are known as "
+                "haigui or sea turtles, reached an all-time high."
+            ),
+        )
+        raw = [
+            ASRDataSeg("Higee", 100, 320),
+            ASRDataSeg("students", 320, 620),
+            ASRDataSeg("and", 620, 760),
+            ASRDataSeg("Higgies", 760, 1040),
+            ASRDataSeg("returned.", 1040, 1360),
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            ["haigui", "students", "and", "haigui", "returned."],
+        )
+        self.assertEqual(
+            [(segment.start_time, segment.end_time) for segment in corrected.segments],
+            [(segment.start_time, segment.end_time) for segment in raw],
+        )
+
+    def test_preserves_words_adjacent_to_an_already_complete_entity(self):
+        context = {
+            "people": [
+                {
+                    "canonical_name": "Donald Trump",
+                    "aliases": [],
+                    "category": "person",
+                }
+            ],
+            "organisations": [
+                {
+                    "canonical_name": "Peking University",
+                    "aliases": [],
+                    "category": "organisation",
+                }
+            ],
+        }
+        raw = [
+            ASRDataSeg("Like,", 100, 180),
+            ASRDataSeg("Peking", 180, 280),
+            ASRDataSeg("University", 280, 420),
+            ASRDataSeg("President", 500, 640),
+            ASRDataSeg("Donald", 640, 760),
+            ASRDataSeg("Trump", 760, 900),
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+        self.assertEqual(
+            [(segment.start_time, segment.end_time) for segment in corrected.segments],
+            [(segment.start_time, segment.end_time) for segment in raw],
+        )
+
+    def test_plain_article_technical_word_is_not_a_phonetic_rewrite_authority(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "automation",
+                        "aliases": [],
+                        "category": "technical_term",
+                    }
+                ]
+            },
+            "Automation can reduce repetitive work.",
+        )
+        raw = [ASRDataSeg("Automotion", 100, 620)]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["Automotion"])
+
     def test_rejects_fluent_common_phrases_that_sound_like_entities(self):
         raw = [
             ASRDataSeg("I mean, they are trading.", 100, 200),
@@ -181,6 +940,127 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
 
         corrected = self._correct(raw)
         self.assertEqual([seg.text for seg in corrected.segments], [seg.text for seg in raw])
+
+    def test_short_alias_collision_with_related_canonical_is_review_only(self):
+        article = (
+            "Northbridge Reserve College opened a research centre. "
+            "Northbridge Reserve Council Directorate published a separate report."
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "organisations": [
+                    {
+                        "canonical_name": "Northbridge Reserve College",
+                        "aliases": [],
+                        "category": "organisation",
+                    },
+                    {
+                        "canonical_name": "Northbridge Reserve Council Directorate",
+                        "aliases": ["Northbridge Reserve"],
+                        "category": "organisation",
+                    },
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Northbridge", 0, 100),
+            ASRDataSeg("Reserve", 100, 200),
+            ASRDataSeg("College", 200, 300),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(" ".join(seg.text for seg in corrected.segments), "Northbridge Reserve College")
+        collision = next(
+            item
+            for item in logs
+            if item.get("reason") == "ambiguous_alias_canonical_collision"
+        )
+        self.assertFalse(collision["applied"])
+        self.assertEqual(collision["result"], "review_only")
+        self.assertEqual(collision["matched_variant"], "Northbridge Reserve")
+        self.assertEqual(collision["canonical_name"], "Northbridge Reserve Council Directorate")
+        self.assertEqual(
+            collision["alias_canonical_collision"]["conflicting_canonicals"][0]["canonical_name"],
+            "Northbridge Reserve College",
+        )
+        self.assertEqual(collision["start_word_index"], 0)
+        self.assertEqual(collision["end_word_index"], 3)
+
+    def test_exact_canonical_correction_survives_related_alias_collision_guard(self):
+        article = (
+            "Northbridge Reserve College opened a research centre. "
+            "Northbridge Reserve Council Directorate published a separate report."
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "organisations": [
+                    {
+                        "canonical_name": "Northbridge Reserve College",
+                        "aliases": [],
+                        "category": "organisation",
+                    },
+                    {
+                        "canonical_name": "Northbridge Reserve Council Directorate",
+                        "aliases": ["Northbridge Reserve"],
+                        "category": "organisation",
+                    },
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Northbridge", 0, 100),
+            ASRDataSeg("Reserve", 100, 200),
+            ASRDataSeg("Collage", 200, 300),
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(" ".join(seg.text for seg in corrected.segments), "Northbridge Reserve College")
+
+    def test_unrelated_high_confidence_entity_correction_remains_automatic(self):
+        article = "Harborview Dynamics released a new report."
+        context = enrich_article_context_with_evidence(
+            {
+                "companies": [
+                    {
+                        "canonical_name": "Harborview Dynamics",
+                        "aliases": [],
+                        "category": "company",
+                    }
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Harbourview", 0, 100),
+            ASRDataSeg("Dynamics", 100, 200),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(" ".join(seg.text for seg in corrected.segments), "Harborview Dynamics")
+        self.assertTrue(
+            any(
+                item.get("applied")
+                and item.get("canonical_name") == "Harborview Dynamics"
+                for item in logs
+            )
+        )
 
     def test_preserves_count_and_timestamps(self):
         raw = [
@@ -316,6 +1196,230 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             }
         )
 
+    def test_article_work_context_corrects_split_title_but_not_unrelated_phrase(self):
+        article = (
+            'The animated film "Niulai" unexpectedly went viral. '
+            'Hashtags such as "Niulai box office surges 1000 times" and '
+            '"How did Niulai pass censorship" became trending topics.'
+        )
+        context = enrich_article_context_with_evidence(
+            {
+                "books_and_works": [
+                    {
+                        "canonical_name": "Niulai",
+                        "aliases": [],
+                        "category": "film",
+                    }
+                ]
+            },
+            article,
+        )
+        raw = [
+            ASRDataSeg("Hashtags", 0, 100),
+            ASRDataSeg("like,", 100, 200),
+            ASRDataSeg("new", 200, 300),
+            ASRDataSeg("lie", 300, 400),
+            ASRDataSeg("box", 400, 500),
+            ASRDataSeg("office", 500, 600),
+            ASRDataSeg("surges.", 600, 700),
+            ASRDataSeg("Separately,", 800, 900),
+            ASRDataSeg("a", 900, 1000),
+            ASRDataSeg("new", 1000, 1100),
+            ASRDataSeg("lie", 1100, 1200),
+            ASRDataSeg("spread", 1200, 1300),
+            ASRDataSeg("yesterday.", 1300, 1400),
+            ASRDataSeg("How", 1500, 1600),
+            ASRDataSeg("did", 1600, 1700),
+            ASRDataSeg("new", 1700, 1800),
+            ASRDataSeg("lie", 1800, 1900),
+            ASRDataSeg("past", 1900, 2000),
+            ASRDataSeg("censorship?", 2000, 2100),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads(
+                (Path(tmp) / "correction_log.json").read_text(encoding="utf-8")
+            )
+
+        corrected_text = " ".join(segment.text for segment in corrected.segments)
+        self.assertIn("Niulai box office surges.", corrected_text)
+        self.assertIn("a new lie spread yesterday.", corrected_text)
+        self.assertIn("How did Niulai past censorship?", corrected_text)
+        applied = [
+            item
+            for item in logs
+            if item.get("applied") and item.get("candidate_text") == "Niulai"
+        ]
+        self.assertEqual(len(applied), 2)
+        self.assertTrue(all(item.get("book_title_context_match") for item in applied))
+        self.assertEqual(
+            [(segment.start_time, segment.end_time) for segment in corrected.segments if segment.text == "Niulai"],
+            [(200, 400), (1700, 1900)],
+        )
+
+    def test_scope_rejected_high_signal_title_candidate_reaches_review_artifact(self):
+        frozen = ASRDataSeg("Yulai appears.", 100, 500)
+        frozen.subtitle_id = "S0001"
+        artifact = build_article_asr_review_artifact(
+            [
+                {
+                    "candidate_id": "candidate-yulai",
+                    "applied": False,
+                    "result": "review_only",
+                    "reason": "ordinary_text_not_article_proper_noun_scope",
+                    "entity_gate_passed": True,
+                    "final_confidence": 0.84,
+                    "start_time": 100,
+                    "end_time": 300,
+                    "original_text": "Yulai",
+                    "candidate_text": "Niulai",
+                    "candidate_token_count": 1,
+                    "original_token_count": 1,
+                    "source_key": "books_and_works",
+                    "category": "film",
+                    "evidence": {"evidence_sentence": 'The film "Niulai" opened.'},
+                }
+            ],
+            [frozen],
+            word_ledger_hash="ledger-hash",
+            source_file_hash="source-hash",
+        )
+
+        self.assertEqual(artifact["item_count"], 1)
+        self.assertEqual(artifact["items"][0]["subtitle_ids"], ["S0001"])
+        self.assertEqual(artifact["items"][0]["suggested_text"], "Niulai")
+
+    def test_review_artifact_rejects_place_demonym_and_existing_full_name(self):
+        chinese = ASRDataSeg("Chinese suppliers expanded.", 100, 500)
+        chinese.subtitle_id = "S0001"
+        full_name = ASRDataSeg("Deborah Elms explained it.", 600, 1000)
+        full_name.subtitle_id = "S0002"
+        common = {
+            "applied": False,
+            "result": "review_only",
+            "reason": "below_high_confidence_threshold",
+            "entity_gate_passed": True,
+            "final_confidence": 0.82,
+            "candidate_token_count": 1,
+            "original_token_count": 1,
+        }
+        artifact = build_article_asr_review_artifact(
+            [
+                {
+                    **common,
+                    "candidate_id": "candidate-chinese",
+                    "start_time": 100,
+                    "end_time": 300,
+                    "original_text": "Chinese",
+                    "candidate_text": "China",
+                    "source_key": "places",
+                    "category": "place",
+                },
+                {
+                    **common,
+                    "candidate_id": "candidate-elms",
+                    "start_time": 700,
+                    "end_time": 900,
+                    "original_text": "Elms",
+                    "candidate_text": "Deborah Elms",
+                    "candidate_token_count": 2,
+                    "source_key": "people",
+                    "category": "person",
+                },
+            ],
+            [chinese, full_name],
+            word_ledger_hash="ledger-hash",
+            source_file_hash="source-hash",
+        )
+
+        self.assertEqual(artifact["item_count"], 0)
+        self.assertEqual(
+            {item["reason"] for item in artifact["dropped"]},
+            {
+                "place_demonym_not_reviewable",
+                "canonical_entity_already_present_in_frozen_cue",
+            },
+        )
+
+    def test_review_artifact_rejects_confirmed_entity_collision_and_frozen_name_part(self):
+        britain = ASRDataSeg("A chaotic moment in Britain.", 100, 500)
+        britain.subtitle_id = "S0001"
+        bretton = ASRDataSeg("The Bretton Woods system failed.", 600, 1000)
+        bretton.subtitle_id = "S0002"
+        common = {
+            "applied": False,
+            "result": "review_only",
+            "reason": "below_high_confidence_threshold",
+            "entity_gate_passed": True,
+            "final_confidence": 0.82,
+            "candidate_token_count": 1,
+            "original_token_count": 1,
+        }
+        artifact = build_article_asr_review_artifact(
+            [
+                {
+                    **common,
+                    "candidate_id": "candidate-britain-to-person",
+                    "start_time": 300,
+                    "end_time": 450,
+                    "original_text": "Britain",
+                    "candidate_text": "Andrew Batson",
+                    "candidate_token_count": 2,
+                    "source_key": "people",
+                    "category": "person",
+                    "source_glossary": {
+                        "canonical_name": "Andrew Batson",
+                        "aliases": ["Batson"],
+                    },
+                },
+                {
+                    **common,
+                    "candidate_id": "candidate-batson-to-britain",
+                    "start_time": 1200,
+                    "end_time": 1400,
+                    "original_text": "Batson",
+                    "candidate_text": "Britain",
+                    "source_key": "places",
+                    "category": "country",
+                    "source_glossary": {
+                        "canonical_name": "Britain",
+                        "aliases": [],
+                    },
+                },
+                {
+                    **common,
+                    "candidate_id": "candidate-bretton-to-britain",
+                    "start_time": 700,
+                    "end_time": 800,
+                    "original_text": "Bretton",
+                    "candidate_text": "Britain",
+                    "source_key": "places",
+                    "category": "country",
+                    "source_glossary": {
+                        "canonical_name": "Britain",
+                        "aliases": [],
+                    },
+                },
+            ],
+            [britain, bretton],
+            word_ledger_hash="ledger-hash",
+            source_file_hash="source-hash",
+        )
+
+        self.assertEqual(artifact["item_count"], 0)
+        self.assertEqual(
+            {item["reason"] for item in artifact["dropped"]},
+            {
+                "original_is_confirmed_article_entity",
+                "original_is_part_of_frozen_proper_name",
+            },
+        )
+
     def test_save_article_artifacts_writes_raw_response_and_audit(self):
         article = "DeepSeek was founded by Liang Wenfeng."
         context = {
@@ -359,6 +1463,13 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             "places": [],
             "technical_terms": [],
             "numbers_and_dates": [],
+            ARTICLE_ANALYSIS_META_KEY: {
+                "article_text_hash": article_text_hash("Cached summary text."),
+                "prompt_hash": article_analysis_prompt_hash(),
+                "analysis_prompt_hash": article_analysis_prompt_hash(),
+                "analysis_prompt_policy_version": ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+                "analysis_cache_key": article_analysis_cache_key("Cached summary text."),
+            },
         }
 
         context = analyze_article_text(
@@ -369,6 +1480,34 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
 
         self.assertTrue(context[ARTICLE_ANALYSIS_META_KEY]["cache_used"])
         self.assertEqual(context["summary"], "Cached summary")
+        self.assertEqual(
+            context[ARTICLE_ANALYSIS_META_KEY]["article_text_hash"],
+            article_text_hash("Cached summary text."),
+        )
+        self.assertEqual(
+            context[ARTICLE_ANALYSIS_META_KEY]["analysis_prompt_hash"],
+            article_analysis_prompt_hash(),
+        )
+        self.assertEqual(
+            context[ARTICLE_ANALYSIS_META_KEY]["analysis_prompt_policy_version"],
+            ARTICLE_ANALYSIS_PROMPT_POLICY_VERSION,
+        )
+
+    def test_article_analysis_cache_key_includes_prompt_policy_identity(self):
+        article = "The same article text."
+
+        current = article_analysis_cache_key(article)
+        changed_policy = article_analysis_cache_key(
+            article,
+            prompt_policy_version="article-context-analysis-test-version",
+        )
+        changed_prompt = article_analysis_cache_key(
+            article,
+            prompt="A materially different analysis prompt.",
+        )
+
+        self.assertNotEqual(current, changed_policy)
+        self.assertNotEqual(current, changed_prompt)
 
     def test_overlapping_candidates_keep_highest_score_for_same_range(self):
         low = _candidate(
@@ -472,7 +1611,38 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
         texts = [seg.text for seg in corrected.segments]
         self.assertEqual(texts, ["Sam Bankman-Fried.", "Maya Angelou", "Benjamin Todd."])
         self.assertTrue(
-            any(item["reason"] == "adjacent_canonical_entity_overlap_deduped" for item in logs)
+            any(
+                item["reason"]
+                in {
+                    "adjacent_canonical_entity_overlap_deduped",
+                    "exact_multi_segment_canonical_merge",
+                }
+                for item in logs
+            )
+        )
+
+    def test_exact_adjacent_canonical_merge_does_not_cross_sentence_boundary(self):
+        context = {
+            "people": [
+                {"canonical_name": "Benjamin Todd", "aliases": [], "category": "person"}
+            ]
+        }
+        raw = [
+            ASRDataSeg("Benjamin.", 0, 100),
+            ASRDataSeg("Todd", 200, 300),
+            ASRDataSeg("answered.", 300, 400),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            ["Benjamin.", "Todd", "answered."],
         )
 
     def test_dedupe_does_not_delete_general_adjacent_repeated_words(self):
@@ -494,6 +1664,251 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             [(seg.start_time, seg.end_time) for seg in raw],
         )
 
+    def test_exact_supported_alias_surface_is_not_canonicalized(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "places": [
+                    {
+                        "canonical_name": "United States",
+                        "aliases": ["America"],
+                        "category": "country",
+                    }
+                ]
+            },
+            "The United States is also known as America.",
+        )
+        alias_details = context["places"][0]["alias_details"]
+        self.assertTrue(
+            any(
+                detail.get("alias") == "America" and detail.get("in_article")
+                for detail in alias_details
+            )
+        )
+        raw = [ASRDataSeg("America.", 100, 620)]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["America."])
+        self.assertEqual(
+            [(segment.start_time, segment.end_time) for segment in corrected.segments],
+            [(100, 620)],
+        )
+
+    def test_article_correction_preserves_valid_short_entity_surfaces(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {
+                        "canonical_name": "Peter Navarro",
+                        "aliases": [],
+                        "category": "person",
+                    },
+                    {
+                        "canonical_name": "G K. Chesterton",
+                        "aliases": [],
+                        "category": "person",
+                    },
+                ],
+                "organisations": [
+                    {
+                        "canonical_name": "Donald Trump administration",
+                        "aliases": [],
+                        "category": "organisation",
+                    }
+                ],
+            },
+            (
+                "Peter Navarro served in the Donald Trump administration. "
+                "G K. Chesterton was also discussed."
+            ),
+        )
+        raw = [
+            ASRDataSeg("Navarro", 0, 200),
+            ASRDataSeg("Trump", 300, 500),
+            ASRDataSeg("administration", 500, 700),
+            ASRDataSeg("G", 800, 900),
+            ASRDataSeg("K.", 900, 1000),
+            ASRDataSeg("Chesterton", 1000, 1200),
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+
+    def test_exact_connector_format_is_corrected_without_expanding_meaning(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "technical_terms": [
+                    {
+                        "canonical_name": "R&D",
+                        "aliases": [],
+                        "category": "technical term",
+                    }
+                ]
+            },
+            "The company established an R&D unit in China.",
+        )
+        raw = [ASRDataSeg("R", 100, 300), ASRDataSeg("&D", 300, 500)]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual([segment.text for segment in corrected.segments], ["R&D"])
+
+    def test_connector_formatting_does_not_insert_a_new_hyphen(self):
+        context = {
+            "places": [
+                {
+                    "canonical_name": "south-west China",
+                    "aliases": [],
+                    "category": "place",
+                }
+            ]
+        }
+        raw = [
+            ASRDataSeg("southwest", 0, 100),
+            ASRDataSeg("China", 100, 200),
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            ["southwest", "China"],
+        )
+
+    def test_multiword_place_adjective_is_not_canonicalized(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "places": [
+                    {
+                        "canonical_name": "South-East Asia",
+                        "aliases": [],
+                        "category": "place",
+                    }
+                ]
+            },
+            "South-East Asia is a major assembly region.",
+        )
+        raw = [
+            ASRDataSeg("Southeast", 100, 300),
+            ASRDataSeg("Asian", 300, 500),
+        ]
+
+        corrected = self._correct_with_context(raw, context)
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            ["Southeast", "Asian"],
+        )
+
+    def test_article_phrase_near_match_and_person_variant_are_review_only(self):
+        context = enrich_article_context_with_evidence(
+            {
+                "people": [
+                    {
+                        "canonical_name": "Xie Liang",
+                        "aliases": [],
+                        "category": "person",
+                    }
+                ]
+            },
+            "The company was founded by Xie Liang.",
+        )
+        raw = [
+            ASRDataSeg("Shi", 100, 300),
+            ASRDataSeg("Liang.", 300, 500),
+            ASRDataSeg("They", 600, 800),
+            ASRDataSeg("are", 800, 1000),
+            ASRDataSeg("stringing", 1000, 1200),
+            ASRDataSeg("up", 1200, 1400),
+            ASRDataSeg("everywhere.", 1400, 1600),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+                article_text=(
+                    "Chinese chocolatiers are springing up around the country. "
+                    "The company was founded by Xie Liang."
+                ),
+            )
+            logs = json.loads(
+                (Path(tmp) / "correction_log.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            [segment.text for segment in raw],
+        )
+        review_pairs = {
+            (item.get("original_text"), item.get("candidate_text"))
+            for item in logs
+            if item.get("result") == "review_only"
+        }
+        self.assertIn(("Shi Liang.", "Xie Liang"), review_pairs)
+        self.assertIn(("stringing", "springing"), review_pairs)
+        review_reasons = {
+            (item.get("original_text"), item.get("candidate_text")): item.get("reason")
+            for item in logs
+            if item.get("result") == "review_only"
+            and item.get("reason")
+            in {"article_person_surname_variant", "article_phrase_near_match"}
+        }
+        self.assertEqual(
+            review_reasons[("Shi Liang.", "Xie Liang")],
+            "article_person_surname_variant",
+        )
+        self.assertEqual(
+            review_reasons[("stringing", "springing")],
+            "article_phrase_near_match",
+        )
+
+    def test_article_alias_cannot_replace_standalone_yes_discourse_marker(self):
+        context = {
+            "places": [
+                {
+                    "canonical_name": "United States",
+                    "aliases": ["US"],
+                    "category": "country",
+                }
+            ]
+        }
+        raw = [
+            ASRDataSeg("Yes,", 100, 420),
+            ASRDataSeg("exactly.", 420, 800),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corrected = apply_article_asr_corrections(
+                ASRData(raw),
+                context,
+                output_dir=Path(tmp),
+            )
+            logs = json.loads(
+                (Path(tmp) / "correction_log.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            [segment.text for segment in corrected.segments],
+            ["Yes,", "exactly."],
+        )
+        yes_candidates = [
+            item for item in logs if item.get("original_text") == "Yes,"
+        ]
+        self.assertTrue(yes_candidates)
+        self.assertTrue(all(not item.get("applied") for item in yes_candidates))
+        self.assertTrue(
+            all(
+                item.get("reason") == "contains_function_word_or_discourse_marker"
+                for item in yes_candidates
+            )
+        )
+
     def test_rejected_file_records_overlapping_candidate(self):
         context = {"organisations": [{"canonical_name": "New York Fed", "aliases": [], "category": "organisation"}]}
         raw = [
@@ -508,9 +1923,26 @@ class ArticleContextASRCorrectionTests(unittest.TestCase):
             rejected = json.loads((Path(tmp) / "correction_rejected.json").read_text(encoding="utf-8"))
             log = json.loads((Path(tmp) / "correction_log.json").read_text(encoding="utf-8"))
 
-        overlap_items = [item for item in rejected if item.get("reason") == "overlapping_candidate"]
-        self.assertTrue(overlap_items)
-        applied = [item for item in log if item.get("applied") and item.get("reason") == "high_confidence_article_glossary_match"]
+        rejected_expansions = [
+            item
+            for item in rejected
+            if item.get("reason")
+            in {
+                "overlapping_candidate",
+                "existing_entity_surface_cannot_be_replaced_or_expanded",
+            }
+        ]
+        self.assertTrue(rejected_expansions)
+        applied = [
+            item
+            for item in log
+            if item.get("applied")
+            and item.get("reason")
+            in {
+                "high_confidence_article_glossary_match",
+                "exact_multi_segment_canonical_merge",
+            }
+        ]
         self.assertTrue(all("start_word_index" in item and "end_word_index" in item for item in applied))
 
 

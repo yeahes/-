@@ -1,4 +1,4 @@
-import openai
+from app.core.llm_client import OpenAI
 
 
 def test_openai(base_url, api_key, model):
@@ -15,7 +15,7 @@ def test_openai(base_url, api_key, model):
     """
     try:
         # 创建OpenAI客户端并发送请求到OpenAI API
-        response = openai.OpenAI(
+        response = OpenAI(
             base_url=base_url, api_key=api_key, timeout=10
         ).chat.completions.create(
             model=model,
@@ -35,7 +35,7 @@ def test_openai(base_url, api_key, model):
 def get_openai_models(base_url, api_key):
     try:
         # 创建OpenAI客户端并获取模型列表
-        models = openai.OpenAI(
+        models = OpenAI(
             base_url=base_url, api_key=api_key, timeout=5
         ).models.list()
 

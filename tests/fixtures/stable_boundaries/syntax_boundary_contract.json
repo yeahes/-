@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "determiner_numeric_noun",
+      "words": ["those", "200", "economists", "signed", "the", "letter."],
+      "cut_after_indices": [0, 1],
+      "expected_issue": "determiner_numeric_noun_split",
+      "expected_legal": false
+    },
+    {
+      "id": "quantifier_phrase",
+      "words": ["a", "few", "thousand", "people", "arrived."],
+      "cut_after_indices": [0, 1],
+      "expected_issue": "quantifier_phrase_split",
+      "expected_legal": false
+    },
+    {
+      "id": "adverb_adjective",
+      "words": ["a", "highly", "valuable", "company", "emerged."],
+      "cut_after_indices": [1],
+      "expected_issue": "adverb_adjective_split",
+      "expected_legal": false
+    },
+    {
+      "id": "short_verb_complement",
+      "words": ["they", "made", "it", "quickly."],
+      "manual_syntax_indices": [1, 2],
+      "manual_syntax_issue": "short_verb_complement_split",
+      "cut_after_indices": [1],
+      "expected_issue": "short_verb_complement_split",
+      "expected_legal": false
+    },
+    {
+      "id": "subject_finite_verb",
+      "words": ["We", "tend", "to", "view", "AI"],
+      "manual_syntax_indices": [0, 1],
+      "manual_syntax_issue": "subject_finite_verb_split",
+      "cut_after_indices": [0],
+      "expected_issue": "subject_finite_verb_split",
+      "expected_legal": false
+    },
+    {
+      "id": "long_object_safe_boundary",
+      "words": ["they", "built", "a", "large", "durable", "export", "business", "with", "capital", "partners", "over", "many", "years."],
+      "cut_after_indices": [6],
+      "expected_issue": null,
+      "expected_legal": true
+    }
+  ]
+}

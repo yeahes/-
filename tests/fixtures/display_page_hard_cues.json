@@ -1,0 +1,3511 @@
+{
+  "schema_version": 1,
+  "source_checkpoint": "20260807T163640.468734-2d954ca8",
+  "cases": [
+    {
+      "subtitle_id": "S0024",
+      "english": "Right. Which totally shatters the current economic model of how these systems are actually supposed to generate revenue.",
+      "chinese": "没错。这彻底粉碎了现有的经济模式，也就是这些系统究竟该如何创收的整个逻辑。",
+      "word_start": 320,
+      "word_end": 337,
+      "word_timing": [
+        {
+          "word_id": 320,
+          "surface": "Right.",
+          "start_ms": 110220,
+          "end_ms": 110360
+        },
+        {
+          "word_id": 321,
+          "surface": "Which",
+          "start_ms": 110480,
+          "end_ms": 110500
+        },
+        {
+          "word_id": 322,
+          "surface": "totally",
+          "start_ms": 110500,
+          "end_ms": 110900
+        },
+        {
+          "word_id": 323,
+          "surface": "shatters",
+          "start_ms": 110900,
+          "end_ms": 111480
+        },
+        {
+          "word_id": 324,
+          "surface": "the",
+          "start_ms": 111480,
+          "end_ms": 111820
+        },
+        {
+          "word_id": 325,
+          "surface": "current",
+          "start_ms": 111820,
+          "end_ms": 112080
+        },
+        {
+          "word_id": 326,
+          "surface": "economic",
+          "start_ms": 112300,
+          "end_ms": 112580
+        },
+        {
+          "word_id": 327,
+          "surface": "model",
+          "start_ms": 112580,
+          "end_ms": 112960
+        },
+        {
+          "word_id": 328,
+          "surface": "of",
+          "start_ms": 112960,
+          "end_ms": 113180
+        },
+        {
+          "word_id": 329,
+          "surface": "how",
+          "start_ms": 113180,
+          "end_ms": 113320
+        },
+        {
+          "word_id": 330,
+          "surface": "these",
+          "start_ms": 113320,
+          "end_ms": 113520
+        },
+        {
+          "word_id": 331,
+          "surface": "systems",
+          "start_ms": 113700,
+          "end_ms": 113800
+        },
+        {
+          "word_id": 332,
+          "surface": "are",
+          "start_ms": 113800,
+          "end_ms": 113980
+        },
+        {
+          "word_id": 333,
+          "surface": "actually",
+          "start_ms": 113980,
+          "end_ms": 114320
+        },
+        {
+          "word_id": 334,
+          "surface": "supposed",
+          "start_ms": 114320,
+          "end_ms": 114660
+        },
+        {
+          "word_id": 335,
+          "surface": "to",
+          "start_ms": 114660,
+          "end_ms": 114920
+        },
+        {
+          "word_id": 336,
+          "surface": "generate",
+          "start_ms": 114980,
+          "end_ms": 115220
+        },
+        {
+          "word_id": 337,
+          "surface": "revenue.",
+          "start_ms": 115397,
+          "end_ms": 115777
+        }
+      ],
+      "display_boundary_evidence": {
+        "321": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 28.0,
+          "protected_syntax": false,
+          "pause_ms": 120
+        },
+        "322": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "323": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "dependency_phrase_entrance_split",
+            "modifier_head_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "324": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "325": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 0
+        },
+        "326": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": true,
+          "pause_ms": 220
+        },
+        "327": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 0
+        },
+        "328": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "329": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "330": {
+          "hard_issues": [
+            "clause_introducer_split",
+            "fronted_wh_clause_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "331": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "fronted_wh_clause_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": true,
+          "pause_ms": 180
+        },
+        "332": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "fronted_wh_clause_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "333": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "fronted_wh_clause_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 286.0,
+          "protected_syntax": true,
+          "pause_ms": 0
+        },
+        "334": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "fronted_wh_clause_split",
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 0
+        },
+        "335": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 0
+        },
+        "336": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "337": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 90.0,
+          "protected_syntax": false,
+          "pause_ms": 177
+        }
+      }
+    },
+    {
+      "subtitle_id": "S0087",
+      "english": "And the other chef is completely locked out of the specialty store and is just forced to invent entirely new cooking techniques just to extract a Michelin star meal out of, you know, basic, accessible ingredients.",
+      "chinese": "而另一位厨师被完全挡在特色食材店门外，只能被迫发明全新的烹饪技法，用普通易得的食材端出米其林星级大餐。",
+      "word_start": 1078,
+      "word_end": 1113,
+      "word_timing": [
+        {
+          "word_id": 1078,
+          "surface": "And",
+          "start_ms": 380514,
+          "end_ms": 380594
+        },
+        {
+          "word_id": 1079,
+          "surface": "the",
+          "start_ms": 380614,
+          "end_ms": 380694
+        },
+        {
+          "word_id": 1080,
+          "surface": "other",
+          "start_ms": 380774,
+          "end_ms": 380934
+        },
+        {
+          "word_id": 1081,
+          "surface": "chef",
+          "start_ms": 380975,
+          "end_ms": 381235
+        },
+        {
+          "word_id": 1082,
+          "surface": "is",
+          "start_ms": 381695,
+          "end_ms": 381775
+        },
+        {
+          "word_id": 1083,
+          "surface": "completely",
+          "start_ms": 381815,
+          "end_ms": 382255
+        },
+        {
+          "word_id": 1084,
+          "surface": "locked",
+          "start_ms": 382315,
+          "end_ms": 382556
+        },
+        {
+          "word_id": 1085,
+          "surface": "out",
+          "start_ms": 382616,
+          "end_ms": 382696
+        },
+        {
+          "word_id": 1086,
+          "surface": "of",
+          "start_ms": 382736,
+          "end_ms": 382776
+        },
+        {
+          "word_id": 1087,
+          "surface": "the",
+          "start_ms": 382816,
+          "end_ms": 382876
+        },
+        {
+          "word_id": 1088,
+          "surface": "specialty",
+          "start_ms": 382896,
+          "end_ms": 383316
+        },
+        {
+          "word_id": 1089,
+          "surface": "store",
+          "start_ms": 383356,
+          "end_ms": 383636
+        },
+        {
+          "word_id": 1090,
+          "surface": "and",
+          "start_ms": 383776,
+          "end_ms": 383856
+        },
+        {
+          "word_id": 1091,
+          "surface": "is",
+          "start_ms": 383916,
+          "end_ms": 383977
+        },
+        {
+          "word_id": 1092,
+          "surface": "just",
+          "start_ms": 383997,
+          "end_ms": 384177
+        },
+        {
+          "word_id": 1093,
+          "surface": "forced",
+          "start_ms": 384737,
+          "end_ms": 385057
+        },
+        {
+          "word_id": 1094,
+          "surface": "to",
+          "start_ms": 385117,
+          "end_ms": 385197
+        },
+        {
+          "word_id": 1095,
+          "surface": "invent",
+          "start_ms": 385237,
+          "end_ms": 385518
+        },
+        {
+          "word_id": 1096,
+          "surface": "entirely",
+          "start_ms": 385598,
+          "end_ms": 386098
+        },
+        {
+          "word_id": 1097,
+          "surface": "new",
+          "start_ms": 386158,
+          "end_ms": 386278
+        },
+        {
+          "word_id": 1098,
+          "surface": "cooking",
+          "start_ms": 386338,
+          "end_ms": 386658
+        },
+        {
+          "word_id": 1099,
+          "surface": "techniques",
+          "start_ms": 386698,
+          "end_ms": 387139
+        },
+        {
+          "word_id": 1100,
+          "surface": "just",
+          "start_ms": 387599,
+          "end_ms": 387819
+        },
+        {
+          "word_id": 1101,
+          "surface": "to",
+          "start_ms": 387879,
+          "end_ms": 387999
+        },
+        {
+          "word_id": 1102,
+          "surface": "extract",
+          "start_ms": 388059,
+          "end_ms": 388600
+        },
+        {
+          "word_id": 1103,
+          "surface": "a",
+          "start_ms": 389100,
+          "end_ms": 389120
+        },
+        {
+          "word_id": 1104,
+          "surface": "Michelin",
+          "start_ms": 389200,
+          "end_ms": 389620
+        },
+        {
+          "word_id": 1105,
+          "surface": "star",
+          "start_ms": 389640,
+          "end_ms": 389941
+        },
+        {
+          "word_id": 1106,
+          "surface": "meal",
+          "start_ms": 389981,
+          "end_ms": 390361
+        },
+        {
+          "word_id": 1107,
+          "surface": "out",
+          "start_ms": 390721,
+          "end_ms": 390821
+        },
+        {
+          "word_id": 1108,
+          "surface": "of,",
+          "start_ms": 390881,
+          "end_ms": 390981
+        },
+        {
+          "word_id": 1109,
+          "surface": "you",
+          "start_ms": 391041,
+          "end_ms": 391141
+        },
+        {
+          "word_id": 1110,
+          "surface": "know,",
+          "start_ms": 391161,
+          "end_ms": 391301
+        },
+        {
+          "word_id": 1111,
+          "surface": "basic,",
+          "start_ms": 391341,
+          "end_ms": 391842
+        },
+        {
+          "word_id": 1112,
+          "surface": "accessible",
+          "start_ms": 392062,
+          "end_ms": 392622
+        },
+        {
+          "word_id": 1113,
+          "surface": "ingredients.",
+          "start_ms": 392662,
+          "end_ms": 393223
+        }
+      ],
+      "display_boundary_evidence": {
+        "1079": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "1080": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "1081": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 41
+        },
+        "1082": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": -28.0,
+          "protected_syntax": false,
+          "pause_ms": 460
+        },
+        "1083": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 286.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1084": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1085": {
+          "hard_issues": [
+            "verb_particle_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "1086": {
+          "hard_issues": [
+            "compound_preposition_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1087": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1088": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "1089": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1090": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 0.0,
+          "protected_syntax": false,
+          "pause_ms": 140
+        },
+        "1091": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "1092": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 286.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "1093": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 412.0,
+          "protected_syntax": true,
+          "pause_ms": 560
+        },
+        "1094": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "1095": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1096": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 96.0,
+          "protected_syntax": false,
+          "pause_ms": 80
+        },
+        "1097": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1098": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1099": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1100": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": -28.0,
+          "protected_syntax": false,
+          "pause_ms": 460
+        },
+        "1101": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 262.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "1102": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1103": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 62.0,
+          "protected_syntax": false,
+          "pause_ms": 500
+        },
+        "1104": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "1105": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "1106": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1107": {
+          "hard_issues": [
+            "object_attached_modifier_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": -12.0,
+          "protected_syntax": false,
+          "pause_ms": 360
+        },
+        "1108": {
+          "hard_issues": [
+            "compound_preposition_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "1109": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 208.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "1110": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [
+            "comparative_clause_split"
+          ],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "1111": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": -12.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1112": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 202.0,
+          "protected_syntax": true,
+          "pause_ms": 220
+        },
+        "1113": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        }
+      }
+    },
+    {
+      "subtitle_id": "S0109",
+      "english": "The much smaller Chinese budgets reflect intense engineering labor to squeeze every last drop of performance",
+      "chinese": "中国预算规模小得多，反映出大量密集的工程人力投入，",
+      "word_start": 1334,
+      "word_end": 1349,
+      "word_timing": [
+        {
+          "word_id": 1334,
+          "surface": "The",
+          "start_ms": 471716,
+          "end_ms": 471956
+        },
+        {
+          "word_id": 1335,
+          "surface": "much",
+          "start_ms": 472196,
+          "end_ms": 472416
+        },
+        {
+          "word_id": 1336,
+          "surface": "smaller",
+          "start_ms": 472516,
+          "end_ms": 472896
+        },
+        {
+          "word_id": 1337,
+          "surface": "Chinese",
+          "start_ms": 472956,
+          "end_ms": 473297
+        },
+        {
+          "word_id": 1338,
+          "surface": "budgets",
+          "start_ms": 473337,
+          "end_ms": 473637
+        },
+        {
+          "word_id": 1339,
+          "surface": "reflect",
+          "start_ms": 473697,
+          "end_ms": 474077
+        },
+        {
+          "word_id": 1340,
+          "surface": "intense",
+          "start_ms": 474157,
+          "end_ms": 474678
+        },
+        {
+          "word_id": 1341,
+          "surface": "engineering",
+          "start_ms": 474758,
+          "end_ms": 475258
+        },
+        {
+          "word_id": 1342,
+          "surface": "labor",
+          "start_ms": 475318,
+          "end_ms": 475678
+        },
+        {
+          "word_id": 1343,
+          "surface": "to",
+          "start_ms": 475778,
+          "end_ms": 475878
+        },
+        {
+          "word_id": 1344,
+          "surface": "squeeze",
+          "start_ms": 475938,
+          "end_ms": 476339
+        },
+        {
+          "word_id": 1345,
+          "surface": "every",
+          "start_ms": 476539,
+          "end_ms": 476799
+        },
+        {
+          "word_id": 1346,
+          "surface": "last",
+          "start_ms": 476859,
+          "end_ms": 477119
+        },
+        {
+          "word_id": 1347,
+          "surface": "drop",
+          "start_ms": 477159,
+          "end_ms": 477399
+        },
+        {
+          "word_id": 1348,
+          "surface": "of",
+          "start_ms": 477439,
+          "end_ms": 477499
+        },
+        {
+          "word_id": 1349,
+          "surface": "performance",
+          "start_ms": 477580,
+          "end_ms": 478060
+        }
+      ],
+      "display_boundary_evidence": {
+        "1335": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 240
+        },
+        "1336": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": true,
+          "pause_ms": 100
+        },
+        "1337": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1338": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1339": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "1340": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 80
+        },
+        "1341": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "1342": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1343": {
+          "hard_issues": [
+            "stranded_leading_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 36.0,
+          "protected_syntax": false,
+          "pause_ms": 100
+        },
+        "1344": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1345": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 90.0,
+          "protected_syntax": false,
+          "pause_ms": 200
+        },
+        "1346": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1347": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1348": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1349": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": false,
+          "pause_ms": 81
+        }
+      }
+    },
+    {
+      "subtitle_id": "S0166",
+      "english": "The market's logic was that dominating the AGI race would eventually unlock unimaginably huge monopoly-scale profits.",
+      "chinese": "市场的逻辑是，在通用人工智能竞赛中占据主导地位，最终会释放出难以想象的垄断级巨额利润。",
+      "word_start": 1984,
+      "word_end": 1999,
+      "word_timing": [
+        {
+          "word_id": 1984,
+          "surface": "The",
+          "start_ms": 708555,
+          "end_ms": 708635
+        },
+        {
+          "word_id": 1985,
+          "surface": "market's",
+          "start_ms": 708675,
+          "end_ms": 708975
+        },
+        {
+          "word_id": 1986,
+          "surface": "logic",
+          "start_ms": 709015,
+          "end_ms": 709355
+        },
+        {
+          "word_id": 1987,
+          "surface": "was",
+          "start_ms": 709395,
+          "end_ms": 709515
+        },
+        {
+          "word_id": 1988,
+          "surface": "that",
+          "start_ms": 709555,
+          "end_ms": 709695
+        },
+        {
+          "word_id": 1989,
+          "surface": "dominating",
+          "start_ms": 709775,
+          "end_ms": 710316
+        },
+        {
+          "word_id": 1990,
+          "surface": "the",
+          "start_ms": 710356,
+          "end_ms": 710436
+        },
+        {
+          "word_id": 1991,
+          "surface": "AGI",
+          "start_ms": 710536,
+          "end_ms": 710936
+        },
+        {
+          "word_id": 1992,
+          "surface": "race",
+          "start_ms": 710996,
+          "end_ms": 711236
+        },
+        {
+          "word_id": 1993,
+          "surface": "would",
+          "start_ms": 711276,
+          "end_ms": 711417
+        },
+        {
+          "word_id": 1994,
+          "surface": "eventually",
+          "start_ms": 711457,
+          "end_ms": 711877
+        },
+        {
+          "word_id": 1995,
+          "surface": "unlock",
+          "start_ms": 711997,
+          "end_ms": 712357
+        },
+        {
+          "word_id": 1996,
+          "surface": "unimaginably",
+          "start_ms": 712577,
+          "end_ms": 713338
+        },
+        {
+          "word_id": 1997,
+          "surface": "huge",
+          "start_ms": 713478,
+          "end_ms": 713938
+        },
+        {
+          "word_id": 1998,
+          "surface": "monopoly-scale",
+          "start_ms": 714258,
+          "end_ms": 715119
+        },
+        {
+          "word_id": 1999,
+          "surface": "profits.",
+          "start_ms": 715159,
+          "end_ms": 715599
+        }
+      ],
+      "display_boundary_evidence": {
+        "1985": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1986": {
+          "hard_issues": [
+            "high_confidence_modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1987": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1988": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 122.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1989": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "clause_introducer_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 80
+        },
+        "1990": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1991": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 100
+        },
+        "1992": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "1993": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "1994": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "1995": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": true,
+          "pause_ms": 120
+        },
+        "1996": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 0.0,
+          "protected_syntax": false,
+          "pause_ms": 220
+        },
+        "1997": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": true,
+          "pause_ms": 140
+        },
+        "1998": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 208.0,
+          "protected_syntax": true,
+          "pause_ms": 320
+        },
+        "1999": {
+          "hard_issues": [
+            "modifier_noun_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [
+            "modifier_noun_head_split"
+          ],
+          "boundary_score": 366.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        }
+      }
+    },
+    {
+      "subtitle_id": "S0169",
+      "english": "Like the July report that NVIDIA was in talks to underwrite a 250 billion chunk of a 500 billion data center project for OpenAI.",
+      "chinese": "比如7月有报道称，英伟达正洽谈为OpenAI的一个5000亿美元数据中心项目承担其中2500亿美元的份额。",
+      "word_start": 2016,
+      "word_end": 2039,
+      "word_timing": [
+        {
+          "word_id": 2016,
+          "surface": "Like",
+          "start_ms": 721343,
+          "end_ms": 721483
+        },
+        {
+          "word_id": 2017,
+          "surface": "the",
+          "start_ms": 721503,
+          "end_ms": 721583
+        },
+        {
+          "word_id": 2018,
+          "surface": "July",
+          "start_ms": 721623,
+          "end_ms": 721964
+        },
+        {
+          "word_id": 2019,
+          "surface": "report",
+          "start_ms": 722024,
+          "end_ms": 722364
+        },
+        {
+          "word_id": 2020,
+          "surface": "that",
+          "start_ms": 722404,
+          "end_ms": 722524
+        },
+        {
+          "word_id": 2021,
+          "surface": "NVIDIA",
+          "start_ms": 722624,
+          "end_ms": 723004
+        },
+        {
+          "word_id": 2022,
+          "surface": "was",
+          "start_ms": 723024,
+          "end_ms": 723144
+        },
+        {
+          "word_id": 2023,
+          "surface": "in",
+          "start_ms": 723205,
+          "end_ms": 723265
+        },
+        {
+          "word_id": 2024,
+          "surface": "talks",
+          "start_ms": 723305,
+          "end_ms": 723625
+        },
+        {
+          "word_id": 2025,
+          "surface": "to",
+          "start_ms": 723665,
+          "end_ms": 723765
+        },
+        {
+          "word_id": 2026,
+          "surface": "underwrite",
+          "start_ms": 723885,
+          "end_ms": 724325
+        },
+        {
+          "word_id": 2027,
+          "surface": "a",
+          "start_ms": 724365,
+          "end_ms": 724425
+        },
+        {
+          "word_id": 2028,
+          "surface": "250",
+          "start_ms": 724505,
+          "end_ms": 724966
+        },
+        {
+          "word_id": 2029,
+          "surface": "billion",
+          "start_ms": 725426,
+          "end_ms": 726167
+        },
+        {
+          "word_id": 2030,
+          "surface": "chunk",
+          "start_ms": 726227,
+          "end_ms": 726487
+        },
+        {
+          "word_id": 2031,
+          "surface": "of",
+          "start_ms": 726527,
+          "end_ms": 726587
+        },
+        {
+          "word_id": 2032,
+          "surface": "a",
+          "start_ms": 726627,
+          "end_ms": 726667
+        },
+        {
+          "word_id": 2033,
+          "surface": "500",
+          "start_ms": 726747,
+          "end_ms": 727267
+        },
+        {
+          "word_id": 2034,
+          "surface": "billion",
+          "start_ms": 727307,
+          "end_ms": 727628
+        },
+        {
+          "word_id": 2035,
+          "surface": "data",
+          "start_ms": 727648,
+          "end_ms": 727988
+        },
+        {
+          "word_id": 2036,
+          "surface": "center",
+          "start_ms": 728508,
+          "end_ms": 728748
+        },
+        {
+          "word_id": 2037,
+          "surface": "project",
+          "start_ms": 728788,
+          "end_ms": 729209
+        },
+        {
+          "word_id": 2038,
+          "surface": "for",
+          "start_ms": 729229,
+          "end_ms": 729369
+        },
+        {
+          "word_id": 2039,
+          "surface": "OpenAI.",
+          "start_ms": 729449,
+          "end_ms": 730069
+        }
+      ],
+      "display_boundary_evidence": {
+        "2017": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2018": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2019": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2020": {
+          "hard_issues": [
+            "content_noun_that_clause_split",
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 62.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2021": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "clause_introducer_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 100
+        },
+        "2022": {
+          "hard_issues": [
+            "relative_clause_subject_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2023": {
+          "hard_issues": [
+            "verb_preposition_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 102.0,
+          "protected_syntax": false,
+          "pause_ms": 61
+        },
+        "2024": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2025": {
+          "hard_issues": [
+            "stranded_leading_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2026": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 120
+        },
+        "2027": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split",
+            "verb_numeric_result_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 96.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2028": {
+          "hard_issues": [
+            "determiner_numeric_noun_split",
+            "determiner_head_phrase_split",
+            "verb_numeric_result_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2029": {
+          "hard_issues": [
+            "determiner_numeric_noun_split",
+            "numeric_unit_or_noun_split",
+            "verb_numeric_result_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 262.0,
+          "protected_syntax": true,
+          "pause_ms": 460
+        },
+        "2030": {
+          "hard_issues": [
+            "numeric_unit_or_noun_split",
+            "determiner_numeric_noun_split",
+            "verb_numeric_result_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2031": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2032": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2033": {
+          "hard_issues": [
+            "determiner_numeric_noun_split",
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2034": {
+          "hard_issues": [
+            "determiner_numeric_noun_split",
+            "numeric_unit_or_noun_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 296.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2035": {
+          "hard_issues": [
+            "numeric_unit_or_noun_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2036": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 192.0,
+          "protected_syntax": true,
+          "pause_ms": 520
+        },
+        "2037": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2038": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2039": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 80
+        }
+      }
+    },
+    {
+      "subtitle_id": "S0198",
+      "english": "The very constraints that were supposed to cripple China's tech sector being cut off from advanced chips, the rigid international trade restrictions seem to have forced them to build a highly sustainable, hyper-efficient business model from the ground up.",
+      "chinese": "那些本应瘫痪中国科技行业的制约因素，即无法获得先进芯片、遭受严苛的国际贸易限制，似乎反而迫使它们从零开始，构建出一套高度可持续、超高效能的商业模式。",
+      "word_start": 2387,
+      "word_end": 2425,
+      "word_timing": [
+        {
+          "word_id": 2387,
+          "surface": "The",
+          "start_ms": 856187,
+          "end_ms": 856287
+        },
+        {
+          "word_id": 2388,
+          "surface": "very",
+          "start_ms": 856307,
+          "end_ms": 856507
+        },
+        {
+          "word_id": 2389,
+          "surface": "constraints",
+          "start_ms": 856547,
+          "end_ms": 857107
+        },
+        {
+          "word_id": 2390,
+          "surface": "that",
+          "start_ms": 857127,
+          "end_ms": 857227
+        },
+        {
+          "word_id": 2391,
+          "surface": "were",
+          "start_ms": 857247,
+          "end_ms": 857327
+        },
+        {
+          "word_id": 2392,
+          "surface": "supposed",
+          "start_ms": 857347,
+          "end_ms": 857587
+        },
+        {
+          "word_id": 2393,
+          "surface": "to",
+          "start_ms": 857607,
+          "end_ms": 857687
+        },
+        {
+          "word_id": 2394,
+          "surface": "cripple",
+          "start_ms": 857787,
+          "end_ms": 858087
+        },
+        {
+          "word_id": 2395,
+          "surface": "China's",
+          "start_ms": 858127,
+          "end_ms": 858448
+        },
+        {
+          "word_id": 2396,
+          "surface": "tech",
+          "start_ms": 858488,
+          "end_ms": 858708
+        },
+        {
+          "word_id": 2397,
+          "surface": "sector",
+          "start_ms": 858728,
+          "end_ms": 859068
+        },
+        {
+          "word_id": 2398,
+          "surface": "being",
+          "start_ms": 859108,
+          "end_ms": 859308
+        },
+        {
+          "word_id": 2399,
+          "surface": "cut",
+          "start_ms": 859608,
+          "end_ms": 859768
+        },
+        {
+          "word_id": 2400,
+          "surface": "off",
+          "start_ms": 859808,
+          "end_ms": 859928
+        },
+        {
+          "word_id": 2401,
+          "surface": "from",
+          "start_ms": 859968,
+          "end_ms": 860068
+        },
+        {
+          "word_id": 2402,
+          "surface": "advanced",
+          "start_ms": 860128,
+          "end_ms": 860488
+        },
+        {
+          "word_id": 2403,
+          "surface": "chips,",
+          "start_ms": 860568,
+          "end_ms": 860848
+        },
+        {
+          "word_id": 2404,
+          "surface": "the",
+          "start_ms": 861429,
+          "end_ms": 861549
+        },
+        {
+          "word_id": 2405,
+          "surface": "rigid",
+          "start_ms": 861649,
+          "end_ms": 861929
+        },
+        {
+          "word_id": 2406,
+          "surface": "international",
+          "start_ms": 862009,
+          "end_ms": 862569
+        },
+        {
+          "word_id": 2407,
+          "surface": "trade",
+          "start_ms": 862649,
+          "end_ms": 862889
+        },
+        {
+          "word_id": 2408,
+          "surface": "restrictions",
+          "start_ms": 862929,
+          "end_ms": 863429
+        },
+        {
+          "word_id": 2409,
+          "surface": "seem",
+          "start_ms": 863809,
+          "end_ms": 864009
+        },
+        {
+          "word_id": 2410,
+          "surface": "to",
+          "start_ms": 864029,
+          "end_ms": 864089
+        },
+        {
+          "word_id": 2411,
+          "surface": "have",
+          "start_ms": 864129,
+          "end_ms": 864249
+        },
+        {
+          "word_id": 2412,
+          "surface": "forced",
+          "start_ms": 864289,
+          "end_ms": 864550
+        },
+        {
+          "word_id": 2413,
+          "surface": "them",
+          "start_ms": 864570,
+          "end_ms": 864730
+        },
+        {
+          "word_id": 2414,
+          "surface": "to",
+          "start_ms": 864770,
+          "end_ms": 864830
+        },
+        {
+          "word_id": 2415,
+          "surface": "build",
+          "start_ms": 864870,
+          "end_ms": 865070
+        },
+        {
+          "word_id": 2416,
+          "surface": "a",
+          "start_ms": 865110,
+          "end_ms": 865150
+        },
+        {
+          "word_id": 2417,
+          "surface": "highly",
+          "start_ms": 865210,
+          "end_ms": 865510
+        },
+        {
+          "word_id": 2418,
+          "surface": "sustainable,",
+          "start_ms": 865530,
+          "end_ms": 865870
+        },
+        {
+          "word_id": 2419,
+          "surface": "hyper-efficient",
+          "start_ms": 866780,
+          "end_ms": 867320
+        },
+        {
+          "word_id": 2420,
+          "surface": "business",
+          "start_ms": 867380,
+          "end_ms": 867701
+        },
+        {
+          "word_id": 2421,
+          "surface": "model",
+          "start_ms": 867741,
+          "end_ms": 867981
+        },
+        {
+          "word_id": 2422,
+          "surface": "from",
+          "start_ms": 868021,
+          "end_ms": 868121
+        },
+        {
+          "word_id": 2423,
+          "surface": "the",
+          "start_ms": 868141,
+          "end_ms": 868221
+        },
+        {
+          "word_id": 2424,
+          "surface": "ground",
+          "start_ms": 868241,
+          "end_ms": 868501
+        },
+        {
+          "word_id": 2425,
+          "surface": "up.",
+          "start_ms": 868601,
+          "end_ms": 868701
+        }
+      ],
+      "display_boundary_evidence": {
+        "2388": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2389": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2390": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 62.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2391": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "relative_clause_subject_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2392": {
+          "hard_issues": [
+            "auxiliary_predicate_split",
+            "relative_clause_subject_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 286.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2393": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2394": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 100
+        },
+        "2395": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 96.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2396": {
+          "hard_issues": [
+            "high_confidence_modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2397": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2398": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2399": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 268.0,
+          "protected_syntax": true,
+          "pause_ms": 300
+        },
+        "2400": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split",
+            "verb_particle_split",
+            "verb_particle_preposition_chain_split",
+            "predicate_complement_chain_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2401": {
+          "hard_issues": [
+            "verb_particle_preposition_chain_split",
+            "predicate_complement_chain_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2402": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "2403": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2404": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": -46.0,
+          "protected_syntax": false,
+          "pause_ms": 581
+        },
+        "2405": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 100
+        },
+        "2406": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2407": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2408": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2409": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": -12.0,
+          "protected_syntax": false,
+          "pause_ms": 380
+        },
+        "2410": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2411": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2412": {
+          "hard_issues": [
+            "auxiliary_predicate_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 376.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2413": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2414": {
+          "hard_issues": [
+            "stranded_leading_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2415": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2416": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [
+            "short_verb_object_split"
+          ],
+          "boundary_score": 96.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2417": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2418": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2419": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 174.0,
+          "protected_syntax": true,
+          "pause_ms": 910
+        },
+        "2420": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [
+            "modifier_noun_head_split"
+          ],
+          "boundary_score": 366.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2421": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2422": {
+          "hard_issues": [
+            "object_attached_modifier_split",
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2423": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2424": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2425": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 0.0,
+          "protected_syntax": false,
+          "pause_ms": 100
+        }
+      }
+    },
+    {
+      "subtitle_id": "S0202",
+      "english": "So, if highly optimized, specialized AI proves to be much more economically viable in the near term than the massively expensive pursuit of superintelligence, could the trade restrictions placed on China actually turn out to be the exact thing that saves their AI sector from a dot-com style financial bubble?",
+      "chinese": "那么，如果高度优化、专业化的人工智能在短期内被证明远比斥巨资追求超级智能更具经济可行性，对中国的贸易限制会不会最终恰恰成为让中国AI行业免遭互联网泡沫式金融危机的关键？",
+      "word_start": 2469,
+      "word_end": 2518,
+      "word_timing": [
+        {
+          "word_id": 2469,
+          "surface": "So,",
+          "start_ms": 887854,
+          "end_ms": 888155
+        },
+        {
+          "word_id": 2470,
+          "surface": "if",
+          "start_ms": 888495,
+          "end_ms": 888575
+        },
+        {
+          "word_id": 2471,
+          "surface": "highly",
+          "start_ms": 888655,
+          "end_ms": 888975
+        },
+        {
+          "word_id": 2472,
+          "surface": "optimized,",
+          "start_ms": 889135,
+          "end_ms": 889636
+        },
+        {
+          "word_id": 2473,
+          "surface": "specialized",
+          "start_ms": 889656,
+          "end_ms": 890176
+        },
+        {
+          "word_id": 2474,
+          "surface": "AI",
+          "start_ms": 890256,
+          "end_ms": 890636
+        },
+        {
+          "word_id": 2475,
+          "surface": "proves",
+          "start_ms": 890816,
+          "end_ms": 891017
+        },
+        {
+          "word_id": 2476,
+          "surface": "to",
+          "start_ms": 891057,
+          "end_ms": 891097
+        },
+        {
+          "word_id": 2477,
+          "surface": "be",
+          "start_ms": 891137,
+          "end_ms": 891237
+        },
+        {
+          "word_id": 2478,
+          "surface": "much",
+          "start_ms": 891357,
+          "end_ms": 891557
+        },
+        {
+          "word_id": 2479,
+          "surface": "more",
+          "start_ms": 891657,
+          "end_ms": 891837
+        },
+        {
+          "word_id": 2480,
+          "surface": "economically",
+          "start_ms": 891937,
+          "end_ms": 892518
+        },
+        {
+          "word_id": 2481,
+          "surface": "viable",
+          "start_ms": 892578,
+          "end_ms": 892978
+        },
+        {
+          "word_id": 2482,
+          "surface": "in",
+          "start_ms": 893038,
+          "end_ms": 893118
+        },
+        {
+          "word_id": 2483,
+          "surface": "the",
+          "start_ms": 893138,
+          "end_ms": 893198
+        },
+        {
+          "word_id": 2484,
+          "surface": "near",
+          "start_ms": 893238,
+          "end_ms": 893458
+        },
+        {
+          "word_id": 2485,
+          "surface": "term",
+          "start_ms": 893498,
+          "end_ms": 893778
+        },
+        {
+          "word_id": 2486,
+          "surface": "than",
+          "start_ms": 894179,
+          "end_ms": 894319
+        },
+        {
+          "word_id": 2487,
+          "surface": "the",
+          "start_ms": 894339,
+          "end_ms": 894399
+        },
+        {
+          "word_id": 2488,
+          "surface": "massively",
+          "start_ms": 894439,
+          "end_ms": 894959
+        },
+        {
+          "word_id": 2489,
+          "surface": "expensive",
+          "start_ms": 894999,
+          "end_ms": 895500
+        },
+        {
+          "word_id": 2490,
+          "surface": "pursuit",
+          "start_ms": 895560,
+          "end_ms": 896020
+        },
+        {
+          "word_id": 2491,
+          "surface": "of",
+          "start_ms": 896080,
+          "end_ms": 896120
+        },
+        {
+          "word_id": 2492,
+          "surface": "superintelligence,",
+          "start_ms": 896240,
+          "end_ms": 897121
+        },
+        {
+          "word_id": 2493,
+          "surface": "could",
+          "start_ms": 897702,
+          "end_ms": 897842
+        },
+        {
+          "word_id": 2494,
+          "surface": "the",
+          "start_ms": 897862,
+          "end_ms": 897922
+        },
+        {
+          "word_id": 2495,
+          "surface": "trade",
+          "start_ms": 897962,
+          "end_ms": 898162
+        },
+        {
+          "word_id": 2496,
+          "surface": "restrictions",
+          "start_ms": 898202,
+          "end_ms": 898683
+        },
+        {
+          "word_id": 2497,
+          "surface": "placed",
+          "start_ms": 898743,
+          "end_ms": 898983
+        },
+        {
+          "word_id": 2498,
+          "surface": "on",
+          "start_ms": 899043,
+          "end_ms": 899124
+        },
+        {
+          "word_id": 2499,
+          "surface": "China",
+          "start_ms": 899164,
+          "end_ms": 899504
+        },
+        {
+          "word_id": 2500,
+          "surface": "actually",
+          "start_ms": 899764,
+          "end_ms": 900065
+        },
+        {
+          "word_id": 2501,
+          "surface": "turn",
+          "start_ms": 900145,
+          "end_ms": 900305
+        },
+        {
+          "word_id": 2502,
+          "surface": "out",
+          "start_ms": 900345,
+          "end_ms": 900445
+        },
+        {
+          "word_id": 2503,
+          "surface": "to",
+          "start_ms": 900465,
+          "end_ms": 900525
+        },
+        {
+          "word_id": 2504,
+          "surface": "be",
+          "start_ms": 900565,
+          "end_ms": 900645
+        },
+        {
+          "word_id": 2505,
+          "surface": "the",
+          "start_ms": 900685,
+          "end_ms": 900786
+        },
+        {
+          "word_id": 2506,
+          "surface": "exact",
+          "start_ms": 900866,
+          "end_ms": 901246
+        },
+        {
+          "word_id": 2507,
+          "surface": "thing",
+          "start_ms": 901326,
+          "end_ms": 901526
+        },
+        {
+          "word_id": 2508,
+          "surface": "that",
+          "start_ms": 901566,
+          "end_ms": 901687
+        },
+        {
+          "word_id": 2509,
+          "surface": "saves",
+          "start_ms": 901767,
+          "end_ms": 902087
+        },
+        {
+          "word_id": 2510,
+          "surface": "their",
+          "start_ms": 902107,
+          "end_ms": 902267
+        },
+        {
+          "word_id": 2511,
+          "surface": "AI",
+          "start_ms": 902347,
+          "end_ms": 902648
+        },
+        {
+          "word_id": 2512,
+          "surface": "sector",
+          "start_ms": 902708,
+          "end_ms": 903088
+        },
+        {
+          "word_id": 2513,
+          "surface": "from",
+          "start_ms": 903449,
+          "end_ms": 903569
+        },
+        {
+          "word_id": 2514,
+          "surface": "a",
+          "start_ms": 903629,
+          "end_ms": 903649
+        },
+        {
+          "word_id": 2515,
+          "surface": "dot-com",
+          "start_ms": 903749,
+          "end_ms": 904340
+        },
+        {
+          "word_id": 2516,
+          "surface": "style",
+          "start_ms": 904340,
+          "end_ms": 904440
+        },
+        {
+          "word_id": 2517,
+          "surface": "financial",
+          "start_ms": 904710,
+          "end_ms": 905131
+        },
+        {
+          "word_id": 2518,
+          "surface": "bubble?",
+          "start_ms": 905171,
+          "end_ms": 905471
+        }
+      ],
+      "display_boundary_evidence": {
+        "2470": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": -40.0,
+          "protected_syntax": false,
+          "pause_ms": 340
+        },
+        "2471": {
+          "hard_issues": [
+            "clause_introducer_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 286.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2472": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": true,
+          "pause_ms": 160
+        },
+        "2473": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": -12.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2474": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2475": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 0.0,
+          "protected_syntax": false,
+          "pause_ms": 180
+        },
+        "2476": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2477": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2478": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 150.0,
+          "protected_syntax": false,
+          "pause_ms": 120
+        },
+        "2479": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 0.0,
+          "protected_syntax": false,
+          "pause_ms": 100
+        },
+        "2480": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 0.0,
+          "protected_syntax": false,
+          "pause_ms": 100
+        },
+        "2481": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "2482": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "2483": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2484": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2485": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2486": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": -12.0,
+          "protected_syntax": false,
+          "pause_ms": 401
+        },
+        "2487": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [
+            "comparative_clause_split"
+          ],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2488": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2489": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2490": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2491": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "2492": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 220.0,
+          "protected_syntax": false,
+          "pause_ms": 120
+        },
+        "2493": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": -46.0,
+          "protected_syntax": false,
+          "pause_ms": 581
+        },
+        "2494": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2495": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2496": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2497": {
+          "hard_issues": [
+            "post_noun_participial_modifier_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "2498": {
+          "hard_issues": [
+            "verb_preposition_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "2499": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2500": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": -12.0,
+          "protected_syntax": false,
+          "pause_ms": 260
+        },
+        "2501": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "dependency_phrase_entrance_split",
+            "modifier_head_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 80
+        },
+        "2502": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split",
+            "verb_particle_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2503": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2504": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2505": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 156.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2506": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2507": {
+          "hard_issues": [
+            "modifier_noun_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [
+            "modifier_noun_head_split"
+          ],
+          "boundary_score": 366.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2508": {
+          "hard_issues": [
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 62.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2509": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "relative_clause_subject_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": false,
+          "pause_ms": 80
+        },
+        "2510": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2511": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 80
+        },
+        "2512": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2513": {
+          "hard_issues": [
+            "object_attached_modifier_split",
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 24.0,
+          "protected_syntax": false,
+          "pause_ms": 361
+        },
+        "2514": {
+          "hard_issues": [
+            "preposition_object_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 60
+        },
+        "2515": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 100
+        },
+        "2516": {
+          "hard_issues": [
+            "modifier_noun_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [
+            "modifier_noun_head_split"
+          ],
+          "boundary_score": 366.0,
+          "protected_syntax": true,
+          "pause_ms": 0
+        },
+        "2517": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 208.0,
+          "protected_syntax": true,
+          "pause_ms": 270
+        },
+        "2518": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        }
+      }
+    },
+    {
+      "subtitle_id": "S0203",
+      "english": "The possibility that external guardrails meant to slow them down might actually ensure their long-term economic survival is a fascinating paradox for you to consider.",
+      "chinese": "那些旨在减缓它们发展的外部护栏，反而可能确保它们的长期经济生存，这种可能性本身就是一个引人深思的有趣悖论。",
+      "word_start": 2519,
+      "word_end": 2543,
+      "word_timing": [
+        {
+          "word_id": 2519,
+          "surface": "The",
+          "start_ms": 905932,
+          "end_ms": 906012
+        },
+        {
+          "word_id": 2520,
+          "surface": "possibility",
+          "start_ms": 906052,
+          "end_ms": 906612
+        },
+        {
+          "word_id": 2521,
+          "surface": "that",
+          "start_ms": 906653,
+          "end_ms": 906753
+        },
+        {
+          "word_id": 2522,
+          "surface": "external",
+          "start_ms": 906813,
+          "end_ms": 907173
+        },
+        {
+          "word_id": 2523,
+          "surface": "guardrails",
+          "start_ms": 907233,
+          "end_ms": 907694
+        },
+        {
+          "word_id": 2524,
+          "surface": "meant",
+          "start_ms": 907734,
+          "end_ms": 907854
+        },
+        {
+          "word_id": 2525,
+          "surface": "to",
+          "start_ms": 907894,
+          "end_ms": 907954
+        },
+        {
+          "word_id": 2526,
+          "surface": "slow",
+          "start_ms": 908014,
+          "end_ms": 908234
+        },
+        {
+          "word_id": 2527,
+          "surface": "them",
+          "start_ms": 908274,
+          "end_ms": 908375
+        },
+        {
+          "word_id": 2528,
+          "surface": "down",
+          "start_ms": 908415,
+          "end_ms": 908655
+        },
+        {
+          "word_id": 2529,
+          "surface": "might",
+          "start_ms": 908695,
+          "end_ms": 908835
+        },
+        {
+          "word_id": 2530,
+          "surface": "actually",
+          "start_ms": 908935,
+          "end_ms": 909176
+        },
+        {
+          "word_id": 2531,
+          "surface": "ensure",
+          "start_ms": 909196,
+          "end_ms": 909456
+        },
+        {
+          "word_id": 2532,
+          "surface": "their",
+          "start_ms": 909476,
+          "end_ms": 909616
+        },
+        {
+          "word_id": 2533,
+          "surface": "long-term",
+          "start_ms": 909656,
+          "end_ms": 910097
+        },
+        {
+          "word_id": 2534,
+          "surface": "economic",
+          "start_ms": 910157,
+          "end_ms": 910537
+        },
+        {
+          "word_id": 2535,
+          "surface": "survival",
+          "start_ms": 910577,
+          "end_ms": 911038
+        },
+        {
+          "word_id": 2536,
+          "surface": "is",
+          "start_ms": 911138,
+          "end_ms": 911198
+        },
+        {
+          "word_id": 2537,
+          "surface": "a",
+          "start_ms": 911238,
+          "end_ms": 911278
+        },
+        {
+          "word_id": 2538,
+          "surface": "fascinating",
+          "start_ms": 911318,
+          "end_ms": 911819
+        },
+        {
+          "word_id": 2539,
+          "surface": "paradox",
+          "start_ms": 911859,
+          "end_ms": 912299
+        },
+        {
+          "word_id": 2540,
+          "surface": "for",
+          "start_ms": 912319,
+          "end_ms": 912399
+        },
+        {
+          "word_id": 2541,
+          "surface": "you",
+          "start_ms": 912419,
+          "end_ms": 912520
+        },
+        {
+          "word_id": 2542,
+          "surface": "to",
+          "start_ms": 912540,
+          "end_ms": 912580
+        },
+        {
+          "word_id": 2543,
+          "surface": "consider.",
+          "start_ms": 912620,
+          "end_ms": 912880
+        }
+      ],
+      "display_boundary_evidence": {
+        "2520": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2521": {
+          "hard_issues": [
+            "content_noun_that_clause_split",
+            "dependency_phrase_entrance_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 62.0,
+          "protected_syntax": false,
+          "pause_ms": 41
+        },
+        "2522": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "clause_introducer_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2523": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2524": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2525": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2526": {
+          "hard_issues": [
+            "preposition_object_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2527": {
+          "hard_issues": [
+            "short_verb_object_split",
+            "short_verb_complement_split",
+            "separable_verb_particle_chain_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 96.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2528": {
+          "hard_issues": [
+            "separable_verb_particle_chain_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2529": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2530": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 440.0,
+          "protected_syntax": true,
+          "pause_ms": 100
+        },
+        "2531": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "dependency_phrase_entrance_split",
+            "modifier_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2532": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 6.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2533": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2534": {
+          "hard_issues": [
+            "modifier_noun_head_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [
+            "modifier_noun_head_split"
+          ],
+          "boundary_score": 366.0,
+          "protected_syntax": true,
+          "pause_ms": 60
+        },
+        "2535": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2536": {
+          "hard_issues": [
+            "subject_finite_verb_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 0.0,
+          "protected_syntax": false,
+          "pause_ms": 100
+        },
+        "2537": {
+          "hard_issues": [
+            "verb_complement_split",
+            "short_verb_complement_split"
+          ],
+          "soft_issues": [],
+          "boundary_score": 66.0,
+          "protected_syntax": false,
+          "pause_ms": 40
+        },
+        "2538": {
+          "hard_issues": [
+            "determiner_head_phrase_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2539": {
+          "hard_issues": [
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 226.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        },
+        "2540": {
+          "hard_issues": [],
+          "soft_issues": [],
+          "boundary_score": 42.0,
+          "protected_syntax": false,
+          "pause_ms": 20
+        },
+        "2541": {
+          "hard_issues": [
+            "preposition_object_split",
+            "clause_introducer_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2542": {
+          "hard_issues": [
+            "subject_finite_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [
+            "comparative_clause_split"
+          ],
+          "boundary_score": 262.0,
+          "protected_syntax": true,
+          "pause_ms": 20
+        },
+        "2543": {
+          "hard_issues": [
+            "preposition_object_split",
+            "subject_finite_verb_split",
+            "protected_syntax_cut"
+          ],
+          "soft_issues": [],
+          "boundary_score": 446.0,
+          "protected_syntax": true,
+          "pause_ms": 40
+        }
+      }
+    }
+  ]
+}

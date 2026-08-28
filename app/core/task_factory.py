@@ -4,10 +4,11 @@ from typing import Optional
 
 from app.common.config import cfg
 from app.config import MODEL_PATH, SUBTITLE_STYLE_PATH
+from app.core.output_paths import media_result_video_dir
+from app.core.llm_service_config import resolve_llm_service_config
 from app.core.entities import (
     LANGUAGES,
     FullProcessTask,
-    LLMServiceEnum,
     SplitTypeEnum,
     SubtitleConfig,
     SubtitleTask,
@@ -21,6 +22,23 @@ from app.core.entities import (
 
 class TaskFactory:
     """任务工厂类，用于创建各种类型的任务"""
+
+    @staticmethod
+    def _needs_word_timestamps_for_subtitle_pipeline(
+        *,
+        need_split: bool,
+        need_screen_subtitle_edit: bool,
+        screen_subtitle_stable_mode: bool,
+    ) -> bool:
+        """Request native ASR word times for every pipeline that owns word spans.
+
+        Stable screen subtitles freeze their English cue ranges against a word
+        ledger. That contract is independent of the legacy coarse-splitting
+        switch, which only controls the compatibility pipeline.
+        """
+        return bool(need_split) or bool(
+            need_screen_subtitle_edit and screen_subtitle_stable_mode
+        )
 
     @staticmethod
     def get_subtitle_style(style_name: str) -> str:
@@ -39,18 +57,27 @@ class TaskFactory:
 
     @staticmethod
     def create_transcribe_task(
-        file_path: str, need_next_task: bool = False
+        file_path: str,
+        need_next_task: bool = False,
+        *,
+        source_audio_path: Optional[str] = None,
+        article_reference_text: str = "",
+        article_context_data: Optional[dict] = None,
+        use_article_reference_assist: bool = False,
+        use_article_translation_terms: bool = False,
     ) -> TranscribeTask:
         """创建转录任务"""
-
-        # 根据是否需要分段来决定是否需要词级时间戳
 
         # 获取文件名
         file_name = Path(file_path).stem
 
         # 构建输出路径
         if need_next_task:
-            need_word_time_stamp = cfg.need_split.value
+            need_word_time_stamp = TaskFactory._needs_word_timestamps_for_subtitle_pipeline(
+                need_split=cfg.need_split.value,
+                need_screen_subtitle_edit=cfg.need_screen_subtitle_edit.value,
+                screen_subtitle_stable_mode=cfg.screen_subtitle_stable_mode.value,
+            )
             output_path = str(
                 Path(cfg.work_dir.value)
                 / file_name
@@ -98,6 +125,11 @@ class TaskFactory:
             output_path=output_path,
             transcribe_config=config,
             need_next_task=need_next_task,
+            source_audio_path=source_audio_path or file_path,
+            article_reference_text=article_reference_text or "",
+            article_context_data=article_context_data,
+            use_article_reference_assist=use_article_reference_assist,
+            use_article_translation_terms=use_article_translation_terms,
         )
 
     @staticmethod
@@ -109,6 +141,8 @@ class TaskFactory:
         article_context_data: Optional[dict] = None,
         use_article_reference_assist: bool = False,
         use_article_translation_terms: bool = False,
+        source_audio_path: Optional[str] = None,
+        require_manual_review_before_synthesis: bool = False,
     ) -> SubtitleTask:
         """创建字幕任务"""
         output_name = (
@@ -135,50 +169,17 @@ class TaskFactory:
         else:
             split_type = "semantic"
 
-        # 根据当前选择的LLM服务获取对应的配置
-        current_service = cfg.llm_service.value
-        if current_service == LLMServiceEnum.OPENAI:
-            base_url = cfg.openai_api_base.value
-            api_key = cfg.openai_api_key.value
-            llm_model = cfg.openai_model.value
-        elif current_service == LLMServiceEnum.SILICON_CLOUD:
-            base_url = cfg.silicon_cloud_api_base.value
-            api_key = cfg.silicon_cloud_api_key.value
-            llm_model = cfg.silicon_cloud_model.value
-        elif current_service == LLMServiceEnum.DEEPSEEK:
-            base_url = cfg.deepseek_api_base.value
-            api_key = cfg.deepseek_api_key.value
-            llm_model = cfg.deepseek_model.value
-        elif current_service == LLMServiceEnum.OLLAMA:
-            base_url = cfg.ollama_api_base.value
-            api_key = cfg.ollama_api_key.value
-            llm_model = cfg.ollama_model.value
-        elif current_service == LLMServiceEnum.LM_STUDIO:
-            base_url = cfg.lm_studio_api_base.value
-            api_key = cfg.lm_studio_api_key.value
-            llm_model = cfg.lm_studio_model.value
-        elif current_service == LLMServiceEnum.GEMINI:
-            base_url = cfg.gemini_api_base.value
-            api_key = cfg.gemini_api_key.value
-            llm_model = cfg.gemini_model.value
-        elif current_service == LLMServiceEnum.CHATGLM:
-            base_url = cfg.chatglm_api_base.value
-            api_key = cfg.chatglm_api_key.value
-            llm_model = cfg.chatglm_model.value
-        elif current_service == LLMServiceEnum.PUBLIC:
-            base_url = cfg.public_api_base.value
-            api_key = cfg.public_api_key.value
-            llm_model = cfg.public_model.value
-        else:
-            base_url = ""
-            api_key = ""
-            llm_model = ""
+        llm_runtime = resolve_llm_service_config()
 
         config = SubtitleConfig(
             # 翻译配置
-            base_url=base_url,
-            api_key=api_key,
-            llm_model=llm_model,
+            base_url=llm_runtime.base_url,
+            api_key=llm_runtime.api_key,
+            llm_model=llm_runtime.model,
+            screen_subtitle_full_translation_model=(
+                llm_runtime.full_translation_model
+            ),
+            screen_subtitle_allocation_review_model=llm_runtime.model,
             deeplx_endpoint=cfg.deeplx_endpoint.value,
             # 翻译服务
             translator_service=cfg.translator_service.value,
@@ -204,12 +205,13 @@ class TaskFactory:
             need_remove_punctuation=cfg.needs_remove_punctuation.value,
             need_screen_subtitle_edit=cfg.need_screen_subtitle_edit.value,
             screen_subtitle_stable_mode=cfg.screen_subtitle_stable_mode.value,
-            need_screen_subtitle_quality_check=cfg.need_screen_subtitle_quality_check.value,
-            screen_subtitle_safe_auto_repair=cfg.screen_subtitle_safe_auto_repair.value,
+            screen_subtitle_chinese_polish=cfg.screen_subtitle_chinese_polish.value,
             screen_subtitle_max_cjk=cfg.screen_subtitle_max_cjk.value,
             screen_subtitle_max_english=cfg.screen_subtitle_max_english.value,
             screen_subtitle_allocation_max_concurrency=cfg.screen_subtitle_allocation_max_concurrency.value,
             screen_subtitle_allocation_batch_size=cfg.screen_subtitle_allocation_batch_size.value,
+            screen_subtitle_translation_request_budget=cfg.screen_subtitle_translation_request_budget.value,
+            screen_subtitle_translation_request_max_attempts=cfg.screen_subtitle_translation_request_max_attempts.value,
             # 字幕提示
             custom_prompt_text=cfg.custom_prompt_text.value,
         )
@@ -221,30 +223,96 @@ class TaskFactory:
             output_path=output_path,
             subtitle_config=config,
             need_next_task=need_next_task,
+            require_manual_review_before_synthesis=bool(
+                require_manual_review_before_synthesis
+            ),
             article_reference_text=article_reference_text or "",
             article_context_data=article_context_data,
             use_article_reference_assist=use_article_reference_assist,
             use_article_translation_terms=use_article_translation_terms,
+            # Existing production callers use ``video_path`` for both roles.
+            # E2E can supply a separate read-only alignment input while keeping
+            # report sidecars in its own output directory.
+            source_audio_path=source_audio_path or video_path,
+        )
+
+    @staticmethod
+    def recreate_subtitle_task(
+        previous_task: SubtitleTask,
+        *,
+        file_path: str,
+    ) -> SubtitleTask:
+        """Rebuild current-config subtitle settings without losing task context.
+
+        Context is inherited only when the editor is retrying the same subtitle
+        input. Importing a different file must start an isolated task.
+        """
+        previous_path = Path(str(getattr(previous_task, "subtitle_path", ""))).resolve()
+        current_path = Path(str(file_path)).resolve()
+        same_input = previous_path == current_path
+        if not same_input:
+            return TaskFactory.create_subtitle_task(file_path=file_path)
+        return TaskFactory.create_subtitle_task(
+            file_path=file_path,
+            video_path=getattr(previous_task, "video_path", None),
+            need_next_task=bool(getattr(previous_task, "need_next_task", False)),
+            article_reference_text=str(
+                getattr(previous_task, "article_reference_text", "") or ""
+            ),
+            article_context_data=getattr(previous_task, "article_context_data", None),
+            use_article_reference_assist=bool(
+                getattr(previous_task, "use_article_reference_assist", False)
+            ),
+            use_article_translation_terms=bool(
+                getattr(previous_task, "use_article_translation_terms", False)
+            ),
+            source_audio_path=getattr(previous_task, "source_audio_path", None),
+            require_manual_review_before_synthesis=bool(
+                getattr(previous_task, "require_manual_review_before_synthesis", False)
+            ),
         )
 
     @staticmethod
     def create_synthesis_task(
-        video_path: str, subtitle_path: str, need_next_task: bool = False
+        video_path: str,
+        subtitle_path: str,
+        need_next_task: bool = False,
+        *,
+        manual_draft_mode: bool = False,
     ) -> SynthesisTask:
         """创建视频合成任务"""
+        output_dir = media_result_video_dir(video_path)
         if cfg.podcast_learning_template.value:
             template_name = cfg.podcast_template_style.value or "暗色播客"
-            prefix = "【文章单词模板】" if template_name == "文章单词" else "【英语学习模板】"
+            english_only = bool(cfg.podcast_template_english_only.value)
+            if manual_draft_mode:
+                prefix = (
+                    "【人工草稿-英文字幕版】"
+                    if english_only
+                    else "【人工草稿】"
+                )
+            elif template_name == "文章单词":
+                prefix = (
+                    "【文章单词模板-英文字幕版】"
+                    if english_only
+                    else "【文章单词模板】"
+                )
+            else:
+                prefix = (
+                    "【英语学习模板-英文字幕版】"
+                    if english_only
+                    else "【英语学习模板】"
+                )
             output_path = str(
-                Path(video_path).parent / f"{prefix}{Path(video_path).stem}.mp4"
+                output_dir / f"{prefix}{Path(video_path).stem}.mp4"
             )
         elif need_next_task:
             output_path = str(
-                Path(video_path).parent / f"【卡卡】{Path(video_path).stem}.mp4"
+                output_dir / f"【卡卡】{Path(video_path).stem}.mp4"
             )
         else:
             output_path = str(
-                Path(video_path).parent / f"【卡卡】{Path(video_path).stem}.mp4"
+                output_dir / f"【卡卡】{Path(video_path).stem}.mp4"
             )
 
         config = SynthesisConfig(
@@ -252,8 +320,17 @@ class TaskFactory:
             soft_subtitle=cfg.soft_subtitle.value,
             podcast_learning_template=cfg.podcast_learning_template.value,
             podcast_template_style=cfg.podcast_template_style.value,
+            podcast_template_resolution=cfg.podcast_template_resolution.value,
+            podcast_template_ai_vocab=cfg.podcast_template_ai_vocab.value,
+            podcast_template_english_only=cfg.podcast_template_english_only.value,
+            podcast_template_title=cfg.podcast_template_title.value,
+            podcast_template_background=cfg.podcast_template_background.value,
+            podcast_template_cover=cfg.podcast_template_cover.value,
+            podcast_template_logo=cfg.podcast_template_logo.value,
+            podcast_template_date=cfg.podcast_template_date.value,
             subtitle_render_mode=cfg.subtitle_render_mode.value,
             subtitle_layout=cfg.subtitle_layout.value,
+            manual_draft_mode=bool(manual_draft_mode),
             rounded_style={
                 "font_name": cfg.rounded_font_name.value,
                 "font_size": cfg.rounded_font_size.value,
@@ -286,6 +363,11 @@ class TaskFactory:
         output_path: Optional[str] = None,
         transcribe_config: Optional[TranscribeConfig] = None,
         subtitle_config: Optional[SubtitleConfig] = None,
+        source_audio_path: Optional[str] = None,
+        article_reference_text: str = "",
+        article_context_data: Optional[dict] = None,
+        use_article_reference_assist: bool = False,
+        use_article_translation_terms: bool = False,
     ) -> TranscriptAndSubtitleTask:
         """创建转录和字幕任务"""
         if output_path is None:
@@ -297,6 +379,13 @@ class TaskFactory:
             queued_at=datetime.datetime.now(),
             file_path=file_path,
             output_path=output_path,
+            transcribe_config=transcribe_config,
+            subtitle_config=subtitle_config,
+            source_audio_path=source_audio_path or file_path,
+            article_reference_text=article_reference_text or "",
+            article_context_data=article_context_data,
+            use_article_reference_assist=use_article_reference_assist,
+            use_article_translation_terms=use_article_translation_terms,
         )
 
     @staticmethod
@@ -306,6 +395,11 @@ class TaskFactory:
         transcribe_config: Optional[TranscribeConfig] = None,
         subtitle_config: Optional[SubtitleConfig] = None,
         synthesis_config: Optional[SynthesisConfig] = None,
+        source_audio_path: Optional[str] = None,
+        article_reference_text: str = "",
+        article_context_data: Optional[dict] = None,
+        use_article_reference_assist: bool = False,
+        use_article_translation_terms: bool = False,
     ) -> FullProcessTask:
         """创建完整处理任务（转录+字幕+合成）"""
         if output_path is None:
@@ -318,4 +412,12 @@ class TaskFactory:
             queued_at=datetime.datetime.now(),
             file_path=file_path,
             output_path=output_path,
+            transcribe_config=transcribe_config,
+            subtitle_config=subtitle_config,
+            synthesis_config=synthesis_config,
+            source_audio_path=source_audio_path or file_path,
+            article_reference_text=article_reference_text or "",
+            article_context_data=article_context_data,
+            use_article_reference_assist=use_article_reference_assist,
+            use_article_translation_terms=use_article_translation_terms,
         )

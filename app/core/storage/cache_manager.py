@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional, TypeVar, Generic
 from sqlalchemy import and_
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from .constants import CACHE_CONFIG, OperationType, TranslatorType
@@ -138,6 +139,7 @@ class CacheManager(BaseManager):
                 result = (
                     session.query(LLMCache)
                     .filter_by(content_hash=hash_key, model_name=model_name)
+                    .order_by(LLMCache.id.desc())
                     .first()
                 )
                 return str(result.result) if result else None
@@ -153,16 +155,25 @@ class CacheManager(BaseManager):
         hash_key = self._generate_hash(prompt, params)
         try:
             with self.db_manager.get_session() as session:
-                llm_result = LLMCache(
+                statement = sqlite_insert(LLMCache).values(
                     prompt=prompt,
                     result=result,
                     model_name=model_name,
                     params=params,
                     content_hash=hash_key,
+                    created_at=datetime.utcnow(),
                 )
-                session.add(llm_result)
+                statement = statement.on_conflict_do_update(
+                    index_elements=["content_hash", "model_name"],
+                    set_={
+                        "prompt": prompt,
+                        "result": result,
+                        "params": params,
+                        "created_at": datetime.utcnow(),
+                    },
+                )
+                session.execute(statement)
                 session.commit()
-                # self.logger.info(f"Cached LLM result for {model_name}")
         except Exception as e:
             self.logger.error(f"Error setting LLM cache: {str(e)}")
             raise

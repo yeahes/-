@@ -1,0 +1,894 @@
+{
+ "production_accepted_boundaries": 5180,
+ "arms": {
+  "A_shipped": {
+   "illegal": 516,
+   "illegal_pct": 9.96,
+   "resolved_vs_shipped": 0,
+   "newly_illegal_vs_shipped": 0,
+   "open_sub_code_hits": 110,
+   "top_codes": [
+    [
+     "open_subordinate_prefix_fragment",
+     110
+    ],
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "short_open_prefix_fragment",
+     47
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "weak_subject_fragment",
+     37
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ]
+   ]
+  },
+  "E_incomplete_subclause": {
+   "illegal": 440,
+   "illegal_pct": 8.49,
+   "resolved_vs_shipped": 76,
+   "newly_illegal_vs_shipped": 0,
+   "open_sub_code_hits": 12,
+   "top_codes": [
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "short_open_prefix_fragment",
+     47
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "weak_subject_fragment",
+     37
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "open_subordinate_prefix_fragment",
+     12
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ]
+   ]
+  },
+  "F_E_plus_comma_required": {
+   "illegal": 452,
+   "illegal_pct": 8.73,
+   "resolved_vs_shipped": 64,
+   "newly_illegal_vs_shipped": 0,
+   "open_sub_code_hits": 37,
+   "top_codes": [
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "short_open_prefix_fragment",
+     47
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "open_subordinate_prefix_fragment",
+     37
+    ],
+    [
+     "weak_subject_fragment",
+     37
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ]
+   ]
+  },
+  "G_E_plus_finite_fix": {
+   "illegal": 405,
+   "illegal_pct": 7.82,
+   "resolved_vs_shipped": 111,
+   "newly_illegal_vs_shipped": 0,
+   "open_sub_code_hits": 12,
+   "top_codes": [
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "short_open_prefix_fragment",
+     31
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "weak_subject_fragment",
+     20
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "open_subordinate_prefix_fragment",
+     12
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ]
+   ]
+  }
+ },
+ "samples": {
+  "E_resolved": [
+   {
+    "episode": "AI竞赛：中美殊途",
+    "subtitle_id": "S0070",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because developers have access to the underlying architecture, the weights,",
+    "right_head": "they can custom-tailor the model to distribute its computational"
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "subtitle_id": "S0225",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "when our primary job is no longer to do the work,",
+    "right_head": "but simply to serve as the training data for"
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "subtitle_id": "S0045",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because if the core problem in the U S. is that hardware costs aren't translating into sustainable software businesses,",
+    "right_head": "the reality in China right now is the exact"
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "subtitle_id": "S0075",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because when a dev team doesn't have a blank check,",
+    "right_head": "they lean into strategies like model distillation."
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "subtitle_id": "S0134",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If they had easy access to endless high-end chips,",
+    "right_head": "they might have just copied the American brute force"
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0001",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When recent Middle East tensions trapped 14 million barrels a day of crude inside the Gulf,",
+    "right_head": "analysts practically guaranteed oil would hit 150 a barrel."
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0028",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you look at any Western economy,",
+    "right_head": "domestic energy demand is, well, it's millions of independent"
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0039",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because to understand how they pulled off this demand-side OPEC trick,",
+    "right_head": "we have to start with the first lever, which"
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0102",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When you refine a barrel of crude,",
+    "right_head": "you only get a tiny percentage of jet fuel"
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0161",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "while OPEC can logically cut production and leave oil in the ground for years,",
+    "right_head": "no importer can artificially compress demand indefinitely."
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0101",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Yes. If you are a Chinese tech company looking to expand globally,",
+    "right_head": "wouldn't you still want someone who navigated that international"
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0110",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because the enrollment numbers were so astronomically high for so long,",
+    "right_head": "Chinese employers now view the entry requirements for many"
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0182",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "because her visa status made it",
+    "right_head": "almost impossible for her to switch employers or advance"
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0219",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you are a company and a single client",
+    "right_head": "makes up nearly half of your premium revenue, your"
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0251",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because educational exchanges aren't just about tuition revenue or granting degrees,",
+    "right_head": "they establish a baseline of mobility and shared experience."
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "subtitle_id": "S0054",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because, I mean, when dream core exploded on Western social media,",
+    "right_head": "it had a very specific look."
+   },
+   {
+    "episode": "创业者的天堂",
+    "subtitle_id": "S0031",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Right. Because it became irrational",
+    "right_head": "for most people to take on the profound financial"
+   },
+   {
+    "episode": "创业者的天堂",
+    "subtitle_id": "S0167",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you opened a brick-and mortar store on Main Street 50 years ago,",
+    "right_head": "your inventory had to appeal to the average person"
+   },
+   {
+    "episode": "创业者的天堂",
+    "subtitle_id": "S0246",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If AI is serving as the web developer, the compliance officer, and the inventory manager,",
+    "right_head": "well, what happens to human hiring?"
+   },
+   {
+    "episode": "创业者的天堂",
+    "subtitle_id": "S0249",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If the software does the work,",
+    "right_head": "the political promise of the small business as the"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "subtitle_id": "S0135",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When she dates a man her own age or older,",
+    "right_head": "she often enters a dynamic loaded with decades of"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "subtitle_id": "S0268",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If modern relationships are increasingly functioning as temporary tools for individual self-actualization and creative fuel rather than lifelong partnerships,",
+    "right_head": "what does that mean for the traditional romantic ideals"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0015",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you're listening to this right now and you're actively avoiding a project,",
+    "right_head": "you know, you're not just lazy."
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0053",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because that unwritten email is hanging over you,",
+    "right_head": "your body just remains in this subtle, prolonged state"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0085",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Yeah. When that self-betrayal happens repeatedly, day after day, year after year,",
+    "right_head": "you just stop trusting your own word."
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0094",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If procrastination is this deeply destructive, if it's costing us 15 000 a year,",
+    "right_head": "causing physical pain, predicting depression, why does it feel"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0125",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If I hit a hard sentence while writing a script,",
+    "right_head": "the instinct to just glance at a screen is"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0274",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If procrastination is a recognized failure of executive function, and the medical community has compounds that enhance executive function,",
+    "right_head": "the boundary between treating a clinical disorder and treating"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0285",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If procrastination is deeply tied to executive function, and modern life constantly drains that battery, maybe",
+    "right_head": "the real trick is designing a daily environment that"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0097",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you feed a machine a massive diet of New York Times reporting or Economist articles",
+    "right_head": "during its training phase, doesn't it just become a"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0160",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you really want to spot a synthetic author today,",
+    "right_head": "the data reveals that analyzing what AI does with"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0183",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If we break down the actual mechanics of next token prediction,",
+    "right_head": "why does a machine write with so few commas?"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0251",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "if it thought AI overused the dash,",
+    "right_head": "the bot replied with an incredibly colloquial, almost defensive,"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0265",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If tools like Pangram can spot AI copy today,",
+    "right_head": "how can they possibly maintain that 99% accuracy when"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0092",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When a premier hospital with the best resources is forced to pivot to group therapy",
+    "right_head": "just to manage the sheer volume of patients, the"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0096",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If I am one of those patients and SMHC is completely booked,",
+    "right_head": "I am looking for an alternative."
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0102",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If 191 million people need help, shouldn't we be thrilled tech is democratizing access",
+    "right_head": "rather than waiting decades for physical hospitals to catch"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0109",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you are stuck on a six-month waiting list at a physical clinic,",
+    "right_head": "an app on your phone giving you cognitive behavioral"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0115",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you teach 191 million people to recognize they need help,",
+    "right_head": "but you lack the clinical infrastructure to provide it,"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0119",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because the top hospitals are overflowing,",
+    "right_head": "the burden of care is falling onto an under-regulated"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0160",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If we connect this to the bigger picture,",
+    "right_head": "it exposes the hidden trap of that fudaoke mindset."
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0162",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you frame therapy as a remedial tutoring class,",
+    "right_head": "the natural consumer expectation is that you will learn"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0170",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Exactly. If you apply that same logic to deep-seated anxiety,",
+    "right_head": "you are going to be incredibly frustrated when two"
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "subtitle_id": "S0012",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because we're looking at this stack of sources about economic measurement,",
+    "right_head": "specifically focusing on China's labor statistics."
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "subtitle_id": "S0198",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Right. Because before 2020, if they lost their job in the city,",
+    "right_head": "they couldn't easily register for benefits locally, right?"
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "subtitle_id": "S0087",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When the market feels volatile or entirely out of your control,",
+    "right_head": "you look for signals in the noise."
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "subtitle_id": "S0177",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If modern audiences are suddenly willing to pay millions of dollars",
+    "right_head": "just to experience something definitively flawed, human, and messy,"
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "subtitle_id": "S0183",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If a machine learns to successfully simulate human authenticity,",
+    "right_head": "to perfectly replicate that lopsided clay mug, some print"
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0057",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because the National Film Administration's licensing process isn't just some,",
+    "right_head": "you know, rubber stamp you buy online."
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0091",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When this distributor saw the final cut of New Ally,",
+    "right_head": "he saw exactly what the netizen saw. The hollow"
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0101",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If your friend spends three years baking a cake out of mud,",
+    "right_head": "you don't rent out a bakery to sell it."
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0198",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Yeah. Once the onlooking netizens get bored and the carnival ends,",
+    "right_head": "a movie still has to rely on its actual"
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "subtitle_id": "S0014",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because when you hear that one-fifth of the world's oil supply is suddenly trapped behind a blockade,",
+    "right_head": "your immediate expectation is just total panic, right?"
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "subtitle_id": "S0114",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because every two years, oil field depletion physically costs the world",
+    "right_head": "one Saudi Arabia's worth of crude supply."
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "subtitle_id": "S0130",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If China checks out of the oil game,",
+    "right_head": "the rest of the world has to face the"
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "subtitle_id": "S0139",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If the world's most powerful buyer is aggressively engineering its way out of needing oil entirely,",
+    "right_head": "why are so many other nations still acting as"
+   },
+   {
+    "episode": "美国已成为创业者的天堂",
+    "subtitle_id": "S0208",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Right. Because for anyone who slept through high school chemistry,",
+    "right_head": "activation potential is just the amount of energy you"
+   },
+   {
+    "episode": "美国已成为创业者的天堂",
+    "subtitle_id": "S0226",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Yes. Because if AI allows one person to do the work of a whole team,",
+    "right_head": "what does this mean for the broader economy?"
+   },
+   {
+    "episode": "美国已成为创业者的天堂",
+    "subtitle_id": "S0250",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If an AI can do your bookkeeping,",
+    "right_head": "run your social media marketing, and handle initial customer"
+   },
+   {
+    "episode": "美国已成为创业者的天堂",
+    "subtitle_id": "S0309",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Once you taste that kind of independence,",
+    "right_head": "and the technology makes it sustainable to actually run"
+   }
+  ],
+  "F_still_blocked": [
+   {
+    "episode": "AI竞赛：中美殊途",
+    "subtitle_id": "S0123",
+    "now": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Right. Because instead of hiring traditional film crews,",
+    "right_head": "production companies started heavily utilizing AI to generate backgrounds,"
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0259",
+    "now": [
+     "coordinated_constituent_split",
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If the next generation of global executives,",
+    "right_head": "researchers, and policymakers grow up in entirely separate, increasingly"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "subtitle_id": "S0172",
+    "now": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Right. Because of uneven economic development across the country,",
+    "right_head": "there are still pockets of the pre 2008 urban"
+   },
+   {
+    "episode": "创业者的天堂",
+    "subtitle_id": "S0017",
+    "now": [
+     "open_subordinate_prefix_fragment",
+     "short_open_prefix_fragment"
+    ],
+    "left": "Because for the last hundred years,",
+    "right_head": "the momentum of the workforce was moving in the"
+   },
+   {
+    "episode": "创业者的天堂",
+    "subtitle_id": "S0086",
+    "now": [
+     "open_subordinate_prefix_fragment",
+     "short_open_prefix_fragment"
+    ],
+    "left": "Because during the early 2020 s,",
+    "right_head": "there was this massive flight of office workers leaving"
+   },
+   {
+    "episode": "创业者的天堂",
+    "subtitle_id": "S0235",
+    "now": [
+     "open_subordinate_prefix_fragment",
+     "right_orphaned_finite_predicate",
+     "subject_finite_verb_split"
+    ],
+    "left": "Because for the last several years, the dominant anxiety around artificial intelligence",
+    "right_head": "was that it would be this dystopian weapon for"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "subtitle_id": "S0006",
+    "now": [
+     "open_subordinate_prefix_fragment",
+     "short_open_prefix_fragment"
+    ],
+    "left": "Because out in the real world,",
+    "right_head": "women are suddenly feeling a massive surge in attention"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0246",
+    "now": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If mental exercises like MCII help pave the neural pathways,",
+    "right_head": "and physical habits like HII training build up biological"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0240",
+    "now": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because with every single background software update,",
+    "right_head": "the study shows that AI writing is drifting closer"
+   },
+   {
+    "episode": "美国已成为创业者的天堂",
+    "subtitle_id": "S0228",
+    "now": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Because politicians on the campaign trail, regardless of their political affiliation,",
+    "right_head": "they all use the exact same phrase when they"
+   },
+   {
+    "episode": "英伟达的硅基大决战",
+    "subtitle_id": "S0197",
+    "now": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If a neocloud company",
+    "right_head": "defaults on a billion dollar loan in year three,"
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "subtitle_id": "S0195",
+    "now": [
+     "open_subordinate_prefix_fragment",
+     "short_open_prefix_fragment"
+    ],
+    "left": "Because looking through these sources,",
+    "right_head": "Felugia hasn't announced any official plans to take their"
+   }
+  ]
+ }
+}

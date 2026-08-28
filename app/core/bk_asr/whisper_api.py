@@ -1,5 +1,7 @@
+import hashlib
 import os
 from typing import Optional
+from urllib.parse import urlsplit
 
 from openai import OpenAI
 
@@ -34,7 +36,7 @@ class WhisperAPI(BaseASR):
             api_key: API密钥,可选
             use_cache: 是否使用缓存
         """
-        super().__init__(audio_path, use_cache)
+        super().__init__(audio_path, use_cache, need_word_time_stamp)
 
         # 优先使用传入的参数,否则使用环境变量
         self.base_url = base_url
@@ -60,10 +62,16 @@ class WhisperAPI(BaseASR):
     def _make_segments(self, resp_data: dict) -> list[ASRDataSeg]:
         """从响应数据构建语音片段"""
         segments = []
-        for seg in resp_data["segments"]:
+        source_segments = resp_data.get("segments") or []
+        if self.need_word_time_stamp and resp_data.get("words"):
+            source_segments = resp_data["words"]
+        for seg in source_segments:
+            text = str(seg.get("word") or seg.get("text") or "").strip()
+            if not text:
+                continue
             segments.append(
                 ASRDataSeg(
-                    text=seg["text"].strip(),
+                    text=text,
                     start_time=int(float(seg["start"]) * 1000),
                     end_time=int(float(seg["end"]) * 1000),
                 )
@@ -72,13 +80,36 @@ class WhisperAPI(BaseASR):
 
     def _get_key(self) -> str:
         """获取缓存键值"""
-        return f"{self.crc32_hex}-{self.model}-{self.language}-{self.prompt}"
+        endpoint = urlsplit(self.base_url or "")
+        endpoint_identity = "|".join(
+            [
+                endpoint.scheme.lower(),
+                (endpoint.hostname or "").lower(),
+                str(endpoint.port or ""),
+                endpoint.path.rstrip("/"),
+            ]
+        )
+        endpoint_hash = hashlib.sha256(endpoint_identity.encode("utf-8")).hexdigest()[:16]
+        return "-".join(
+            [
+                self.crc32_hex,
+                str(self.model),
+                str(self.language),
+                str(self.need_word_time_stamp),
+                self._effective_prompt(),
+                endpoint_hash,
+            ]
+        )
+
+    def _effective_prompt(self) -> str:
+        if self.language == "zh" and not self.prompt:
+            return "你好，我们需要使用简体中文，以下是普通话的句子。"
+        return self.prompt or ""
 
     def _submit(self) -> dict:
         """提交音频进行识别"""
         try:
-            if self.language == "zh" and not self.prompt:
-                self.prompt = "你好，我们需要使用简体中文，以下是普通话的句子。"
+            prompt = self._effective_prompt()
             args = {}
             if self.need_word_time_stamp and "groq" not in self.base_url:
                 args["timestamp_granularities"] = ["word", "segment"]
@@ -88,8 +119,8 @@ class WhisperAPI(BaseASR):
                 temperature=0,
                 response_format="verbose_json",
                 file=("audio.mp3", self.file_binary, "audio/mp3"),
-                prompt=self.prompt,
-                language=None,
+                prompt=prompt,
+                language=self.language or None,
                 **args,
             )
             logger.info("音频识别完成")

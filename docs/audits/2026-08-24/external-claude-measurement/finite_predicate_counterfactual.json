@@ -1,0 +1,272 @@
+{
+ "production_accepted_boundaries": 5180,
+ "illegal_before_fix": 516,
+ "illegal_after_fix": 484,
+ "resolved_by_one_helper_fix": 32,
+ "resolved_pct_of_contradictions": 6.2,
+ "illegal_pct_before": 9.96,
+ "illegal_pct_after": 9.34,
+ "still_illegal_after": 484,
+ "per_code": [
+  {
+   "code": "open_subordinate_prefix_fragment",
+   "before": 110,
+   "after": 110,
+   "resolved": 0
+  },
+  {
+   "code": "dependency_phrase_entrance_split",
+   "before": 64,
+   "after": 64,
+   "resolved": 0
+  },
+  {
+   "code": "right_orphaned_finite_predicate",
+   "before": 64,
+   "after": 64,
+   "resolved": 0
+  },
+  {
+   "code": "predicate_attached_continuation_split",
+   "before": 62,
+   "after": 62,
+   "resolved": 0
+  },
+  {
+   "code": "coordinated_constituent_split",
+   "before": 52,
+   "after": 52,
+   "resolved": 0
+  },
+  {
+   "code": "short_open_prefix_fragment",
+   "before": 47,
+   "after": 31,
+   "resolved": 16
+  },
+  {
+   "code": "relative_clause_entrance_split",
+   "before": 40,
+   "after": 40,
+   "resolved": 0
+  },
+  {
+   "code": "weak_subject_fragment",
+   "before": 37,
+   "after": 20,
+   "resolved": 17
+  },
+  {
+   "code": "dependent_clause_entrance_split",
+   "before": 32,
+   "after": 32,
+   "resolved": 0
+  },
+  {
+   "code": "incomplete_short_fragment",
+   "before": 23,
+   "after": 23,
+   "resolved": 0
+  },
+  {
+   "code": "post_noun_participial_modifier_split",
+   "before": 14,
+   "after": 14,
+   "resolved": 0
+  },
+  {
+   "code": "subject_finite_verb_split",
+   "before": 12,
+   "after": 12,
+   "resolved": 0
+  },
+  {
+   "code": "object_attached_modifier_split",
+   "before": 10,
+   "after": 10,
+   "resolved": 0
+  },
+  {
+   "code": "unfinished_wh_complement_fragment",
+   "before": 10,
+   "after": 7,
+   "resolved": 3
+  },
+  {
+   "code": "incomplete_interrogative_fragment",
+   "before": 10,
+   "after": 10,
+   "resolved": 0
+  },
+  {
+   "code": "short_verb_complement_split",
+   "before": 6,
+   "after": 6,
+   "resolved": 0
+  },
+  {
+   "code": "trailing_modifier_fragment",
+   "before": 5,
+   "after": 5,
+   "resolved": 0
+  },
+  {
+   "code": "trailing_auxiliary_fragment",
+   "before": 4,
+   "after": 4,
+   "resolved": 0
+  },
+  {
+   "code": "verb_particle_preposition_chain_split",
+   "before": 4,
+   "after": 4,
+   "resolved": 0
+  },
+  {
+   "code": "trailing_discourse_fragment",
+   "before": 4,
+   "after": 4,
+   "resolved": 0
+  },
+  {
+   "code": "comparative_clause_split",
+   "before": 4,
+   "after": 4,
+   "resolved": 0
+  },
+  {
+   "code": "clause_scope_modifier_split",
+   "before": 4,
+   "after": 4,
+   "resolved": 0
+  },
+  {
+   "code": "predicate_complement_chain_split",
+   "before": 3,
+   "after": 3,
+   "resolved": 0
+  },
+  {
+   "code": "object_control_complement_split",
+   "before": 3,
+   "after": 3,
+   "resolved": 0
+  },
+  {
+   "code": "zero_relative_clause_split",
+   "before": 3,
+   "after": 3,
+   "resolved": 0
+  },
+  {
+   "code": "verb_complement_split",
+   "before": 3,
+   "after": 3,
+   "resolved": 0
+  },
+  {
+   "code": "embedded_wh_clause_split",
+   "before": 3,
+   "after": 3,
+   "resolved": 0
+  },
+  {
+   "code": "fronted_wh_clause_split",
+   "before": 2,
+   "after": 2,
+   "resolved": 0
+  },
+  {
+   "code": "protected_syntax_cut",
+   "before": 2,
+   "after": 2,
+   "resolved": 0
+  },
+  {
+   "code": "short_verb_object_split",
+   "before": 2,
+   "after": 2,
+   "resolved": 0
+  },
+  {
+   "code": "object_content_clause_split",
+   "before": 2,
+   "after": 2,
+   "resolved": 0
+  },
+  {
+   "code": "coordinated_subject_split",
+   "before": 2,
+   "after": 2,
+   "resolved": 0
+  },
+  {
+   "code": "clause_introducer_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "verb_particle_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "content_noun_that_clause_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "trailing_connector_fragment",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "verb_preposition_complement_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "appositive_name_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "numeric_range_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "modifier_head_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "separable_verb_particle_chain_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "preposition_object_split",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  },
+  {
+   "code": "trailing_quantifier_fragment",
+   "before": 1,
+   "after": 1,
+   "resolved": 0
+  }
+ ],
+ "boundaries_fixed_not_in_after_set": 32,
+ "boundaries_newly_illegal_after": 0
+}

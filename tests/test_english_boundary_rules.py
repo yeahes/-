@@ -1,0 +1,224 @@
+"""Fixture-backed contracts for local stable English boundary legality."""
+
+import json
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.core.bk_asr.asr_data import ASRDataSeg
+from app.core.subtitle_processor.screen_editor import ScreenSubtitleEditor
+
+
+CASES_PATH = ROOT / "tests" / "fixtures" / "stable_boundaries" / "syntax_boundary_contract.json"
+AUDIT_CASES_PATH = ROOT / "tests" / "fixtures" / "stable_boundaries" / "boundary_audit_contract.json"
+
+
+def _boundary_editor(words):
+    editor = ScreenSubtitleEditor.__new__(ScreenSubtitleEditor)
+    editor.max_english_words = 16
+    editor._syntax_protected_cuts = set()
+    editor._syntax_hard_cut_issues = {}
+    editor._syntax_nlp = None
+    editor._active_word_entries = [
+        {
+            "token": ScreenSubtitleEditor._word_tokens(word)[0],
+            "surface": word,
+            "start_time": index * 200,
+            "end_time": index * 200 + 120,
+        }
+        for index, word in enumerate(words)
+    ]
+    editor._active_source_word_spans = {
+        index + 1: (index, index) for index in range(len(words))
+    }
+    editor._active_source_segments_by_id = {
+        index + 1: ASRDataSeg(word, index * 200, index * 200 + 120, "")
+        for index, word in enumerate(words)
+    }
+    return editor
+
+
+def test_fixture_backed_stable_boundary_contracts():
+    cases = json.loads(CASES_PATH.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        editor = _boundary_editor(case["words"])
+        if case.get("manual_syntax_issue"):
+            editor._record_syntax_hard_issue_for_indices(
+                case["manual_syntax_indices"],
+                case["manual_syntax_issue"],
+            )
+        for cut_after in case["cut_after_indices"]:
+            evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+            assert evaluation["legal"] is case["expected_legal"], (case["id"], evaluation)
+            if case["expected_issue"]:
+                assert case["expected_issue"] in evaluation["hard_issues"], (
+                    case["id"],
+                    evaluation,
+                )
+            else:
+                assert evaluation["hard_issues"] == [], (case["id"], evaluation)
+
+
+def _boundary_audit_segments(editor, cut_after: int):
+    left = editor._item_from_word_span(0, cut_after)
+    right = editor._item_from_word_span(cut_after + 1, len(editor._active_word_entries) - 1)
+    assert left is not None and right is not None
+    left.subtitle_id = "S0001"
+    right.subtitle_id = "S0002"
+    editor._last_subtitle_items = [left, right]
+    segments = []
+    for item in (left, right):
+        start_ms, end_ms = editor._item_word_timing(item)
+        segment = ASRDataSeg(item.original, start_ms, end_ms, "")
+        segment.subtitle_id = item.subtitle_id
+        segments.append(segment)
+    return segments
+
+
+def test_fixture_backed_whole_file_boundary_audit_contracts():
+    cases = json.loads(AUDIT_CASES_PATH.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        editor = _boundary_editor(case["words"])
+        pause_ms = case.get("pause_ms")
+        if pause_ms is not None:
+            cut_after = int(case["cut_after"])
+            current_pause = (
+                editor._active_word_entries[cut_after + 1]["start_time"]
+                - editor._active_word_entries[cut_after]["end_time"]
+            )
+            for entry in editor._active_word_entries[cut_after + 1:]:
+                entry["start_time"] += int(pause_ms) - current_pause
+                entry["end_time"] += int(pause_ms) - current_pause
+
+        records = editor._scan_final_english_boundaries(
+            _boundary_audit_segments(editor, int(case["cut_after"]))
+        )
+
+        assert len(records) == 1
+        record = records[0]
+        assert record["classification"] == case["expected_classification"], (case["id"], record)
+        if case["expected_issue"]:
+            assert case["expected_issue"] in record["rule_codes"], (case["id"], record)
+        else:
+            assert record["rule_codes"] == [], (case["id"], record)
+
+
+def test_residual_hard_boundary_blocks_export():
+    editor = _boundary_editor(
+        ["The", "fund", "raised", "one", "hundred", "million", "dollars."]
+    )
+    editor._translation_structure_errors = []
+    editor._final_cue_timeline = {}
+    segments = _boundary_audit_segments(editor, 4)
+    audit = editor._scan_final_english_boundaries(segments)
+    health = {
+        "overlong_english": [],
+        "structural_english_overflow": [],
+        "bad_cuts": [],
+        "translationese": [],
+        "reading_speed_errors": [],
+        "reading_speed_warnings": [],
+        "duration_errors": [],
+        "duration_warnings": [],
+        "duplicate_chinese": [],
+        "asr_suspicious": [],
+        "discourse_marker_orphans": [],
+        "syntax_boundary_audit": audit,
+        "chinese_semantic_group_warnings": [],
+        "chinese_semantic_group_info": [],
+    }
+
+    editor.last_validation_summary = editor._validation_summary([], [], health, segments)
+
+    assert any(
+        group["code"] == "hard_english_boundary"
+        for group in editor.last_validation_summary["errors"]
+    )
+    assert editor.has_blocking_validation_errors()
+
+
+def test_parser_confirmed_metalinguistic_reference_blocks_the_word_referent_cut():
+    words = (
+        "It points out that claiming a text is AI just because it uses the word "
+        "delve is as ridiculous."
+    ).split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    cut_after = words.index("word")
+    evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+    assert "metalinguistic_reference_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_confirmed_named_term_keeps_the_full_naming_relation():
+    words = "The term known as hallucination is widely used.".split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    for left, right in (("term", "known"), ("known", "as"), ("as", "hallucination")):
+        cut_after = words.index(left)
+        evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+        assert words[cut_after + 1] == right
+        assert "metalinguistic_reference_split" in evaluation["hard_issues"]
+        assert not evaluation["legal"]
+
+
+def test_parser_confirmed_post_noun_participial_modifier_stays_with_its_noun():
+    words = (
+        "Now when you compare that to Alphabet talking about a 205 billion spend "
+        "for a much shorter time frame"
+    ).split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    cut_after = words.index("Alphabet")
+    evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+    assert "post_noun_participial_modifier_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_parser_confirmed_zero_relative_clause_stays_with_its_content_noun():
+    words = (
+        "They are forcing the domestic supply chain to communicate and optimize "
+        "at a level they never would have reached if they could import the hardware"
+    ).split()
+    editor = _boundary_editor(words)
+    editor._prepare_syntax_cut_hints()
+
+    cut_after = words.index("level")
+    evaluation = editor._evaluate_stable_cut_boundary(cut_after, cut_after + 1)
+
+    assert "zero_relative_clause_split" in evaluation["hard_issues"]
+    assert not evaluation["legal"]
+
+
+def test_unmapped_final_boundary_is_a_contract_error_not_an_allow():
+    editor = _boundary_editor(["The", "term", "delve", "is", "quoted."])
+    segments = _boundary_audit_segments(editor, 1)
+    editor._last_subtitle_items = []
+
+    records = editor._scan_final_english_boundaries(segments)
+
+    assert len(records) == 1
+    assert records[0]["classification"] == "hard"
+    assert records[0]["recommended_action"] == "pre_id_auto_repair_required"
+    assert "unmapped_frozen_boundary" in records[0]["rule_codes"]
+
+
+if __name__ == "__main__":
+    test_fixture_backed_stable_boundary_contracts()
+    test_fixture_backed_whole_file_boundary_audit_contracts()
+    test_residual_hard_boundary_blocks_export()
+    test_parser_confirmed_metalinguistic_reference_blocks_the_word_referent_cut()
+    test_parser_confirmed_named_term_keeps_the_full_naming_relation()
+    test_parser_confirmed_post_noun_participial_modifier_stays_with_its_noun()
+    test_parser_confirmed_zero_relative_clause_stays_with_its_content_noun()
+    test_unmapped_final_boundary_is_a_contract_error_not_an_allow()
+    print("English boundary rule tests passed.")

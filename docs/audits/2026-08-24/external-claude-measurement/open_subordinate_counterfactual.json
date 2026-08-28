@@ -1,0 +1,1024 @@
+{
+ "production_accepted_boundaries": 5180,
+ "arms": {
+  "A_shipped": {
+   "illegal": 516,
+   "illegal_pct": 9.96,
+   "resolved_vs_shipped": 0,
+   "newly_illegal_vs_shipped": 0,
+   "top_codes": [
+    [
+     "open_subordinate_prefix_fragment",
+     110
+    ],
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "short_open_prefix_fragment",
+     47
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "weak_subject_fragment",
+     37
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ],
+    [
+     "incomplete_interrogative_fragment",
+     10
+    ],
+    [
+     "unfinished_wh_complement_fragment",
+     10
+    ]
+   ]
+  },
+  "B_finite_only": {
+   "illegal": 484,
+   "illegal_pct": 9.34,
+   "resolved_vs_shipped": 32,
+   "newly_illegal_vs_shipped": 0,
+   "top_codes": [
+    [
+     "open_subordinate_prefix_fragment",
+     110
+    ],
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "short_open_prefix_fragment",
+     31
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "weak_subject_fragment",
+     20
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ],
+    [
+     "incomplete_interrogative_fragment",
+     10
+    ],
+    [
+     "object_attached_modifier_split",
+     10
+    ]
+   ]
+  },
+  "C_opensub_only": {
+   "illegal": 501,
+   "illegal_pct": 9.67,
+   "resolved_vs_shipped": 15,
+   "newly_illegal_vs_shipped": 0,
+   "top_codes": [
+    [
+     "open_subordinate_prefix_fragment",
+     92
+    ],
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "short_open_prefix_fragment",
+     47
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "weak_subject_fragment",
+     37
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ],
+    [
+     "incomplete_interrogative_fragment",
+     10
+    ],
+    [
+     "unfinished_wh_complement_fragment",
+     10
+    ]
+   ]
+  },
+  "D_both": {
+   "illegal": 469,
+   "illegal_pct": 9.05,
+   "resolved_vs_shipped": 47,
+   "newly_illegal_vs_shipped": 0,
+   "top_codes": [
+    [
+     "open_subordinate_prefix_fragment",
+     92
+    ],
+    [
+     "dependency_phrase_entrance_split",
+     64
+    ],
+    [
+     "right_orphaned_finite_predicate",
+     64
+    ],
+    [
+     "predicate_attached_continuation_split",
+     62
+    ],
+    [
+     "coordinated_constituent_split",
+     52
+    ],
+    [
+     "relative_clause_entrance_split",
+     40
+    ],
+    [
+     "dependent_clause_entrance_split",
+     32
+    ],
+    [
+     "short_open_prefix_fragment",
+     31
+    ],
+    [
+     "incomplete_short_fragment",
+     23
+    ],
+    [
+     "weak_subject_fragment",
+     20
+    ],
+    [
+     "post_noun_participial_modifier_split",
+     14
+    ],
+    [
+     "subject_finite_verb_split",
+     12
+    ],
+    [
+     "incomplete_interrogative_fragment",
+     10
+    ],
+    [
+     "object_attached_modifier_split",
+     10
+    ]
+   ]
+  }
+ },
+ "per_code_A_to_C": [
+  {
+   "code": "open_subordinate_prefix_fragment",
+   "A": 110,
+   "C": 92,
+   "D": 92
+  },
+  {
+   "code": "dependency_phrase_entrance_split",
+   "A": 64,
+   "C": 64,
+   "D": 64
+  },
+  {
+   "code": "right_orphaned_finite_predicate",
+   "A": 64,
+   "C": 64,
+   "D": 64
+  },
+  {
+   "code": "predicate_attached_continuation_split",
+   "A": 62,
+   "C": 62,
+   "D": 62
+  },
+  {
+   "code": "coordinated_constituent_split",
+   "A": 52,
+   "C": 52,
+   "D": 52
+  },
+  {
+   "code": "short_open_prefix_fragment",
+   "A": 47,
+   "C": 47,
+   "D": 31
+  },
+  {
+   "code": "relative_clause_entrance_split",
+   "A": 40,
+   "C": 40,
+   "D": 40
+  },
+  {
+   "code": "weak_subject_fragment",
+   "A": 37,
+   "C": 37,
+   "D": 20
+  },
+  {
+   "code": "dependent_clause_entrance_split",
+   "A": 32,
+   "C": 32,
+   "D": 32
+  },
+  {
+   "code": "incomplete_short_fragment",
+   "A": 23,
+   "C": 23,
+   "D": 23
+  },
+  {
+   "code": "post_noun_participial_modifier_split",
+   "A": 14,
+   "C": 14,
+   "D": 14
+  },
+  {
+   "code": "subject_finite_verb_split",
+   "A": 12,
+   "C": 12,
+   "D": 12
+  },
+  {
+   "code": "incomplete_interrogative_fragment",
+   "A": 10,
+   "C": 10,
+   "D": 10
+  },
+  {
+   "code": "unfinished_wh_complement_fragment",
+   "A": 10,
+   "C": 10,
+   "D": 7
+  },
+  {
+   "code": "object_attached_modifier_split",
+   "A": 10,
+   "C": 10,
+   "D": 10
+  },
+  {
+   "code": "short_verb_complement_split",
+   "A": 6,
+   "C": 6,
+   "D": 6
+  },
+  {
+   "code": "trailing_modifier_fragment",
+   "A": 5,
+   "C": 5,
+   "D": 5
+  },
+  {
+   "code": "clause_scope_modifier_split",
+   "A": 4,
+   "C": 4,
+   "D": 4
+  },
+  {
+   "code": "trailing_auxiliary_fragment",
+   "A": 4,
+   "C": 4,
+   "D": 4
+  },
+  {
+   "code": "verb_particle_preposition_chain_split",
+   "A": 4,
+   "C": 4,
+   "D": 4
+  },
+  {
+   "code": "comparative_clause_split",
+   "A": 4,
+   "C": 4,
+   "D": 4
+  },
+  {
+   "code": "trailing_discourse_fragment",
+   "A": 4,
+   "C": 4,
+   "D": 4
+  },
+  {
+   "code": "object_control_complement_split",
+   "A": 3,
+   "C": 3,
+   "D": 3
+  },
+  {
+   "code": "zero_relative_clause_split",
+   "A": 3,
+   "C": 3,
+   "D": 3
+  },
+  {
+   "code": "verb_complement_split",
+   "A": 3,
+   "C": 3,
+   "D": 3
+  },
+  {
+   "code": "predicate_complement_chain_split",
+   "A": 3,
+   "C": 3,
+   "D": 3
+  },
+  {
+   "code": "embedded_wh_clause_split",
+   "A": 3,
+   "C": 3,
+   "D": 3
+  },
+  {
+   "code": "object_content_clause_split",
+   "A": 2,
+   "C": 2,
+   "D": 2
+  },
+  {
+   "code": "fronted_wh_clause_split",
+   "A": 2,
+   "C": 2,
+   "D": 2
+  },
+  {
+   "code": "protected_syntax_cut",
+   "A": 2,
+   "C": 2,
+   "D": 2
+  },
+  {
+   "code": "coordinated_subject_split",
+   "A": 2,
+   "C": 2,
+   "D": 2
+  },
+  {
+   "code": "short_verb_object_split",
+   "A": 2,
+   "C": 2,
+   "D": 2
+  },
+  {
+   "code": "clause_introducer_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "preposition_object_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "trailing_connector_fragment",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "modifier_head_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "content_noun_that_clause_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "separable_verb_particle_chain_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "appositive_name_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "verb_preposition_complement_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "trailing_quantifier_fragment",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "numeric_range_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  },
+  {
+   "code": "verb_particle_split",
+   "A": 1,
+   "C": 1,
+   "D": 1
+  }
+ ],
+ "samples": {
+  "C_resolved": [
+   {
+    "episode": "AI竞赛：中美殊途",
+    "subtitle_id": "S0225",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "when our primary job is no longer to do the work,",
+    "right_head": "but simply to serve as the training data for"
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0001",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When recent Middle East tensions trapped 14 million barrels a day of crude inside the Gulf,",
+    "right_head": "analysts practically guaranteed oil would hit 150 a barrel."
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0102",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When you refine a barrel of crude,",
+    "right_head": "you only get a tiny percentage of jet fuel"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "subtitle_id": "S0135",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When she dates a man her own age or older,",
+    "right_head": "she often enters a dynamic loaded with decades of"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0015",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you're listening to this right now and you're actively avoiding a project,",
+    "right_head": "you know, you're not just lazy."
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0085",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Yeah. When that self-betrayal happens repeatedly, day after day, year after year,",
+    "right_head": "you just stop trusting your own word."
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0092",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When a premier hospital with the best resources is forced to pivot to group therapy",
+    "right_head": "just to manage the sheer volume of patients, the"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0096",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If I am one of those patients and SMHC is completely booked,",
+    "right_head": "I am looking for an alternative."
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0102",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If 191 million people need help, shouldn't we be thrilled tech is democratizing access",
+    "right_head": "rather than waiting decades for physical hospitals to catch"
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "subtitle_id": "S0087",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When the market feels volatile or entirely out of your control,",
+    "right_head": "you look for signals in the noise."
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0091",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When this distributor saw the final cut of New Ally,",
+    "right_head": "he saw exactly what the netizen saw. The hollow"
+   },
+   {
+    "episode": "美国已成为创业者的天堂",
+    "subtitle_id": "S0313",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When the tools required to build an empire are available to a single individual,",
+    "right_head": "the magnetic pull of the large corporation loses a"
+   },
+   {
+    "episode": "蜜雪冰城为何卖起了啤酒",
+    "subtitle_id": "S0068",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When you look at an economic model that just shouldn't survive,",
+    "right_head": "you have to look for the invisible architecture holding"
+   },
+   {
+    "episode": "识别",
+    "subtitle_id": "S0001",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When The Economist recently analyzed 1.2 million words to uncover how AI actually writes,",
+    "right_head": "they discovered that ChatGPT now uses markedly fewer em-dashes"
+   },
+   {
+    "episode": "识别",
+    "subtitle_id": "S0061",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Right. When researchers asked an older ChatGPT model if it thought AI overused the DASH,",
+    "right_head": "it enthusiastically replied, ha, great question."
+   }
+  ],
+  "C_new": [],
+  "D_resolved": [
+   {
+    "episode": "AI竞赛：中美殊途",
+    "subtitle_id": "S0198",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "I see.",
+    "right_head": "The entire approach is engineered to balance the undeniable"
+   },
+   {
+    "episode": "AI竞赛：中美殊途",
+    "subtitle_id": "S0225",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "when our primary job is no longer to do the work,",
+    "right_head": "but simply to serve as the training data for"
+   },
+   {
+    "episode": "中国AI为何更省钱？",
+    "subtitle_id": "S0102",
+    "was": [
+     "unfinished_wh_complement_fragment"
+    ],
+    "left": "Right. But when you're constrained, every single parameter,",
+    "right_head": "every line of code has to be optimized to"
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "subtitle_id": "S0057",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "I see.",
+    "right_head": "So these legacy giants, they captured a tiny sliver"
+   },
+   {
+    "episode": "中国人会爱上巧克力吗？",
+    "subtitle_id": "S0157",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "Yeah, I imagine.",
+    "right_head": "They are attempting to bypass the African raw material"
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "subtitle_id": "S0057",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "I see.",
+    "right_head": "So these legacy giants, they captured a tiny sliver"
+   },
+   {
+    "episode": "中国会有爱上巧克力的一天吗？",
+    "subtitle_id": "S0157",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "Yeah, I imagine.",
+    "right_head": "They are attempting to bypass the African raw material"
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0001",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When recent Middle East tensions trapped 14 million barrels a day of crude inside the Gulf,",
+    "right_head": "analysts practically guaranteed oil would hit 150 a barrel."
+   },
+   {
+    "episode": "中国已成为世界石油强国",
+    "subtitle_id": "S0102",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When you refine a barrel of crude,",
+    "right_head": "you only get a tiny percentage of jet fuel"
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0033",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "As the middle class expanded,",
+    "right_head": "a Western education transitioned from being an exclusive signal"
+   },
+   {
+    "episode": "中国年轻人为何不爱留学了？",
+    "subtitle_id": "S0232",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "They treated a geopolitical anomaly,",
+    "right_head": "this massive, unhindered flow of Chinese capital into Western"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "subtitle_id": "S0011",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "Yeah, it's huge.",
+    "right_head": "And looking at the sheer scale of this, it"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "subtitle_id": "S0051",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "I like that.",
+    "right_head": "Yeah. So if the West used this eerie nostalgia"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "subtitle_id": "S0122",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "Just old-style buildings, turn-of the-millennium decor,",
+    "right_head": "playground equipment, and the sound of your own footsteps,"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "subtitle_id": "S0131",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "Yeah, it's terrifying.",
+    "right_head": "Yet creators are getting comments saying, that's exactly how"
+   },
+   {
+    "episode": "中式梦核：千禧一代的怀旧密码",
+    "subtitle_id": "S0156",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "They incorporate Chinese architecture, interior decor,",
+    "right_head": "and everyday commodities spanning all the way from the"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "subtitle_id": "S0135",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When she dates a man her own age or older,",
+    "right_head": "she often enters a dynamic loaded with decades of"
+   },
+   {
+    "episode": "好莱坞最新热潮：姐弟恋",
+    "subtitle_id": "S0213",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "They take charge.",
+    "right_head": "Exactly. They introduce a level of certainty and direction"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0015",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If you're listening to this right now and you're actively avoiding a project,",
+    "right_head": "you know, you're not just lazy."
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0040",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "They ignore it.",
+    "right_head": "They need a physical."
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0085",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "Yeah. When that self-betrayal happens repeatedly, day after day, year after year,",
+    "right_head": "you just stop trusting your own word."
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0100",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "Weaponized it.",
+    "right_head": "Yeah. The psychological vulnerabilities we just discussed are constantly"
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0155",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "I know.",
+    "right_head": "The name is a lot."
+   },
+   {
+    "episode": "如何停止拖延",
+    "subtitle_id": "S0247",
+    "was": [
+     "unfinished_wh_complement_fragment"
+    ],
+    "left": "and physical habits like HII training build up biological resilience to friction, what happens",
+    "right_head": "when those interventions still aren't enough?"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0061",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "Right. They spit out a percentage,",
+    "right_head": "but they completely refuse to show you the math"
+   },
+   {
+    "episode": "如何识别人工智能写作",
+    "subtitle_id": "S0179",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "The models use fewer commas,",
+    "right_head": "they use significantly fewer semicolons than humans,"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0092",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When a premier hospital with the best resources is forced to pivot to group therapy",
+    "right_head": "just to manage the sheer volume of patients, the"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0096",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If I am one of those patients and SMHC is completely booked,",
+    "right_head": "I am looking for an alternative."
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0102",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "If 191 million people need help, shouldn't we be thrilled tech is democratizing access",
+    "right_head": "rather than waiting decades for physical hospitals to catch"
+   },
+   {
+    "episode": "心理治疗，中国社会的奢侈品",
+    "subtitle_id": "S0114",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "That makes sense.",
+    "right_head": "If you teach 191 million people to recognize they"
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "subtitle_id": "S0022",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "It bends.",
+    "right_head": "Yeah. So to really understand this, we actually need"
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "subtitle_id": "S0077",
+    "was": [
+     "unfinished_wh_complement_fragment"
+    ],
+    "left": "Wow. So if Goodhart's law is universal, what happens when it collides with, you know,",
+    "right_head": "the main case study in our sources, which is"
+   },
+   {
+    "episode": "无论怎么衡量，就业市场都很疲软",
+    "subtitle_id": "S0228",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "That's exactly. The ghost metric,",
+    "right_head": "the one nobody cared about anymore, is suddenly the"
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "subtitle_id": "S0087",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When the market feels volatile or entirely out of your control,",
+    "right_head": "you look for signals in the noise."
+   },
+   {
+    "episode": "烂到爆红：一部动画的逆袭",
+    "subtitle_id": "S0097",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "Yeah, and you said unmarketed earlier,",
+    "right_head": "this production was so low-budget and low-key, it didn't"
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0082",
+    "was": [
+     "short_open_prefix_fragment"
+    ],
+    "left": "The government board clears the runway,",
+    "right_head": "assuming the traditional market forces like distributors and theater"
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0091",
+    "was": [
+     "open_subordinate_prefix_fragment"
+    ],
+    "left": "When this distributor saw the final cut of New Ally,",
+    "right_head": "he saw exactly what the netizen saw. The hollow"
+   },
+   {
+    "episode": "牛来",
+    "subtitle_id": "S0126",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "I love that.",
+    "right_head": "Proof of life."
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "subtitle_id": "S0039",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "They achieved this...",
+    "right_head": "Well, it's really a stunning feat of state engineering"
+   },
+   {
+    "episode": "石油市场，现在中国说了算？",
+    "subtitle_id": "S0045",
+    "was": [
+     "weak_subject_fragment"
+    ],
+    "left": "I know.",
+    "right_head": "It is incredibly difficult."
+   }
+  ],
+  "D_new": []
+ }
+}

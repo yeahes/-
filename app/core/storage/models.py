@@ -56,7 +56,9 @@ class LLMCache(Base):
     content_hash = Column(String(32), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    __table_args__ = (Index("idx_llm_lookup", content_hash, model_name),)
+    __table_args__ = (
+        Index("idx_llm_lookup", content_hash, model_name, unique=True),
+    )
 
     def __repr__(self):
         return f"<LlmResult(id={self.id}, model={self.model_name})>"

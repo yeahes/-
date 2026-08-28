@@ -1,0 +1,172 @@
+{
+  "schema_version": 2,
+  "sample_id": "bad-animation-curated-v2",
+  "english_segmentation": {
+    "windows": [
+      {
+        "anchor_id": "specific-reason",
+        "english_anchor": "They are deliberately driving up this box office specifically because the plot is incomprehensible and the animation is shockingly terrible.",
+        "expected_segments": [
+          "They are deliberately driving up this box office",
+          "specifically because the plot is incomprehensible and the animation is shockingly terrible."
+        ]
+      },
+      {
+        "anchor_id": "garbage-question",
+        "english_anchor": "Wait, so you're telling me people are shelling out millions for a movie they actively know is complete garbage?",
+        "expected_segments": [
+          "Wait, so you're telling me",
+          "people are shelling out millions for a movie they actively know is complete garbage?"
+        ]
+      },
+      {
+        "anchor_id": "mission-explanation",
+        "english_anchor": "We're looking at, well, retail trading superstitions, social media trends, and scathing state media commentaries to figure out how terrible animation basically became a weapon against artificial intelligence.",
+        "expected_segments": [
+          "We're looking at, well, retail trading superstitions, social media trends, and scathing state media commentaries",
+          "to figure out how terrible animation basically became a weapon against artificial intelligence."
+        ]
+      },
+      {
+        "anchor_id": "movie-proof",
+        "english_anchor": "People on Weibo are sharing clips of this movie, which is called Niu Lai, as definitive proof that no AI was involved.",
+        "expected_segments": [
+          "People on Weibo are sharing clips of this movie, which is called Niu Lai,",
+          "as definitive proof that no AI was involved."
+        ]
+      }
+    ]
+  },
+  "parent_translation": {
+    "anchors": [
+      {
+        "anchor_id": "box-office-rise",
+        "english_anchor": "A low-budget Chinese animated movie about a cow in a dream sequence made just 11 140 in its first 10 days, but then it inexplicably skyrocketed to over 11.4 million yuan, beating out Hollywood blockbusters like The Odyssey and Spider-Man.",
+        "must_contain_any": [["11140元"], ["1140万元"], ["奥德赛"], ["蜘蛛侠"]],
+        "accepted_chinese": ["一部讲述梦境奶牛的低成本国产动画，前10天票房仅11140元，此后却莫名暴涨至1140万元以上，甚至击败《奥德赛》和《蜘蛛侠》等好莱坞大片。"],
+        "max_chinese_chars": 70
+      },
+      {
+        "anchor_id": "ai-weapon",
+        "english_anchor": "to figure out how terrible animation basically became a weapon against artificial intelligence.",
+        "must_contain_any": [["烂动画"], ["人工智能"], ["武器"]],
+        "accepted_chinese": ["弄清烂动画究竟如何成了对抗人工智能的武器。"],
+        "max_chinese_chars": 24
+      },
+      {
+        "anchor_id": "ai-slop",
+        "english_anchor": "It's what the internet calls AI slop.",
+        "must_contain_any": [["AI垃圾内容", "AI垃圾"]],
+        "accepted_chinese": ["这就是网上常说的“AI垃圾内容”。"],
+        "max_chinese_chars": 18
+      },
+      {
+        "anchor_id": "niu-lai",
+        "english_anchor": "People on Weibo are sharing clips of this movie, which is called Niu Lai,",
+        "must_contain_any": [["微博"], ["牛来"], ["电影片段"]],
+        "accepted_chinese": ["微博网友正在转发这部名为《牛来》的电影片段。"],
+        "max_chinese_chars": 25
+      }
+    ]
+  },
+  "fixed_id_allocation": {
+    "anchors": [
+      {
+        "anchor_id": "box-office-owner",
+        "english_anchor": "inexplicably skyrocketed to over 11.4 million yuan",
+        "must_contain_any": [["1140万元"]],
+        "must_not_appear_in_adjacent": true
+      },
+      {
+        "anchor_id": "weapon-owner",
+        "english_anchor": "weapon against artificial intelligence",
+        "must_contain_any": [["人工智能"], ["武器"]],
+        "must_not_appear_in_adjacent": true
+      },
+      {
+        "anchor_id": "ai-slop-owner",
+        "english_anchor": "It's what the internet calls AI slop",
+        "must_contain_any": [["AI垃圾内容", "AI垃圾"]],
+        "must_not_appear_in_adjacent": true
+      },
+      {
+        "anchor_id": "niu-lai-owner",
+        "english_anchor": "Niu Lai",
+        "must_contain_any": [["牛来"]],
+        "must_not_appear_in_adjacent": true
+      }
+    ]
+  },
+  "display_pages": {
+    "windows": [
+      {
+        "anchor_id": "opening-box-office-pages",
+        "english_anchor": "A low-budget Chinese animated movie about a cow in a dream sequence made just 11 140 in its first 10 days, but then it inexplicably skyrocketed to over 11.4 million yuan, beating out Hollywood blockbusters like The Odyssey and Spider-Man.",
+        "expected_segments": [
+          "A low-budget Chinese animated movie about a cow in a dream sequence",
+          "made just 11 140 in its first 10 days,",
+          "but then it inexplicably skyrocketed to over 11.4 million yuan,",
+          "beating out Hollywood blockbusters like The Odyssey and Spider-Man."
+        ],
+        "max_words_per_page": 12,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["低成本国产动画"], ["奶牛"]]},
+          {"must_contain_any": [["前10天"], ["11140元"]]},
+          {"must_contain_any": [["1140万元"]]},
+          {"must_contain_any": [["奥德赛"], ["蜘蛛侠"]]}
+        ]
+      },
+      {
+        "anchor_id": "research-topics-pages",
+        "english_anchor": "We're looking at, well, retail trading superstitions, social media trends, and scathing state media commentaries",
+        "expected_segments": [
+          "We're looking at, well, retail trading superstitions,",
+          "social media trends, and scathing state media commentaries"
+        ],
+        "max_words_per_page": 9,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["散户交易迷信"]]},
+          {"must_contain_any": [["社交媒体趋势"], ["官媒"]]}
+        ]
+      },
+      {
+        "anchor_id": "cinema-quality-pages",
+        "english_anchor": "I mean, if you go to the cinema, you expect a certain baseline of quality, right?",
+        "expected_segments": [
+          "I mean, if you go to the cinema,",
+          "you expect a certain baseline of quality, right?"
+        ],
+        "max_words_per_page": 9,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["电影院"]]},
+          {"must_contain_any": [["质量底线"]]}
+        ]
+      },
+      {
+        "anchor_id": "soulless-perfection-pages",
+        "english_anchor": "So when you're saturated with instantaneous perfection, it just becomes, it becomes entirely soulless.",
+        "expected_segments": [
+          "So when you're saturated with instantaneous perfection,",
+          "it just becomes, it becomes entirely soulless."
+        ],
+        "max_words_per_page": 8,
+        "min_english_font_size": 52,
+        "max_english_lines": 2,
+        "page_expectations": [
+          {"must_contain_any": [["瞬间的完美"]]},
+          {"must_contain_any": [["毫无灵魂"]]}
+        ]
+      }
+    ]
+  },
+  "thresholds": {
+    "min_overall_score": 0.9,
+    "min_component_score": 0.85
+  }
+}

@@ -111,7 +111,13 @@ def audit_srt(
 
 
 def main() -> int:
-    names = sys.argv[1:] or ["222", "777", "999"]
+    names = [name.strip() for name in sys.argv[1:] if name.strip()]
+    if not names:
+        print(
+            "Usage: runtime\\python.exe tests\\audit_stable_outputs.py <work-dir sample> [... ]",
+            file=sys.stderr,
+        )
+        return 2
     results = {}
     for name in names:
         subtitle_dir = ROOT / "work-dir" / name / "subtitle"

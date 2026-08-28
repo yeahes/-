@@ -79,11 +79,23 @@ class LLMServiceEnum(Enum):
     OPENAI = "OpenAI"
     SILICON_CLOUD = "SiliconCloud"
     DEEPSEEK = "DeepSeek"
+    OPENCODE_GO = "OpenCode Go"
     OLLAMA = "Ollama"
+    # Legacy configuration identifiers. They remain deserializable so an old
+    # settings file can migrate safely, but are not offered in the current UI.
     LM_STUDIO = "LM Studio"
     GEMINI = "Gemini"
     CHATGLM = "ChatGLM"
     PUBLIC = "软件公益模型"
+
+
+AVAILABLE_LLM_SERVICES = (
+    LLMServiceEnum.DEEPSEEK,
+    LLMServiceEnum.OPENCODE_GO,
+    LLMServiceEnum.OPENAI,
+    LLMServiceEnum.SILICON_CLOUD,
+    LLMServiceEnum.OLLAMA,
+)
 
 
 class TranscribeModelEnum(Enum):
@@ -545,6 +557,8 @@ class SubtitleConfig:
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     llm_model: Optional[str] = None
+    screen_subtitle_full_translation_model: Optional[str] = None
+    screen_subtitle_allocation_review_model: Optional[str] = None
     deeplx_endpoint: Optional[str] = None
     # 翻译服务
     translator_service: Optional[TranslatorServiceEnum] = None
@@ -564,12 +578,13 @@ class SubtitleConfig:
     need_remove_punctuation: bool = False
     need_screen_subtitle_edit: bool = False
     screen_subtitle_stable_mode: bool = True
-    need_screen_subtitle_quality_check: bool = False
-    screen_subtitle_safe_auto_repair: bool = False
+    screen_subtitle_chinese_polish: bool = False
     screen_subtitle_max_cjk: int = 24
     screen_subtitle_max_english: int = 16
-    screen_subtitle_allocation_max_concurrency: int = 3
+    screen_subtitle_allocation_max_concurrency: int = 2
     screen_subtitle_allocation_batch_size: int = 16
+    screen_subtitle_translation_request_budget: int = 40
+    screen_subtitle_translation_request_max_attempts: int = 3
     custom_prompt_text: Optional[str] = None
 
 
@@ -581,9 +596,18 @@ class SynthesisConfig:
     soft_subtitle: bool = True
     podcast_learning_template: bool = False
     podcast_template_style: str = "暗色播客"
+    podcast_template_resolution: str = "1080p"
+    podcast_template_ai_vocab: bool = False
+    podcast_template_english_only: bool = False
+    podcast_template_title: str = ""
+    podcast_template_background: str = ""
+    podcast_template_cover: str = ""
+    podcast_template_logo: str = ""
+    podcast_template_date: str = ""
     subtitle_render_mode: str = "ASS样式"
     subtitle_layout: str = "译文在上"
     rounded_style: dict = field(default_factory=dict)
+    manual_draft_mode: bool = False
 
 
 @dataclass
@@ -604,6 +628,11 @@ class TranscribeTask:
     need_next_task: bool = False
 
     transcribe_config: Optional[TranscribeConfig] = None
+    source_audio_path: Optional[str] = None
+    article_reference_text: str = ""
+    article_context_data: Optional[dict] = None
+    use_article_reference_assist: bool = False
+    use_article_translation_terms: bool = False
 
 
 @dataclass
@@ -624,12 +653,17 @@ class SubtitleTask:
 
     # 是否需要执行下一个任务（视频合成）
     need_next_task: bool = True
+    # 交互式完整流程先停在字幕编辑器，由用户明确发起合成。
+    require_manual_review_before_synthesis: bool = False
 
     subtitle_config: Optional[SubtitleConfig] = None
     article_reference_text: str = ""
     article_context_data: Optional[dict] = None
     use_article_reference_assist: bool = False
     use_article_translation_terms: bool = False
+    # Original media used only by final word-level alignment.  ``video_path``
+    # remains the report/output anchor for backwards-compatible workflows.
+    source_audio_path: Optional[str] = None
 
 
 @dataclass
@@ -669,6 +703,11 @@ class TranscriptAndSubtitleTask:
 
     transcribe_config: Optional[TranscribeConfig] = None
     subtitle_config: Optional[SubtitleConfig] = None
+    source_audio_path: Optional[str] = None
+    article_reference_text: str = ""
+    article_context_data: Optional[dict] = None
+    use_article_reference_assist: bool = False
+    use_article_translation_terms: bool = False
 
 
 @dataclass
@@ -687,6 +726,11 @@ class FullProcessTask:
     transcribe_config: Optional[TranscribeConfig] = None
     subtitle_config: Optional[SubtitleConfig] = None
     synthesis_config: Optional[SynthesisConfig] = None
+    source_audio_path: Optional[str] = None
+    article_reference_text: str = ""
+    article_context_data: Optional[dict] = None
+    use_article_reference_assist: bool = False
+    use_article_translation_terms: bool = False
 
 
 class BatchTaskType(Enum):

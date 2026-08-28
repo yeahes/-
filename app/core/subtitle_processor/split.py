@@ -9,7 +9,7 @@ from typing import List, Optional, Union
 import json
 from concurrent.futures import as_completed
 
-from openai import OpenAI
+from app.core.llm_client import OpenAI
 
 from app.config import CACHE_PATH
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg

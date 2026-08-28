@@ -1,8 +1,18 @@
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+from app.core.subtitle_processor.translation_review_suggestions import (
+    currency_unit_review_suggestions,
+    validate_translation_review_suggestions,
+)
+from app.core.subtitle_processor.review_evidence_identity import (
+    SEMANTIC_REVIEW_QUEUE_SCHEMA_VERSION,
+    build_review_source_identity,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +28,16 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _print_console(text: str) -> None:
+    """Do not fail a completed QA run when a legacy filename has unsupported characters."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+        print(safe_text)
+
+
 def _latest_artifact_dir() -> Path:
     candidates = sorted(
         (ROOT / "work-dir").glob("*/subtitle/*artifacts"),
@@ -27,6 +47,26 @@ def _latest_artifact_dir() -> Path:
     if not candidates:
         raise FileNotFoundError("No artifact directory found under work-dir/*/subtitle/*artifacts")
     return candidates[0]
+
+
+def _resolve_artifact_dir(path: Path) -> Path:
+    """Accept either a stable artifacts directory or its parent subtitle directory."""
+    candidate = path.expanduser().resolve()
+    if (candidate / "run-manifest.json").is_file():
+        return candidate
+
+    children = [
+        child
+        for child in candidate.iterdir()
+        if child.is_dir() and (child / "run-manifest.json").is_file()
+    ] if candidate.is_dir() else []
+    if children:
+        return max(children, key=lambda child: child.stat().st_mtime)
+
+    raise FileNotFoundError(
+        "Could not find run-manifest.json. Provide a stable artifacts directory "
+        "or the subtitle directory that contains one."
+    )
 
 
 def _subtitle_id_sort_key(subtitle_id: str) -> tuple[int, str]:
@@ -119,6 +159,9 @@ class QASummaryBuilder:
         self.allocation_retry_log = _load_json(artifact_dir / "allocation-retry-log.json", [])
         self.spans = _load_json(artifact_dir / "subtitle-spans.json", [])
         self.translations = _load_json(artifact_dir / "translations.json", [])
+        self.final_timeline = _load_json(artifact_dir / "final-cue-timeline.json", {})
+        self.word_ledger = _load_json(artifact_dir / "word-ledger.json", {})
+        self.article_context = _load_json(self.subtitle_dir / "article_context.json", {})
         self.by_id = self._build_subtitle_index()
 
     def _build_subtitle_index(self) -> dict[str, dict]:
@@ -132,6 +175,8 @@ class QASummaryBuilder:
                 "end_ms": item.get("end_ms"),
                 "english": _normal_text(item, "original", "text", "english"),
                 "chinese": _normal_text(item, "translated", "translated_text", "zh"),
+                "word_start": item.get("word_start"),
+                "word_end": item.get("word_end"),
             }
         for index, item in enumerate(self.translations, 1):
             subtitle_id = str(item.get("subtitle_id") or f"S{index:04d}")
@@ -139,10 +184,25 @@ class QASummaryBuilder:
                 subtitle_id,
                 {"subtitle_id": subtitle_id, "index": index, "english": "", "chinese": ""},
             )
-            record["start_ms"] = record.get("start_ms", item.get("start_ms"))
-            record["end_ms"] = record.get("end_ms", item.get("end_ms"))
+            if record.get("start_ms") is None:
+                record["start_ms"] = item.get("start_ms")
+            if record.get("end_ms") is None:
+                record["end_ms"] = item.get("end_ms")
             record["english"] = record.get("english") or _normal_text(item, "text", "original", "english")
             record["chinese"] = _normal_text(item, "translated_text", "translated", "zh") or record.get("chinese", "")
+        timeline_records = self.final_timeline.get("records") if isinstance(self.final_timeline, dict) else []
+        for item in timeline_records or []:
+            if not isinstance(item, dict):
+                continue
+            subtitle_id = str(item.get("subtitle_id") or "")
+            record = records.get(subtitle_id)
+            if record is None:
+                continue
+            record["start_ms"] = item.get("start_ms", record.get("start_ms"))
+            record["end_ms"] = item.get("end_ms", record.get("end_ms"))
+            record["word_start"] = item.get("word_start")
+            record["word_end"] = item.get("word_end")
+            record["word_alignment_sources"] = list(item.get("word_alignment_sources") or [])
         return records
 
     def build(self) -> dict:
@@ -151,6 +211,7 @@ class QASummaryBuilder:
         items.extend(self._validation_items())
         items.extend(self._allocation_items())
         items.extend(self._local_boundary_items())
+        items.extend(self._timeline_alignment_items())
         items.sort(key=lambda item: (self._severity_rank(item["severity"]), _subtitle_id_sort_key((item.get("subtitle_ids") or [""])[0]), item["code"]))
         counts = {"BLOCKER": 0, "REVIEW": 0, "INFO": 0}
         for item in items:
@@ -170,6 +231,17 @@ class QASummaryBuilder:
                 "translation_model": self.manifest.get("translation_model") or self.manifest.get("model"),
                 "code_commit": self.manifest.get("code_commit"),
                 "cache_used": self.manifest.get("cache_used"),
+                "timeline_alignment_backend": self._timeline_alignment_backend(),
+                "timeline_fallback_cue_count": sum(
+                    1
+                    for item in items
+                    if item.get("code") == "timeline_alignment_fallback"
+                ),
+                "timeline_contract_error_count": sum(
+                    1
+                    for item in items
+                    if item.get("code") == "final_cue_timeline_invalid"
+                ),
             },
             "items": items,
         }
@@ -186,9 +258,13 @@ class QASummaryBuilder:
                 {
                     "subtitle_id": subtitle_id,
                     "time": self._time_for_record(record),
+                    "start_ms": record.get("start_ms"),
+                    "end_ms": record.get("end_ms"),
                     "english": record.get("english", ""),
                     "chinese": record.get("chinese", ""),
                     "word_count": _word_count(record.get("english", "")),
+                    "word_start": record.get("word_start"),
+                    "word_end": record.get("word_end"),
                 }
             )
         return context
@@ -251,17 +327,28 @@ class QASummaryBuilder:
             for group in self.validation.get(level, []) or []:
                 code = str(group.get("code") or "validation_item")
                 source_severity = severity
-                if code in {"suspicious_cut", "syntax_boundary_audit"}:
+                if code == "suspicious_cut":
                     source_severity = "INFO"
                 items = group.get("items") if isinstance(group.get("items"), list) else [group]
-                max_items = 12 if source_severity == "REVIEW" else 8
-                for entry in items[:max_items]:
+                for entry in items:
+                    entry_severity = source_severity
+                    if code == "syntax_boundary_audit":
+                        entry_severity = (
+                            "REVIEW"
+                            if entry.get("classification") == "review"
+                            else "INFO"
+                        )
+                    if (
+                        code == "chinese_semantic_group_warning"
+                        and entry.get("mapping_valid") is False
+                    ):
+                        entry_severity = "INFO"
                     subtitle_ids = _ids_from_payload(entry)
                     if not subtitle_ids:
                         subtitle_ids = self._ids_by_english_pair(entry)
                     result.append(
                         self._make_item(
-                            severity=source_severity,
+                            severity=entry_severity,
                             code=code,
                             title=self._validation_title(code, entry, group),
                             reason=str(entry.get("reason") or group.get("message") or ""),
@@ -367,6 +454,210 @@ class QASummaryBuilder:
                 )
         return result
 
+    def _timeline_alignment_backend(self) -> str:
+        if not isinstance(self.final_timeline, dict):
+            return ""
+        alignment = self.final_timeline.get("alignment") or {}
+        return str(alignment.get("applied_backend") or alignment.get("requested_backend") or "")
+
+    def _timeline_alignment_items(self) -> list[dict]:
+        """Surface only direct timing-evidence limitations for human review.
+
+        A cue is not considered uncertain merely because its display padding
+        differs from its word envelope. The final timeline intentionally adds
+        controlled lead-in and tail padding. The two cases below instead have
+        direct evidence: a failed timeline contract or one or more words that
+        could not be matched by WhisperX and retained stable-ts timing.
+        """
+        if not isinstance(self.final_timeline, dict):
+            return []
+        result = []
+        validation = self.final_timeline.get("validation") or {}
+        errors = validation.get("errors") if isinstance(validation, dict) else []
+        if errors:
+            result.append(
+                self._make_item(
+                    severity="BLOCKER",
+                    code="final_cue_timeline_invalid",
+                    title="最终字幕时间轴契约失败",
+                    reason="最终 cue 未能完整满足冻结词账本的 ID、顺序或词时间契约。",
+                    subtitle_ids=_ids_from_payload(errors),
+                    source="final-cue-timeline.json",
+                    details={"errors": list(errors)},
+                )
+            )
+
+        word_sources = self._timeline_word_sources()
+        for subtitle_id, record in sorted(self.by_id.items(), key=lambda item: _subtitle_id_sort_key(item[0])):
+            sources = set(record.get("word_alignment_sources") or [])
+            word_start = record.get("word_start")
+            word_end = record.get("word_end")
+            fallback_word_ids = []
+            if isinstance(word_start, int) and isinstance(word_end, int):
+                fallback_word_ids = [
+                    word_id
+                    for word_id in range(word_start, word_end + 1)
+                    if "fallback" in word_sources.get(word_id, "").lower()
+                ]
+            if not fallback_word_ids and not any("fallback" in value.lower() for value in sources):
+                continue
+            total_words = max(1, int(word_end) - int(word_start) + 1) if isinstance(word_start, int) and isinstance(word_end, int) else 0
+            result.append(
+                self._make_item(
+                    severity="REVIEW",
+                    code="timeline_alignment_fallback",
+                    title="最终时间轴含回退词",
+                    reason=(
+                        f"该条 {len(fallback_word_ids)}/{total_words or '?'} 个冻结词未匹配 WhisperX，"
+                        "保留 stable-ts 词时间；建议试听这一条的首尾。"
+                    ),
+                    subtitle_ids=[subtitle_id],
+                    source="final-cue-timeline.json",
+                    details={
+                        "word_start": word_start,
+                        "word_end": word_end,
+                        "fallback_word_ids": fallback_word_ids,
+                        "word_alignment_sources": sorted(sources),
+                        "timeline_backend": self._timeline_alignment_backend(),
+                    },
+                )
+            )
+        return result
+
+    def semantic_review_items(self) -> list[dict]:
+        """Return only high-signal Chinese meaning/fluency items.
+
+        This queue is intentionally narrower than the general playable QA
+        queue. It is an audit view: it never changes the stable translation or
+        its publication gate.
+        """
+        result: list[dict] = []
+        high_signal = {
+            "semantic_loss",
+            "missing_predicate",
+            "dangling_preposition",
+            "modifier_head_split",
+            "english_word_order",
+            "cross_id_semantic_leakage",
+            "group_allocation_information_omission",
+            "entity_allocation_mismatch",
+            "number_allocation_mismatch",
+            "negation_allocation_mismatch",
+            "adjacent_chinese_semantic_duplication",
+        }
+        for group in self.validation.get("warnings", []) or []:
+            code = str(group.get("code") or "")
+            entries = group.get("items") if isinstance(group.get("items"), list) else [group]
+            for entry in entries:
+                issue_codes = {str(value) for value in entry.get("rule_codes") or []}
+                if code == "chinese_semantic_group_warning" and (
+                    str(entry.get("confidence") or "").lower() == "high"
+                    or issue_codes & high_signal
+                ):
+                    result.append(
+                        self._make_item(
+                            severity="REVIEW",
+                            code="semantic_translation_review",
+                            title="中文语义复核",
+                            reason=str(entry.get("reason") or ", ".join(sorted(issue_codes))),
+                            subtitle_ids=_ids_from_payload(entry),
+                            semantic_group_ids=_group_ids_from_payload(entry),
+                            source="validation-report.json",
+                            details={"issue_codes": sorted(issue_codes), "findings": entry.get("findings") or []},
+                        )
+                    )
+                elif code == "translationese":
+                    result.append(
+                        self._make_item(
+                            severity="REVIEW",
+                            code="translation_fluency_review",
+                            title="中文翻译腔复核",
+                            reason=str(entry.get("reason") or group.get("message") or ""),
+                            subtitle_ids=_ids_from_payload(entry) or self._ids_by_english_pair(entry),
+                            source="validation-report.json",
+                            details={"original": entry.get("original", ""), "translated": entry.get("translated", "")},
+                        )
+                    )
+        for record in self.allocation_unresolved:
+            issue_codes = [str(code) for code in record.get("issue_codes") or []]
+            result.append(
+                self._make_item(
+                    severity="REVIEW",
+                    code="semantic_allocation_review",
+                    title="中文逐条对应复核",
+                    reason=f"{record.get('reason', '')}; issues={', '.join(issue_codes)}",
+                    subtitle_ids=_ids_from_payload(record.get("allocation")) or _ids_from_payload(record),
+                    semantic_group_ids=_group_ids_from_payload(record),
+                    source="allocation-unresolved.json",
+                    details={"issue_codes": issue_codes, "full_english": record.get("full_english", ""), "full_translation": record.get("full_translation", "")},
+                )
+            )
+        expected = {
+            subtitle_id: {
+                "english": str(record.get("english") or ""),
+                "chinese": str(record.get("chinese") or ""),
+            }
+            for subtitle_id, record in self.by_id.items()
+        }
+        raw_currency_suggestions = currency_unit_review_suggestions(
+            expected,
+            self.article_context,
+        )
+        validated_currency = validate_translation_review_suggestions(
+            {"suggestions": raw_currency_suggestions},
+            expected,
+        )
+        for suggestion in validated_currency.get("suggestions") or []:
+            subtitle_id = str(suggestion.get("subtitle_id") or "")
+            source = next(
+                (
+                    item
+                    for item in raw_currency_suggestions
+                    if str(item.get("subtitle_id") or "") == subtitle_id
+                ),
+                {},
+            )
+            result.append(
+                self._make_item(
+                    severity="REVIEW",
+                    code="currency_unit_conflict_review",
+                    title="金额单位复核",
+                    reason=str(source.get("reason") or "金额单位与文章证据不一致。"),
+                    subtitle_ids=[subtitle_id],
+                    source="article_context.json",
+                    details={
+                        "evidence": dict(source.get("evidence") or {}),
+                        "suggestion": {
+                            "subtitle_id": subtitle_id,
+                            "source_english": str(suggestion.get("source_english") or ""),
+                            "current_chinese_hash": str(
+                                suggestion.get("current_chinese_hash") or ""
+                            ),
+                            "suggested_chinese": str(suggestion.get("suggested_chinese") or ""),
+                        },
+                    },
+                )
+            )
+        unique: dict[tuple[str, tuple[str, ...]], dict] = {}
+        for item in result:
+            key = (item.get("code", ""), tuple(item.get("subtitle_ids") or []))
+            unique.setdefault(key, item)
+        return sorted(unique.values(), key=lambda item: _subtitle_id_sort_key((item.get("subtitle_ids") or [""])[0]))
+
+    def _timeline_word_sources(self) -> dict[int, str]:
+        if not isinstance(self.word_ledger, dict):
+            return {}
+        result = {}
+        for position, word in enumerate(self.word_ledger.get("words") or []):
+            if not isinstance(word, dict):
+                continue
+            try:
+                word_id = int(word.get("word_id", position))
+            except (TypeError, ValueError):
+                continue
+            result[word_id] = str(word.get("alignment_source") or "")
+        return result
+
     @staticmethod
     def _validation_title(code: str, entry: dict, group: dict) -> str:
         titles = {
@@ -427,18 +718,209 @@ def _markdown(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Build a human-readable subtitle QA summary from stable artifacts.")
-    parser.add_argument("--artifact-dir", type=Path, default=None)
-    args = parser.parse_args()
-    artifact_dir = args.artifact_dir or _latest_artifact_dir()
+def _ms_to_srt_timestamp(ms: int) -> str:
+    ms = max(0, int(ms))
+    hours, rem = divmod(ms, 3600000)
+    minutes, rem = divmod(rem, 60000)
+    seconds, millis = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def _review_queue_items(
+    summary: dict,
+    review_limit: int | None = None,
+) -> tuple[list[dict], int]:
+    """Keep every distinct blocker and actionable review in the playable queue."""
+    selected: list[dict] = []
+    review_count = 0
+    normalized_limit = None if review_limit is None else max(0, int(review_limit))
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for item in summary.get("items") or []:
+        severity = str(item.get("severity") or "")
+        if severity not in {"BLOCKER", "REVIEW"}:
+            continue
+        key = (str(item.get("code") or ""), tuple(item.get("subtitle_ids") or []))
+        if key in seen:
+            continue
+        seen.add(key)
+        if severity == "REVIEW":
+            review_count += 1
+            if normalized_limit is not None and review_count > normalized_limit:
+                continue
+        selected.append(item)
+    omitted = (
+        max(0, review_count - normalized_limit)
+        if normalized_limit is not None
+        else 0
+    )
+    return selected, omitted
+
+
+def _review_item_time_range(item: dict) -> tuple[int, int] | None:
+    context = item.get("context") or []
+    values = [
+        (entry.get("start_ms"), entry.get("end_ms"))
+        for entry in context
+        if entry.get("start_ms") is not None and entry.get("end_ms") is not None
+    ]
+    if not values:
+        return None
+    start_ms = min(int(start) for start, _ in values)
+    end_ms = max(int(end) for _, end in values)
+    return (start_ms, max(start_ms + 1, end_ms))
+
+
+def _review_queue_srt(
+    summary: dict,
+    review_limit: int | None = None,
+) -> tuple[str, dict]:
+    items, omitted = _review_queue_items(summary, review_limit=review_limit)
+    blocks: list[str] = []
+    written_items: list[dict] = []
+    for item in items:
+        time_range = _review_item_time_range(item)
+        if time_range is None:
+            continue
+        start_ms, end_ms = time_range
+        lines = [
+            f"[QC][{item.get('severity', 'REVIEW')}] {item.get('title', '')}",
+            f"ID: {', '.join(item.get('subtitle_ids') or []) or '-'}",
+            f"原因: {item.get('reason') or '-'}",
+        ]
+        for context in (item.get("context") or [])[:3]:
+            subtitle_id = str(context.get("subtitle_id") or "")
+            english = str(context.get("english") or "").strip()
+            chinese = str(context.get("chinese") or "").strip()
+            if english:
+                lines.append(f"{subtitle_id} EN: {english}")
+            if chinese:
+                lines.append(f"{subtitle_id} ZH: {chinese}")
+        blocks.append(
+            "\n".join(
+                [
+                    str(len(blocks) + 1),
+                    f"{_ms_to_srt_timestamp(start_ms)} --> {_ms_to_srt_timestamp(end_ms)}",
+                    *lines,
+                ]
+            )
+        )
+        written_items.append(item)
+    return "\n\n".join(blocks) + ("\n" if blocks else ""), {
+        "queue_item_count": len(written_items),
+        "omitted_review_count": omitted,
+        "review_limit": 0 if review_limit is None else max(0, int(review_limit)),
+        "subtitle_ids": [
+            subtitle_id
+            for item in written_items
+            for subtitle_id in item.get("subtitle_ids") or []
+        ],
+    }
+
+
+def _semantic_review_queue_srt(items: list[dict]) -> tuple[str, dict]:
+    blocks: list[str] = []
+    written: list[dict] = []
+    for item in items:
+        time_range = _review_item_time_range(item)
+        if time_range is None:
+            continue
+        start_ms, end_ms = time_range
+        lines = [
+            f"[SEMANTIC] {item.get('title', '')}",
+            f"ID: {', '.join(item.get('subtitle_ids') or []) or '-'}",
+            f"原因: {item.get('reason') or '-'}",
+        ]
+        for context in (item.get("context") or [])[:4]:
+            subtitle_id = str(context.get("subtitle_id") or "")
+            if context.get("english"):
+                lines.append(f"{subtitle_id} EN: {context['english']}")
+            if context.get("chinese"):
+                lines.append(f"{subtitle_id} ZH: {context['chinese']}")
+        blocks.append("\n".join([str(len(blocks) + 1), f"{_ms_to_srt_timestamp(start_ms)} --> {_ms_to_srt_timestamp(end_ms)}", *lines]))
+        written.append(item)
+    return "\n\n".join(blocks) + ("\n" if blocks else ""), {
+        "queue_item_count": len(written),
+        "subtitle_ids": [sid for item in written for sid in item.get("subtitle_ids") or []],
+    }
+
+
+def write_qa_review_artifacts(
+    artifact_dir: Path,
+    source_audio_dir: Path | None = None,
+    review_limit: int | None = None,
+) -> dict:
+    """Write reproducible machine artifacts and a complete human-review SRT."""
     builder = QASummaryBuilder(artifact_dir)
     summary = builder.build()
     json_path = artifact_dir / "qa-summary.json"
     md_path = artifact_dir / "qa-summary.md"
+    queue_json_path = artifact_dir / "qa-review-queue.json"
+    queue_srt_path = artifact_dir / "qa-review-queue.srt"
+    semantic_json_path = artifact_dir / "semantic-review-queue.json"
+    semantic_srt_path = artifact_dir / "semantic-review-queue.srt"
     _write_json(json_path, summary)
     md_path.write_text(_markdown(summary), encoding="utf-8")
-    print(json.dumps({"qa_summary": str(json_path), "qa_markdown": str(md_path), **summary["summary"]}, ensure_ascii=False, indent=2))
+    queue_srt, queue_meta = _review_queue_srt(summary, review_limit=review_limit)
+    source_run = {
+        "artifact_dir": str(artifact_dir),
+        "code_commit": summary["summary"].get("code_commit"),
+        "translation_model": summary["summary"].get("translation_model"),
+        "subtitle_count": summary["summary"].get("subtitle_count"),
+        **build_review_source_identity(builder.word_ledger, builder.spans),
+    }
+    for key in ("stable_run_id", "attempt_id"):
+        value = str(builder.manifest.get(key) or "").strip()
+        if value:
+            source_run[key] = value
+    queue_payload = {
+        "schema_version": 1,
+        "source_run": source_run,
+        "queue": queue_meta,
+        "items": _review_queue_items(summary, review_limit=review_limit)[0],
+    }
+    _write_json(queue_json_path, queue_payload)
+    queue_srt_path.write_text(queue_srt, encoding="utf-8-sig")
+    semantic_items = builder.semantic_review_items()
+    semantic_srt, semantic_meta = _semantic_review_queue_srt(semantic_items)
+    _write_json(
+        semantic_json_path,
+        {
+            "schema_version": SEMANTIC_REVIEW_QUEUE_SCHEMA_VERSION,
+            "source_run": source_run,
+            "queue": semantic_meta,
+            "items": semantic_items,
+        },
+    )
+    semantic_srt_path.write_text(semantic_srt, encoding="utf-8-sig")
+
+    result = {
+        "qa_summary": str(json_path),
+        "qa_markdown": str(md_path),
+        "qa_review_queue_json": str(queue_json_path),
+        "qa_review_queue_srt": str(queue_srt_path),
+        "semantic_review_queue_json": str(semantic_json_path),
+        "semantic_review_queue_srt": str(semantic_srt_path),
+        "semantic_review_item_count": semantic_meta["queue_item_count"],
+        **summary["summary"],
+        **queue_meta,
+    }
+    if source_audio_dir is not None and source_audio_dir.exists():
+        source_path = source_audio_dir / "字幕质检队列.srt"
+        source_path.write_text(queue_srt, encoding="utf-8-sig")
+        result["source_audio_qa_review_queue_srt"] = str(source_path)
+        semantic_source_path = source_audio_dir / "字幕语义复核队列.srt"
+        semantic_source_path.write_text(semantic_srt, encoding="utf-8-sig")
+        result["source_audio_semantic_review_queue_srt"] = str(semantic_source_path)
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build a human-readable subtitle QA summary from stable artifacts.")
+    parser.add_argument("--artifact-dir", type=Path, default=None)
+    args = parser.parse_args()
+    artifact_dir = _resolve_artifact_dir(args.artifact_dir) if args.artifact_dir else _latest_artifact_dir()
+    result = write_qa_review_artifacts(artifact_dir)
+    _print_console(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 

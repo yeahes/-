@@ -24,7 +24,7 @@ class WhisperCppASR(BaseASR):
         use_cache: bool = False,
         need_word_time_stamp: bool = False,
     ):
-        super().__init__(audio_path, False)
+        super().__init__(audio_path, use_cache, need_word_time_stamp)
         assert os.path.exists(audio_path), f"音频文件 {audio_path} 不存在"
         assert audio_path.endswith(".wav"), f"音频文件 {audio_path} 必须是WAV格式"
 
@@ -132,7 +132,7 @@ class WhisperCppASR(BaseASR):
                 self.process = subprocess.Popen(
                     whisper_params,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                 )
@@ -143,12 +143,9 @@ class WhisperCppASR(BaseASR):
                 # 处理输出和进度
                 full_output = []
                 while True:
-                    try:
-                        line = self.process.stdout.readline()
-                    except Exception as e:
-                        break
+                    line = self.process.stdout.readline()
                     if not line:
-                        continue
+                        break
 
                     full_output.append(line)
 
@@ -167,9 +164,15 @@ class WhisperCppASR(BaseASR):
                         except (ValueError, IndexError):
                             continue
                 # 等待进程完成
-                stdout, stderr = self.process.communicate()
+                stdout, _ = self.process.communicate()
+                if stdout:
+                    full_output.append(stdout)
                 if self.process.returncode != 0:
-                    raise RuntimeError(f"WhisperCPP 执行失败: {stderr}")
+                    error_output = "".join(full_output).strip()
+                    raise RuntimeError(
+                        f"WhisperCPP 执行失败，return code "
+                        f"{self.process.returncode}: {error_output}"
+                    )
 
                 callback(100, "转换完成")
 

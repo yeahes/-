@@ -2,7 +2,7 @@
 import os
 import logging
 from contextlib import contextmanager
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from .models import Base
 from .constants import CACHE_CONFIG
@@ -26,18 +26,55 @@ class DatabaseManager:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             self._engine = create_engine(
                 self.db_url,
-                connect_args={"check_same_thread": False},
+                connect_args={
+                    "check_same_thread": False,
+                    "timeout": 30.0,
+                },
                 pool_pre_ping=True,
                 pool_size=5,
                 max_overflow=10,
                 pool_recycle=3600,
             )
             Base.metadata.create_all(self._engine)
+            self._ensure_llm_cache_unique_lookup()
             self._session_maker = sessionmaker(bind=self._engine)
             # logger.info(f"Database initialized at {self.db_path}")
         except Exception as e:
             logger.error(f"Failed to initialize database: {str(e)}")
             raise
+
+    def _ensure_llm_cache_unique_lookup(self) -> None:
+        """Migrate old LLM cache rows/indexes to one key per model request."""
+        # Older releases created a non-unique lookup index and could write the
+        # same request more than once.  Deduplicate before replacing it so the
+        # unique index can be installed for existing user databases as well as
+        # new databases. SQLite serializes the DDL transaction across processes.
+        with self._engine.begin() as connection:
+            indexes = connection.execute(
+                text("PRAGMA index_list('llm_cache')")
+            ).fetchall()
+            for index in indexes:
+                if str(index[1]) == "idx_llm_lookup" and bool(index[2]):
+                    return
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM llm_cache
+                    WHERE id NOT IN (
+                        SELECT MAX(id)
+                        FROM llm_cache
+                        GROUP BY content_hash, model_name
+                    )
+                    """
+                )
+            )
+            connection.execute(text("DROP INDEX IF EXISTS idx_llm_lookup"))
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_llm_lookup ON llm_cache (content_hash, model_name)"
+                )
+            )
 
     def close(self):
         """关闭数据库连接"""
