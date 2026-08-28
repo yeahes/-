@@ -6082,6 +6082,104 @@ def test_saved_reload_can_switch_between_parent_and_actual_page_rows():
         )
 
 
+def test_manual_page_preview_reflows_unchanged_legacy_ranges_after_guard_rejection():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        session, _, _ = _splittable_parent_session(root)
+        artifact_path = session.artifact_dir / "display-page-translations.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        plan = artifact["render_plans"][0]
+        words = str(session.cues[0]["original_subtitle"]).split()
+        split = 3
+        source_page = dict(plan["pages"][0])
+        plan["pages"] = [
+            {
+                **source_page,
+                "display_page_id": "S0001.P01",
+                "page_index": 1,
+                "word_start": 0,
+                "word_end": split - 1,
+                "english": " ".join(words[:split]),
+                "chinese": "甲",
+                "start_ms": 0,
+                "end_ms": split * 400,
+                "english_lines": ["Students", "compare choices"],
+                "english_width": 1455,
+            },
+            {
+                **source_page,
+                "display_page_id": "S0001.P02",
+                "page_index": 2,
+                "word_start": split,
+                "word_end": len(words) - 1,
+                "english": " ".join(words[split:]),
+                "chinese": "乙",
+                "start_ms": split * 400,
+                "end_ms": 7200,
+                "english_lines": ["carefully. Families review"],
+                "english_width": 1455,
+                "boundary_before": {
+                    "classification": "allow",
+                    "confidence": "low",
+                    "issue_codes": [],
+                },
+            },
+        ]
+        _write_json(artifact_path, artifact)
+        manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
+        manifest["display_page_translation_sha256"] = file_sha256(artifact_path)
+        _write_json(session.manifest_path, manifest)
+
+        session.display_page_boundary_overrides = {"S0001": [split]}
+        session.display_page_edits = [
+            {
+                "display_page_id": "S0001.P01",
+                "parent_subtitle_id": "S0001",
+                "word_start": 0,
+                "word_end": split - 1,
+                "english": " ".join(words[:split]),
+                "chinese": "甲",
+                "chinese_review_acknowledged": True,
+            },
+            {
+                "display_page_id": "S0001.P02",
+                "parent_subtitle_id": "S0001",
+                "word_start": split,
+                "word_end": len(words) - 1,
+                "english": " ".join(words[split:]),
+                "chinese": "乙",
+                "chinese_review_acknowledged": True,
+            },
+        ]
+
+        with patch.object(
+            podcast_learning_video,
+            "rebuild_article_frozen_page_plan_from_word_ranges",
+            side_effect=podcast_learning_video.RenderStructuralOverflowError(
+                [{"cue_index": 1, "reason": "manual_page_layout_overflow"}]
+            ),
+        ) as rebuild, patch.object(
+            podcast_learning_video,
+            "reflow_article_frozen_page_plan_same_screen",
+            wraps=podcast_learning_video.reflow_article_frozen_page_plan_same_screen,
+        ) as reflow:
+            rows = list(session.to_model_data(prefer_display_pages=True).values())
+            contract = session._write_manual_render_contract(root / "contract")
+
+        assert rebuild.called
+        assert reflow.call_count >= 2
+        assert [row["display_page_id"] for row in rows] == [
+            "S0001.P01",
+            "S0001.P02",
+        ]
+        assert all(row["display_page_unavailable"] is False for row in rows)
+        assert [row["word_start"] for row in rows] == [0, split]
+        assert " ".join(row["original_subtitle"] for row in rows) == (
+            session.cues[0]["original_subtitle"]
+        )
+        assert contract["render_blocked"] is False
+
+
 def test_manual_save_upgrades_old_page_layout_without_replanning_pages():
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)

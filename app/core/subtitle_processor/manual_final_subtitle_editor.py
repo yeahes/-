@@ -7514,10 +7514,12 @@ class ManualFinalSubtitleSession:
                         if edited is not None
                         else str(translated.get("zh") or "")
                     )
+                render_cue = None
                 try:
                     from app.core.utils.podcast_learning_video import (
                         RenderStructuralOverflowError,
                         rebuild_article_frozen_page_plan_from_word_ranges,
+                        reflow_article_frozen_page_plan_same_screen,
                     )
 
                     if boundary_payload is None:
@@ -7535,8 +7537,46 @@ class ManualFinalSubtitleSession:
                         allow_incomplete_page_translations=True,
                         allow_manual_review=True,
                     )
-                except (RenderStructuralOverflowError, ManualFinalSubtitleEditError):
-                    continue
+                except (
+                    RenderStructuralOverflowError,
+                    ManualFinalSubtitleEditError,
+                ) as exc:
+                    if not (
+                        isinstance(exc, RenderStructuralOverflowError)
+                        and any(
+                            str(item.get("reason") or "")
+                            == "manual_page_layout_overflow"
+                            for item in exc.errors
+                            if isinstance(item, Mapping)
+                        )
+                    ):
+                        continue
+                    try:
+                        source_ranges = [
+                            (
+                                int(page.get("word_start", -1)),
+                                int(page.get("word_end", -1)),
+                            )
+                            for page in source_pages
+                        ]
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if render_cue is None or source_ranges != ranges:
+                        continue
+                    try:
+                        # The frozen ranges already match the user's manual
+                        # boundary. Only upgrade legacy page-local typography.
+                        plan = reflow_article_frozen_page_plan_same_screen(
+                            render_cue,
+                            source_plan,
+                        )
+                    except (
+                        RenderStructuralOverflowError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        continue
             raw_pages = plan.get("pages")
             if cue is None or not isinstance(raw_pages, list) or not raw_pages:
                 continue
@@ -9176,9 +9216,52 @@ class ManualFinalSubtitleSession:
                         allow_manual_review=True,
                     )
                 except (RenderStructuralOverflowError, KeyError, TypeError, ValueError) as exc:
-                    raise ManualFinalSubtitleEditError(
-                        "manual_page_translation_required: 人工分页边界无法通过重新校验。"
-                    ) from exc
+                    if not (
+                        isinstance(exc, RenderStructuralOverflowError)
+                        and any(
+                            str(item.get("reason") or "")
+                            == "manual_page_layout_overflow"
+                            for item in exc.errors
+                            if isinstance(item, Mapping)
+                        )
+                    ):
+                        raise ManualFinalSubtitleEditError(
+                            "manual_page_translation_required: 人工分页边界无法通过重新校验。"
+                        ) from exc
+                    try:
+                        source_ranges = [
+                            (
+                                int(page.get("word_start", -1)),
+                                int(page.get("word_end", -1)),
+                            )
+                            for page in source_pages
+                        ]
+                    except (KeyError, TypeError, ValueError) as range_exc:
+                        raise ManualFinalSubtitleEditError(
+                            "manual_page_translation_required: 人工分页边界无法通过重新校验。"
+                        ) from range_exc
+                    if source_ranges != override_ranges:
+                        raise ManualFinalSubtitleEditError(
+                            "manual_page_translation_required: 人工分页边界无法通过重新校验。"
+                        ) from exc
+                    try:
+                        # A legacy page wrap can fail the newer imbalance guard
+                        # even when the frozen manual ranges are unchanged.
+                        # Reflow only the page-local typography in that case;
+                        # changed ranges must still pass the strict rebuild.
+                        plan = reflow_article_frozen_page_plan_same_screen(
+                            render_cue,
+                            raw_plan,
+                        )
+                    except (
+                        RenderStructuralOverflowError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as reflow_exc:
+                        raise ManualFinalSubtitleEditError(
+                            "manual_page_translation_required: 冻结分页的页内排版无法升级。"
+                        ) from reflow_exc
             if cue is not None:
                 plan["english"] = self._display_words_text(
                     int(cue["word_start"]),
