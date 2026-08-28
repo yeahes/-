@@ -24,7 +24,12 @@ from PIL import (
     ImageOps,
 )
 
-from app.config import BIN_PATH, CACHE_PATH, RESOURCE_PATH
+from app.config import (
+    BIN_PATH,
+    CACHE_PATH,
+    PODCAST_ARTICLE_WHOLE_PARENT_CHINESE,
+    RESOURCE_PATH,
+)
 from app.core.llm_service_config import resolve_llm_service_config
 from app.core.subtitle_processor.stable_display_planner import (
     plan_word_page_span_frontier,
@@ -3672,7 +3677,13 @@ def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tup
         return "", ""
     page = _article_visual_page(cue, display_time)
     if page is not None:
-        return str(page["en"]), str(page["zh"])
+        chinese = str(page["zh"])
+        if (
+            PODCAST_ARTICLE_WHOLE_PARENT_CHINESE
+            and len(list((cue.article_page_plan or {}).get("pages") or [])) > 1
+        ):
+            chinese = re.sub(r"\s+", "", str(cue.zh or ""))
+        return str(page["en"]), chinese
     page_count = article_visual_page_count(cue)
     page_index = article_visual_page_index(cue, display_time)
     english_pages = split_article_visual_pages(cue.en, page_count)
@@ -3682,9 +3693,16 @@ def article_visual_page_text(cue: Cue | None, display_time: float | None) -> tup
         # a legacy caller still reaches this fallback, keep the complete text
         # together rather than reproducing a character-level split.
         chinese_pages = [re.sub(r"\s+", "", str(cue.zh or ""))]
+    chinese = (
+        chinese_pages[min(page_index, len(chinese_pages) - 1)]
+        if chinese_pages
+        else ""
+    )
+    if PODCAST_ARTICLE_WHOLE_PARENT_CHINESE and page_count > 1:
+        chinese = re.sub(r"\s+", "", str(cue.zh or ""))
     return (
         english_pages[min(page_index, len(english_pages) - 1)] if english_pages else "",
-        chinese_pages[min(page_index, len(chinese_pages) - 1)] if chinese_pages else "",
+        chinese,
     )
 
 
@@ -5441,7 +5459,7 @@ def _article_same_screen_english_lines(
     enforce_word_limit: bool = True,
 ) -> list[str]:
     """Resolve one visible page through the sole same-screen wrap contract."""
-    return _article_fixed_english_lines(
+    lines = _article_fixed_english_lines(
         draw,
         " ".join(words[start:end]),
         font_size=int(font_size),
@@ -5466,6 +5484,13 @@ def _article_same_screen_english_lines(
             )
         ),
     )
+    # A severe orphan is not a valid same-screen layout. Returning no layout
+    # lets the frozen-page planner try another already-enumerated word span or
+    # publish an explicit structural-overflow review seed instead of silently
+    # emitting a visibly broken two-line page.
+    if _article_layout_has_severe_imbalance(draw, lines, int(font_size)):
+        return []
+    return lines
 
 
 def _article_final_page_layout(
@@ -5552,6 +5577,59 @@ def _article_candidate_fallback_tier(
     return 0
 
 
+def _article_frozen_page_relaxed_layout(
+    draw: ImageDraw.ImageDraw,
+    cue: Cue,
+    words: Sequence[str],
+    start: int,
+    end: int,
+    *,
+    allow_legacy_fallback: bool = False,
+) -> tuple[int, list[str]] | None:
+    """Find a balanced page-local wrap without changing its frozen span.
+
+    This is only a compatibility path for already reviewed manual pages. It
+    removes cross-page syntax scoring after the normal same-screen contract
+    rejects a severe orphan, while retaining measured width and two-line
+    limits. Automatic page selection still uses the stricter contract.
+    """
+    font_sizes = (
+        ARTICLE_SUBTITLE_EN_ALLOWED_SIZES
+        if allow_legacy_fallback
+        else ARTICLE_SUBTITLE_EN_AUTOMATIC_SIZES
+    )
+    text = " ".join(words[start:end])
+    for font_size in font_sizes:
+        lines = _article_fixed_english_lines(
+            draw,
+            text,
+            font_size=int(font_size),
+            boundary_penalty=lambda _split: 0,
+            relax_same_screen_syntax=True,
+            intrinsic_penalty=lambda _page_words, _split: 0,
+        )
+        if (
+            not lines
+            or len(lines) > 2
+            or any(
+                text_w(draw, line, article_subtitle_en_font(int(font_size), 600))
+                > acx(ARTICLE_SUBTITLE_EN_WIDTH)
+                for line in lines
+            )
+            or (
+                len(lines) == 2
+                and _article_layout_has_severe_imbalance(
+                    draw,
+                    lines,
+                    int(font_size),
+                )
+            )
+        ):
+            continue
+        return int(font_size), list(lines)
+    return None
+
+
 def _finalize_article_same_screen_layout(
     cue: Cue,
     draw: ImageDraw.ImageDraw,
@@ -5578,6 +5656,17 @@ def _finalize_article_same_screen_layout(
                 previous_font_size in ARTICLE_SUBTITLE_EN_LEGACY_FALLBACK_SIZES
             ),
         )
+        if layout is None:
+            layout = _article_frozen_page_relaxed_layout(
+                draw,
+                cue,
+                words,
+                start,
+                end,
+                allow_legacy_fallback=(
+                    previous_font_size in ARTICLE_SUBTITLE_EN_LEGACY_FALLBACK_SIZES
+                ),
+            )
         if layout is None:
             return finalized
         font_size, lines = layout
@@ -9035,6 +9124,8 @@ def _article_plan_from_frozen_artifact(
     frozen: Mapping[str, object],
     page_translations: Mapping[str, str],
     draw: ImageDraw.ImageDraw,
+    *,
+    preserve_page_lines: bool = False,
 ) -> dict | None:
     words = _article_boundary_words(cue)
     timing = list(cue.word_timing or ())
@@ -9132,15 +9223,38 @@ def _article_plan_from_frozen_artifact(
         # typography-only change may still carry the previous face's lines;
         # keep its immutable word span and timing, but publish the lines
         # measured with the current subtitle font.
-        frozen_lines = list(expected_lines)
+        frozen_lines = (
+            [
+                " ".join(str(line or "").split())
+                for line in raw_page.get("english_lines") or []
+                if str(line or "").strip()
+            ]
+            if preserve_page_lines
+            else list(expected_lines)
+        )
         expected_width = _article_english_layout_width(
             draw,
-            expected_lines,
+            frozen_lines,
             page_font_size,
         )
         boundary_before = dict(raw_page.get("boundary_before") or {})
         if (
-            not expected_lines
+            not frozen_lines
+            or " ".join(frozen_lines).split() != page_english.split()
+            or len(frozen_lines) > 2
+            or any(
+                text_w(draw, line, article_subtitle_en_font(page_font_size, 600))
+                > acx(english_width)
+                for line in frozen_lines
+            )
+            or (
+                preserve_page_lines
+                and _article_layout_has_severe_imbalance(
+                    draw,
+                    frozen_lines,
+                    page_font_size,
+                )
+            )
             or (page_index > 0 and boundary_before.get("classification") == "hard")
         ):
             return None
@@ -9219,6 +9333,7 @@ def apply_article_display_page_translation_artifact(
     artifact: Mapping[str, object],
     *,
     failure_items: list[dict[str, str]] | None = None,
+    reflow_frozen_page_lines: bool = False,
 ) -> bool:
     """Validate and attach the frozen page plans selected after final timing."""
     for cue in cues:
@@ -9301,11 +9416,25 @@ def apply_article_display_page_translation_artifact(
     for cue in cues:
         parent_id = str(cue.subtitle_id or "")
         translations = translations_by_parent.get(parent_id, {})
+        frozen = frozen_by_id[parent_id]
+        if reflow_frozen_page_lines:
+            try:
+                frozen = reflow_article_frozen_page_plan_same_screen(cue, frozen)
+            except (RenderStructuralOverflowError, KeyError, TypeError, ValueError):
+                if failure_items is not None:
+                    failure_items.append(
+                        {
+                            "subtitle_id": parent_id,
+                            "reason": "display_page_frozen_reflow_failed",
+                        }
+                    )
+                return False
         plan = _article_plan_from_frozen_artifact(
             cue,
-            frozen_by_id[parent_id],
+            frozen,
             translations,
             draw,
+            preserve_page_lines=reflow_frozen_page_lines,
         )
         if plan is None:
             if failure_items is not None:
@@ -9326,6 +9455,8 @@ def apply_article_display_page_translation_artifact(
 def load_article_display_page_translation_artifact(
     cues: Sequence[Cue],
     subtitle_path: str | Path,
+    *,
+    reflow_frozen_page_lines: bool = False,
 ) -> bool:
     manifest_path = find_stable_manifest_for_artifact(subtitle_path)
     if manifest_path is None:
@@ -9356,7 +9487,11 @@ def load_article_display_page_translation_artifact(
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("Article renderer could not load display page translations: %s", exc)
         return False
-    return apply_article_display_page_translation_artifact(cues, artifact)
+    return apply_article_display_page_translation_artifact(
+        cues,
+        artifact,
+        reflow_frozen_page_lines=reflow_frozen_page_lines,
+    )
 
 
 def _manual_draft_page_boundaries(
@@ -9700,6 +9835,10 @@ def apply_article_manual_draft_page_artifact(
     pending: list[tuple[Cue, dict, dict[str, str]]] = []
     for cue in cues:
         frozen = frozen_by_id[str(cue.subtitle_id or "")]
+        try:
+            frozen = reflow_article_frozen_page_plan_same_screen(cue, frozen)
+        except (RenderStructuralOverflowError, KeyError, TypeError, ValueError):
+            return False
         raw_pages = list(frozen.get("pages") or [])
         translations: dict[str, str] = {}
         for page in raw_pages:
@@ -9710,7 +9849,13 @@ def apply_article_manual_draft_page_artifact(
             if not page_id or not chinese or page_id in translations:
                 return False
             translations[page_id] = chinese
-        plan = _article_plan_from_frozen_artifact(cue, frozen, translations, draw)
+        plan = _article_plan_from_frozen_artifact(
+            cue,
+            frozen,
+            translations,
+            draw,
+            preserve_page_lines=True,
+        )
         if plan is None:
             return False
         plan["manual_draft_mode"] = True
@@ -9787,7 +9932,11 @@ def prepare_article_visual_page_plans(
                 }
             ]
         )
-    if not load_article_display_page_translation_artifact(cues, subtitle_path):
+    if not load_article_display_page_translation_artifact(
+        cues,
+        subtitle_path,
+        reflow_frozen_page_lines=allow_manual_draft,
+    ):
         if allow_manual_draft:
             if load_article_manual_draft_page_artifact(cues, subtitle_path):
                 return

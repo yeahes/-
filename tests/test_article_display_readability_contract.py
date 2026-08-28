@@ -897,6 +897,88 @@ def test_same_screen_wrap_does_not_favor_a_short_punctuation_prefix():
     assert min(widths) / max(widths) >= 0.50
 
 
+def test_same_screen_rejects_severe_short_manual_page_fragment():
+    draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
+    text = "Okay. He stated definitively that artificial intelligence systems,"
+    cue = _cue(
+        text,
+        "S0006",
+        display_boundary_evidence={
+            str(split): {"hard_issues": ["protected_syntax_cut"]}
+            for split in (2, 3, 4, 5, 6, 7)
+        },
+    )
+
+    lines = podcast_learning_video._article_same_screen_english_lines(
+        draw,
+        cue,
+        text.split(),
+        0,
+        len(text.split()),
+        56,
+    )
+
+    assert lines == []
+
+
+def test_severe_processing_module_page_is_replanned():
+    text = (
+        "They're creating a central memory bank where the AI pulls data from "
+        "different processing modules simultaneously."
+    )
+    cue = _cue(
+        text,
+        "S0063",
+        display_boundary_evidence={
+            "11": {
+                "hard_issues": [
+                    "dependency_phrase_entrance_split",
+                    "object_attached_modifier_split",
+                    "predicate_attached_continuation_split",
+                ],
+                "pause_ms": 280,
+            }
+        },
+    )
+
+    plan = _plan(cue)
+    assert all(
+        not podcast_learning_video._article_layout_has_severe_imbalance(
+            ImageDraw.Draw(Image.new("RGB", (1920, 1080))),
+            page["en_lines"],
+            page["english_font_size"],
+        )
+        for page in plan["pages"]
+    )
+
+
+def test_severe_public_psychology_page_is_replanned():
+    text = (
+        "And the deep connection formed by that physical proximity, it'll "
+        "inevitably lead to a massive psychological shift in the public."
+    )
+    cue = _cue(
+        text,
+        "S0088",
+        display_boundary_evidence={
+            "17": {
+                "hard_issues": ["dependency_phrase_entrance_split"],
+                "pause_ms": 480,
+            }
+        },
+    )
+
+    plan = _plan(cue)
+    assert all(
+        not podcast_learning_video._article_layout_has_severe_imbalance(
+            ImageDraw.Draw(Image.new("RGB", (1920, 1080))),
+            page["en_lines"],
+            page["english_font_size"],
+        )
+        for page in plan["pages"]
+    )
+
+
 def test_hyphenated_word_is_not_a_barrier_after_the_complete_token():
     draw = ImageDraw.Draw(Image.new("RGB", (1920, 1080)))
     text = "Since China's self-interest temporarily saved the market,"
@@ -4304,6 +4386,205 @@ def test_frozen_artifact_same_screen_reflow_changes_only_typography():
     assert upgraded["english_font_size"] == 54
     assert upgraded["pages"][0]["english_lines"] == layouts[0][1]
     assert upgraded["pages"][1]["english_lines"] == layouts[1][1]
+
+
+def test_frozen_reflow_relaxes_page_penalty_for_severe_orphan_without_moving_words():
+    text = (
+        "Okay. He stated definitively that artificial intelligence systems, "
+        "they do not undergo experiences."
+    )
+    cue = _cue(text, "S9704", chinese="甲乙")
+    frozen = {
+        "parent_subtitle_id": "S9704",
+        "english": text,
+        "chinese": "甲乙",
+        "word_start": 0,
+        "word_end": 12,
+        "english_font_size": 56,
+        "font_fallback": {"used": False},
+        "pages": [
+            {
+                "display_page_id": "S9704.P01",
+                "word_start": 0,
+                "word_end": 7,
+                "english": "Okay. He stated definitively that artificial intelligence systems,",
+                "chinese": "甲",
+                "start_ms": 0,
+                "end_ms": 3600,
+                "english_lines": [
+                    "Okay. He",
+                    "stated definitively that artificial intelligence systems,",
+                ],
+                "english_font_size": 56,
+                "english_width": 1455,
+                "boundary_before": {"classification": "allow"},
+            },
+            {
+                "display_page_id": "S9704.P02",
+                "word_start": 8,
+                "word_end": 12,
+                "english": "they do not undergo experiences.",
+                "chinese": "乙",
+                "start_ms": 3600,
+                "end_ms": 5720,
+                "english_lines": ["they do not undergo experiences."],
+                "english_font_size": 56,
+                "english_width": 1260,
+                "boundary_before": {"classification": "review"},
+            },
+        ],
+    }
+
+    upgraded = podcast_learning_video.reflow_article_frozen_page_plan_same_screen(
+        cue,
+        frozen,
+    )
+
+    assert upgraded["pages"][0]["english_lines"] == [
+        "Okay. He stated definitively that",
+        "artificial intelligence systems,",
+    ]
+    assert podcast_learning_video._article_line_balance_ratio(
+        ImageDraw.Draw(Image.new("RGB", (1920, 1080))),
+        upgraded["pages"][0]["english_lines"],
+        56,
+    ) >= 0.48
+    for key in (
+        "display_page_id",
+        "word_start",
+        "word_end",
+        "english",
+        "chinese",
+        "start_ms",
+        "end_ms",
+        "boundary_before",
+    ):
+        assert [page[key] for page in upgraded["pages"]] == [
+            page[key] for page in frozen["pages"]
+        ]
+
+
+def test_manual_artifact_load_applies_frozen_page_reflow_only_to_typography():
+    text = (
+        "Okay. He stated definitively that artificial intelligence systems, "
+        "they do not undergo experiences."
+    )
+    cue = _cue(text, "S9705", chinese="甲乙")
+    frozen = {
+        "parent_subtitle_id": "S9705",
+        "english": text,
+        "chinese": "甲乙",
+        "word_start": 0,
+        "word_end": 12,
+        "english_font_size": 56,
+        "font_fallback": {"used": False},
+        "pages": [
+            {
+                "display_page_id": "S9705.P01",
+                "word_start": 0,
+                "word_end": 7,
+                "english": "Okay. He stated definitively that artificial intelligence systems,",
+                "chinese": "甲",
+                "start_ms": 0,
+                "end_ms": 3600,
+                "english_lines": ["Okay. He", "stated definitively that artificial intelligence systems,"],
+                "english_font_size": 56,
+                "english_width": 1455,
+                "boundary_before": {"classification": "allow"},
+            },
+            {
+                "display_page_id": "S9705.P02",
+                "word_start": 8,
+                "word_end": 12,
+                "english": "they do not undergo experiences.",
+                "chinese": "乙",
+                "start_ms": 3600,
+                "end_ms": 5720,
+                "english_lines": ["they do not undergo experiences."],
+                "english_font_size": 56,
+                "english_width": 1260,
+                "boundary_before": {"classification": "review"},
+            },
+        ],
+    }
+    artifact = {
+        "schema_version": podcast_learning_video.MANUAL_DRAFT_PAGE_SCHEMA_VERSION,
+        "status": "REVIEW",
+        "planner_version": podcast_learning_video.DISPLAY_PAGE_PLANNER_VERSION,
+        "layout_profile": podcast_learning_video.article_display_page_layout_profile(),
+        "render_plans": [frozen],
+    }
+
+    assert podcast_learning_video.apply_article_manual_draft_page_artifact(
+        [cue],
+        artifact,
+    )
+    assert cue.article_page_plan["pages"][0]["en_lines"] == [
+        "Okay. He stated definitively that",
+        "artificial intelligence systems,",
+    ]
+    assert [
+        (
+            page["display_page_id"],
+            page["global_word_start"],
+            page["global_word_end"],
+            page["start"],
+            page["end"],
+            page["zh"],
+        )
+        for page in cue.article_page_plan["pages"]
+    ] == [
+        ("S9705.P01", 0, 7, 0.0, 3.6, "甲"),
+        ("S9705.P02", 8, 12, 3.6, 5.72, "乙"),
+    ]
+
+    display_cue = _cue(text, "S9706", chinese="甲乙")
+    display_frozen = copy.deepcopy(frozen)
+    display_frozen["parent_subtitle_id"] = "S9706"
+    for page in display_frozen["pages"]:
+        page["display_page_id"] = page["display_page_id"].replace("S9705", "S9706")
+    display_artifact = {
+        "schema_version": podcast_learning_video.DISPLAY_PAGE_SCHEMA_VERSION,
+        "status": "PASS",
+        "planner_version": podcast_learning_video.DISPLAY_PAGE_PLANNER_VERSION,
+        "layout_profile": podcast_learning_video.article_display_page_layout_profile(),
+        "render_plans": [display_frozen],
+        "parents": [
+            {
+                "parent_subtitle_id": "S9706",
+                "source_parent_chinese": "甲乙",
+                "aggregate_chinese": "甲乙",
+                "pages": [
+                    {"display_page_id": "S9706.P01", "zh": "甲"},
+                    {"display_page_id": "S9706.P02", "zh": "乙"},
+                ],
+            }
+        ],
+    }
+
+    assert podcast_learning_video.apply_article_display_page_translation_artifact(
+        [display_cue],
+        display_artifact,
+        reflow_frozen_page_lines=True,
+    )
+    assert display_cue.article_page_plan["pages"][0]["en_lines"] == [
+        "Okay. He stated definitively that",
+        "artificial intelligence systems,",
+    ]
+    assert [
+        (
+            page["display_page_id"],
+            page["global_word_start"],
+            page["global_word_end"],
+            page["start"],
+            page["end"],
+            page["zh"],
+        )
+        for page in display_cue.article_page_plan["pages"]
+    ] == [
+        ("S9706.P01", 0, 7, 0.0, 3.6, "甲"),
+        ("S9706.P02", 8, 12, 3.6, 5.72, "乙"),
+    ]
 
 
 def test_manual_page_boundary_rebuild_preserves_parent_and_rederives_pages():

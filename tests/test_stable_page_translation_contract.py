@@ -125,6 +125,69 @@ def _response(case, *, reverse=False):
     return {"pages": pages}
 
 
+def test_article_visual_page_text_parent_chinese_flag_is_display_only():
+    cue = podcast_learning_video.Cue(
+        1,
+        0.0,
+        4.0,
+        "First frozen page. Second frozen page.",
+        "完整父句中文。",
+        "male",
+        subtitle_id="S0001",
+    )
+    cue.article_page_plan = {
+        "status": "ok",
+        "pages": [
+            {
+                "en": "First frozen page.",
+                "zh": "第一页中文。",
+                "start": 0.0,
+                "end": 2.0,
+            },
+            {
+                "en": "Second frozen page.",
+                "zh": "第二页中文。",
+                "start": 2.0,
+                "end": 4.0,
+            },
+        ],
+    }
+
+    with patch.object(
+        podcast_learning_video,
+        "PODCAST_ARTICLE_WHOLE_PARENT_CHINESE",
+        False,
+    ):
+        assert podcast_learning_video.article_visual_page_text(cue, 1.0) == (
+            "First frozen page.",
+            "第一页中文。",
+        )
+        assert podcast_learning_video.article_visual_page_text(cue, 3.0) == (
+            "Second frozen page.",
+            "第二页中文。",
+        )
+
+    with patch.object(
+        podcast_learning_video,
+        "PODCAST_ARTICLE_WHOLE_PARENT_CHINESE",
+        True,
+    ):
+        assert podcast_learning_video.article_visual_page_text(cue, 1.0) == (
+            "First frozen page.",
+            "完整父句中文。",
+        )
+        assert podcast_learning_video.article_visual_page_text(cue, 3.0) == (
+            "Second frozen page.",
+            "完整父句中文。",
+        )
+
+        cue.article_page_plan["pages"] = [cue.article_page_plan["pages"][0]]
+        assert podcast_learning_video.article_visual_page_text(cue, 1.0) == (
+            "First frozen page.",
+            "第一页中文。",
+        )
+
+
 def _error_codes(result):
     return {
         str(error.get("code") if isinstance(error, dict) else error)
