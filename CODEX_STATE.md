@@ -1,10 +1,10 @@
 # Project State
 
-Status: in_progress
-Last verified: 2026-08-28 21:06:22 Asia/Shanghai
+Status: complete
+Last verified: 2026-08-28 21:11:24 Asia/Shanghai
 Branch: codex/backup-20260828
-Verified HEAD: 4959be4
-Working tree: staged backup candidate; local generated media remains ignored
+Verified HEAD: ea84999
+Working tree: clean; local generated media remains ignored
 
 ## Current Goal
 Prepare a recoverable GitHub backup branch containing source, tests, state,
@@ -94,8 +94,8 @@ handoffs, and reproducible audit material without generated media.
   nonblank with the expected reflowed lines.
 
 ## Next Action
-Run the focused probe test and `git diff --check`, then create the local backup
-checkpoint commit. User will review and push this branch to GitHub.
+Review the local backup checkpoint, then push branch `codex/backup-20260828` to
+the configured GitHub remote when ready.
 
 ## Do Not Regress
 - Preserve frozen English/IDs/word ownership/final timing, reject inconsistent checkpoints, keep successful page-batch caches, and never write `D:\\软件缓存\\VideoCaptioner`.
