@@ -9452,6 +9452,33 @@ def apply_article_display_page_translation_artifact(
     return True
 
 
+def _article_manual_final_override_matches(
+    manifest_path: Path,
+    manifest: Mapping[str, object],
+    subtitle_path: str | Path,
+) -> bool:
+    """Recognize a hash-bound manual-final SRT without authorizing drafts."""
+    override = manifest.get("manual_final_override") or {}
+    if not isinstance(override, Mapping):
+        return False
+    declared_path = str(override.get("subtitle_path") or "")
+    expected_sha256 = str(override.get("subtitle_sha256") or "")
+    if not declared_path or not expected_sha256:
+        return False
+    owned_path = resolve_manifest_owned_path(
+        manifest_path,
+        manifest,
+        declared_path,
+        expected_sha256,
+    )
+    if owned_path is None:
+        return False
+    try:
+        return owned_path.resolve() == Path(subtitle_path).resolve()
+    except OSError:
+        return False
+
+
 def load_article_display_page_translation_artifact(
     cues: Sequence[Cue],
     subtitle_path: str | Path,
@@ -9484,6 +9511,14 @@ def load_article_display_page_translation_artifact(
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
         if str(artifact.get("contract_hash") or "") != expected_contract_hash:
             return False
+        reflow_frozen_page_lines = bool(
+            reflow_frozen_page_lines
+            or _article_manual_final_override_matches(
+                manifest_path,
+                manifest,
+                subtitle_path,
+            )
+        )
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("Article renderer could not load display page translations: %s", exc)
         return False

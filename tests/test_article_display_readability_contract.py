@@ -4587,6 +4587,33 @@ def test_manual_artifact_load_applies_frozen_page_reflow_only_to_typography():
     ]
 
 
+def test_manual_final_override_enables_reflow_on_formal_render_path(tmp_path):
+    generation_dir = tmp_path / "generations" / "g1"
+    generation_dir.mkdir(parents=True)
+    subtitle_path = generation_dir / "manual.srt"
+    subtitle_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nA\n\n", encoding="utf-8")
+    manifest_path = tmp_path / "stable-final-manifest.json"
+    manifest = {
+        "schema_version": 5,
+        "package_generation": {"id": "g1", "relative_dir": "generations/g1"},
+        "manual_final_override": {
+            "subtitle_path": str(subtitle_path),
+            "subtitle_sha256": podcast_learning_video.file_sha256(subtitle_path),
+        },
+    }
+
+    assert podcast_learning_video._article_manual_final_override_matches(
+        manifest_path,
+        manifest,
+        subtitle_path,
+    )
+    assert not podcast_learning_video._article_manual_final_override_matches(
+        manifest_path,
+        manifest,
+        generation_dir / "other.srt",
+    )
+
+
 def test_manual_page_boundary_rebuild_preserves_parent_and_rederives_pages():
     text = (
         "Reliable systems preserve every frozen parent while manual reviewers "
