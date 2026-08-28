@@ -113,11 +113,11 @@ ledger, WhisperX alignment, or the final cue timeline.
   before other legal lexical breaks.
 - The article cover, vocabulary-card, and subtitle panels now composite their
   bundled container textures (`封面容器.png`, `单词卡容器.png`, and `字幕区背景.png`)
-  at 70% opacity inside their existing rounded 1080p frames. The fallback flat
+  at 40% opacity inside their existing rounded 1080p frames. The fallback flat
   panels remain underneath, and each asset is clipped before foreground content
   is drawn. The shared panel shadow uses `alpha=22` and a 16px Gaussian blur to
   retain edge contrast against the light textures. Focused background/layout tests
-  pass; sample: `output/current-hd-render-20260828/current-layout-neutral-texture-70.png`.
+  pass; sample: `output/current-hd-render-20260828/current-layout-neutral-texture-40.png`.
 - The production changes are split into mechanism-scoped commits through
   `b1ae687`; the unverified page-selection experiment was removed. Remaining
   uncommitted changes are historical audit/state updates and generated evidence.

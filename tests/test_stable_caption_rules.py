@@ -6956,7 +6956,7 @@ def test_article_subtitle_background_uses_configured_opacity_and_rounded_clip(tm
     ), patch.object(
         podcast_learning_video,
         "ARTICLE_SUBTITLE_BACKGROUND_OPACITY",
-        70,
+        40,
     ):
         podcast_learning_video.draw_article_subtitle_background(base, rect, 4)
 
@@ -6967,7 +6967,7 @@ def test_article_subtitle_background_uses_configured_opacity_and_rounded_clip(tm
     assert base.getpixel((2, 2)) == (100, 120, 140, 255)
 
 
-def test_article_frame_assigns_each_container_texture_at_70_percent():
+def test_article_frame_assigns_each_container_texture_at_40_percent():
     article_image = Image.new(
         "RGB",
         (
@@ -6994,9 +6994,9 @@ def test_article_frame_assigns_each_container_texture_at_70_percent():
         )
 
     assert calls == [
-        ("封面容器.png", 70),
-        ("单词卡容器.png", 70),
-        ("字幕区背景.png", 70),
+        ("封面容器.png", 40),
+        ("单词卡容器.png", 40),
+        ("字幕区背景.png", 40),
     ]
 
 
